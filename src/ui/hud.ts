@@ -4,7 +4,7 @@ import { ensureSensors, releaseBike } from '../ble/sources';
 import { audio, buzz } from '../audio/audio';
 import { WorkoutEngine } from '../domain/engine';
 import { CORRIDOR_RPM, cueFor, pacerDecision, type Cue, type PacerConfig } from '../domain/pacer';
-import { PHASE_COLOR, fmtDur, programById, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
+import { PHASE_COLOR, fmtDur, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
 import { wattsForRpm } from '../domain/airbikeCurve';
 import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
@@ -19,7 +19,7 @@ import { renderSummary } from './summaryView';
 
 /** Display smoothing for cadence and power. The gauge needle is deliberately NOT smoothed. */
 const SMOOTH_MS = 3000;
-const rpmTxt = (g: Segment): string => `${Math.round(g.rpm ?? 0)}${g.allOut ? '+' : ''}`;
+const rpmTxt = (g: Segment): string => `${fmtRpm(g.rpm ?? 0)}${g.allOut ? '+' : ''}`;
 
 export function hudScreen(root: HTMLElement, args: string[], query: URLSearchParams): () => void {
   const program = programById(args[0]);
@@ -31,6 +31,9 @@ export function hudScreen(root: HTMLElement, args: string[], query: URLSearchPar
 }
 
 class Hud {
+  private baseProgram: Program;
+  private p: Program;
+  private offsetWatts = 0;
   private engine: WorkoutEngine;
   private rec: Recorder | null = null;
   private goal: number;
@@ -51,9 +54,11 @@ class Hud {
   private tlReady = true;
   private el!: Record<string, HTMLElement>;
 
-  constructor(private root: HTMLElement, private p: Program, private eventId: number | null) {
-    this.engine = new WorkoutEngine(p);
-    this.goal = p.goal?.def ?? 0;
+  constructor(private root: HTMLElement, baseProgram: Program, private eventId: number | null) {
+    this.baseProgram = baseProgram;
+    this.p = resolveProgram(baseProgram, getSettings().ftp, 0);
+    this.engine = new WorkoutEngine(this.p);
+    this.goal = this.p.goal?.def ?? 0;
   }
 
   // ------------------------------------------------------------------ mount / teardown
@@ -61,6 +66,7 @@ class Hud {
   mount(): () => void {
     ensureSensors({ bike: true });
     this.paintHud();
+    this.loop();
     this.offSmooth = bikeFrame.on((f) => {
       const t = Date.now();
       this.cadAvg.push(t, f.cad);
@@ -114,6 +120,14 @@ class Hud {
     const goalCtl = p.goal
       ? `<div class="goal" id="goalCtl"><button data-goal="-1" aria-label="Less">−</button><div><b id="goalVal">${this.goal}</b> <small>${p.goal.unit}</small></div><button data-goal="1" aria-label="More">+</button></div>`
       : '';
+    const hasTrim = this.baseProgram.zone === 'Z5' || this.baseProgram.zone === 'Z2';
+    const trimRow = hasTrim
+      ? `<div class="trim" id="trimCtl">
+          <button type="button" data-trim="-5" aria-label="Lower target 5 watts">−5 W</button>
+          <button type="button" class="trim-mid" id="trimLbl" title="Tap to reset trim"></button>
+          <button type="button" data-trim="5" aria-label="Raise target 5 watts">+5 W</button>
+        </div>`
+      : '';
 
     this.root.innerHTML = `<div class="hud">
       ${topbar({ back: '#/airbike', title: p.name, bike: true })}
@@ -124,6 +138,7 @@ class Hud {
       <div class="banner" id="banner">
         <span class="ph" id="ph">READY</span><span class="tag" id="tag"></span><span class="tgt" id="tgt"></span>
       </div>
+      ${trimRow}
       <div class="big">
         <small id="cdLabel">${segs.length ? 'NEXT TRANSITION' : p.goal ? (p.goal.type === 'time' ? 'TIME LEFT' : 'CAL TO GO') : 'ELAPSED'}</small>
         <div class="cd" id="cd">${segs.length ? mmss(segs[0].seconds) : p.goal?.type === 'time' ? mmss(this.goal * 60) : p.goal ? String(this.goal) : '0:00'}</div>
@@ -166,10 +181,20 @@ class Hud {
       'pauseSub', 'doneModal', 'ovRight', 'tl', 'sigNote']) this.el[id] = q(id);
     if (segs.length) this.el.tlHead = q('tlHead');
     else this.el.tlFill = q('tlFill');
+    if (hasTrim) this.el.trimLbl = q('trimLbl');
 
     this.offChips?.();
     this.offChips = wireChips(this.root);
     this.bind();
+  }
+
+  private adjustTarget(nextOffset: number): void {
+    const clamped = Math.max(-80, Math.min(120, nextOffset));
+    if (clamped === this.offsetWatts) return;
+    this.offsetWatts = clamped;
+    this.p = resolveProgram(this.baseProgram, getSettings().ftp, this.offsetWatts);
+    this.engine.setProgram(this.p);
+    this.loop();
   }
 
   private bind(): void {
@@ -183,6 +208,9 @@ class Hud {
       audio.unlock();
       updateSettings({ metroEnabled: !getSettings().metroEnabled });
     });
+    this.root.querySelectorAll<HTMLElement>('[data-trim]').forEach((b) =>
+      b.addEventListener('click', () => this.adjustTarget(this.offsetWatts + Number(b.dataset.trim))));
+    this.root.querySelector('#trimLbl')?.addEventListener('click', () => this.adjustTarget(0));
     this.root.querySelectorAll<HTMLElement>('[data-goal]').forEach((b) =>
       b.addEventListener('click', () => {
         if (this.engine.state !== 'ready' || !this.p.goal) return;
@@ -388,6 +416,13 @@ class Hud {
     e.cadSub.textContent = shown?.rpm != null ? `target ${rpmTxt(shown)}` : 'rpm';
     e.mCad.dataset.level = cue.level;
     e.mW.dataset.level = cue.level === 'bad' ? 'bad' : 'idle';
+    if (e.trimLbl) {
+      const ref = p.segments.find((g) => g.kind === 'work' || g.kind === 'steady');
+      if (ref?.rpm != null) {
+        const off = this.offsetWatts ? ` (${this.offsetWatts > 0 ? '+' : '−'}${Math.abs(this.offsetWatts)} W)` : '';
+        e.trimLbl.textContent = `WORK ${targetWatts(ref)} W · ${fmtRpm(ref.rpm)} RPM${off}`;
+      }
+    }
 
     // strip
     e.sEl.textContent = hms(elapsed);

@@ -12,7 +12,11 @@ export class WorkoutEngine {
   private accMs = 0;
   private resumedAt = 0;
 
-  constructor(readonly program: Program) {}
+  constructor(public program: Program) {}
+
+  setProgram(p: Program): void {
+    this.program = p;
+  }
 
   start(now: number): void {
     this.accMs = 0;

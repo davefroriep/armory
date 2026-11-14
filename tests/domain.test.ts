@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { bpmForRpm, rpmForWatts, wattsForRpm } from '../src/domain/airbikeCurve';
-import { PROGRAMS, programById, totalSeconds, workSeconds } from '../src/domain/programs';
+import { PROGRAMS, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds } from '../src/domain/programs';
 import { locate } from '../src/domain/timeline';
 import { WorkoutEngine } from '../src/domain/engine';
 import { cueFor, pacerDecision, type PacerConfig } from '../src/domain/pacer';
@@ -52,8 +52,23 @@ describe('programs', () => {
     expect(dur('tabata')).toBe(240);
     expect(dur('sprint1020')).toBe(240);
   });
-  it('ids are unique', () => {
+  it('ids are unique and Z5 protocols are ordered p6x2 -> v5x3 -> b6030 -> n4x4', () => {
     expect(new Set(PROGRAMS.map((p) => p.id)).size).toBe(PROGRAMS.length);
+    expect(PROGRAMS.filter((p) => p.group === 'z5').map((p) => p.id)).toEqual(['p6x2', 'v5x3', 'b6030', 'n4x4']);
+    expect([56, 55, 57, 54.5].map(fmtRpm)).toEqual(['56', '55', '57', '54.5']);
+  });
+  it('resolveProgram scales by FTP and shifts work watts cleanly with live +/-5 W trim', () => {
+    const p = programById('p6x2')!;
+    const baseWork = resolveProgram(p, 182, 0).segments.find((g) => g.kind === 'work')!;
+    expect(targetWatts(baseWork)).toBe(240);
+    const trimmedDown = resolveProgram(p, 182, -10).segments.find((g) => g.kind === 'work')!;
+    expect(targetWatts(trimmedDown)).toBe(230);
+    const trimmedUp = resolveProgram(p, 182, 5).segments.find((g) => g.kind === 'work')!;
+    expect(targetWatts(trimmedUp)).toBe(245);
+    const scaled = resolveProgram(p, 165, 0);
+    const scaledWork = scaled.segments.find((g) => g.kind === 'work')!;
+    expect(targetWatts(scaledWork)).toBe(Math.round(240 * (165 / 182)));
+    expect(scaled.segments.find((g) => g.kind === 'rest')!.rpm!).toBeGreaterThanOrEqual(36);
   });
 });
 

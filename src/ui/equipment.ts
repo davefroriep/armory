@@ -1,9 +1,10 @@
 import { ensureSensors, releaseBike } from '../ble/sources';
 import { calendar } from '../intervals/calendar';
-import { PROGRAMS, fmtDur, targetWatts, totalSeconds, workSeconds, type Program, type ProgramGroup } from '../domain/programs';
+import { PROGRAMS, fmtDur, fmtRpm, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program, type ProgramGroup } from '../domain/programs';
+import { getSettings, settingsChanged } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import { ICON, esc } from './dom';
-import { calendarCard, topbar, wireCalendar, wireChips } from './chrome';
+import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
 
 // Zone 2 and Free Ride are the least-used on the AirBike, so they sit at the bottom.
 const GROUPS: { id: ProgramGroup; title: string }[] = [
@@ -13,14 +14,15 @@ const GROUPS: { id: ProgramGroup; title: string }[] = [
   { id: 'z2', title: 'ZONE 2' },
 ];
 
-function programCard(p: Program, today: boolean): string {
+function programCard(raw: Program, today: boolean, ftp: number): string {
+  const p = resolveProgram(raw, ftp);
   const total = totalSeconds(p);
   const work = workSeconds(p);
   const chips: string[] = [];
-  if (total) chips.push(fmtDur(total));
-  if (work && p.zone === 'Z5') chips.push(`${fmtDur(work)} Z5`);
   const w = p.segments.find((g) => g.kind === 'work' || g.kind === 'steady');
-  if (w?.rpm) chips.push(`${Math.round(w.rpm)}${w.allOut ? '+' : ''} RPM${w.allOut ? '' : ` · ${targetWatts(w)} W`}`);
+  if (w?.rpm != null) chips.push(`${fmtRpm(w.rpm)}${w.allOut ? '+' : ''} RPM${w.allOut ? '' : ` · ${targetWatts(w)} W`}`);
+  if (work && p.zone === 'Z5') chips.push(`${fmtDur(work)} Z5`);
+  if (total) chips.push(fmtDur(total));
   if (p.goal) chips.push(`${p.goal.def} ${p.goal.unit}`);
   return `<a class="prog ${p.group} ${today ? 'today' : ''}" href="#/airbike/p/${p.id}">
     <span class="prog-h"><b>${esc(p.name)}</b>${today ? '<em>TODAY</em>' : ''}</span>
@@ -34,25 +36,29 @@ export function airbikeScreen(root: HTMLElement): () => void {
   void calendar.refresh();
 
   const paint = () => {
+    const ftp = getSettings().ftp;
     const todays = calendar.forEquipment('airbike');
     const todayIds = new Set(todays.map((t) => t.match.programId).filter(Boolean));
     const groups = GROUPS.map(
       (g) => `<h2 class="sec">${g.title}</h2><div class="progs">${PROGRAMS.filter((p) => p.group === g.id)
-        .map((p) => programCard(p, todayIds.has(p.id))).join('')}</div>`,
+        .map((p) => programCard(p, todayIds.has(p.id), ftp)).join('')}</div>`,
     ).join('');
     root.innerHTML = `${topbar({ back: '#/', title: 'AirBike', bike: true, cog: true })}
       <main class="page">
         ${calendarCard(todays, false)}
         ${groups}
         <a class="free" href="#/airbike/p/free"><span>${ICON.airbike}</span><b>Free Ride</b><small>Just ride &amp; record</small><i>›</i></a>
+        ${revFooter()}
       </main>`;
   };
   paint();
   const cleanup = wireChips(root);
   const offCal = wireCalendar(root, paint);
+  const offSet = settingsChanged.on(paint);
   return () => {
     cleanup();
     offCal();
+    offSet();
     releaseBike();
   };
 }
@@ -79,6 +85,7 @@ export function stubScreen(eq: Exclude<Equipment, 'airbike' | 'strength'>) {
           ${calendarCard(calendar.forEquipment(eq), false)}
           <section class="card soon"><span class="soon-ico ${eq}">${ICON[eq]}</span><h3>${n.head}</h3><p>${n.body}</p>
 </section>
+          ${revFooter()}
         </main>`;
     };
     paint();

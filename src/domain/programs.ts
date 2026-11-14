@@ -1,4 +1,11 @@
-import { wattsForRpm } from './airbikeCurve';
+import { rpmForWatts, wattsForRpm } from './airbikeCurve';
+
+export const BASE_FTP = 182;
+
+export function fmtRpm(rpm: number): string {
+  const half = Math.round(rpm * 2) / 2;
+  return Number.isInteger(half) ? String(half) : half.toFixed(1);
+}
 
 export type PhaseKind = 'warmup' | 'work' | 'steady' | 'float' | 'rest' | 'cooldown';
 
@@ -95,7 +102,7 @@ function rounds(n: number, workSec: number, restSec: number, workRpm: number): S
 export const PROGRAMS: Program[] = [
   {
     id: 'z2', name: 'Zone 2 Base', intervalsName: 'AirBike Z2', group: 'z2', zone: 'Z2',
-    blurb: 'Aerobic base. Hold about 45 RPM (130 W).',
+    blurb: 'Aerobic base · 45:00 steady @ 72% FTP.',
     segments: [
       s('warmup', 'WARM-UP', 300, EASY_RPM),
       s('steady', 'ZONE 2', 2700, 44.5),
@@ -103,20 +110,20 @@ export const PROGRAMS: Program[] = [
     ],
   },
   {
-    id: 'n4x4', name: 'Norwegian 4×4', intervalsName: 'AirBike Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5',
-    blurb: 'Helgerud / NTNU. 4 × 4:00 @ 223 W (55 RPM), 3:00 easy.', segments: repeats(4, 240, 54.5, 180),
+    id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5',
+    blurb: 'Jamieson 1:1 · 6 × 2:00 @ 132% FTP, 2:00 easy.', segments: repeats(6, 120, 56.0, 120),
   },
   {
     id: 'v5x3', name: 'Classic VO2 5×3', intervalsName: 'AirBike Z5 — Classic VO2 5×3', group: 'z5', zone: 'Z5',
-    blurb: 'Fractionated macro-intervals. 5 × 3:00 @ 228 W (55 RPM), 2:00 easy.', segments: repeats(5, 180, 55.0, 120),
-  },
-  {
-    id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5',
-    blurb: '1:1 aerobic power. 6 × 2:00 @ 240 W (56 RPM), 2:00 easy.', segments: repeats(6, 120, 56.0, 120),
+    blurb: 'Macro-Intervals · 5 × 3:00 @ 125% FTP, 2:00 easy.', segments: repeats(5, 180, 55.0, 120),
   },
   {
     id: 'b6030', name: 'Billat / Rønnestad 60/30', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
-    blurb: '2 sets × 8 × (60s @ 252 W / 30s float). Never stop the fan.', segments: billat(),
+    blurb: 'Float VO2 · 2 × 8 × (60s @ 138% FTP / 30s float). Keep fan moving.', segments: billat(),
+  },
+  {
+    id: 'n4x4', name: 'Norwegian 4×4', intervalsName: 'AirBike Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5',
+    blurb: 'NTNU CERG · 4 × 4:00 @ 122% FTP, 3:00 easy.', segments: repeats(4, 240, 54.5, 180),
   },
   {
     id: 'tabata', name: 'Tabata 20/10', intervalsName: 'AirBike Tabata 20/10', group: 'hiit', zone: null,
@@ -141,6 +148,23 @@ export const PROGRAMS: Program[] = [
     blurb: 'No program. Just ride and record.', segments: [], paceRpm: FREE_PACE_RPM,
   },
 ];
+
+export function resolveProgram(p: Program, ftp = BASE_FTP, offsetWatts = 0): Program {
+  if ((p.zone !== 'Z5' && p.zone !== 'Z2') || (ftp === BASE_FTP && offsetWatts === 0)) return p;
+  return {
+    ...p,
+    segments: p.segments.map((g) => {
+      if (g.rpm == null || g.allOut) return g;
+      if (g.kind === 'work' || g.kind === 'steady') {
+        const w = Math.max(50, Math.round(wattsForRpm(g.rpm) * (ftp / BASE_FTP)) + offsetWatts);
+        return { ...g, rpm: rpmForWatts(w) };
+      }
+      if (ftp === BASE_FTP) return g;
+      const w = wattsForRpm(g.rpm) * (ftp / BASE_FTP);
+      return { ...g, rpm: Math.min(48, Math.max(36, rpmForWatts(w))) };
+    }),
+  };
+}
 
 export const programById = (id: string | null | undefined): Program | undefined => PROGRAMS.find((p) => p.id === id);
 

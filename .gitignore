@@ -28,3 +28,5 @@ Thumbs.db
 
 # one-time setup QR codes (contain the Intervals.icu key)
 local-secrets/
+__pycache__/
+*.pyc

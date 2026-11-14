@@ -1,6 +1,6 @@
 import { Emitter } from '../emitter';
 import { getSettings } from '../store/settings';
-import { hasKey } from './api';
+import { hasKey, syncAthleteFtp } from './api';
 import { classifyEvent, isPlannedWorkout, type EventMatch, type IntervalsEvent } from './parse';
 
 export interface TodayItem {
@@ -12,6 +12,7 @@ export type CalendarStatus = 'nokey' | 'loading' | 'ok' | 'error';
 
 const BASE = 'https://intervals.icu/api/v1';
 const CACHE_KEY = 'armory.calendar.today';
+let lastFtpSync = 0;
 
 export const localDate = (d = new Date()): string =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -54,6 +55,10 @@ class Calendar {
       localStorage.setItem(CACHE_KEY, JSON.stringify({ date: day, items: this.items }));
       this.status = 'ok';
       this.error = '';
+      if (Date.now() - lastFtpSync > 10 * 60_000) {
+        lastFtpSync = Date.now();
+        void syncAthleteFtp(false).catch(() => {});
+      }
     } catch (e) {
       this.status = 'error';
       this.error = e instanceof TypeError ? 'Offline - showing last known plan' : (e as Error).message;

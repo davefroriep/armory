@@ -5,8 +5,7 @@ import { allMeta, getSamples, putMeta } from '../store/db';
 import { summarize } from '../workout/summary';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
 import { ICON, esc, mmss } from './dom';
-import { calendarCard, topbar, wireCalendar, wireChips } from './chrome';
-import { REV, REV_STAMP } from '../rev';
+import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
 
 const TILES: Equipment[] = ['strength', 'treadmill', 'spin', 'airbike'];
 const SUB: Record<Equipment, string> = {
@@ -34,7 +33,7 @@ export function homeScreen(root: HTMLElement): () => void {
         ${banners}
         ${calendarCard(calendar.items, true)}
         <div class="tiles4">${tiles}</div>
-        <footer class="rev">Rev ${REV} — ${REV_STAMP}</footer>
+        ${revFooter()}
       </main>`;
   };
 

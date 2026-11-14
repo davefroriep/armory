@@ -2,12 +2,11 @@ import { bikeLink, hrLink } from '../ble/devices';
 import { transport } from '../ble/transport';
 import { sim } from '../ble/sim';
 import { ensureSensors } from '../ble/sources';
-import { hasKey, testConnection } from '../intervals/api';
+import { hasKey, syncAthleteFtp, testConnection } from '../intervals/api';
 import { calendar } from '../intervals/calendar';
 import { audio } from '../audio/audio';
-import { getSettings, updateSettings } from '../store/settings';
-import { REV, REV_STAMP } from '../rev';
-import { topbar, wireChips } from './chrome';
+import { getSettings, settingsChanged, updateSettings } from '../store/settings';
+import { revFooter, topbar, wireChips } from './chrome';
 import { $ } from './dom';
 
 export function settingsScreen(root: HTMLElement): () => void {
@@ -17,26 +16,41 @@ export function settingsScreen(root: HTMLElement): () => void {
   const tog = (name: string, on: boolean) => `<button class="switch ${on ? 'on' : ''}" data-tog="${name}" role="switch" aria-checked="${on}"><i></i></button>`;
   const num = (name: string, v: number, min: number, max: number) =>
     `<input class="num" type="number" inputmode="numeric" data-num="${name}" min="${min}" max="${max}" value="${v}">`;
+  const ftpStatus = () => {
+    const cur = getSettings();
+    return `Intervals modeled eFTP: <b>${cur.intervalsEftp != null ? `${cur.intervalsEftp} W` : '—'}</b> · Manual FTP: <b>${cur.intervalsSetFtp != null ? `${cur.intervalsSetFtp} W` : '—'}</b>`;
+  };
 
   root.innerHTML = `${topbar({ back: '#/', title: 'Settings' })}
   <main class="page settings">
+    <h2 class="sec">TRAINING &amp; FTP</h2>
+    <section class="card">
+      <div class="line"><span>AirBike FTP<small>Scales Z2 &amp; Z5 % FTP targets (182 W baseline)</small></span>${num('ftp', s.ftp, 80, 450)}<em>W</em></div>
+      <div class="line"><span>Auto-sync eFTP from Intervals<small>Updates FTP automatically when Intervals models a new eFTP</small></span>${tog('ftpAutoSync', s.ftpAutoSync)}</div>
+      <div class="hint" id="ftpInfo">${ftpStatus()}</div>
+      <div class="row">
+        <button class="btn sm" id="useEftp" ${s.intervalsEftp ? '' : 'disabled'}>Use modeled eFTP</button>
+        <button class="btn sm" id="syncFtp">Sync from Intervals</button>
+      </div>
+    </section>
+
     <h2 class="sec">INTERVALS.ICU</h2>
     <section class="card">
       <label class="field">Athlete ID<input id="aid" value="${s.athleteId}" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
-      <label class="field">API key<input id="key" type="password" value="${s.apiKey}" placeholder="Paste once — stays on this phone" autocomplete="off" spellcheck="false"></label>
+      <label class="field">API key<input id="key" type="password" value="${s.apiKey}" placeholder="Pre-configured" autocomplete="off" spellcheck="false"></label>
       <div class="row"><button class="btn sm" id="test">Test connection</button><span id="testout" class="hint"></span></div>
-      <p class="hint">Intervals → Settings → Developer Settings → API Key. Stored only in this browser, never in the app’s code.</p>
+      <p class="hint">Pre-configured for your account on this device (Intervals → Settings → Developer Settings).</p>
     </section>
 
     <h2 class="sec">METRONOME</h2>
     <section class="card">
-      <div class="line"><span>When it plays<small>The ♪ button on the workout screen turns it on/off</small></span></div>
+      <div class="line"><span>When it plays<small>The button on the workout screen turns it on/off</small></span></div>
       ${seg('metroMode', s.metroMode, [['transitions', 'Only on transitions'], ['whole', 'Whole workout']])}
       <div class="line"><span>Start before transition<small>Lead-in at the upcoming tempo</small></span>${num('metroLead', s.metroLead, 0, 15)}<em>sec</em></div>
       <div class="line"><span>Keep going after<small>Transitions mode only</small></span>${num('metroTail', s.metroTail, 0, 60)}<em>sec</em></div>
       <div class="line"><span>Auto-mute when locked in<small>Stop early once cadence holds target ±1.5 RPM for 3 s</small></span>${tog('metroAutoMute', s.metroAutoMute)}</div>
       <div class="line"><span>Volume</span><input id="vol" type="range" min="0.1" max="1" step="0.05" value="${s.metroVolume}"></div>
-      <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 55 RPM · 223 W ticks at 109 BPM.</p>
+      <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 54.5 RPM · 223 W ticks at 109 BPM.</p>
     </section>
 
     <h2 class="sec">WORKOUT</h2>
@@ -49,13 +63,21 @@ export function settingsScreen(root: HTMLElement): () => void {
     <h2 class="sec">DEVICES</h2>
     <section class="card">
       <div class="row"><button class="btn sm" id="forget">Forget Polar H10 &amp; AirBike</button></div>
-      <p class="hint">Chrome remembers a paired sensor so the app can reconnect silently. Use this if one stops reconnecting, then tap the chip to pair again.</p>
+      <p class="hint">Remembers paired sensors so the app can reconnect silently. Use this if one stops reconnecting, then tap the chip to pair again.</p>
       <div class="line"><span>Simulator<small>Fake H10 + AirBike to try the app without hardware</small></span>${tog('simulator', s.simulator)}</div>
     </section>
-    <footer class="rev">Armory Fit · Rev ${REV} — ${REV_STAMP}</footer>
+    ${revFooter()}
   </main>`;
 
   const cleanupChips = wireChips(root);
+  const paintFtpBox = () => {
+    const cur = getSettings();
+    $('#ftpInfo', root).innerHTML = ftpStatus();
+    $<HTMLButtonElement>('#useEftp', root).disabled = !cur.intervalsEftp;
+    $<HTMLInputElement>('[data-num="ftp"]', root).value = String(cur.ftp);
+  };
+  const offSet = settingsChanged.on(paintFtpBox);
+  if (hasKey()) void syncAthleteFtp(false).catch(() => {});
 
   const onClick = (e: Event) => {
     const t = e.target as HTMLElement;
@@ -67,17 +89,23 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'metroAutoMute' | 'chime' | 'haptics' | 'simulator';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
+      if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
       if (name === 'simulator') {
         if (on) { hrLink.release(); bikeLink.release(); }
         else sim.stop();
         ensureSensors({ bike: false });
       }
     }
+    if (t.closest('#useEftp')) {
+      const ef = getSettings().intervalsEftp;
+      if (ef) updateSettings({ ftp: ef });
+    }
+    if (t.closest('#syncFtp')) void syncFtp();
     if (t.closest('#forget')) void forget();
     if (t.closest('#test')) void test();
   };
@@ -98,6 +126,18 @@ export function settingsScreen(root: HTMLElement): () => void {
   root.addEventListener('click', onClick);
   root.addEventListener('input', onInput);
 
+  async function syncFtp() {
+    const infoEl = $('#ftpInfo', root);
+    if (!hasKey()) { infoEl.textContent = 'Add an API key first'; return; }
+    infoEl.textContent = 'Syncing from Intervals.icu…';
+    try {
+      await syncAthleteFtp(false);
+      paintFtpBox();
+    } catch (e) {
+      infoEl.textContent = `✗ ${(e as Error).message}`;
+    }
+  }
+
   async function test() {
     const out = $('#testout', root);
     if (!hasKey()) { out.textContent = 'Paste an API key first'; return; }
@@ -115,6 +155,7 @@ export function settingsScreen(root: HTMLElement): () => void {
 
   return () => {
     cleanupChips();
+    offSet();
     root.removeEventListener('click', onClick);
     root.removeEventListener('input', onInput);
     if (hasKey()) void calendar.refresh();

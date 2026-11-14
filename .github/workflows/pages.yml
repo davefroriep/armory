@@ -23,6 +23,8 @@ jobs:
       - run: npm test
       # Rev badge + sw.js cache are bumped locally by `npm run build` before committing.
       - run: npm run build:ci
+        env:
+          VITE_INTERVALS_API_KEY: ${{ secrets.VITE_INTERVALS_API_KEY }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

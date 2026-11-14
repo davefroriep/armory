@@ -1,4 +1,4 @@
-import { getSettings } from '../store/settings';
+import { getSettings, updateSettings } from '../store/settings';
 
 const BASE = 'https://intervals.icu/api/v1';
 
@@ -31,9 +31,51 @@ async function call(path: string, init: RequestInit = {}): Promise<Response> {
 
 const aid = () => encodeURIComponent(getSettings().athleteId.trim());
 
-export async function testConnection(): Promise<string> {
+export interface AthleteFtpInfo {
+  name: string;
+  eftp: number | null;
+  setFtp: number | null;
+  maxHr: number | null;
+}
+
+interface SportSettingRaw {
+  types?: string[];
+  ftp?: number;
+  indoor_ftp?: number;
+  eftp?: number;
+  max_hr?: number;
+  mmp_model?: { ftp?: number };
+}
+
+export async function fetchAthleteProfile(): Promise<AthleteFtpInfo> {
   const j = await (await call(`/athlete/${aid()}`)).json();
-  return j.name ?? aid();
+  const list: SportSettingRaw[] = Array.isArray(j.sportSettings) ? j.sportSettings : [];
+  const ss = list.find((x) => Array.isArray(x.types) && (x.types.includes('VirtualRide') || x.types.includes('Ride'))) ?? list[0];
+  const rawEftp = ss?.mmp_model?.ftp ?? ss?.eftp ?? null;
+  const rawSetFtp = ss?.indoor_ftp && ss.indoor_ftp > 0 ? ss.indoor_ftp : ss?.ftp ?? null;
+  return {
+    name: String(j.name ?? aid()),
+    eftp: typeof rawEftp === 'number' && rawEftp > 0 ? Math.round(rawEftp) : null,
+    setFtp: typeof rawSetFtp === 'number' && rawSetFtp > 0 ? Math.round(rawSetFtp) : null,
+    maxHr: typeof ss?.max_hr === 'number' && ss.max_hr > 0 ? Math.round(ss.max_hr) : null,
+  };
+}
+
+export async function syncAthleteFtp(forceUseEftp = false): Promise<AthleteFtpInfo> {
+  const info = await fetchAthleteProfile();
+  const patch: Partial<ReturnType<typeof getSettings>> = {
+    intervalsEftp: info.eftp,
+    intervalsSetFtp: info.setFtp,
+  };
+  if ((forceUseEftp || getSettings().ftpAutoSync) && info.eftp) {
+    patch.ftp = info.eftp;
+  }
+  updateSettings(patch);
+  return info;
+}
+
+export async function testConnection(): Promise<string> {
+  return (await syncAthleteFtp(false)).name;
 }
 
 export interface UploadArgs {

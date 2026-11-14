@@ -15,13 +15,20 @@ import sys
 import qrcode
 
 SYNC = r"j:\My Drive\Misc\Health\Scripts\sync_intervals.py"
+SKILL_CREDS = r"C:\Users\davef\.gemini\config\skills\intervals-icu\intervals_creds.json"
 PWA = "https://davefroriep.github.io/armory/#setup={key}&aid={aid}"
 APP = "armory://setup?key={key}&aid={aid}"
 
 
 def find_key() -> tuple[str, str]:
+    import json
+
     aid = "i758105"
     key = os.environ.get("ARMORY_INTERVALS_KEY", "").strip()
+    if not key and os.path.exists(SKILL_CREDS):
+        creds = json.load(open(SKILL_CREDS, encoding="utf8"))
+        key = str(creds.get("api_key", "")).strip()
+        aid = str(creds.get("athlete_id", aid)).strip() or aid
     if not key and os.path.exists(SYNC):
         src = open(SYNC, encoding="utf8").read()
         m = re.search(r'DEFAULT_API_KEY\s*=\s*"([A-Za-z0-9]{16,64})"', src)

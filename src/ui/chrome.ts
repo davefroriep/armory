@@ -2,6 +2,7 @@ import { $, ICON, esc } from './dom';
 import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { hrFresh, live } from '../ble/telemetry';
 import { calendar, type TodayItem } from '../intervals/calendar';
+import { REV, REV_STAMP } from '../rev';
 import { EQUIPMENT_LABEL } from '../types';
 
 export interface BarOpts {
@@ -95,5 +96,7 @@ export function wireCalendar(root: HTMLElement, repaint: () => void): () => void
     off();
   };
 }
+
+export const revFooter = (): string => `<footer class="rev">Rev ${REV} — ${REV_STAMP}</footer>`;
 
 export { $ };

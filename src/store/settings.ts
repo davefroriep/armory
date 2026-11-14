@@ -4,8 +4,16 @@ import type { MetroMode } from '../domain/pacer';
 export interface Settings {
   /** Intervals.icu athlete id (not a secret). */
   athleteId: string;
-  /** Intervals.icu API key. Lives ONLY in this device's localStorage - never in the repo. */
+  /** Intervals.icu API key. Baked via build-time env or pasted in Settings; never committed to git. */
   apiKey: string;
+  /** Threshold power (W) used to scale AirBike Z2/Z5 targets (% FTP). */
+  ftp: number;
+  /** Automatically update `ftp` whenever Intervals.icu models a new eFTP. */
+  ftpAutoSync: boolean;
+  /** Last modeled eFTP reported by Intervals.icu (`sportSettings.mmp_model.ftp`). */
+  intervalsEftp: number | null;
+  /** Last manual FTP configured on Intervals.icu (`sportSettings.indoor_ftp` / `ftp`). */
+  intervalsSetFtp: number | null;
   hrMax: number;
   metroEnabled: boolean;
   metroMode: MetroMode;
@@ -20,10 +28,15 @@ export interface Settings {
 }
 
 const KEY = 'armory.settings.v1';
+const BAKED_KEY = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_INTERVALS_API_KEY ?? '').trim();
 
 export const DEFAULTS: Settings = {
   athleteId: 'i758105',
-  apiKey: '',
+  apiKey: BAKED_KEY,
+  ftp: 182,
+  ftpAutoSync: false,
+  intervalsEftp: null,
+  intervalsSetFtp: null,
   hrMax: 180,
   metroEnabled: true,
   metroMode: 'transitions',
@@ -38,7 +51,12 @@ export const DEFAULTS: Settings = {
 
 function load(): Settings {
   try {
-    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) ?? '{}') };
+    const parsed = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<Settings>;
+    return {
+      ...DEFAULTS,
+      ...parsed,
+      apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
+    };
   } catch {
     return { ...DEFAULTS };
   }

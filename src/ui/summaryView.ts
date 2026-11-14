@@ -2,6 +2,7 @@ import { RPE_STEPS, rpeLabel } from '../domain/rpe';
 import { putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
 import { discard, syncWorkout } from '../workout/sync';
+import { revFooter } from './chrome';
 import { esc, hms } from './dom';
 
 export interface SummaryOpts {
@@ -31,6 +32,7 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
       <button class="btn primary big" id="save" disabled>Save &amp; upload to Intervals.icu</button>
       <button class="btn danger big" id="discard">Discard workout</button>
     </div>
+    ${revFooter()}
   </main>`;
 
   let rpe = 0;

@@ -1,16 +1,14 @@
 import { hrFresh, live } from '../ble/telemetry';
 import { ensureSensors } from '../ble/sources';
 import { calendar } from '../intervals/calendar';
-import { isNative, workoutService } from '../native/service';
+import { isNative, openBoostcamp, workoutService } from '../native/service';
 import { getSettings } from '../store/settings';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
-import { calendarCard, topbar, wireCalendar, wireChips } from './chrome';
+import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
 import { $, hms, mmss } from './dom';
 import { ZONE_COLOR, hrZone } from './hr';
 import { renderSummary } from './summaryView';
-
-const BOOSTCAMP = 'https://www.boostcamp.app/';
 
 /**
  * Strength = heart-rate logging only. You lift in Boostcamp; this records the H10 for the session
@@ -48,10 +46,11 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
           </div>
         </section>
         <div class="ctrl nopad">
-          <a class="metro" href="${BOOSTCAMP}" target="_blank" rel="noopener">OPEN BOOSTCAMP</a>
+          <button class="metro" id="openBoostcamp" type="button">OPEN BOOSTCAMP</button>
           <button class="go" id="go">START</button>
         </div>
         <p class="hint c">Start logging, then lift in Boostcamp. Come back and finish to save your heart-rate session.</p>
+        ${revFooter()}
       </main>
       <div class="modal" id="pauseModal" hidden>
         <div class="sheet"><h2>Paused</h2><p id="pauseSub"></p>
@@ -61,6 +60,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
     offChips = wireChips(root);
     offCal?.();
     offCal = wireCalendar(root, () => { if (state === 'ready') paintReady(); });
+    $('#openBoostcamp', root).addEventListener('click', () => { void openBoostcamp(); });
     $('#go', root).addEventListener('click', () => (state === 'ready' ? start() : pause()));
     $('#resume', root).addEventListener('click', resume);
     $('#finish', root).addEventListener('click', finish);
@@ -123,7 +123,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
     offChips = null;
     const meta = rec?.finalize();
     if (!rec || !meta || meta.seconds < 5) {
-      root.innerHTML = `${topbar({})}<main class="page"><section class="card"><h3>Nothing recorded</h3><p>No heart-rate data was captured.</p><a class="btn primary" href="#/strength">Back</a></section></main>`;
+      root.innerHTML = `${topbar({})}<main class="page"><section class="card"><h3>Nothing recorded</h3><p>No heart-rate data was captured.</p><a class="btn primary" href="#/strength">Back</a></section>${revFooter()}</main>`;
       if (meta) void discard(meta.id);
       return;
     }
