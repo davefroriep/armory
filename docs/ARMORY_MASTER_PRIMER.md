@@ -1,7 +1,7 @@
 # THE ARMORY — Strength & Conditioning Hub + Armory Fit Telemetry Primer
 
-**Created:** 2026-11-14 (Updated for 5 Hz Direct BLE Architecture)  
-**Umbrella Workspace:** `N:\Documents\Antigravity\Armory` *(Strength & Conditioning Ecosystem)*  
+**Created:** 2026-11-14 (Updated for `Strength and Conditioning` Workspace + 5 Hz Direct BLE Architecture)  
+**Umbrella Workspace:** `N:\Documents\Antigravity\Strength and Conditioning` *(Strength & Conditioning Ecosystem)*  
 **Target Athlete:** Dave Froriep (`Intervals.icu` ID `i758105` — Cycling FTP `182 W`, Zone 2 `128–130 W`, Norwegian 4×4 `218–225 W`)  
 **Scope:** Unified **Strength & Conditioning Hub** housing **Armory Fit** (Capacitor `.apk` + GitHub Pages mirror), **Boostcamp** (`boostcamp_client.py` strength programming), and **Intervals.icu** telemetry/analytics — connecting over **5 Hz Direct BLE (`NUS`)** to **Spin (Bowflex C7 / SS2K)**, **AirBike (Assault Elite)**, and **Treadmill (Horizon T101)** + **Polar H10**, while leaving **BLE FTMS (`0x1826`)** passive in the background for **MyWhoosh**.
 
@@ -15,7 +15,7 @@ Because **"The Armory"** represents your entire home Strength & Conditioning gym
 | :--- | :--- | :--- |
 | **Thread 1: Strength Programming** | `Boostcamp` (moved/linked under S&C Hub) | 100% programmatic workout programming via `boostcamp_client.py` + `backups/` |
 | **Thread 2: Telemetry & Wellness** | `Intervals.icu` (`i758105` + `health_records.sqlite`) | Daily wellness trends, TSB/CTL load, power zone tracking, `.fit`/`.tcx` sync |
-| **Thread 3: `Armory Fit` App** | `N:\Documents\Antigravity\Armory` (`davefroriep/armory`) | Unified Capacitor `.apk` + GitHub Pages mirror replacing `SS2K/cockpit_pwa` & `Treadmill/pwa` |
+| **Thread 3: `Armory Fit` App** | `N:\Documents\Antigravity\Strength and Conditioning` (`davefroriep/armory`) | Unified Capacitor `.apk` + GitHub Pages mirror replacing `SS2K/cockpit_pwa` & `Treadmill/pwa` |
 | **Hardware Repo 1: AirBike** | `N:\Documents\Antigravity\Smart Airbike` | XIAO ESP32-C6 (`AssaultBike`) CAD + firmware + `/dev` bench calibration |
 | **Hardware Repo 2: Spin** | `N:\Documents\Antigravity\SS2K Head` | ESP32-WROOM (`SS2K_Tuner`) NEMA17 + TMC2209 actuator + Power Pedal calibration |
 | **Hardware Repo 3: Treadmill** | `N:\Documents\Antigravity\Smart Treadmill` | XIAO ESP32-C6 (`Horizon T101 Pod`) roller/MPU-6050 firmware + enclosure |
@@ -102,19 +102,19 @@ Source verified: `N:\Documents\Antigravity\SS2K Head\ss2k_install_mode\src\main.
 
 ---
 
-### 5.3 Equipment 2: AirBike — Assault Elite / `AssaultBike` (`Rev v1.3`)
+### 5.3 Equipment 2: AirBike — Assault Elite / `AssaultBike` (`Rev v1.5`)
 Source verified: `N:\Documents\Antigravity\Smart Airbike\PlatformIO\include\airbike_math.h`
 - **Scan Filter:** Name `"AssaultBike"` or NUS UUID `6e400001-b5a3-f393-e0a9-e50e24dcca9e` (Primary ADV carries `NUS` + `FTMS 0x1826`; Scan Response carries `AssaultBike` + `CSC 0x1816`)
 - **Primary 5 Hz TX Notify (`6e400003-...`) JSON (`200 ms`):**
-  `{"dev":"airbike","w":127.0,"cad":44.0,"fan":126.5,"rfan":126.8,"spd":16.87,"dist":452.1,"kcal":15.42,"cpm":5.12,"pls":1042,"dt":473120,"ratio":2.8750,"mag":1,"mphf":0.3833}\n`
+  `{"dev":"airbike","w":127.0,"cad":44.0,"fan":488.8,"rfan":489.2,"spd":16.87,"dist":452.1,"kcal":15.42,"cpm":5.65,"pls":1042,"dt":122649,"ratio":11.1100,"mag":1,"mphf":0.3833}\n`
   - `w`: Interpolated official Assault Elite Watts (`float`, `0.1 W` resolution)
   - `cad`: Pedal/Crank RPM (`fan / ratio`)
-  - `fan` / `rfan`: EMA-smoothed and raw Fan RPM
-  - `spd`: Console MPH (`cad * mphf`) · `dist`: Cumulative meters · `kcal`: Cumulative kcal · `cpm`: `watts * 0.04035`
+  - `fan` / `rfan`: EMA-smoothed and raw Fan RPM (`alpha = 0.35f`)
+  - `spd`: Console MPH (`cad * mphf`) · `dist`: Cumulative meters · `kcal`: Cumulative kcal · `cpm`: `watts * 0.04445`
   - `pls`: Cumulative ISR Hall pulses · `dt`: Last inter-pulse microsecond delta (`us`)
   - `ratio` / `mag` / `mphf`: Active NVS calibration parameters
 - **RX Write (`6e400002-...`) Commands (persisted immediately to NVS Flash):**
-  - `SET_RATIO:<float>` (`0.25..30.0`, default `2.875`)
+  - `SET_RATIO:<float>` (`0.25..30.0`, default `11.1100`)
   - `SET_MAGNETS:<int>` (`1..16`, default `1`)
   - `SET_MPH_FACTOR:<float>` (`0.05..2.0`, default `0.3833`)
   - `RESET` or `RESET_PULSES` (zeros distance, calories, and pulse counters)
@@ -140,7 +140,7 @@ Source verified: `N:\Documents\Antigravity\Smart Treadmill\PlatformIO\src\main.c
 
 | Machine | Status | Immediate & Next Calibration Milestones |
 | :--- | :--- | :--- |
-| **1. Assault AirBike (`Smart Airbike`)** | **~90% Done** (`Rev v1.3` built/flashed; CAD clip `v16.3` printed) | 1. Snap mount onto fan shroud & spin fan to confirm `Total Pulses` increments on `/dev`.<br>2. Run **100-pedal-revolution tally** on `http://assaultbike.local/dev` (Start at stroke 0 -> Lock at stroke 100 *before* coasting) to lock `fanToCrankRatio` in NVS.<br>3. **5-Minute Screen Video Overlay**: Film physical LCD for 5 min while Python logs `/api/telemetry` at `4 Hz`; extract `1 fps` frames with `ffmpeg` and match timestamps to dial in dynamic fan inertia EMA smoothing (`alpha`) & exact watt parity. |
+| **1. Assault AirBike (`Smart Airbike`)** | **100% Calibrated & Frozen (`Rev v1.5` @ `a783314`)** | 1. **DONE:** Factory magnet + flipped `3144E` (`D2`/GPIO 2) + 5-min + `4 fps` LCD calibration completed (`fanToCrankRatio = 11.1100`, `alpha = 0.35f`, `1.064 RPM` RMSE, `cpm = watts * 0.04445`, `20 ms` debounce).<br>2. Live on `AssaultBike` (`http://assaultbike.local`) ready for **Armory Fit** `5 Hz` `NUS` integration. *(Optional future mod: GPIO-gated sensor power + reed wake + BLE-only mode for 1S battery run).* |
 | **2. Bowflex C7 (`SS2K Head`)** | **~75% Done** (Stepper/knob collar installed; ERG works up to Level 36) | 1. **Stage 1 — Full-Range C7 Sweep (`Levels 3–100`):** Measure `SS2K Potentiometer ADC` vs. C7 head up through Levels `36–70` (`218–225 W`) to remove the physical Bowflex C7 head.<br>2. **Stage 2 — Tactical BLE Power-Pedal Protocol:** Install borrowed/rental BLE Power Pedals (`0x1818`, `9/16"` crank) and run automated `scripts/calibrate_true_watts.py` across 15 Potentiometer ADC steps (`0–100%`) at `70/85/95 RPM` to eliminate "photocopied C7 fuzz" forever (`trueWatts = f(pot_adc, rpm)`).<br>3. **Stage 3 — Slim-Down + FTMS:** Decouple `isErgActive`, retire SPIFFS `/wo.bin` + `cockpit_pwa`, and add passive FTMS (`0x2AD2` + `0x2AD9`) for MyWhoosh spin races. |
 | **3. Horizon T101 (`Smart Treadmill`)** | **~45% Done** (Parts on workbench) | 1. **Workbench Solder & Dry Test:** Solder 7 shared points (`3V3`, `GND`, `D2` Hall `D0`, `D3` Tare button, `D4 SDA`, `D5 SCL` MPU-6050) + bench test OLED, magnet pulses, and tilt (`0–15%`).<br>2. **Physical Install + Firmware Upgrade:** Glue roller magnet (`1–3 mm` gap), mount Y-aligned MPU-6050 on frame, and add **5 Hz Direct BLE (`NUS`)** + `TARE_INCLINE`.<br>3. **True Belt Speed & Incline Verification:** Time 10 chalked belt revolutions at `2.0 / 4.0 / 6.0 MPH` to calibrate `ROLLER_DIAMETER_CM`, and check `0% / 5% / 10%` against a digital level. |
 
@@ -157,4 +157,4 @@ Source verified: `N:\Documents\Antigravity\Smart Treadmill\PlatformIO\src\main.c
 ## 8. Copy-Paste Kickoff Prompts (Thread Structure)
 
 ### For the `Armory Fit` App Thread
-> *"We are building the **Armory Fit** cardio cockpit app in `N:\Documents\Antigravity\Armory`. Read `GEMINI.md` and `docs/ARMORY_MASTER_PRIMER.md` first. Every machine (`Spin`, `AirBike`, `Treadmill`) uses **5 Hz Direct BLE (`NUS` `6e400001-...`)** as its primary telemetry and calibration transport, with FTMS kept strictly passive for MyWhoosh. Let's scaffold the `Vite + TypeScript + Capacitor` app with our custom `WorkoutForegroundService.kt`, `BleTransport` abstraction, 1 Hz `IndexedDB` session recorder with crash recovery, machine adapters (`SpinAdapter`, `AirBikeAdapter`, `TreadmillAdapter`, `PolarH10`), Intervals.icu `.tcx` uploader, and GitHub Actions `.apk` CI build."*
+> *"We are building the **Armory Fit** cardio cockpit app in `N:\Documents\Antigravity\Strength and Conditioning`. Read `GEMINI.md` and `docs/ARMORY_MASTER_PRIMER.md` first. Every machine (`Spin`, `AirBike`, `Treadmill`) uses **5 Hz Direct BLE (`NUS` `6e400001-...`)** as its primary telemetry and calibration transport, with FTMS kept strictly passive for MyWhoosh. Let's scaffold the `Vite + TypeScript + Capacitor` app with our custom `WorkoutForegroundService.kt`, `BleTransport` abstraction, 1 Hz `IndexedDB` session recorder with crash recovery, machine adapters (`SpinAdapter`, `AirBikeAdapter`, `TreadmillAdapter`, `PolarH10`), Intervals.icu `.tcx` uploader, and GitHub Actions `.apk` CI build."*
