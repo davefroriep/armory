@@ -149,7 +149,7 @@ Source verified: `N:\Documents\Antigravity\Smart Treadmill\PlatformIO\src\main.c
 ## 7. Intervals.icu TCX Upload & Security Hygiene
 
 - **Endpoint:** `POST https://intervals.icu/api/v1/athlete/{athleteId}/activities?name={title}&description={desc}` (`Basic btoa("API_KEY:" + apiKey)`)
-- **Format:** `.tcx` (`Sport="Biking"` for Spin/AirBike; `Sport="Running"` with `Speed` + `AltitudeMeters` + `RunCadence` for Treadmill) with `pending_upload` IndexedDB retry queue.
+- **Format & Calories Rule:** `.tcx` (`Sport="Biking"` for Spin/AirBike; `Sport="Running"` with `Speed` + `AltitudeMeters` + `RunCadence` for Treadmill) with `pending_upload` IndexedDB retry queue. Always write TCX `<Calories>` from mechanical work (`round(totalWorkKj)`, i.e. `1 kJ = 1 kcal`, matching Bowflex/Intervals convention) while keeping Assault console calories (`watts * 0.04445`) on the live AirBike workout screen.
 - **STRICT SECRETS RULE:** Never commit `intervalsApiKey` or Wi-Fi credentials into public `.html`/`.ts` files; keep secrets exclusively in local device `Preferences` / `localStorage` *(and scrub the legacy hardcoded key in `SS2K Head/cockpit_pwa/index.html` when retiring it).*
 
 ---
