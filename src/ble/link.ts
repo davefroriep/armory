@@ -1,4 +1,5 @@
 import { Emitter, sleep } from '../emitter';
+import { transport, type DeviceSpec } from './transport';
 import { linkStatus } from './telemetry';
 
 export type LinkState = 'unsupported' | 'idle' | 'connecting' | 'connected' | 'lost';
@@ -7,29 +8,25 @@ const CONNECT_TIMEOUT_MS = 12000;
 const RETRY_MS = 3000;
 
 /**
- * One Web Bluetooth peripheral that reconnects by itself.
+ * One BLE peripheral that reconnects by itself, on top of whichever transport is active.
  *
- * Launch behaviour: `ensure()` silently re-attaches to a device this browser has already been
- * granted (navigator.bluetooth.getDevices()). The very first pairing - and any browser that does not
- * keep grants - needs one tap on the chip (`pair()`), because Chrome only allows the chooser from a
- * user gesture.
+ * Web: `ensure()` silently re-attaches to a device the browser already granted; the first pairing
+ * needs one tap (`pair()`). Native (Android app): the stored device id is connected directly.
  */
 export abstract class BleLink {
   state: LinkState = 'idle';
   deviceName = '';
   readonly changed = new Emitter();
 
-  protected device: BluetoothDevice | null = null;
+  protected id: string | null = null;
   protected wanted = false;
   private looping = false;
 
-  constructor(private readonly storeKey: string) {
-    if (typeof navigator === 'undefined' || !navigator.bluetooth) this.state = 'unsupported';
+  constructor(private readonly storeKey: string, protected readonly spec: DeviceSpec) {
+    if (!transport.supported()) this.state = 'unsupported';
   }
 
-  protected abstract requestOptions(): RequestDeviceOptions;
-  protected abstract matches(d: BluetoothDevice): boolean;
-  protected abstract subscribe(server: BluetoothRemoteGATTServer): Promise<void>;
+  protected abstract subscribe(id: string): Promise<void>;
 
   protected setState(s: LinkState): void {
     if (this.state === s) return;
@@ -47,57 +44,39 @@ export abstract class BleLink {
     if (this.state === 'unsupported') return;
     this.wanted = true;
     if (this.connected || this.looping) return;
-    if (!this.device) {
-      const granted = await this.grantedDevice();
-      if (!granted) {
+    if (!this.id) {
+      this.id = await transport.known(this.spec, localStorage.getItem(this.storeKey));
+      if (!this.id) {
         this.setState('idle');
         return;
       }
-      this.attach(granted);
     }
     void this.connectLoop();
   }
 
-  /** Needs a user gesture: opens the chooser the first time. */
+  /** Chooser (web: needs a user gesture). */
   async pair(): Promise<void> {
     if (this.state === 'unsupported') return;
     this.wanted = true;
-    try {
-      const d = await navigator.bluetooth.requestDevice(this.requestOptions());
-      this.attach(d);
-      void this.connectLoop();
-    } catch (e) {
-      if ((e as DOMException).name !== 'NotFoundError') console.warn('pair failed', e);
-    }
+    const id = await transport.pick(this.spec);
+    if (!id) return;
+    this.id = id;
+    this.deviceName = transport.name(id);
+    localStorage.setItem(this.storeKey, id);
+    void this.connectLoop();
   }
 
-  /** Stop reconnecting and drop the GATT link (the browser keeps the grant). */
+  /** Stop reconnecting and drop the link (the stored pairing is kept). */
   release(): void {
     this.wanted = false;
-    try {
-      this.device?.gatt?.disconnect();
-    } catch { /* already gone */ }
+    if (this.id) void transport.disconnect(this.id);
     if (this.state !== 'unsupported') this.setState('idle');
   }
 
-  private async grantedDevice(): Promise<BluetoothDevice | null> {
-    try {
-      if (!navigator.bluetooth.getDevices) return null;
-      const list = await navigator.bluetooth.getDevices();
-      const saved = localStorage.getItem(this.storeKey);
-      return list.find((d) => d.id === saved) ?? list.find((d) => this.matches(d)) ?? null;
-    } catch {
-      return null;
-    }
-  }
-
-  private attach(d: BluetoothDevice): void {
-    if (this.device && this.device !== d) this.device.removeEventListener('gattserverdisconnected', this.onDrop);
-    this.device = d;
-    this.deviceName = d.name ?? '';
-    localStorage.setItem(this.storeKey, d.id);
-    d.removeEventListener('gattserverdisconnected', this.onDrop);
-    d.addEventListener('gattserverdisconnected', this.onDrop);
+  forget(): void {
+    this.release();
+    this.id = null;
+    localStorage.removeItem(this.storeKey);
   }
 
   private onDrop = () => {
@@ -110,25 +89,22 @@ export abstract class BleLink {
     if (this.looping) return;
     this.looping = true;
     try {
-      while (this.wanted && this.device && !this.device.gatt?.connected) {
+      while (this.wanted && this.id && this.state !== 'connected') {
         this.setState(this.state === 'lost' ? 'lost' : 'connecting');
         try {
-          const server = await Promise.race([
-            this.device.gatt!.connect(),
-            sleep(CONNECT_TIMEOUT_MS).then(() => { throw new Error('connect timeout'); }),
-          ]);
-          await this.subscribe(server);
+          await transport.connect(this.id, this.onDrop, CONNECT_TIMEOUT_MS);
+          await this.subscribe(this.id);
+          this.deviceName = transport.name(this.id);
           this.setState('connected');
           return;
         } catch (e) {
-          try { this.device.gatt?.disconnect(); } catch { /* ignore */ }
+          await transport.disconnect(this.id);
           if (!this.wanted) break;
           this.setState('lost');
           await sleep(RETRY_MS);
           console.debug('retry connect', this.constructor.name, e);
         }
       }
-      if (this.device?.gatt?.connected && this.wanted) this.setState('connected');
     } finally {
       this.looping = false;
     }

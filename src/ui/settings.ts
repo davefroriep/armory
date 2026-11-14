@@ -1,4 +1,5 @@
 import { bikeLink, hrLink } from '../ble/devices';
+import { transport } from '../ble/transport';
 import { sim } from '../ble/sim';
 import { ensureSensors } from '../ble/sources';
 import { hasKey, testConnection } from '../intervals/api';
@@ -35,7 +36,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       <div class="line"><span>Keep going after<small>Transitions mode only</small></span>${num('metroTail', s.metroTail, 0, 60)}<em>sec</em></div>
       <div class="line"><span>Auto-mute when locked in<small>Stop early once cadence holds target ±1.5 RPM for 3 s</small></span>${tog('metroAutoMute', s.metroAutoMute)}</div>
       <div class="line"><span>Volume</span><input id="vol" type="range" min="0.1" max="1" step="0.05" value="${s.metroVolume}"></div>
-      <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 54.5 RPM · 223 W ticks at 109 BPM.</p>
+      <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 55 RPM · 223 W ticks at 109 BPM.</p>
     </section>
 
     <h2 class="sec">WORKOUT</h2>
@@ -106,13 +107,9 @@ export function settingsScreen(root: HTMLElement): () => void {
   }
 
   async function forget() {
-    hrLink.release();
-    bikeLink.release();
-    try {
-      for (const d of (await navigator.bluetooth?.getDevices?.()) ?? []) await (d as unknown as { forget?: () => Promise<void> }).forget?.();
-    } catch { /* unsupported */ }
-    localStorage.removeItem('armory.ble.polar');
-    localStorage.removeItem('armory.ble.airbike');
+    hrLink.forget();
+    bikeLink.forget();
+    await transport.forgetAll();
     alert('Sensors forgotten. Tap the heart-rate chip on the home screen to pair again.');
   }
 

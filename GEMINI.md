@@ -20,3 +20,9 @@
 - `docs/`: `ARMORY_MASTER_PRIMER.md` and S&C / BLE protocol specs.
 - `.github/workflows/`: Automated CI build for Android `.apk` releases + GitHub Pages deployment.
 *(Root policy: Keep build scripts in `package.json` or `scripts/`; zero hardcoded API keys or Wi-Fi credentials in repo.)*
+
+## 4. Build & Android (Capacitor)
+- Web: `npm run build` (auto-bumps `Rev` badge + `sw.js` cache; push `main` -> Pages workflow deploys). Tests: `npm test`.
+- Android debug APK: `.\scripts\android.ps1 -Install` (portable JDK 21 in `C:\Users\davef\Tools\jdk-21`, SDK in `%LOCALAPPDATA%\Android\Sdk`, phone via adb).
+- One-time Intervals.icu hookup: `python scripts\make_setup_qr.py` -> scan QR (key never in repo; `local-secrets/` is git-ignored).
+- Names: `Assault AirBike Elite` (Assault Fitness). Effort scale = 8 words -> RPE 3-10.

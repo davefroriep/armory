@@ -95,7 +95,7 @@ function rounds(n: number, workSec: number, restSec: number, workRpm: number): S
 export const PROGRAMS: Program[] = [
   {
     id: 'z2', name: 'Zone 2 Base', intervalsName: 'AirBike Z2', group: 'z2', zone: 'Z2',
-    blurb: 'Aerobic base. Hold 44.5 RPM (about 131 W).',
+    blurb: 'Aerobic base. Hold about 45 RPM (130 W).',
     segments: [
       s('warmup', 'WARM-UP', 300, EASY_RPM),
       s('steady', 'ZONE 2', 2700, 44.5),
@@ -104,19 +104,19 @@ export const PROGRAMS: Program[] = [
   },
   {
     id: 'n4x4', name: 'Norwegian 4×4', intervalsName: 'AirBike Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5',
-    blurb: 'Helgerud / NTNU. 4 × 4:00 @ 54.5 RPM, 3:00 easy.', segments: repeats(4, 240, 54.5, 180),
+    blurb: 'Helgerud / NTNU. 4 × 4:00 @ 223 W (55 RPM), 3:00 easy.', segments: repeats(4, 240, 54.5, 180),
   },
   {
     id: 'v5x3', name: 'Classic VO2 5×3', intervalsName: 'AirBike Z5 — Classic VO2 5×3', group: 'z5', zone: 'Z5',
-    blurb: 'Fractionated macro-intervals. 5 × 3:00 @ 55 RPM, 2:00 easy.', segments: repeats(5, 180, 55.0, 120),
+    blurb: 'Fractionated macro-intervals. 5 × 3:00 @ 228 W (55 RPM), 2:00 easy.', segments: repeats(5, 180, 55.0, 120),
   },
   {
     id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5',
-    blurb: '1:1 aerobic power. 6 × 2:00 @ 56 RPM, 2:00 easy.', segments: repeats(6, 120, 56.0, 120),
+    blurb: '1:1 aerobic power. 6 × 2:00 @ 240 W (56 RPM), 2:00 easy.', segments: repeats(6, 120, 56.0, 120),
   },
   {
     id: 'b6030', name: 'Billat / Rønnestad 60/30', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
-    blurb: '2 sets × 8 × (60s @ 57 RPM / 30s float). Never stop the fan.', segments: billat(),
+    blurb: '2 sets × 8 × (60s @ 252 W / 30s float). Never stop the fan.', segments: billat(),
   },
   {
     id: 'tabata', name: 'Tabata 20/10', intervalsName: 'AirBike Tabata 20/10', group: 'hiit', zone: null,

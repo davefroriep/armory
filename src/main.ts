@@ -4,6 +4,9 @@ import { airbikeScreen, stubScreen } from './ui/equipment';
 import { homeScreen } from './ui/home';
 import { hudScreen } from './ui/hud';
 import { settingsScreen } from './ui/settings';
+import { strengthScreen } from './ui/strength';
+import { initSetupLinks } from './setup';
+import { isNative } from './native/service';
 
 type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (() => void) | void;
 
@@ -12,7 +15,7 @@ const routes: Record<string, Screen> = {
   airbike: (root, args, q) => (args[0] === 'p' ? hudScreen(root, args.slice(1), q) : airbikeScreen(root)),
   spin: stubScreen('spin'),
   treadmill: stubScreen('treadmill'),
-  strength: stubScreen('strength'),
+  strength: strengthScreen,
   settings: settingsScreen,
 };
 
@@ -34,6 +37,7 @@ function route(): void {
   cleanup = (routes[name] ?? routes[''])(root, args, new URLSearchParams(qs));
 }
 
+initSetupLinks();
 window.addEventListener('hashchange', route);
 route();
 
@@ -42,6 +46,6 @@ const retry = () => { void retryPending().catch(() => {}); };
 window.addEventListener('online', retry);
 setTimeout(retry, 2500);
 
-if ('serviceWorker' in navigator && location.protocol !== 'file:' && !import.meta.env.DEV) {
+if ('serviceWorker' in navigator && location.protocol !== 'file:' && !import.meta.env.DEV && !isNative()) {
   navigator.serviceWorker.register('./sw.js').catch(() => {});
 }

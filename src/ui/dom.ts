@@ -12,12 +12,6 @@ export const mmss = (sec: number): string => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
-/** MM:SS, switching to SS.d tenths for the final 10 seconds (matches the tactical countdown). */
-export const countdown = (sec: number): string => {
-  if (sec <= 10 && sec > 0) return sec.toFixed(1);
-  return mmss(Math.ceil(sec));
-};
-
 export const hms = (sec: number): string => {
   const s = Math.floor(sec);
   const h = Math.floor(s / 3600);

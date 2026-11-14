@@ -6,21 +6,20 @@ import { WorkoutEngine } from '../domain/engine';
 import { CORRIDOR_RPM, cueFor, pacerDecision, type Cue, type PacerConfig } from '../domain/pacer';
 import { PHASE_COLOR, fmtDur, programById, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
 import { wattsForRpm } from '../domain/airbikeCurve';
+import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
+import { workoutService } from '../native/service';
 import { getSettings, updateSettings } from '../store/settings';
-import { putMeta } from '../store/db';
+import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
-import { discard, syncWorkout } from '../workout/sync';
-import { ICON, countdown, esc, hms, mmss } from './dom';
+import { ICON, esc, hms, mmss } from './dom';
 import { topbar, wireChips } from './chrome';
+import { ZONE_COLOR, hrZone } from './hr';
+import { renderSummary } from './summaryView';
 
-const RPE_LABEL = ['', 'Very easy', 'Very easy', 'Easy', 'Easy', 'Moderate', 'Moderate', 'Hard', 'Hard', 'Very hard', 'Max effort'];
-
-const hrZone = (hr: number, max: number): { z: number; pct: number } => {
-  const pct = hr / max;
-  return { pct, z: pct < 0.6 ? 1 : pct < 0.7 ? 2 : pct < 0.8 ? 3 : pct < 0.88 ? 4 : 5 };
-};
-const ZONE_COLOR = ['', '#8a94a3', '#38bdf8', '#22c55e', '#f59e0b', '#ff4d2e'];
+/** Display smoothing for cadence and power. The gauge needle is deliberately NOT smoothed. */
+const SMOOTH_MS = 3000;
+const rpmTxt = (g: Segment): string => `${Math.round(g.rpm ?? 0)}${g.allOut ? '+' : ''}`;
 
 export function hudScreen(root: HTMLElement, args: string[], query: URLSearchParams): () => void {
   const program = programById(args[0]);
@@ -37,13 +36,19 @@ class Hud {
   private goal: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private offFrame: (() => void) | null = null;
+  private offSmooth: (() => void) | null = null;
   private offChips: (() => void) | null = null;
   private lock: WakeLockSentinel | null = null;
   private lastIndex = -2;
   private lockSince: number | null = null;
   private lastChirp = 0;
+  private lastSvc = 0;
   private completeShown = false;
   private view: 'hud' | 'summary' = 'hud';
+  private cadAvg = new WindowAvg(SMOOTH_MS);
+  private wAvg = new WindowAvg(SMOOTH_MS);
+  private tlIndex = -2;
+  private tlReady = true;
   private el!: Record<string, HTMLElement>;
 
   constructor(private root: HTMLElement, private p: Program, private eventId: number | null) {
@@ -56,6 +61,11 @@ class Hud {
   mount(): () => void {
     ensureSensors({ bike: true });
     this.paintHud();
+    this.offSmooth = bikeFrame.on((f) => {
+      const t = Date.now();
+      this.cadAvg.push(t, f.cad);
+      this.wAvg.push(t, f.w);
+    });
     this.timer = setInterval(() => this.loop(), 100);
     const vis = () => { if (!document.hidden && this.active) void this.acquireLock(); };
     const unload = (e: BeforeUnloadEvent) => { if (this.active) e.preventDefault(); };
@@ -64,10 +74,12 @@ class Hud {
     return () => {
       if (this.timer) clearInterval(this.timer);
       this.offFrame?.();
+      this.offSmooth?.();
       this.offChips?.();
       audio.setMetronome(false, null);
       sim.setTarget(0);
       this.releaseLock();
+      void workoutService.stop();
       releaseBike();
       document.removeEventListener('visibilitychange', vis);
       window.removeEventListener('beforeunload', unload);
@@ -197,6 +209,7 @@ class Hud {
     this.engine.start(Date.now());
     this.lastIndex = -2;
     void this.acquireLock();
+    void workoutService.start(`Armory Fit · ${this.p.name}`, 'Starting…');
     this.el.go.textContent = 'PAUSE';
     this.el.go.classList.add('pause');
     this.root.querySelector('#goalCtl')?.setAttribute('hidden', '');
@@ -208,6 +221,7 @@ class Hud {
     audio.setMetronome(false, null);
     this.el.pauseSub.textContent = `${hms(this.engine.elapsed(Date.now()))} elapsed`;
     this.el.pauseModal.hidden = false;
+    void workoutService.update(`Armory Fit · ${this.p.name}`, `PAUSED · ${hms(this.engine.elapsed(Date.now()))}`);
   }
 
   private resume(): void {
@@ -224,6 +238,7 @@ class Hud {
     this.el.pauseModal.hidden = true;
     this.el.doneModal.hidden = true;
     this.releaseLock();
+    void workoutService.stop();
     this.showSummary();
   }
 
@@ -252,9 +267,12 @@ class Hud {
       this.lockSince = null;
     }
 
-    // lock-in tracking (cadence within corridor for 3 s)
-    const cad = bikeFresh() ? live.cad : 0;
-    if (running && seg?.rpm != null && !seg.allOut && Math.abs(cad - seg.rpm) <= CORRIDOR_RPM) this.lockSince ??= now;
+    // 3 s smoothed readings drive the numbers, the cue text and the lock-in test
+    const bike = bikeFresh();
+    const cadS = bike ? this.cadAvg.value(now) ?? 0 : 0;
+    const wS = bike ? this.wAvg.value(now) ?? 0 : 0;
+
+    if (running && seg?.rpm != null && !seg.allOut && Math.abs(cadS - seg.rpm) <= CORRIDOR_RPM) this.lockSince ??= now;
     else this.lockSince = null;
     const lockedIn = this.lockSince != null && now - this.lockSince >= 3000;
 
@@ -263,8 +281,8 @@ class Hud {
     const dec = pacerDecision(this.p, loc, cfg, st.metroEnabled, lockedIn);
     audio.setMetronome(running && dec.play, dec.bpm);
 
-    // cue + overshoot chirp
-    const cue = running ? cueFor(seg, cad, loc.into) : { level: 'idle', text: '', chirp: false } as Cue;
+    // cue + overshoot chirp (smoothed, so a single hard pedal stroke doesn't nag)
+    const cue = running ? cueFor(seg, cadS, loc.into) : ({ level: 'idle', text: '', chirp: false } as Cue);
     if (cue.chirp && now - this.lastChirp > 6000) {
       this.lastChirp = now;
       audio.chirp();
@@ -286,21 +304,26 @@ class Hud {
       }
     }
 
-    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running);
+    // lock-screen notification text (Android app only), every 5 s
+    if (running && now - this.lastSvc > 5000) {
+      this.lastSvc = now;
+      const hr = hrFresh() ? live.hr : 0;
+      void workoutService.update(`Armory Fit · ${this.p.name}`, `${mmss(elapsed)} · ${Math.round(wS)} W · ${hr || '--'} BPM`);
+    }
+
+    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running, cadS, wS);
   }
 
   // ------------------------------------------------------------------ painting
 
   private paint(seg: Segment | null, next: Segment | null, remaining: number, index: number, elapsed: number,
-    cue: Cue, bpm: number | null, playing: boolean, running: boolean): void {
+    cue: Cue, bpm: number | null, playing: boolean, running: boolean, cadS: number, wS: number): void {
     const e = this.el;
     const p = this.p;
     const st = getSettings();
     const ready = this.engine.state === 'ready';
     const hr = hrFresh() ? live.hr : 0;
     const bike = bikeFresh();
-    const w = bike ? live.w : 0;
-    const cad = bike ? live.cad : 0;
 
     // banner
     const shown = ready ? p.segments[0] ?? null : seg;
@@ -310,18 +333,18 @@ class Hud {
     e.tag.textContent = shown?.tag ?? '';
     e.tgt.textContent = shown ? segTarget(shown) : p.goal ? 'steady effort' : '';
 
-    // countdown
+    // countdown (whole seconds only)
     if (p.segments.length) {
       e.cdLabel.textContent = next ? 'NEXT TRANSITION' : 'WORKOUT ENDS IN';
-      e.cd.textContent = ready ? mmss(p.segments[0].seconds) : countdown(remaining);
+      e.cd.textContent = ready ? mmss(p.segments[0].seconds) : mmss(Math.ceil(remaining));
       e.cd.classList.toggle('hot', !ready && remaining <= 5 && running);
       e.next.innerHTML = ready
         ? `FIRST UP: ${esc(p.segments[0].label)}`
-        : next ? `NEXT: <b>${esc(next.label)}</b>${next.rpm != null ? ` · ${next.rpm}${next.allOut ? '+' : ''} RPM${next.allOut ? '' : ` · ${targetWatts(next)} W`}` : ' · full rest'}` : 'LAST BLOCK';
+        : next ? `NEXT: <b>${esc(next.label)}</b>${next.rpm != null ? ` · ${rpmTxt(next)} RPM${next.allOut ? '' : ` · ${targetWatts(next)} W`}` : ' · full rest'}` : 'LAST BLOCK';
     } else if (p.goal?.type === 'time') {
-      e.cd.textContent = mmss(Math.max(0, this.goal * 60 - elapsed));
+      e.cd.textContent = mmss(Math.ceil(Math.max(0, this.goal * 60 - elapsed)));
     } else if (p.goal?.type === 'cal') {
-      e.cd.textContent = Math.max(0, this.goal - (this.rec?.lastKcal ?? 0)).toFixed(1);
+      e.cd.textContent = String(Math.ceil(Math.max(0, this.goal - (this.rec?.lastKcal ?? 0))));
     } else {
       e.cd.textContent = mmss(elapsed);
     }
@@ -330,9 +353,9 @@ class Hud {
     if (p.segments.length) {
       const total = totalSeconds(p);
       (e.tlHead as HTMLElement).style.left = `${Math.min(100, (elapsed / total) * 100)}%`;
-      if (index !== this._tlIndex || ready !== this._tlReady) {
-        this._tlIndex = index;
-        this._tlReady = ready;
+      if (index !== this.tlIndex || ready !== this.tlReady) {
+        this.tlIndex = index;
+        this.tlReady = ready;
         e.tl.querySelectorAll<HTMLElement>('.tl-seg').forEach((s, i) => {
           s.classList.toggle('past', !ready && i < index);
           s.classList.toggle('cur', !ready && i === index);
@@ -344,25 +367,25 @@ class Hud {
       e.ovRight.textContent = `${mmss(elapsed)} / ${mmss(this.goal * 60)}`;
     } else if (p.goal?.type === 'cal') {
       (e.tlFill as HTMLElement).style.width = `${Math.min(100, ((this.rec?.lastKcal ?? 0) / this.goal) * 100)}%`;
-      e.ovRight.textContent = `${(this.rec?.lastKcal ?? 0).toFixed(1)} / ${this.goal} cal`;
+      e.ovRight.textContent = `${Math.round(this.rec?.lastKcal ?? 0)} / ${this.goal} cal`;
     } else {
       e.ovRight.textContent = mmss(elapsed);
     }
 
-    // cue
+    // cue + center bar (the bar uses the raw, instant cadence for early warning)
     e.cue.textContent = cue.text || '\u00a0';
     e.cue.className = `cue ${cue.level}`;
-    this.paintGauge(shown, cad, cue);
+    this.paintGauge(shown, bike ? live.cad : 0, cue);
 
-    // metrics
+    // metrics: integers only
     e.hr.textContent = hr ? String(hr) : '--';
     const hz = hr ? hrZone(hr, st.hrMax) : null;
     e.hrSub.textContent = hz ? `Z${hz.z} · ${Math.round(hz.pct * 100)}%` : 'bpm';
     e.mHr.style.setProperty('--c', hz ? ZONE_COLOR[hz.z] : '#8a94a3');
-    e.w.textContent = String(Math.round(w));
+    e.w.textContent = String(Math.round(wS));
     e.wSub.textContent = shown?.rpm != null && !ready ? `target ${segWatts(shown)}` : 'watts';
-    e.cad.textContent = cad ? cad.toFixed(1) : '0';
-    e.cadSub.textContent = shown?.rpm != null ? `target ${shown.rpm}${shown.allOut ? '+' : ''}` : 'rpm';
+    e.cad.textContent = String(Math.round(cadS));
+    e.cadSub.textContent = shown?.rpm != null ? `target ${rpmTxt(shown)}` : 'rpm';
     e.mCad.dataset.level = cue.level;
     e.mW.dataset.level = cue.level === 'bad' ? 'bad' : 'idle';
 
@@ -370,7 +393,7 @@ class Hud {
     e.sEl.textContent = hms(elapsed);
     e.sLeft.textContent = p.segments.length ? mmss(Math.max(0, totalSeconds(p) - elapsed)) : String(Math.round(this.rec?.avgW ?? 0));
     e.sAvg.textContent = String(Math.round(this.rec?.avgW ?? 0));
-    e.sCal.textContent = (this.rec?.lastKcal ?? 0).toFixed(1);
+    e.sCal.textContent = String(Math.round(this.rec?.lastKcal ?? 0));
     e.sX.textContent = p.zone === 'Z5' ? mmss(this.rec?.z5Seconds ?? 0) : ((this.rec?.lastDist ?? 0) / 1609.344).toFixed(2);
 
     // metronome button
@@ -380,17 +403,13 @@ class Hud {
       : running && playing && bpm ? `${Math.round(bpm)} BPM`
       : st.metroMode === 'whole' ? 'METRONOME ON' : 'ARMED · TRANSITIONS';
 
-    // sensor note
     e.sigNote.textContent = !bike ? 'Waiting for AirBike signal…' : '';
 
-    // go button state
-    if (this.engine.state === 'paused') { e.go.textContent = 'PAUSED'; }
-    else if (running) { e.go.textContent = 'PAUSE'; }
+    if (this.engine.state === 'paused') e.go.textContent = 'PAUSED';
+    else if (running) e.go.textContent = 'PAUSE';
   }
 
-  private _tlIndex = -2;
-  private _tlReady = true;
-
+  /** Center-bar: target in the middle, instant needle left/right of it. */
   private paintGauge(seg: Segment | null, cad: number, cue: Cue): void {
     const e = this.el;
     if (!seg || seg.rpm == null) {
@@ -423,71 +442,24 @@ class Hud {
       if (meta) void discard(meta.id);
       return;
     }
-    const p = this.p;
-    const stat = (l: string, v: string) => `<div><small>${l}</small><b>${v}</b></div>`;
-    this.root.innerHTML = `<main class="page summary">
-      <h1 class="sum-title">${esc(p.name)}</h1>
-      <div class="sum-sub">${new Date(meta.startEpochMs).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })}</div>
-      <section class="stats">
-        ${stat('TIME', hms(meta.seconds))}
-        ${stat('AVG POWER', `${Math.round(meta.avgW)} W`)}
-        ${stat('MAX POWER', `${Math.round(meta.maxW)} W`)}
-        ${stat('AVG HR', meta.avgHr ? `${Math.round(meta.avgHr)}` : '--')}
-        ${stat('MAX HR', meta.maxHr ? `${Math.round(meta.maxHr)}` : '--')}
-        ${stat('WORK', `${Math.round(meta.kj)} kJ`)}
-        ${stat('ASSAULT CAL', rec.lastKcal.toFixed(1))}
-        ${stat('AVG CADENCE', `${rec.samples.length ? (rec.samples.reduce((a, x) => a + x.cad, 0) / rec.samples.length).toFixed(1) : '--'} rpm`)}
-        ${stat('DISTANCE', `${(rec.lastDist / 1609.344).toFixed(2)} mi`)}
-        ${p.zone === 'Z5' ? stat('Z5 BANK (≥88%)', mmss(rec.z5Seconds)) : ''}
-      </section>
-      <h2 class="sec">HOW HARD WAS IT?</h2>
-      <section class="card">
-        <div class="rpe" id="rpe">${[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => `<button data-rpe="${n}">${n}</button>`).join('')}</div>
-        <div class="rpe-label" id="rpeLabel">Rate perceived effort (1–10)</div>
-      </section>
-      <div id="saveBox">
-        <button class="btn primary big" id="save" disabled>Save &amp; upload to Intervals.icu</button>
-        <button class="btn danger big" id="discard">Discard workout</button>
-      </div>
-    </main>`;
-
-    let rpe = 0;
-    const q = <T extends HTMLElement>(id: string) => this.root.querySelector<T>('#' + id)!;
-    q('rpe').addEventListener('click', (ev) => {
-      const b = (ev.target as HTMLElement).closest<HTMLElement>('[data-rpe]');
-      if (!b) return;
-      rpe = Number(b.dataset.rpe);
-      this.root.querySelectorAll('#rpe button').forEach((x) => x.classList.toggle('on', x === b));
-      q('rpeLabel').textContent = `${rpe}/10 · ${RPE_LABEL[rpe]}`;
-      q<HTMLButtonElement>('save').disabled = false;
-    });
-    q('discard').addEventListener('click', async () => {
-      if (!confirm('Discard this workout? It will not be saved or uploaded.')) return;
-      await discard(meta.id);
-      location.hash = '#/airbike';
-    });
-    q('save').addEventListener('click', async () => {
-      const box = q('saveBox');
-      meta.rpe = rpe;
-      meta.status = 'saved';
-      meta.upload = 'pending';
-      await putMeta(meta);
-      box.innerHTML = `<div class="status busy"><span class="spinner"></span> Saving &amp; uploading…</div>`;
-      const r = await syncWorkout(meta);
-      if (r.upload === 'done') {
-        box.innerHTML = `<div class="status ok">✓ Synced to Intervals.icu</div>
-          <a class="btn big" href="https://intervals.icu/activities/${esc(r.activityId ?? '')}" target="_blank" rel="noopener">Open in Intervals.icu</a>
-          <a class="btn primary big" href="#/">Done</a>`;
-      } else {
-        box.innerHTML = `<div class="status warn">Saved on this phone. Upload didn’t go through:<br><small>${esc(r.lastError ?? 'unknown error')}</small><br><small>It will retry automatically next time you open the app.</small></div>
-          <a class="btn primary big" href="#/">Done</a>`;
-      }
-    });
+    const avgCad = rec.samples.length ? rec.samples.reduce((a, x) => a + x.cad, 0) / rec.samples.length : 0;
+    const stats: [string, string][] = [
+      ['AVG POWER', `${Math.round(meta.avgW)} W`],
+      ['MAX POWER', `${Math.round(meta.maxW)} W`],
+      ['AVG CADENCE', `${Math.round(avgCad)} rpm`],
+      ['AVG HR', meta.avgHr ? `${Math.round(meta.avgHr)}` : '--'],
+      ['MAX HR', meta.maxHr ? `${Math.round(meta.maxHr)}` : '--'],
+      ['WORK', `${Math.round(meta.kj)} kJ`],
+      ['ASSAULT CAL', `${Math.round(rec.lastKcal)}`],
+      ['DISTANCE', `${(rec.lastDist / 1609.344).toFixed(2)} mi`],
+      this.p.zone === 'Z5' ? ['Z5 BANK (≥88%)', mmss(rec.z5Seconds)] : ['TIME', hms(meta.seconds)],
+    ];
+    renderSummary(this.root, { title: this.p.name, meta, stats, backHref: '#/airbike' });
   }
 }
 
 function segTarget(g: Segment): string {
   if (g.rpm == null) return 'full rest';
-  return g.allOut ? `${g.rpm}+ RPM · all out` : `${g.rpm} RPM · ${segWatts(g)}`;
+  return g.allOut ? `${rpmTxt(g)} RPM · all out` : `${rpmTxt(g)} RPM · ${segWatts(g)}`;
 }
 const segWatts = (g: Segment): string => `${Math.round(wattsForRpm(g.rpm ?? 0))} W`;

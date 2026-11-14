@@ -10,10 +10,10 @@ import { REV, REV_STAMP } from '../rev';
 
 const TILES: Equipment[] = ['strength', 'treadmill', 'spin', 'airbike'];
 const SUB: Record<Equipment, string> = {
-  strength: 'Boostcamp',
+  strength: 'HR logging',
   treadmill: 'Horizon T101',
   spin: 'Bowflex C7',
-  airbike: 'Assault Elite',
+  airbike: 'Assault AirBike Elite',
 };
 
 export function homeScreen(root: HTMLElement): () => void {

@@ -25,3 +25,6 @@ local.properties
 .DS_Store
 Thumbs.db
 *.log
+
+# one-time setup QR codes (contain the Intervals.icu key)
+local-secrets/

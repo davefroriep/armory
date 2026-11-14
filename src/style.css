@@ -222,3 +222,33 @@ a.cal-empty { color: var(--blue); }
 .switch i { position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #fff; transition: transform .15s; }
 .switch.on { background: var(--green); }
 .switch.on i { transform: translateX(22px); }
+
+/* ---------- calm HUD overrides (no flashing; the numbers are 3 s smoothed) ---------- */
+.cd.hot { color: var(--red); animation: none; }
+.cue.bad { animation: none; }
+.metro.playing { animation: none; }
+.g-needle { transition: left .12s linear; }
+
+/* ---------- effort scale (plain words, RPE 3-10 behind the scenes) ---------- */
+.rpe { display: flex; flex-direction: column; gap: 8px; padding: 0; background: none; }
+.rpe button { height: 50px; border-radius: 14px; background: var(--card2); font-size: 1.05rem; font-weight: 700; text-align: left; padding: 0 18px; border-left: 6px solid var(--c, #3b4452); }
+.rpe .rpe-3 { --c: #38bdf8; } .rpe .rpe-4 { --c: #22d3ee; } .rpe .rpe-5 { --c: #22c55e; } .rpe .rpe-6 { --c: #a3e635; }
+.rpe .rpe-7 { --c: #f59e0b; } .rpe .rpe-8 { --c: #fb923c; } .rpe .rpe-9 { --c: #ff4d2e; } .rpe .rpe-10 { --c: #ef2b6b; }
+.rpe button.on { background: var(--c); color: #00131f; }
+
+/* ---------- strength HR logger ---------- */
+.card.strength { text-align: center; }
+.lbl { color: var(--mut); font-size: .7rem; font-weight: 800; letter-spacing: .16em; }
+.hr-big { font-size: min(34vw, 8.5rem); font-weight: 800; line-height: 1.05; font-variant-numeric: tabular-nums; letter-spacing: -.03em; }
+.hr-sub { color: var(--mut); font-weight: 600; margin-bottom: 10px; }
+.strip.s3 { grid-template-columns: repeat(3, 1fr); padding: 6px 0 0; }
+.ctrl.nopad { padding: 0; margin-top: 0; }
+a.metro { text-decoration: none; }
+.hint.c { text-align: center; }
+.zones .zrow { display: grid; grid-template-columns: 30px 1fr 46px; align-items: center; gap: 10px; padding: 5px 0; font-size: .85rem; font-variant-numeric: tabular-nums; }
+.zones .zrow span { color: var(--mut); font-weight: 800; }
+.zones .zrow i { display: block; height: 10px; background: var(--card2); border-radius: 999px; overflow: hidden; }
+.zones .zrow u { display: block; height: 100%; border-radius: 999px; }
+.zones .zrow b { text-align: right; }
+
+.toast { position: fixed; left: 50%; bottom: calc(28px + var(--sab)); transform: translateX(-50%); background: #14301f; color: #86efac; border: 1px solid rgba(34, 197, 94, .5); padding: 12px 18px; border-radius: 14px; font-weight: 700; z-index: 99; }
