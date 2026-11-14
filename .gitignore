@@ -1,0 +1,27 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+.vite/
+
+# Android / Capacitor build artifacts
+android/app/build/
+android/build/
+android/.gradle/
+android/capacitor-cordova-android-plugins/
+local.properties
+*.apk
+*.aab
+*.ap_
+*.keystore
+*.jks
+
+# Environment & local secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# IDE & OS noise
+.DS_Store
+Thumbs.db
+*.log
