@@ -66,16 +66,48 @@ Build **one** responsive web UI (`Vite + TypeScript`), shipped in two ways:
 
 ---
 
-## 4. Athlete Profile, Master Selector & Workout Modes (`i758105`)
+## 4. Athlete Profile, Master Selector, Zone 5 Suite & Tactical HUD (`i758105`)
 
 - **Top Bar:** Master Machine Toggle **`SPIN`** | **`AIRBIKE`** | **`TREADMILL`** + Always-On **`POLAR H10`** (`0x180D`, `0x2A37`, `HRmax` default `180 BPM`).
 
-| Mode | Spin (`Bowflex C7`) | AirBike (`Assault Elite`) | Treadmill (`Horizon T101`) |
+| Mode Button | Spin (`Bowflex C7`) | AirBike (`Assault Elite`) | Treadmill (`Horizon T101`) |
 | :--- | :--- | :--- | :--- |
-| **Zone 2 Base** | Auto-ERG **`129 W`** (`128–130 W`); default 5m Warmup + 45m Z2 + 5m Cooldown | Pace Cue **`44 RPM`** (`~127–134 W` Assault table); Music BPM (`2×RPM`) | HR & Pace Guided **`Zone 2 (60–70% HRmax)`** walk/jog + incline tracking |
-| **Zone 5 Norwegian 4×4** | Auto-ERG Warmup (`129 W`) → **4 × (`4:00 @ 220 W` [218–225 W] / `3:00 @ 105 W`)** → Cooldown (`105 W`) | **4 × (`4:00 @ 54–55 RPM` [`218–228 W`] / `3:00 @ ~40 RPM` [`~99 W`])** with chimes/vibrate | **4 × (`4:00 Work @ 85–95% HRmax` / `3:00 Active Recovery`)** with elevation integration |
-| **Quick / Custom / HIIT** | **Quick ERG** (`±5W / ±10W`) or **1–100 Gears** (`±1 / ±5 LVL`) + handlebar buttons | **Quick Start**, **Tabata 20/10**, **Interval 10/20**, **Target Cal**, **Target Time** | **Quick Run / Walk**, Custom Intervals, `[TARE 0%]` BLE command |
-| **Intervals.icu Activity Type** | `Sport="Biking"` (`VirtualRide`) | `Sport="Biking"` (`VirtualRide`) | `Sport="Running"` (`VirtualRun`) with `RunCadence`, `Speed`, `AltitudeMeters` |
+| **`[ZONE 2 BASE]`** | Auto-ERG **`129 W`** (`128–130 W`); default 5m Warmup + 45m Z2 + 5m Cooldown | Target **`44.5 RPM`** (`131 W` · `89 BPM` stroke); optional Lock-In Pacer | HR & Pace Guided **`Zone 2 (60–70% HRmax)`** incline walk/jog |
+| **`[ZONE 5 VO2]`** *(Opens 4-Protocol Drawer)* | Auto-ERG across all 4 Z5 protocols below (`220–245 W` work / `105 W` recovery) | **4-Protocol Z5 Selector** (see **§4.1**) with Tactical Transition HUD + Lock-In Metronome | **Norwegian 4×4** / **5×3** / **6×2** (`85–95% HRmax`) with elevation integration |
+| **`[QUICK / HIIT]`** | **Quick ERG** (`±5W / ±10W`) or **1–100 Gears** (`±1 / ±5 LVL`) + handlebar buttons | **Quick Start**, **Tabata 20/10**, **Sprint 10/20**, **Target Cal**, **Target Time** | **Quick Walk / Run**, Custom Intervals, `[TARE 0%]` BLE command |
+| **Intervals.icu Naming & Sport** | `Bowflex C7 Z2` / `Bowflex C7 Z5 — <Protocol>` (`VirtualRide`) | `AirBike Z2` / `AirBike Z5 — <Protocol>` (`VirtualRide`) | `Treadmill Z2` / `Treadmill Z5 — <Protocol>` (`VirtualRun`) |
+
+### 4.1 AirBike `[ZONE 5 VO2]` 4-Protocol Drawer (Exact `airbike_math.h` Targets)
+
+Tapping **`[ZONE 5 VO2]`** on **AirBike** opens a 4-card protocol drawer displaying each workout's established sports-science/coaching name, structure, total time, Z5 work volume, and exact Assault Elite curve targets (`5:00` Warmup @ `44.0 RPM` / `127 W` included on all):
+
+| # | Protocol Card Title | Coaching / Physiology Pedigree | Block Structure | Work Target (`RPM` · `Watts` · `L/R BPM`) | Recovery / Float Target | Total / Work Time |
+| :-: | :--- | :--- | :--- | :--- | :--- | :---: |
+| **1** | **Norwegian 4×4** | *Helgerud / NTNU CERG Protocol* — Classic stroke-volume ceiling benchmark | `5:00` WU → **4 × (`4:00` Work / `3:00` Easy)** *(4th rec = cooldown)* | **`54.5 RPM`** · **`223 W`** · **`109 BPM`** | **`40.0 RPM`** (`99 W` · `80 BPM` spin) | `33:00` (`16:00` Z5) |
+| **2** | **Classic VO2 5×3** *(Recommended Start)* | *Fractionated Macro-Intervals* — Same Z5 stimulus before minute-4 posture breakdown | `5:00` WU → **5 × (`3:00` Work / `2:00` Cool-Down Spin)** | **`55.0 RPM`** · **`228 W`** · **`110 BPM`** | **`40.0 RPM`** (`99 W` · `80 BPM` spin) | `30:00` (`15:00` Z5) |
+| **3** | **Cardiac Power 6×2** | *Joel Jamieson 1:1 Aerobic Power* — Crisp 2-min repeats; low mental dread & minimal overshoot penalty | `5:00` WU → **6 × (`2:00` Work / `2:00` Cool-Down Spin)** | **`56.0 RPM`** · **`240 W`** · **`112 BPM`** | **`40.0 RPM`** (`99 W` · `80 BPM` spin) | `29:00` (`12:00` Z5) |
+| **4** | **Billat / Rønnestad 60/30** | *Intermittent Float VO2* — Adapted from Rønnestad `30/15` & Billat `60/30`; keeps $\text{VO}_2$ pinned via moving-fan floats | `5:00` WU → **2 Sets × [8 × (`60s` Work / `30s` Float)]** (`7` floats/set) + **`3:00` Full Set Rest** between sets + `2:00` CD | **`57.0 RPM`** · **`252 W`** · **`114 BPM`** | Float: **`40.0 RPM`** (`99 W` — *keep fan moving!*)<br>Set Rest: **`≤35 RPM` or Full Rest** | `33:00` (`16:00` Z5) |
+
+*(Note: Spin `[ZONE 5 VO2]` mirrors the exact same 4 protocol cards using SS2K Auto-ERG at `220 W`, `225 W`, `235 W`, and `245 W` work / `105 W` recovery so either bike can execute the full Z5 menu.)*
+
+### 4.2 Tactical Interval Cockpit HUD & "Lock-In" Transition Engine
+
+Because AirBike wattage scales cubically ($P \propto \text{RPM}^3$), overshooting a launch by just `+10 RPM` spikes power by `+150–300 W` and blows anaerobic $W'$ in seconds. **Armory Fit** pairs a high-contrast cockpit HUD with a 5 Hz (`200 ms`) audio/visual transition pacer:
+
+1. **Phase State Banner & Split Countdown HUD:**
+   - Full-width color-coded phase header (`WARMUP` amber · `WORK` crimson-orange · `FLOAT / COOL` cyan · `SET REST` slate · `COOLDOWN` emerald).
+   - Giant center-stage phase countdown (`MM:SS`, switching to **`SS.d` tenths** for the final `10.0s`), active pill (`SET 1/2 • REP 5/8`), and `"UP NEXT IN 0:10 → WORK 55.0 RPM (228 W)"` lookahead strip.
+2. **5 Hz "Sweet-Spot" Horizon Gauge & Guardrails:**
+   - Ultra-smooth `200 ms` needle + digital readout (`55.1 RPM` • `229 W`) centered on a glowing green target corridor (`±1.5 RPM` on AirBike / `±8 W` on Spin).
+   - **Overshoot Red-Zone Flash:** Crossing `target + 2.5 RPM` flashes the gauge crimson with live watt-excess callout (`+140 W TOO HOT — EASE OFF`).
+   - **Moving-Fan Float Floor (`AirBike`):** During `FLOAT` (`40 RPM`), dropping below `35 RPM` triggers an amber `"KEEP FAN SPINNING (40 RPM)"` cue so you never launch the next work rep against dead-fan inertia.
+3. **Timeline Scrubber & Live `Z5 Bank` Telemetry:**
+   - Bottom full-workout block timeline lighting up completed/current intervals + live **Polar H10** BPM, `%HRmax` badge, and cumulative **`Time ≥ 88% HRmax` (`Z5 Bank`)** timer so you see true central $\text{VO}_2\text{max}$ minutes stack up live.
+4. **WebAudio "Lock-In & Auto-Mute" Transition Pacer (Zero Spotify Ducking):**
+   - **`T-10s` Prep Pip:** Subtle double-pip + lookahead banner pulse (`"PREP SPIN-UP"`).
+   - **`T-3s` Tempo Lead-In:** `3-2-1` countdown clicks pulsed **at the upcoming left/right stroke tempo** (`BPM = 2 × targetRPM`, e.g. `110 BPM` for `55 RPM`) + crisp phase-start chime at `T=0`.
+   - **`T+0s..T+10s` Auto-Muting Metronome:** Keeps ticking the left/right arm-punch beat (`2 × targetRPM`) through the transition and **automatically fades out** as soon as live 5 Hz cadence stays within `±1.5 RPM` of target for `3.0s` (1-tap HUD pill `[PACER: AUTO | ON | MUTE]`).
+   - **Instant Launch Overshoot Chirp (`<400 ms`):** High-pitch warning double-chirp + native phone haptic buzz if cadence exceeds `target + 3.0 RPM` during the first `15s` of any work interval.
 
 ---
 
@@ -157,4 +189,4 @@ Source verified: `N:\Documents\Antigravity\Smart Treadmill\PlatformIO\src\main.c
 ## 8. Copy-Paste Kickoff Prompts (Thread Structure)
 
 ### For the `Armory Fit` App Thread
-> *"We are building the **Armory Fit** cardio cockpit app in `N:\Documents\Antigravity\Strength and Conditioning`. Read `GEMINI.md` and `docs/ARMORY_MASTER_PRIMER.md` first. Every machine (`Spin`, `AirBike`, `Treadmill`) uses **5 Hz Direct BLE (`NUS` `6e400001-...`)** as its primary telemetry and calibration transport, with FTMS kept strictly passive for MyWhoosh. Let's scaffold the `Vite + TypeScript + Capacitor` app with our custom `WorkoutForegroundService.kt`, `BleTransport` abstraction, 1 Hz `IndexedDB` session recorder with crash recovery, machine adapters (`SpinAdapter`, `AirBikeAdapter`, `TreadmillAdapter`, `PolarH10`), Intervals.icu `.tcx` uploader, and GitHub Actions `.apk` CI build."*
+> *"We are building the **Armory Fit** cardio cockpit app in `N:\Documents\Antigravity\Strength and Conditioning`. Read `GEMINI.md` and `docs/ARMORY_MASTER_PRIMER.md` first. Every machine (`Spin`, `AirBike`, `Treadmill`) uses **5 Hz Direct BLE (`NUS` `6e400001-...`)** as its primary telemetry and calibration transport, with FTMS kept strictly passive for MyWhoosh. Let's scaffold the `Vite + TypeScript + Capacitor` app with our custom `WorkoutForegroundService.kt`, `BleTransport` abstraction, 1 Hz `IndexedDB` session recorder with crash recovery, machine adapters (`SpinAdapter`, `AirBikeAdapter`, `TreadmillAdapter`, `PolarH10`), the 4-protocol `[ZONE 5 VO2]` drawer (`Norwegian 4×4`, `Classic VO2 5×3`, `Cardiac Power 6×2`, `Billat/Rønnestad 60/30`), Tactical Cockpit HUD with WebAudio Lock-In Transition Metronome & Overshoot Chirp, Intervals.icu `.tcx` uploader, and GitHub Actions `.apk` CI build."*

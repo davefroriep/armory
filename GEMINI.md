@@ -11,6 +11,7 @@
 - **AirBike (`AssaultBike` `Rev v1.5`):** Primary 5 Hz NUS JSON (`w`, `cad`, `fan`, `pls`, `dt`, `SET_RATIO` [`11.1100`], `RESET`) + passive FTMS (`0x1826`) / CSC (`0x1816`).
 - **Treadmill (`Horizon T101 Pod`):** Planned 5 Hz NUS stream (`spd_mph`, `inc_pct`, `cad_spm`, `TARE_INCLINE`) alongside existing passive FTMS (`0x2ACD`) / RSC (`0x2A53`).
 - **Heart Rate (`Polar H10`) & Profile:** BLE HR `0x180D` (`0x2A37`); `i758105` FTP `182 W`, Z2 `128–130 W`, 4×4 `218–225 W` (API key stored strictly in local device settings, NEVER committed to git).
+- **Z5 Suite & Tactical HUD:** `[ZONE 5 VO2]` 4-protocol drawer (`Norwegian 4×4`, `Classic VO2 5×3`, `Cardiac Power 6×2`, `Billat/Rønnestad 60/30`) + 5 Hz Sweet-Spot Horizon HUD, split/lookahead timers, and auto-muting WebAudio `2×RPM` Lock-In Transition Metronome + Overshoot Chirp.
 
 ## 3. Canonical Directory Structure
 - `src/`: Modular TypeScript/JS UI, BLE transport adapters (`capacitor` / `web`), `IndexedDB` recorder, workout protocols, and TCX/Intervals uploader.
