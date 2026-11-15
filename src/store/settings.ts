@@ -32,6 +32,8 @@ export interface Settings {
   metroVolume: number;
   chime: boolean;
   haptics: boolean;
+  /** Seconds of averaging on the cadence bar + cue text ('0' = raw). Stored as a string by the segmented control. */
+  needleSmooth: '0' | '1' | '2' | '3';
   /** Fake H10 + AirBike for testing the UI without hardware. */
   simulator: boolean;
 }
@@ -59,6 +61,7 @@ export const DEFAULTS: Settings = {
   metroVolume: 0.8,
   chime: true,
   haptics: true,
+  needleSmooth: '2',
   simulator: false,
 };
 

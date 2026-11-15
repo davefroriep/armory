@@ -9,12 +9,13 @@ export class WindowAvg {
   }
 
   /** Mean of the samples in the window, or null when there are none (sensor silent). */
-  value(now: number): number | null {
+  value(now: number, windowMs: number = this.windowMs): number | null {
     this.trim(now);
-    if (!this.pts.length) return null;
+    const cut = now - Math.min(windowMs, this.windowMs);
     let s = 0;
-    for (const p of this.pts) s += p.v;
-    return s / this.pts.length;
+    let n = 0;
+    for (const p of this.pts) if (p.t >= cut) { s += p.v; n++; }
+    return n ? s / n : null;
   }
 
   clear(): void {

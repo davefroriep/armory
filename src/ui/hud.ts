@@ -21,7 +21,7 @@ import { ZONE_COLOR, hrZone } from './hr';
 import { renderSummary } from './summaryView';
 import { LeaveGuard } from './leaveGuard';
 
-/** Display smoothing for cadence and power. The gauge needle is deliberately NOT smoothed. */
+/** Display smoothing for cadence and power. The gauge needle + cue use their own window (Settings). */
 const SMOOTH_MS = 3000;
 const rpmTxt = (g: Segment): string => `${fmtRpm(g.rpm ?? 0)}${g.allOut ? '+' : ''}`;
 
@@ -321,6 +321,9 @@ class Hud {
     const bike = bikeFresh();
     const cadS = bike ? this.cadAvg.value(now) ?? 0 : 0;
     const wS = bike ? this.wAvg.value(now) ?? 0 : 0;
+    // bar needle + cue use their own (shorter) window so they agree with each other
+    const needleMs = Number(st.needleSmooth) * 1000;
+    const cadN = !bike ? 0 : needleMs <= 0 ? live.cad : this.cadAvg.value(now, needleMs) ?? 0;
 
     if (running && seg?.rpm != null && !seg.allOut && Math.abs(cadS - seg.rpm) <= CORRIDOR_RPM) this.lockSince ??= now;
     else this.lockSince = null;
@@ -332,7 +335,7 @@ class Hud {
     audio.setMetronome(running && dec.play, dec.bpm);
 
     // cue + overshoot chirp (smoothed, so a single hard pedal stroke doesn't nag)
-    let cue = running ? cueFor(seg, cadS, loc.into) : ({ level: 'idle', text: '', chirp: false } as Cue);
+    let cue = running ? cueFor(seg, cadN, loc.into) : ({ level: 'idle', text: '', chirp: false } as Cue);
     if (running && cue.level !== 'bad') {
       const gateLimit = waiting && !this.gateState?.timerOnly ? hrLimit : null;
       const extra = hrCue(seg, hrNow ?? 0, st.hrMax, gateLimit);
@@ -366,13 +369,13 @@ class Hud {
       void workoutService.update(`Armory Fit · ${this.p.name}`, `${mmss(elapsed)} · ${Math.round(wS)} W · ${hr || '--'} BPM`);
     }
 
-    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running, cadS, wS);
+    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running, cadS, wS, cadN);
   }
 
   // ------------------------------------------------------------------ painting
 
   private paint(seg: Segment | null, next: Segment | null, remaining: number, index: number, elapsed: number,
-    cue: Cue, bpm: number | null, playing: boolean, running: boolean, cadS: number, wS: number): void {
+    cue: Cue, bpm: number | null, playing: boolean, running: boolean, cadS: number, wS: number, cadN: number): void {
     const e = this.el;
     const p = this.p;
     const st = getSettings();
@@ -434,10 +437,10 @@ class Hud {
       e.ovRight.textContent = mmss(elapsed);
     }
 
-    // cue + center bar (the bar uses the raw, instant cadence for early warning)
+    // cue + center bar (the bar uses the Settings → cadence bar smoothing window, default 2 s)
     e.cue.textContent = cue.text || '\u00a0';
     e.cue.className = `cue ${cue.level}`;
-    this.paintGauge(shown, bike ? live.cad : 0, cue);
+    this.paintGauge(shown, cadN, cue);
 
     // metrics: integers only
     e.hr.textContent = hr ? String(hr) : '--';
@@ -493,7 +496,7 @@ class Hud {
     return Math.min(1, (before + Math.min(1, into / len) * nominal) / total);
   }
 
-  /** Center-bar: target in the middle, instant needle left/right of it. */
+  /** Center-bar: target in the middle, smoothed needle left/right of it. */
   private paintGauge(seg: Segment | null, cad: number, cue: Cue): void {
     const e = this.el;
     if (!seg || seg.rpm == null) {

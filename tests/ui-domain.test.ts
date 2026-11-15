@@ -19,6 +19,15 @@ describe('3 s smoothing', () => {
     a.push(3000, 62);
     expect(Math.round(a.value(3000)!)).toBe(55); // +7 RPM spike moves the average by ~0.4
   });
+  it('can read a shorter sub-window of the same samples (needle smoothing)', () => {
+    const a = new WindowAvg(3000);
+    for (let t = 0; t <= 2000; t += 1000) a.push(t, 50);
+    for (let t = 2200; t <= 3000; t += 200) a.push(t, 56);
+    expect(a.value(3000, 800)).toBeCloseTo(56); // last 0.8 s: only the 56s
+    expect(a.value(3000, 2000)).toBeCloseTo((2 * 50 + 5 * 56) / 7); // last 2 s: t=1000..3000
+    expect(a.value(3000)).toBeCloseTo((50 * 3 + 56 * 5) / 8); // full 3 s window
+    expect(a.value(3000, 99999)).toBeCloseTo(a.value(3000)!); // never wider than the window
+  });
 });
 
 describe('effort scale', () => {

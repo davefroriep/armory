@@ -67,6 +67,8 @@ export function settingsScreen(root: HTMLElement): () => void {
     <section class="card">
       <div class="line"><span>Transition chime<small>Sound on every phase change</small></span>${tog('chime', s.chime)}</div>
       <div class="line"><span>Vibration<small>Transitions and overshoot warnings</small></span>${tog('haptics', s.haptics)}</div>
+      <div class="line"><span>Cadence bar smoothing<small>Averages the needle and the ON TARGET / PICK IT UP cue. More = steadier but laggier. Big numbers stay at 3 s.</small></span></div>
+      ${seg('needleSmooth', s.needleSmooth, [['0', 'Raw'], ['1', '1 s'], ['2', '2 s'], ['3', '3 s']])}
       <div class="line"><span>Max heart rate<small>Drives HR zones &amp; the Z5 bank (≥ 88%)</small></span>${num('hrMax', s.hrMax, 120, 230)}<em>bpm</em></div>
     </section>
 
