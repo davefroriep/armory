@@ -1,4 +1,4 @@
-import { ensureSensors, releaseBike } from '../ble/sources';
+import { ensureSensors } from '../ble/sources';
 import { calendar } from '../intervals/calendar';
 import { arrange, moveProgram, restoreOrder, toggleHidden } from '../domain/library';
 import { PROGRAMS, fmtDur, fmtRpm, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program } from '../domain/programs';
@@ -148,7 +148,6 @@ export function airbikeScreen(root: HTMLElement): () => void {
     cleanup();
     offCal();
     offSet();
-    releaseBike();
   };
 }
 

@@ -9,6 +9,8 @@ const RETRY_MS = 1500;
 /** A disconnect that never completes (device already gone) must not stall the next attempt. */
 const DISCONNECT_WAIT_MS = 1500;
 const WATCHDOG_MS = 1000;
+/** Let Android finish closing the old GATT client before opening a new one. */
+const SETTLE_MS = 400;
 
 /**
  * One BLE peripheral that reconnects by itself, on top of whichever transport is active.
@@ -35,6 +37,10 @@ export abstract class BleLink {
   protected wanted = false;
   private looping = false;
   private wake: (() => void) | null = null;
+  /** Bumped on every attempt / release so disconnect events from an older session are ignored. */
+  private gen = 0;
+  /** A disconnect still settling; the next connect waits for it (Android reports "Characteristic not found" otherwise). */
+  private dropping: Promise<void> | null = null;
   private watchdog: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly storeKey: string, protected readonly spec: DeviceSpec) {
@@ -117,6 +123,7 @@ export abstract class BleLink {
   /** Stop reconnecting and drop the link (the stored pairing is kept). */
   release(): void {
     this.wanted = false;
+    this.gen++;
     this.wake?.();
     if (this.id) void this.dropLink(this.id);
     if (this.state !== 'unsupported') this.setState('idle');
@@ -128,12 +135,16 @@ export abstract class BleLink {
     localStorage.removeItem(this.storeKey);
   }
 
-  private async dropLink(id: string): Promise<void> {
-    await Promise.race([transport.disconnect(id).catch(() => {}), sleep(DISCONNECT_WAIT_MS)]);
+  private dropLink(id: string): Promise<void> {
+    const p = Promise.race([transport.disconnect(id).catch(() => {}), sleep(DISCONNECT_WAIT_MS)])
+      .then(() => sleep(SETTLE_MS))
+      .then(() => { if (this.dropping === p) this.dropping = null; });
+    this.dropping = p;
+    return p;
   }
 
-  private onDrop = () => {
-    if (!this.wanted) return;
+  private onDrop(gen: number): void {
+    if (gen !== this.gen || !this.wanted) return;
     this.setState('lost');
     void this.connectLoop();
   };
@@ -145,6 +156,7 @@ export abstract class BleLink {
       // "Connected" but silent: rebuild the link from scratch.
       this.lastError = 'No data from the bike';
       const id = this.id;
+      this.gen++;
       this.setState('lost');
       if (id) void this.dropLink(id).then(() => void this.connectLoop());
     }, WATCHDOG_MS);
@@ -172,16 +184,19 @@ export abstract class BleLink {
     try {
       while (this.wanted && this.id && this.state !== 'connected') {
         this.setState(this.state === 'lost' ? 'lost' : 'connecting');
+        if (this.dropping) await this.dropping;
+        if (!this.wanted || !this.id) break;
         this.attempts++;
+        const gen = ++this.gen;
         try {
-          await transport.connect(this.id, this.onDrop, CONNECT_TIMEOUT_MS);
+          await transport.connect(this.id, () => this.onDrop(gen), CONNECT_TIMEOUT_MS);
           await this.subscribe(this.id);
           this.deviceName = transport.name(this.id);
           this.setState('connected');
           return;
         } catch (e) {
           this.lastError = (e as Error)?.message ?? String(e);
-          void this.dropLink(this.id);
+          await this.dropLink(this.id);
           if (!this.wanted) break;
           this.setState('lost');
           linkStatus.emit();

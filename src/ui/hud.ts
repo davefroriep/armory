@@ -1,6 +1,6 @@
 import { bikeFrame, bikeFresh, hrFresh, live } from '../ble/telemetry';
 import { sim } from '../ble/sim';
-import { bikeStatusNote, ensureSensors, releaseBike } from '../ble/sources';
+import { bikeStatusNote, ensureSensors } from '../ble/sources';
 import { audio, buzz } from '../audio/audio';
 import { WorkoutEngine } from '../domain/engine';
 import { CORRIDOR_RPM, cueFor, hrCue, pacerDecision, type Cue, type PacerConfig } from '../domain/pacer';
@@ -91,7 +91,6 @@ class Hud {
       sim.setTarget(0);
       this.releaseLock();
       void workoutService.stop();
-      releaseBike();
       document.removeEventListener('visibilitychange', vis);
       window.removeEventListener('beforeunload', unload);
     };

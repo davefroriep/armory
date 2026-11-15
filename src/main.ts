@@ -7,7 +7,7 @@ import { settingsScreen } from './ui/settings';
 import { strengthScreen } from './ui/strength';
 import { initSetupLinks } from './setup';
 import { isNative } from './native/service';
-import { kickSensors } from './ble/sources';
+import { kickSensors, releaseBike } from './ble/sources';
 
 type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (() => void) | void;
 
@@ -32,6 +32,8 @@ function route(): void {
   if (key === routeKey && cleanup) return;
   routeKey = key;
   cleanup?.();
+  // The bike link lives across every AirBike screen (list <-> workout); only leaving AirBike drops it.
+  if (name !== 'airbike') releaseBike();
   root.className = 'screen';
   root.innerHTML = '';
   window.scrollTo(0, 0);
