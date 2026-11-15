@@ -49,7 +49,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       ${seg('recoveryMode', s.recoveryMode, [['gated', 'HR-gated'], ['timed', 'Fixed timers']])}
       <div class="line"><span>Recovered at<small>% of max HR (${recoveryLimitBpm(s.hrMax, s.recoveryHrPct)} bpm now). Falls back to the timer if the HR strap is silent.</small></span>${num('recoveryHrPct', s.recoveryHrPct, 50, 90)}<em>%</em></div>
       <div class="row"><button class="btn sm" id="resetProgs">Reset AirBike program list</button><span id="resetOut" class="hint"></span></div>
-      <p class="hint">Hold a program card on the AirBike screen to pin it, move it, or hide it.</p>
+      <p class="hint">Tap Reorder on the AirBike screen to pin, move or hide programs.</p>
     </section>
 
     <h2 class="sec">METRONOME</h2>

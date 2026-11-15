@@ -168,7 +168,15 @@ class NativeTransport implements BleTransport {
   }
 
   async subscribe(id: string, service: string, char: string, cb: (dv: DataView) => void): Promise<void> {
-    await BleClient.startNotifications(id, service, char, cb);
+    try {
+      await BleClient.startNotifications(id, service, char, cb);
+    } catch (e) {
+      // Reconnecting to a peripheral Android still holds an ACL link to can skip service discovery
+      // ("Characteristic not found"). Force a fresh discovery (also clears the GATT cache) and retry once.
+      if (!/not found|service/i.test((e as Error)?.message ?? '')) throw e;
+      await BleClient.discoverServices(id);
+      await BleClient.startNotifications(id, service, char, cb);
+    }
   }
 
   async write(id: string, service: string, char: string, data: Uint8Array): Promise<void> {

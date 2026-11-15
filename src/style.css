@@ -273,3 +273,14 @@ a.metro { text-decoration: none; }
 .reps table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; text-align: center; }
 .reps th { color: var(--mut); font-size: .6rem; font-weight: 800; letter-spacing: .1em; padding: 4px 2px; }
 .reps td { padding: 7px 2px; border-top: 1px solid #1f2630; font-weight: 700; }
+
+/* ---------- reorder mode ---------- */
+.sec-row { display: flex; align-items: center; justify-content: space-between; margin: 10px 4px 0; }
+.sec-row .sec { margin: 0; }
+.prog-edit { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--card); border-radius: 16px; padding: 10px 12px 10px 15px; border-left: 4px solid var(--blue); }
+.prog-edit.z5 { border-left-color: var(--red); } .prog-edit.hiit { border-left-color: var(--amber); } .prog-edit.goal { border-left-color: #a78bfa; } .prog-edit.z2 { border-left-color: var(--green); }
+.prog-edit b { font-size: 1rem; }
+.ed-btns { display: flex; gap: 8px; }
+.ed-btns button { min-width: 46px; height: 46px; border-radius: 12px; background: var(--card2); font-size: 1.15rem; font-weight: 800; color: #fff; }
+.ed-btns button:disabled { opacity: .3; }
+.ed-btns .ed-hide { font-size: .78rem; color: #ff7a66; padding: 0 12px; }
