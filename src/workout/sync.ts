@@ -18,7 +18,7 @@ export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
       );
       const desc = m.equipment === 'strength'
         ? `Armory Fit • ${fmt(m.seconds)} • avg HR ${Math.round(m.avgHr)} • max HR ${Math.round(m.maxHr)}` + (m.rpe ? ` • RPE ${m.rpe}/10` : '')
-        : `Armory Fit • ${fmt(m.seconds)} • avg ${Math.round(m.avgW)} W • ${Math.round(m.kj)} kJ` + (m.rpe ? ` • RPE ${m.rpe}/10` : '');
+        : `Armory Fit • ${fmt(m.seconds)} • avg ${Math.round(m.avgW)} W • ${Math.round(m.kj)} kJ` + (m.rpe ? ` • RPE ${m.rpe}/10` : '') + (m.notes ? ` • ${m.notes}` : '');
       m.activityId = await uploadActivity({
         tcx, name: m.name, description: desc, externalId: `armory-${m.id}`, pairedEventId: m.eventId,
       });

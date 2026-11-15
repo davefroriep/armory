@@ -7,6 +7,7 @@ import { settingsScreen } from './ui/settings';
 import { strengthScreen } from './ui/strength';
 import { initSetupLinks } from './setup';
 import { isNative } from './native/service';
+import { kickSensors } from './ble/sources';
 
 type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (() => void) | void;
 
@@ -38,6 +39,8 @@ function route(): void {
 }
 
 initSetupLinks();
+// Coming back to the app (or the phone waking up) retries a stalled sensor link immediately.
+document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
 window.addEventListener('hashchange', route);
 route();
 

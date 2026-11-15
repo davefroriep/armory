@@ -5,6 +5,7 @@ import { ensureSensors } from '../ble/sources';
 import { hasKey, syncAthleteFtp, testConnection } from '../intervals/api';
 import { calendar } from '../intervals/calendar';
 import { audio } from '../audio/audio';
+import { recoveryLimitBpm } from '../domain/gate';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { revFooter, topbar, wireChips } from './chrome';
 import { $ } from './dom';
@@ -40,6 +41,15 @@ export function settingsScreen(root: HTMLElement): () => void {
       <label class="field">API key<input id="key" type="password" value="${s.apiKey}" placeholder="Pre-configured" autocomplete="off" spellcheck="false"></label>
       <div class="row"><button class="btn sm" id="test">Test connection</button><span id="testout" class="hint"></span></div>
       <p class="hint">Pre-configured for your account on this device (Intervals → Settings → Developer Settings).</p>
+    </section>
+
+    <h2 class="sec">RECOVERIES · AIRBIKE Z5</h2>
+    <section class="card">
+      <div class="line"><span>Rest between reps<small>HR-gated: the rest never ends before the protocol's own rest, then stays easy until HR has recovered (capped at 5 min). Fixed timers: plain countdowns.</small></span></div>
+      ${seg('recoveryMode', s.recoveryMode, [['gated', 'HR-gated'], ['timed', 'Fixed timers']])}
+      <div class="line"><span>Recovered at<small>% of max HR (${recoveryLimitBpm(s.hrMax, s.recoveryHrPct)} bpm now). Falls back to the timer if the HR strap is silent.</small></span>${num('recoveryHrPct', s.recoveryHrPct, 50, 90)}<em>%</em></div>
+      <div class="row"><button class="btn sm" id="resetProgs">Reset AirBike program list</button><span id="resetOut" class="hint"></span></div>
+      <p class="hint">Hold a program card on the AirBike screen to pin it, move it, or hide it.</p>
     </section>
 
     <h2 class="sec">METRONOME</h2>
@@ -107,6 +117,10 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     if (t.closest('#syncFtp')) void syncFtp();
     if (t.closest('#forget')) void forget();
+    if (t.closest('#resetProgs')) {
+      updateSettings({ programOrder: [], programHidden: null });
+      $('#resetOut', root).textContent = '✓ Back to the default list';
+    }
     if (t.closest('#test')) void test();
   };
   const onInput = (e: Event) => {

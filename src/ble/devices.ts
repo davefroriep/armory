@@ -1,6 +1,6 @@
 import { BleLink } from './link';
 import { parseBikeLine, parseHeartRate, LineBuffer } from './parsers';
-import { pushBike, pushHr } from './telemetry';
+import { live, pushBike, pushHr } from './telemetry';
 import { transport } from './transport';
 
 const HR_SERVICE = '0000180d-0000-1000-8000-00805f9b34fb';
@@ -19,6 +19,8 @@ export const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
+const BIKE_SILENCE_MS = 6000;
+
 class AirbikeLink extends BleLink {
   private lines = new LineBuffer();
 
@@ -28,6 +30,11 @@ class AirbikeLink extends BleLink {
       names: ['AssaultBike'],
       matches: (n) => n === 'AssaultBike',
     });
+  }
+
+  /** The bike streams at 5 Hz even when idle, so 6 s of silence means the link is dead. */
+  protected isHealthy(): boolean {
+    return Date.now() - Math.max(this.connectedAt, live.bikeAt) < BIKE_SILENCE_MS;
   }
 
   protected async subscribe(id: string): Promise<void> {

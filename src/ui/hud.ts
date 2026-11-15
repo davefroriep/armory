@@ -1,15 +1,18 @@
 import { bikeFrame, bikeFresh, hrFresh, live } from '../ble/telemetry';
 import { sim } from '../ble/sim';
-import { ensureSensors, releaseBike } from '../ble/sources';
+import { bikeStatusNote, ensureSensors, releaseBike } from '../ble/sources';
 import { audio, buzz } from '../audio/audio';
 import { WorkoutEngine } from '../domain/engine';
-import { CORRIDOR_RPM, cueFor, pacerDecision, type Cue, type PacerConfig } from '../domain/pacer';
+import { CORRIDOR_RPM, cueFor, hrCue, pacerDecision, type Cue, type PacerConfig } from '../domain/pacer';
+import { recoveryLimitBpm } from '../domain/gate';
+import { repNote, repStats, type RepStat } from '../domain/reps';
 import { PHASE_COLOR, fmtDur, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
 import { wattsForRpm } from '../domain/airbikeCurve';
 import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
 import { workoutService } from '../native/service';
 import { getSettings, updateSettings } from '../store/settings';
+import { putMeta } from '../store/db';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import { ICON, esc, hms, mmss } from './dom';
@@ -52,6 +55,8 @@ class Hud {
   private wAvg = new WindowAvg(SMOOTH_MS);
   private tlIndex = -2;
   private tlReady = true;
+  /** Live state of the gated recovery block (null outside gated blocks). */
+  private gateState: { waiting: boolean; timerOnly: boolean; into: number; minSec: number; nominal: number; hrLimit: number } | null = null;
   private el!: Record<string, HTMLElement>;
 
   constructor(private root: HTMLElement, baseProgram: Program, private eventId: number | null) {
@@ -161,6 +166,7 @@ class Hud {
       </div>
       <div class="ctrl">
         <button class="metro" id="metro">${ICON.note}<span id="metroTxt">METRONOME</span></button>
+        <button class="skip" id="skip" hidden>SKIP</button>
         <button class="go" id="go">START</button>
       </div>
       <div class="rt-note" id="sigNote"></div>
@@ -178,7 +184,7 @@ class Hud {
     this.el = {} as Record<string, HTMLElement>;
     for (const id of ['banner', 'ph', 'tag', 'tgt', 'cdLabel', 'cd', 'next', 'cue', 'gauge', 'gZone', 'gNeedle', 'mHr', 'mW', 'mCad',
       'hr', 'hrSub', 'w', 'wSub', 'cad', 'cadSub', 'sEl', 'sLeft', 'sAvg', 'sCal', 'sX', 'metro', 'metroTxt', 'go', 'pauseModal',
-      'pauseSub', 'doneModal', 'ovRight', 'tl', 'sigNote']) this.el[id] = q(id);
+      'pauseSub', 'doneModal', 'ovRight', 'tl', 'sigNote', 'skip']) this.el[id] = q(id);
     if (segs.length) this.el.tlHead = q('tlHead');
     else this.el.tlFill = q('tlFill');
     if (hasTrim) this.el.trimLbl = q('trimLbl');
@@ -199,6 +205,7 @@ class Hud {
 
   private bind(): void {
     const on = (id: string, fn: () => void) => this.root.querySelector('#' + id)!.addEventListener('click', fn);
+    on('skip', () => { if (this.engine.skip(Date.now()) && getSettings().haptics) buzz([60]); this.loop(); });
     on('go', () => (this.engine.state === 'ready' ? this.start() : this.pause()));
     on('resume', () => this.resume());
     on('finish', () => this.finish());
@@ -277,9 +284,20 @@ class Hud {
     const now = Date.now();
     const st = getSettings();
     const running = this.engine.state === 'running';
+    // HR-gated recovery: end the block when HR is back at the target (floor / ceiling rules in domain/gate.ts)
+    const hrNow = hrFresh() ? live.hr : null;
+    const hrLimit = recoveryLimitBpm(st.hrMax, st.recoveryHrPct);
+    if (running) {
+      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: st.recoveryMode, lead: st.metroLead || 5 });
+      if (released !== null && st.haptics) buzz([80, 60, 80]);
+    }
     const elapsed = this.engine.elapsed(now);
     const loc = this.engine.locate(now);
     const seg = loc.seg;
+    const waiting = !!seg?.gate && this.engine.waitingOnGate(now);
+    this.gateState = seg?.gate
+      ? { waiting, timerOnly: st.recoveryMode === 'timed' || hrNow == null, into: loc.into, minSec: seg.gate.minSec, nominal: this.p.segments[loc.index]?.seconds ?? seg.seconds, hrLimit }
+      : null;
     const targetRpm = seg?.rpm ?? (this.p.segments.length === 0 ? this.p.paceRpm ?? 0 : 0);
 
     sim.setTarget(running ? targetRpm : 0);
@@ -310,7 +328,12 @@ class Hud {
     audio.setMetronome(running && dec.play, dec.bpm);
 
     // cue + overshoot chirp (smoothed, so a single hard pedal stroke doesn't nag)
-    const cue = running ? cueFor(seg, cadS, loc.into) : ({ level: 'idle', text: '', chirp: false } as Cue);
+    let cue = running ? cueFor(seg, cadS, loc.into) : ({ level: 'idle', text: '', chirp: false } as Cue);
+    if (running && cue.level !== 'bad') {
+      const gateLimit = waiting && !this.gateState?.timerOnly ? hrLimit : null;
+      const extra = hrCue(seg, hrNow ?? 0, st.hrMax, gateLimit);
+      if (extra) cue = { ...extra, chirp: cue.chirp };
+    }
     if (cue.chirp && now - this.lastChirp > 6000) {
       this.lastChirp = now;
       audio.chirp();
@@ -363,9 +386,16 @@ class Hud {
 
     // countdown (whole seconds only)
     if (p.segments.length) {
-      e.cdLabel.textContent = next ? 'NEXT TRANSITION' : 'WORKOUT ENDS IN';
-      e.cd.textContent = ready ? mmss(p.segments[0].seconds) : mmss(Math.ceil(remaining));
-      e.cd.classList.toggle('hot', !ready && remaining <= 5 && running);
+      const gs = this.gateState;
+      let shownLeft = remaining;
+      if (gs?.waiting) {
+        if (gs.timerOnly) shownLeft = Math.max(0, gs.nominal - gs.into);
+        else shownLeft = Math.max(0, gs.minSec - gs.into);
+      }
+      const hrWait = !!gs?.waiting && !gs.timerOnly && gs.into >= gs.minSec;
+      e.cdLabel.textContent = hrWait ? `RECOVER TO HR ≤ ${gs!.hrLimit}` : gs?.waiting && !gs.timerOnly ? 'MINIMUM REST' : next ? 'NEXT TRANSITION' : 'WORKOUT ENDS IN';
+      e.cd.textContent = ready ? mmss(p.segments[0].seconds) : hrWait ? `+${mmss(Math.floor(gs!.into - gs!.minSec))}` : mmss(Math.ceil(shownLeft));
+      e.cd.classList.toggle('hot', !ready && shownLeft <= 5 && running && !hrWait);
       e.next.innerHTML = ready
         ? `FIRST UP: ${esc(p.segments[0].label)}`
         : next ? `NEXT: <b>${esc(next.label)}</b>${next.rpm != null ? ` · ${rpmTxt(next)} RPM${next.allOut ? '' : ` · ${targetWatts(next)} W`}` : ' · full rest'}` : 'LAST BLOCK';
@@ -380,7 +410,7 @@ class Hud {
     // timeline
     if (p.segments.length) {
       const total = totalSeconds(p);
-      (e.tlHead as HTMLElement).style.left = `${Math.min(100, (elapsed / total) * 100)}%`;
+      (e.tlHead as HTMLElement).style.left = `${Math.min(100, this.progress(index, seg, elapsed, ready, total) * 100)}%`;
       if (index !== this.tlIndex || ready !== this.tlReady) {
         this.tlIndex = index;
         this.tlReady = ready;
@@ -426,7 +456,7 @@ class Hud {
 
     // strip
     e.sEl.textContent = hms(elapsed);
-    e.sLeft.textContent = p.segments.length ? mmss(Math.max(0, totalSeconds(p) - elapsed)) : String(Math.round(this.rec?.avgW ?? 0));
+    e.sLeft.textContent = p.segments.length ? mmss(this.engine.remainingNominal(Date.now())) : String(Math.round(this.rec?.avgW ?? 0));
     e.sAvg.textContent = String(Math.round(this.rec?.avgW ?? 0));
     e.sCal.textContent = String(Math.round(this.rec?.lastKcal ?? 0));
     e.sX.textContent = p.zone === 'Z5' ? mmss(this.rec?.z5Seconds ?? 0) : ((this.rec?.lastDist ?? 0) / 1609.344).toFixed(2);
@@ -438,10 +468,25 @@ class Hud {
       : running && playing && bpm ? `${Math.round(bpm)} BPM`
       : st.metroMode === 'whole' ? 'METRONOME ON' : 'ARMED · TRANSITIONS';
 
-    e.sigNote.textContent = !bike ? 'Waiting for AirBike signal…' : '';
+    e.sigNote.textContent = !bike ? bikeStatusNote() || 'Waiting for AirBike signal…' : '';
 
+    e.skip.hidden = !(running && seg && (seg.kind === 'rest' || seg.kind === 'warmup'));
+    e.skip.textContent = seg?.kind === 'warmup' ? 'SKIP WARM-UP' : 'READY ▶';
     if (this.engine.state === 'paused') e.go.textContent = 'PAUSED';
     else if (running) e.go.textContent = 'PAUSE';
+  }
+
+  /** Timeline head position (0..1) on the nominal timeline; gated blocks fill up to their nominal length. */
+  private progress(index: number, seg: Segment | null, elapsed: number, ready: boolean, total: number): number {
+    if (ready || !seg || !total) return 0;
+    const segs = this.p.segments;
+    if (index >= segs.length - 1 && this.engine.locate(Date.now()).complete) return 1;
+    let before = 0;
+    for (let i = 0; i < index; i++) before += segs[i].seconds;
+    const nominal = segs[index]?.seconds ?? seg.seconds;
+    const into = this.engine.locate(Date.now()).into;
+    const len = this.gateState?.waiting ? nominal : Math.max(1, seg.seconds);
+    return Math.min(1, (before + Math.min(1, into / len) * nominal) / total);
   }
 
   /** Center-bar: target in the middle, instant needle left/right of it. */
@@ -477,6 +522,9 @@ class Hud {
       if (meta) void discard(meta.id);
       return;
     }
+    const reps = repStats(this.engine.segments(this.engine.elapsed(Date.now())), rec.samples);
+    const note = repNote(reps);
+    if (note) { meta.notes = note; void putMeta(meta); }
     const avgCad = rec.samples.length ? rec.samples.reduce((a, x) => a + x.cad, 0) / rec.samples.length : 0;
     const stats: [string, string][] = [
       ['AVG POWER', `${Math.round(meta.avgW)} W`],
@@ -489,7 +537,7 @@ class Hud {
       ['DISTANCE', `${(rec.lastDist / 1609.344).toFixed(2)} mi`],
       this.p.zone === 'Z5' ? ['Z5 BANK (≥88%)', mmss(rec.z5Seconds)] : ['TIME', hms(meta.seconds)],
     ];
-    renderSummary(this.root, { title: this.p.name, meta, stats, backHref: '#/airbike' });
+    renderSummary(this.root, { title: this.p.name, meta, stats, extra: repTable(reps), backHref: '#/airbike' });
   }
 }
 
@@ -498,3 +546,17 @@ function segTarget(g: Segment): string {
   return g.allOut ? `${rpmTxt(g)} RPM · all out` : `${rpmTxt(g)} RPM · ${segWatts(g)}`;
 }
 const segWatts = (g: Segment): string => `${Math.round(wattsForRpm(g.rpm ?? 0))} W`;
+
+const mmssR = (s: number): string => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
+
+/** Per-rep progress table for the summary (power / peak HR per work rep, real recovery length and end HR). */
+function repTable(reps: RepStat[]): string {
+  const work = reps.filter((r) => r.kind === 'work');
+  if (!work.length) return '';
+  const rest = reps.filter((r) => r.kind === 'rest');
+  const rows = work.map((w, i) => {
+    const r = rest[i];
+    return `<tr><td>${w.n}</td><td>${Math.round(w.avgW)} W</td><td>${w.hrPeak || '--'}</td><td>${r ? mmssR(r.sec) : '--'}</td><td>${r?.hrEnd || '--'}</td></tr>`;
+  }).join('');
+  return `<h2 class="sec">REPS &amp; RECOVERY</h2><section class="card reps"><table><thead><tr><th>#</th><th>AVG</th><th>PEAK HR</th><th>REST</th><th>HR AT END</th></tr></thead><tbody>${rows}</tbody></table></section>`;
+}

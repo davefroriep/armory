@@ -1,5 +1,6 @@
 import { Emitter } from '../emitter';
 import type { MetroMode } from '../domain/pacer';
+import type { RecoveryMode } from '../domain/gate';
 
 export interface Settings {
   /** Intervals.icu athlete id (not a secret). */
@@ -15,6 +16,14 @@ export interface Settings {
   /** Last manual FTP configured on Intervals.icu (`sportSettings.indoor_ftp` / `ftp`). */
   intervalsSetFtp: number | null;
   hrMax: number;
+  /** "gated": recoveries last until HR is back at the target (floor + ceiling apply); "timed": plain timers. */
+  recoveryMode: RecoveryMode;
+  /** Recovered once HR is at or below this % of HRmax. */
+  recoveryHrPct: number;
+  /** AirBike program order (ids). Programs not listed follow in library order. */
+  programOrder: string[];
+  /** Hidden AirBike programs; null = never customised (library defaults). */
+  programHidden: string[] | null;
   metroEnabled: boolean;
   metroMode: MetroMode;
   metroLead: number;
@@ -38,6 +47,10 @@ export const DEFAULTS: Settings = {
   intervalsEftp: null,
   intervalsSetFtp: null,
   hrMax: 180,
+  recoveryMode: 'gated',
+  recoveryHrPct: 72,
+  programOrder: [],
+  programHidden: null,
   metroEnabled: true,
   metroMode: 'transitions',
   metroLead: 5,

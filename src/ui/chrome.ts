@@ -1,6 +1,6 @@
 import { $, ICON, esc } from './dom';
 import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
-import { hrFresh, live } from '../ble/telemetry';
+import { bikeFrame, hrFresh, live } from '../ble/telemetry';
 import { calendar, type TodayItem } from '../intervals/calendar';
 import { REV, REV_STAMP } from '../rev';
 import { EQUIPMENT_LABEL } from '../types';
@@ -40,6 +40,14 @@ export function wireChips(root: HTMLElement): () => void {
   root.addEventListener('click', click);
   const off = linkStatus.on(paint);
   const t = setInterval(paint, 1000);
+  // Live RPM on the bike chip: repaint on bike frames, at most ~4x a second.
+  let lastPaint = 0;
+  const offBike = bikeFrame.on(() => {
+    const n = performance.now();
+    if (n - lastPaint < 250) return;
+    lastPaint = n;
+    paint();
+  });
   // screens re-render their header on every repaint; repaint the chips right away
   const obs = new MutationObserver(paint);
   obs.observe(root, { childList: true });
@@ -47,6 +55,7 @@ export function wireChips(root: HTMLElement): () => void {
   return () => {
     root.removeEventListener('click', click);
     off();
+    offBike();
     obs.disconnect();
     clearInterval(t);
   };

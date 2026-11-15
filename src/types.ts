@@ -45,4 +45,6 @@ export interface WorkoutMeta {
   patched: boolean;
   activityId: string | null;
   lastError: string | null;
+  /** Per-rep / recovery progress line appended to the Intervals.icu description. */
+  notes?: string;
 }

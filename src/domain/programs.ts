@@ -20,6 +20,16 @@ export interface Segment {
   rpm: number | null;
   /** All-out effort: `rpm` is a minimum, not a corridor. */
   allOut?: boolean;
+  /**
+   * Heart-rate gated recovery. `seconds` is the nominal (timer) length and also the floor; the block then
+   * stays open until HR has dropped to the recovery target, at most `maxSec`.
+   */
+  gate?: Gate;
+}
+
+export interface Gate {
+  minSec: number;
+  maxSec: number;
 }
 
 export type ProgramGroup = 'z2' | 'z5' | 'hiit' | 'goal';
@@ -45,6 +55,8 @@ export interface Program {
   goal?: GoalSpec;
   /** Pace used by the metronome when the program has no segment targets (free ride / goals). */
   paceRpm?: number;
+  /** Tucked into the "Hidden" shelf until the athlete restores it. */
+  hidden?: boolean;
 }
 
 export const PHASE_COLOR: Record<PhaseKind, string> = {
@@ -67,11 +79,13 @@ const s = (kind: PhaseKind, label: string, seconds: number, rpm: number | null, 
 const warmup = (): Segment => s('warmup', 'WARM-UP', 300, WARM_RPM);
 
 /** WU + N x (work / easy) where the final easy block is the cool-down. */
-function repeats(n: number, workSec: number, workRpm: number, easySec: number): Segment[] {
+function repeats(n: number, workSec: number, workRpm: number, easySec: number, gateMaxSec?: number): Segment[] {
   const out: Segment[] = [warmup()];
   for (let i = 1; i <= n; i++) {
     out.push(s('work', 'WORK', workSec, workRpm, { tag: `REP ${i}/${n}` }));
-    out.push(i < n ? s('rest', 'EASY SPIN', easySec, EASY_RPM, { tag: `REP ${i}/${n}` }) : s('cooldown', 'COOL-DOWN', easySec, EASY_RPM));
+    out.push(i < n
+      ? s('rest', 'EASY SPIN', easySec, EASY_RPM, { tag: `REP ${i}/${n}`, ...(gateMaxSec ? { gate: { minSec: easySec, maxSec: gateMaxSec } } : {}) })
+      : s('cooldown', 'COOL-DOWN', easySec, EASY_RPM));
   }
   return out;
 }
@@ -81,10 +95,10 @@ function billat(): Segment[] {
   const sets = 2, reps = 8;
   for (let st = 1; st <= sets; st++) {
     for (let r = 1; r <= reps; r++) {
-      out.push(s('work', 'WORK', 60, 57.0, { tag: `SET ${st}/${sets} - REP ${r}/${reps}` }));
+      out.push(s('work', 'WORK', 60, 55.0, { tag: `SET ${st}/${sets} - REP ${r}/${reps}` }));
       if (r < reps) out.push(s('float', 'FLOAT', 30, EASY_RPM, { tag: `SET ${st}/${sets} - KEEP FAN MOVING` }));
     }
-    if (st < sets) out.push(s('rest', 'SET REST', 180, null, { tag: 'FULL REST OR <=35 RPM' }));
+    if (st < sets) out.push(s('rest', 'SET REST', 180, null, { tag: 'FULL REST OR <=35 RPM', gate: { minSec: 180, maxSec: 300 } }));
   }
   out.push(s('cooldown', 'COOL-DOWN', 120, EASY_RPM));
   return out;
@@ -99,39 +113,30 @@ function rounds(n: number, workSec: number, restSec: number, workRpm: number): S
   return out;
 }
 
+/**
+ * Default library order = preferred first. The athlete can reorder / hide programs from the AirBike
+ * screen (hold a card); that choice is stored in settings, so editing this list never needs a rebuild
+ * to keep their arrangement.
+ *
+ * Targets are deliberately conservative: arms + legs on a fan bike, so %FTP is a ceiling, not a goal.
+ * Work cadences (52.5 / 53.5 / 55 RPM) = 111% / 117% / 125% of the 182 W baseline.
+ */
 export const PROGRAMS: Program[] = [
   {
-    id: 'z2', name: 'Zone 2 Base', intervalsName: 'AirBike Z2', group: 'z2', zone: 'Z2',
-    blurb: 'Aerobic base · 45:00 steady @ 72% FTP.',
-    segments: [
-      s('warmup', 'WARM-UP', 300, EASY_RPM),
-      s('steady', 'ZONE 2', 2700, 44.5),
-      s('cooldown', 'COOL-DOWN', 300, EASY_RPM),
-    ],
-  },
-  {
-    id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5',
-    blurb: 'Jamieson 1:1 · 6 × 2:00 @ 132% FTP, 2:00 easy.', segments: repeats(6, 120, 56.0, 120),
+    id: 'n4x4', name: 'Norwegian 4×4', intervalsName: 'AirBike Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5',
+    blurb: 'NTNU CERG · 4 × 4:00 @ 111% FTP (HR 85–95%), recover to HR ≤ target.', segments: repeats(4, 240, 52.5, 180, 300),
   },
   {
     id: 'v5x3', name: 'Classic VO2 5×3', intervalsName: 'AirBike Z5 — Classic VO2 5×3', group: 'z5', zone: 'Z5',
-    blurb: 'Macro-Intervals · 5 × 3:00 @ 125% FTP, 2:00 easy.', segments: repeats(5, 180, 55.0, 120),
+    blurb: 'Macro-intervals · 5 × 3:00 @ 117% FTP, recover to HR ≤ target.', segments: repeats(5, 180, 53.5, 120, 240),
   },
   {
-    id: 'b6030', name: 'Billat / Rønnestad 60/30', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
-    blurb: 'Float VO2 · 2 × 8 × (60s @ 138% FTP / 30s float). Keep fan moving.', segments: billat(),
-  },
-  {
-    id: 'n4x4', name: 'Norwegian 4×4', intervalsName: 'AirBike Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5',
-    blurb: 'NTNU CERG · 4 × 4:00 @ 122% FTP, 3:00 easy.', segments: repeats(4, 240, 54.5, 180),
-  },
-  {
-    id: 'tabata', name: 'Tabata 20/10', intervalsName: 'AirBike Tabata 20/10', group: 'hiit', zone: null,
-    blurb: '8 rounds of 20s all-out (65+ RPM) / 10s easy.', segments: rounds(8, 20, 10, 65),
+    id: 'b6030', name: '60/30 Float', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
+    blurb: '2 × 8 × (60s @ 125% FTP / 30s float). Fast clock, keep the fan moving.', segments: billat(),
   },
   {
     id: 'sprint1020', name: 'Sprint 10/20', intervalsName: 'AirBike Sprint 10/20', group: 'hiit', zone: null,
-    blurb: '8 rounds of 10s all-out (65+ RPM) / 20s easy.', segments: rounds(8, 10, 20, 65),
+    blurb: '8 rounds of 10s all-out (65+ RPM) / 20s easy. Painless 4-minute hit.', segments: rounds(8, 10, 20, 65),
   },
   {
     id: 'time', name: 'Target Time', intervalsName: 'AirBike Target Time', group: 'goal', zone: null,
@@ -142,6 +147,23 @@ export const PROGRAMS: Program[] = [
     id: 'cal', name: 'Target Calories', intervalsName: 'AirBike Target Cal', group: 'goal', zone: null,
     blurb: 'Burn the goal in Assault calories, as fast as you like.', segments: [], paceRpm: FREE_PACE_RPM,
     goal: { type: 'cal', unit: 'cal', def: 20, min: 5, max: 500, step: 5 },
+  },
+  {
+    id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5', hidden: true,
+    blurb: 'Jamieson-style · 6 × 2:00 @ 119% FTP, recover to HR ≤ target (2–5 min).', segments: repeats(6, 120, 54.0, 120, 300),
+  },
+  {
+    id: 'tabata', name: 'Tabata 20/10', intervalsName: 'AirBike Tabata 20/10', group: 'hiit', zone: null, hidden: true,
+    blurb: '8 rounds of 20s all-out (65+ RPM) / 10s easy. High dread, little carry-over.', segments: rounds(8, 20, 10, 65),
+  },
+  {
+    id: 'z2', name: 'Zone 2 Base', intervalsName: 'AirBike Z2', group: 'z2', zone: 'Z2', hidden: true,
+    blurb: 'Aerobic base · 45:00 steady @ 72% FTP (Z2 lives on spin / treadmill).',
+    segments: [
+      s('warmup', 'WARM-UP', 300, EASY_RPM),
+      s('steady', 'ZONE 2', 2700, 44.5),
+      s('cooldown', 'COOL-DOWN', 300, EASY_RPM),
+    ],
   },
   {
     id: 'free', name: 'Free Ride', intervalsName: 'AirBike Free Ride', group: 'free', zone: null,

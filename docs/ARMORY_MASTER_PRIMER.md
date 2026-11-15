@@ -90,6 +90,15 @@ Tapping **`[ZONE 5 VO2]`** on **AirBike** opens a 4-card protocol drawer display
 
 *(Note: Spin `[ZONE 5 VO2]` mirrors the exact same 4 protocol cards using SS2K Auto-ERG at `220 W`, `225 W`, `235 W`, and `245 W` work / `105 W` recovery so either bike can execute the full Z5 menu.)*
 
+### 4.1b Rev v0.5 program revision (supersedes the targets / order in the table above)
+
+- **Order = preference, user-editable:** Norwegian 4×4 → Classic VO2 5×3 → 60/30 Float → Sprint 10/20 → Target Time → Target Calories. **Cardiac Power 6×2, Tabata 20/10 and Zone 2 Base ship hidden** (Z2 lives on spin / treadmill); hold any card to pin / move / hide, restore from the *Hidden* shelf, reset in Settings.
+- **Conservative work targets** (arms + legs on a fan bike, %FTP is a ceiling): 4×4 `52.5 RPM` ≈ 111 % · 5×3 `53.5 RPM` ≈ 117 % · 60/30 `55 RPM` ≈ 125 % · Cardiac Power `54 RPM` ≈ 119 % of the 182 W baseline. Live HR ≥ 96 % HRmax on a work block raises an *EASE OFF* cue.
+- **HR-gated recoveries** (Settings → *Recoveries*, default on): a rest never ends before the protocol's own rest (floor), then stays easy until HR ≤ 72 % HRmax (default 130 bpm @ 180), capped at 5:00 (ceiling); 5 s get-ready, then the next rep starts. No live HR, or *Fixed timers* mode = plain countdowns. *READY ▶* / *SKIP WARM-UP* ends a block manually. Cardiac Power recoveries are gated 2:00 → 5:00 (Jamieson).
+- **Progress tracking:** the summary shows per-rep avg W / peak HR and each recovery's real length / end HR; the same line is appended to the Intervals.icu description (`Reps 205W@168 · … | Recoveries 3:05→127 · …`). Same power at lower HR, or faster recoveries, = bigger engine.
+- **Live RPM chip:** the AirBike top-bar chip shows the bike's live pedal RPM once connected (green = frames arriving).
+- **BLE self-healing:** 10 s connect timeout, 1.5 s retry, fire-and-forget disconnect, 6 s no-data watchdog, immediate retry on app resume / chip tap. The ESP32 only starts its radio ~15 s after power-up (Wi-Fi join + 5 s OTA rescue window), so a freshly rebooted bike appears a few seconds into that window.
+
 ### 4.2 Tactical Interval Cockpit HUD & "Lock-In" Transition Engine
 
 Because AirBike wattage scales cubically ($P \propto \text{RPM}^3$), overshooting a launch by just `+10 RPM` spikes power by `+150–300 W` and blows anaerobic $W'$ in seconds. **Armory Fit** pairs a high-contrast cockpit HUD with a 5 Hz (`200 ms`) audio/visual transition pacer:

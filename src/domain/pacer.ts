@@ -93,3 +93,20 @@ export function cueFor(seg: Segment | null, cad: number, into: number): Cue {
   if (diff < -CORRIDOR_RPM) return { level: 'warn', text: 'PICK IT UP', chirp: false };
   return { level: 'ok', text: 'ON TARGET', chirp: false };
 }
+
+/** Work-block HR ceiling (fraction of HRmax): past it the effort is too hot for a repeatable VO2 session. */
+export const HR_CEILING = 0.96;
+
+/** Extra cue on top of the cadence cue: HR too high on a work block, or recovery progress on a gated rest. */
+export function hrCue(seg: Segment | null, hr: number, hrMax: number, gateLimit: number | null): Cue | null {
+  if (!seg || hr <= 0) return null;
+  if (seg.gate && gateLimit != null) {
+    return hr <= gateLimit
+      ? { level: 'ok', text: `HR ${hr} · RECOVERED`, chirp: false }
+      : { level: 'warn', text: `HR ${hr} → ${gateLimit} · EASY SPIN`, chirp: false };
+  }
+  if (seg.kind === 'work' && !seg.allOut && hr >= HR_CEILING * hrMax) {
+    return { level: 'bad', text: `HR ${Math.round((hr / hrMax) * 100)}% — EASE OFF`, chirp: false };
+  }
+  return null;
+}
