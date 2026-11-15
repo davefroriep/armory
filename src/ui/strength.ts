@@ -1,3 +1,4 @@
+import { LeaveGuard } from './leaveGuard';
 import { hrFresh, live } from '../ble/telemetry';
 import { ensureSensors } from '../ble/sources';
 import { calendar } from '../intervals/calendar';
@@ -28,6 +29,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
   let lastSvc = 0;
   let offChips: (() => void) | null = null;
   let offCal: (() => void) | null = null;
+  const guard = new LeaveGuard(() => state === 'running' || state === 'paused');
 
   const elapsed = () => (accMs + (state === 'running' ? Date.now() - t0 : 0)) / 1000;
 
@@ -95,6 +97,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     rec = new Recorder(id, 'strength', 'strength', 'Strength Train', ev?.ev.id ?? null, getSettings().hrMax);
     state = 'running';
+    guard.arm();
     t0 = Date.now();
     accMs = 0;
     if (!isNative()) void navigator.wakeLock?.request('screen').then((l) => { lock = l; }).catch(() => {});
@@ -116,6 +119,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
     if (state === 'running') accMs += Date.now() - t0;
     rec?.tick(elapsed(), 0);
     state = 'summary';
+    guard.disarm();
     void workoutService.stop();
     void lock?.release().catch(() => {});
     lock = null;
@@ -149,6 +153,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
   window.addEventListener('beforeunload', unload);
   return () => {
     if (timer) clearInterval(timer);
+    guard.dispose();
     offChips?.();
     offCal?.();
     void workoutService.stop();

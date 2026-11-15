@@ -19,6 +19,7 @@ import { ICON, esc, hms, mmss } from './dom';
 import { topbar, wireChips } from './chrome';
 import { ZONE_COLOR, hrZone } from './hr';
 import { renderSummary } from './summaryView';
+import { LeaveGuard } from './leaveGuard';
 
 /** Display smoothing for cadence and power. The gauge needle is deliberately NOT smoothed. */
 const SMOOTH_MS = 3000;
@@ -55,6 +56,7 @@ class Hud {
   private wAvg = new WindowAvg(SMOOTH_MS);
   private tlIndex = -2;
   private tlReady = true;
+  private guard = new LeaveGuard(() => this.active);
   /** Live state of the gated recovery block (null outside gated blocks). */
   private gateState: { waiting: boolean; timerOnly: boolean; into: number; minSec: number; nominal: number; hrLimit: number } | null = null;
   private el!: Record<string, HTMLElement>;
@@ -84,6 +86,7 @@ class Hud {
     window.addEventListener('beforeunload', unload);
     return () => {
       if (this.timer) clearInterval(this.timer);
+      this.guard.dispose();
       this.offFrame?.();
       this.offSmooth?.();
       this.offChips?.();
@@ -241,6 +244,7 @@ class Hud {
     this.rec = new Recorder(id, 'airbike', this.p.id, this.p.intervalsName, ev?.ev.id ?? null, s.hrMax);
     this.offFrame = bikeFrame.on(() => { if (this.engine.state === 'running') this.rec?.onFrame(); });
     this.engine.start(Date.now());
+    this.guard.arm();
     this.lastIndex = -2;
     void this.acquireLock();
     void workoutService.start(`Armory Fit · ${this.p.name}`, 'Starting…');
@@ -266,6 +270,7 @@ class Hud {
   private finish(): void {
     const now = Date.now();
     this.engine.finish(now);
+    this.guard.disarm();
     if (this.rec) this.rec.tick(this.engine.elapsed(now), 0);
     audio.setMetronome(false, null);
     sim.setTarget(0);
