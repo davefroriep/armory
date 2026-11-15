@@ -8,6 +8,7 @@ import { recoveryLimitBpm } from '../domain/gate';
 import { repNote, repStats, type RepStat } from '../domain/reps';
 import { PHASE_COLOR, fmtDur, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
 import { wattsForRpm } from '../domain/airbikeCurve';
+import { FTP_LINE_H, profileBar } from '../domain/profile';
 import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
 import { workoutService } from '../native/service';
@@ -113,13 +114,20 @@ class Hud {
 
   // ------------------------------------------------------------------ HUD markup
 
+  /** One bar of the workout profile: width = duration, height + colour = intensity (% FTP). */
+  private profileSeg(g: Segment, i: number): string {
+    const b = profileBar(g, getSettings().ftp);
+    const tip = g.rpm == null ? `${g.label} · full rest` : `${g.label} · ${rpmTxt(g)} RPM${g.allOut ? ' · all out' : ` · ${segWatts(g)} · ${Math.round(b.pct)}% FTP`}`;
+    return `<span class="tl-seg" data-i="${i}" title="${esc(tip)}" style="flex:${g.seconds} 1 0;height:${(b.h * 100).toFixed(1)}%;background:${b.color}"></span>`;
+  }
+
   private paintHud(): void {
     const p = this.p;
     const segs = p.segments;
     const total = totalSeconds(p);
     const tl = segs.length
       ? `<div class="tl" id="tl">${segs.map((g, i) =>
-          `<span class="tl-seg" data-i="${i}" style="flex:${g.seconds} 1 0;background:${PHASE_COLOR[g.kind]}"></span>`).join('')}<span class="tl-head" id="tlHead"></span></div>`
+          this.profileSeg(g, i)).join('')}<span class="tl-ftp" style="bottom:${FTP_LINE_H * 100}%"></span><span class="tl-head" id="tlHead"></span></div>`
       : `<div class="tl plain" id="tl"><span class="tl-fill" id="tlFill"></span></div>`;
     const overview = segs.length
       ? `${fmtDur(total)} total${workSeconds(p) ? ` · ${fmtDur(workSeconds(p))} work` : ''}`

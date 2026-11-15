@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { WindowAvg } from '../src/domain/smooth';
 import { RPE_STEPS, rpeLabel } from '../src/domain/rpe';
 import { buildTcx } from '../src/domain/tcx';
+import { intensityColor, profileBar } from '../src/domain/profile';
+import { PROGRAMS, resolveProgram, BASE_FTP } from '../src/domain/programs';
 
 describe('3 s smoothing', () => {
   it('averages the trailing window and drops old samples', () => {
@@ -52,5 +54,32 @@ describe('HR-only TCX (strength)', () => {
     expect(xml).not.toContain('Cadence');
     expect(xml).not.toContain('DistanceMeters');
     expect(xml.match(/<HeartRateBpm>/g)!.length).toBe(2);
+  });
+});
+
+describe('workout profile bars', () => {
+  const n4x4 = PROGRAMS.find((p) => p.id === 'n4x4')!;
+  it('draws work taller and hotter than rest, warm-up and cool-down', () => {
+    const bars = resolveProgram(n4x4, BASE_FTP).segments.map((g) => ({ k: g.kind, ...profileBar(g, BASE_FTP) }));
+    const work = bars.filter((b) => b.k === 'work');
+    const easy = bars.filter((b) => b.k !== 'work');
+    expect(work).toHaveLength(4);
+    for (const w of work) for (const e of easy) expect(w.h).toBeGreaterThan(e.h);
+    expect(work.every((w) => w.color === intensityColor(111))).toBe(true); // 52.5 RPM = 202 W = 111 % FTP -> Z5 orange
+    expect(easy.every((e) => e.pct < 76)).toBe(true);
+  });
+  it('puts all-out efforts at full height and in the top colour', () => {
+    const sprint = PROGRAMS.find((p) => p.id === 'sprint1020')!;
+    const hard = sprint.segments.find((g) => g.allOut)!;
+    expect(profileBar(hard, BASE_FTP)).toMatchObject({ h: 1, color: intensityColor(0, true) });
+  });
+  it('uses the athlete FTP, so a higher FTP lowers the same target to a cooler colour', () => {
+    const w = n4x4.segments.find((g) => g.kind === 'work')!;
+    expect(profileBar(w, 182).pct).toBeGreaterThan(profileBar(w, 260).pct);
+    expect(profileBar(w, 182).h).toBeGreaterThan(profileBar(w, 260).h);
+  });
+  it('colours by power zone edges', () => {
+    expect([40, 60, 80, 100, 115, 130].map((p) => intensityColor(p))).toEqual(
+      ['#6b7a90', '#3b9cff', '#22c55e', '#facc15', '#fb923c', '#ef4444']);
   });
 });
