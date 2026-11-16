@@ -95,7 +95,7 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
       if (t.closest('[data-retry]')) { await retryPending(); void paintSync(); return; }
       if (t.closest('#share')) return void (await openShareCard(s));
       if (t.closest('#asday')) {
-        const name = await promptSheet('Save as a day', s.name, 'Upper 1, Lower 2…');
+        const name = await promptSheet('Save as a day', s.name === 'Custom Workout' ? '' : s.name, 'Upper 1, Lower 2…');
         if (!name) return;
         const r = routineFromSession(s, name, lifts.routines.size);
         await lifts.saveRoutine(r);

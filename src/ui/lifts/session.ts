@@ -1,19 +1,19 @@
-import { buzz } from '../../audio/audio';
+import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import {
-  addSet, buildExercise, deleteSet, editReps, editWeight, hasLogged, labels, prevSetFor, removeLastSet,
-  swapExercise, toggleDone, unloggedCount,
+  addSet, buildExercise, deleteSet, editReps, editWeight, hasLogged, labels, midSuperset,
+  prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
 } from '../../lifts/logic';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
-import { fmtKg, fmtNum, fromDisplay, liftSettings, stepsFor } from '../../lifts/settings';
+import { fmtKg, fmtNum, fromDisplay, liftSettings, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { resyncSession } from '../../lifts/intervals';
 import { setText } from '../../lifts/summary';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
 import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
-import { clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
+import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
 import { attachVideo, playVideo, recordVideo } from './video';
 
@@ -81,7 +81,9 @@ function build(root: HTMLElement, id?: string): () => void {
     const note = lifts.row(se.exId)?.note;
     const wHead = ex.type === 'bodyweight' ? `+${unit().toUpperCase()}` : unit().toUpperCase();
     const rHead = ex.type === 'time' ? 'SEC' : 'REPS';
-    return `<section class="xcard${se.ss ? ' ss' : ''}" data-uid="${se.uid}">
+    const restSec = active.restSecFor(se);
+    const autoOn = active.restAutoFor(s, idx);
+    return `<section class="xcard" data-idx="${idx}" data-uid="${se.uid}">
       <div class="xhead">
         <span class="xlab">${labs[idx]}</span>
         <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · ')}</small></button>
@@ -92,10 +94,21 @@ function build(root: HTMLElement, id?: string): () => void {
       <div class="xrows">${se.sets.map((_, i) => rowHtml(se, ex, i, labelMap)).join('')}</div>
       <div class="xfoot">
         <button class="stp" data-act="rmset" aria-label="Remove set">−</button><span>SET</span><button class="stp" data-act="addset" aria-label="Add set">+</button>
-        <em class="xrest" data-act="restpick">${active.restSecFor(se) ? `Rest ${clock(active.restSecFor(se))}` : ''}</em>
+        ${edit ? '' : `<div class="xtimer">
+          <button class="xt-auto${autoOn ? ' on' : ''}" type="button" data-act="restauto" aria-pressed="${autoOn}" title="Auto-start rest timer on check">Auto</button>
+          <button class="xt-go" type="button" data-act="reststart" aria-label="Start rest timer">▶ ${clock(restSec)}</button>
+          <button class="xt-cog" type="button" data-act="restcfg" aria-label="Timer settings">${LI.gear}</button>
+        </div>`}
       </div>
     </section>`;
   };
+
+  const cardsHtml = (labs: string[]): string =>
+    supersetGroups(s.exs).map((g) => {
+      if (g.ssIdx == null) return cardHtml(s.exs[g.start], g.start, labs);
+      const inner = Array.from({ length: g.end - g.start + 1 }, (_, k) => cardHtml(s.exs[g.start + k], g.start + k, labs)).join('');
+      return `<div class="ss-group ss-c${g.ssIdx % 2}" data-ss="${g.ssIdx}"><div class="ss-tag">SUPERSET</div>${inner}</div>`;
+    }).join('');
 
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
@@ -112,8 +125,14 @@ function build(root: HTMLElement, id?: string): () => void {
     const labs = labels(s.exs);
     root.innerHTML = `${header()}
       <main class="page lsession">
-        ${s.exs.map((se, i) => cardHtml(se, i, labs)).join('') || '<div class="empty big">No exercises yet.<br>Add your first one below.</div>'}
-        <button class="btn big addex" data-act="addex">+ Add exercise</button>
+        ${cardsHtml(labs)}
+        <button class="addex-banner${s.exs.length === 0 ? ' hero' : ''}" type="button" data-act="addex">
+          <span class="aeb-ico">${LI.plus}</span>
+          <span class="aeb-txt">
+            <b>${s.exs.length === 0 ? 'Add Exercise' : 'Add Next Exercise'}</b>
+            <small>${s.exs.length === 0 ? 'Pick from 120+ lifts or create custom — add exercises &amp; sets live as you go' : 'Pick or create another exercise in real time'}</small>
+          </span>
+        </button>
         ${edit ? '<button class="btn primary big" data-act="finish">Done</button>' : '<button class="btn primary big" data-act="finish">Finish workout</button>'}
       </main>
       <div class="restbar" id="restbar" hidden><i class="rb-fill"></i><span class="rb-lab"></span><b class="rb-time"></b><button data-rest="-15">−15</button><button data-rest="15">+15</button><button data-rest="0">Skip</button></div>
@@ -270,7 +289,7 @@ function build(root: HTMLElement, id?: string): () => void {
       { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
       { key: 'note', label: lifts.row(se.exId)?.note ? 'Edit note' : 'Add note', sub: 'Sticks to the exercise (seat height, handle…)' },
       ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
-      { key: 'rest', label: 'Rest timer', sub: `${clock(active.restSecFor(se))} for this exercise` },
+      { key: 'rest', label: 'Timer settings', sub: `${clock(active.restSecFor(se))} · Auto ${active.restAutoFor(s, idx) ? 'on' : 'off'}` },
       ...(idx > 0 ? [{ key: 'up', label: 'Move up' }] : []),
       ...(idx < s.exs.length - 1 ? [{ key: 'down', label: 'Move down' }] : []),
       { key: 'records', label: 'Records & history' },
@@ -280,7 +299,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (k === 'swap') await swap(se);
     else if (k === 'note') await editNote(se);
     else if (k === 'ss') { se.ss = !se.ss; save(); paint(); }
-    else if (k === 'rest') await pickRest(se);
+    else if (k === 'rest') await openTimerSheet(se);
     else if (k === 'up' || k === 'down') {
       const j = k === 'up' ? idx - 1 : idx + 1;
       [s.exs[idx], s.exs[j]] = [s.exs[j], s.exs[idx]];
@@ -304,17 +323,83 @@ function build(root: HTMLElement, id?: string): () => void {
     paint();
   };
 
-  const pickRest = async (se: SessionEx): Promise<void> => {
-    const cur = active.restSecFor(se);
+  const openTimerSheet = async (se: SessionEx): Promise<void> => {
+    const ex = exOf(se.exId);
+    const idx = s.exs.indexOf(se);
     const opts = [30, 45, 60, 90, 120, 150, 180, 240, 300];
-    const items = [
-      ...(!edit ? [{ key: 'now', label: 'Start rest timer now', sub: clock(cur) }] : []),
-      ...opts.map((o) => ({ key: String(o), label: clock(o), on: o === cur })),
-    ];
-    const k = await actionSheet('Rest timer', items);
-    if (!k) return;
-    if (k === 'now') { active.startRest(cur, exOf(se.exId).name); return; }
-    await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), restSec: Number(k) });
+    let resolveClosed: () => void = () => {};
+    const closed = new Promise<void>((res) => { resolveClosed = res; });
+    const sh = openSheet(
+      `<h3 class="sh-title">Timer · ${esc(ex.name)}</h3>
+       <div class="fl">REST DURATION <small>THIS EXERCISE</small></div>
+       <div class="chips-row wrap" id="tdur"></div>
+       <div class="fl">THIS CARD</div>
+       <div class="line"><span>Auto-timer on check<small>Starts countdown automatically when logging a set here</small></span><button class="switch" type="button" data-tcfg="cardAuto" role="switch"><i></i></button></div>
+       <div class="fl">ALL EXERCISES (DEFAULTS)</div>
+       <div class="line"><span>Auto-timer by default<small>Applies across all cards</small></span><button class="switch" type="button" data-tcfg="masterAuto" role="switch"><i></i></button></div>
+       <div class="line"><span>Default duration</span><select class="lf-input sel" id="tdef">${opts.map((n) => `<option value="${n}">${clock(n)}</option>`).join('')}</select></div>
+       <div class="line"><span>Rest-over chime</span><button class="switch" type="button" data-tcfg="sound" role="switch"><i></i></button></div>
+       ${edit ? '' : '<button class="btn primary big" type="button" data-tnow></button>'}
+       <button class="btn big" type="button" data-tok>Done</button>`,
+      { onClose: resolveClosed },
+    );
+    const syncTog = (sel: string, on: boolean): void => {
+      const b = sh.body.querySelector<HTMLElement>(sel);
+      if (!b) return;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-checked', String(on));
+    };
+    const draw = (): void => {
+      const cur = active.restSecFor(se);
+      const ls = liftSettings();
+      sh.body.querySelector('#tdur')!.innerHTML = opts
+        .map((o) => `<button class="fchip${o === cur ? ' on' : ''}" type="button" data-d="${o}">${clock(o)}</button>`)
+        .join('');
+      syncTog('[data-tcfg="cardAuto"]', active.restAutoFor(s, idx));
+      syncTog('[data-tcfg="masterAuto"]', ls.restAuto);
+      syncTog('[data-tcfg="sound"]', ls.restSound);
+      sh.body.querySelector<HTMLSelectElement>('#tdef')!.value = String(ls.restSec);
+      const nowBtn = sh.body.querySelector<HTMLElement>('[data-tnow]');
+      if (nowBtn) nowBtn.textContent = `▶ Start ${clock(cur)} now`;
+    };
+    draw();
+    sh.body.addEventListener('click', async (e) => {
+      const t = e.target as HTMLElement;
+      const d = t.closest<HTMLElement>('[data-d]');
+      if (d) {
+        delete se.rest;
+        await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), restSec: Number(d.dataset.d) });
+        draw();
+        return;
+      }
+      const cfg = t.closest<HTMLElement>('[data-tcfg]')?.dataset.tcfg;
+      if (cfg === 'cardAuto') {
+        const next = !active.restAutoFor(s, idx);
+        se.restAuto = next;
+        if (!midSuperset(s.exs, idx)) {
+          await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), restAuto: next });
+        }
+        draw();
+      } else if (cfg === 'masterAuto') {
+        await lifts.setMasterRestAuto(!liftSettings().restAuto);
+        draw();
+      } else if (cfg === 'sound') {
+        updateLiftSettings({ restSound: !liftSettings().restSound });
+        draw();
+      } else if (t.closest('[data-tnow]')) {
+        audio.unlock();
+        active.startRest(active.restSecFor(se), ex.name);
+        sh.close();
+      } else if (t.closest('[data-tok]')) {
+        sh.close();
+      }
+    });
+    sh.body.querySelector('#tdef')!.addEventListener('change', (e) => {
+      updateLiftSettings({ restSec: Number((e.target as HTMLSelectElement).value) });
+      draw();
+    });
+    await closed;
+    save();
     paint();
   };
 
@@ -487,7 +572,26 @@ function build(root: HTMLElement, id?: string): () => void {
     const se = find(card.dataset.uid!);
     if (act === 'exmenu') return void (await exMenu(se));
     if (act === 'exnote') return void (await editNote(se));
-    if (act === 'restpick') return void (await pickRest(se));
+    if (act === 'reststart') {
+      audio.unlock();
+      active.startRest(active.restSecFor(se), exOf(se.exId).name);
+      buzz(20);
+      return;
+    }
+    if (act === 'restauto') {
+      const idx = s.exs.indexOf(se);
+      const next = !active.restAutoFor(s, idx);
+      se.restAuto = next;
+      if (!midSuperset(s.exs, idx)) {
+        await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), restAuto: next });
+      }
+      save();
+      a.classList.toggle('on', next);
+      a.setAttribute('aria-pressed', String(next));
+      buzz(15);
+      return;
+    }
+    if (act === 'restcfg') return void (await openTimerSheet(se));
     if (act === 'addset') {
       addSet(se, lifts.previous(se.exId, s.startMs, s.id));
       save(); paint();
@@ -514,7 +618,6 @@ function build(root: HTMLElement, id?: string): () => void {
   });
 
   paint();
-  if (!edit && s.exs.length === 0) void addEx();
 
   return () => {
     offTick(); offRest(); offChips(); offStore();

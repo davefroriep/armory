@@ -9,7 +9,7 @@ Auto-progression, built-in programs, photos / social, how-to or demo content, pl
 ## Screens
 | Tab / route | What it does |
 |---|---|
-| Train `#/strength` | Resume strip, today's Intervals.icu plan (Start pairs the workout with the planned event), Start empty workout, **My Days** (your repeating workouts) |
+| Train `#/strength` | Resume strip, today's Intervals.icu plan (Start pairs the workout with the planned event), **Custom Workout** freestyle card, **My Days** (your repeating workouts) |
 | Session `#/strength/session` | The workout. Boostcamp-style cards, PREVIOUS column, forward-fill, steppers dock, rest timer, supersets |
 | Summary `#/strength/summary/<id>` | Totals, new records, effort rating, upload status, share card, save as a day |
 | History `#/strength/history` | Month calendar + list; detail page per workout (edit sets, repeat, delete, share) |
@@ -26,8 +26,8 @@ Auto-progression, built-in programs, photos / social, how-to or demo content, pl
 * Set types: Normal, Warm-up, Drop, To failure. Warm-ups never count anywhere. Optional per-set RPE (6-10 in halves) and note.
 * Exercise types: weight × reps, bodyweight (+ optional load), time (seconds, e.g. triceps iso hold).
 * **Swap:** "Just today" / "This day · *name*" (updates that repeating day) / "Everywhere" (every day that uses it). Swap suggestions list similar exercises first (shared primary muscles).
-* Supersets: link an exercise with the next one; no rest timer between the pair; labelled 1A / 1B.
-* Rest timer auto-starts on logging (per-exercise override, default 1:30), chime + haptic at zero, shown in the lock-screen notification.
+* Supersets: link an exercise with the next one; spanning left bracket wraps the full pair (`A` + `B`) with alternating colors across consecutive supersets (`1A/1B`, `2A/2B`, …).
+* Rest timer: every card footer has an `Auto` toggle pill (OFF by default on `A` mid-superset, ON on `B` and standalone lifts), a 1-tap `▶` quick-start button, and a `⚙` Timer Settings cog (plus master toggle in Settings), with chime + haptic at zero and lock-screen notification updates.
 * Sticky exercise notes ("seat 4, neutral handles") appear every time the exercise comes up.
 
 ## Records & PRs

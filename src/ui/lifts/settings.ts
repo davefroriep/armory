@@ -24,7 +24,7 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
           <section class="card">
             <div class="line"><span>Units</span>${seg('unit', s.unit, [['lb', 'Pounds'], ['kg', 'Kilograms']])}</div>
             <div class="line"><span>Default rest<small>Between sets, unless an exercise has its own</small></span><select class="lf-input sel" id="rest">${[30, 45, 60, 90, 120, 150, 180, 240, 300].map((n) => `<option value="${n}" ${n === s.restSec ? 'selected' : ''}>${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}</option>`).join('')}</select></div>
-            <div class="line"><span>Auto-start rest timer<small>When you log a set</small></span>${tog('restAuto', s.restAuto)}</div>
+            <div class="line"><span>Auto-timer<small>Start rest timer automatically when checking a set</small></span>${tog('restAuto', s.restAuto)}</div>
             <div class="line"><span>Rest-over chime</span>${tog('restSound', s.restSound)}</div>
           </section>
           <h2 class="sec">RECORD LIFT</h2>
@@ -58,7 +58,12 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
         return void paint();
       }
       const tog = t.closest<HTMLElement>('[data-tog]');
-      if (tog) { const k = tog.dataset.tog as 'restAuto' | 'restSound'; updateLiftSettings({ [k]: !liftSettings()[k] }); return void paint(); }
+      if (tog) {
+        const k = tog.dataset.tog as 'restAuto' | 'restSound';
+        if (k === 'restAuto') await lifts.setMasterRestAuto(!liftSettings().restAuto);
+        else updateLiftSettings({ restSound: !liftSettings().restSound });
+        return void paint();
+      }
       if (t.closest('[data-retry]')) { const n = await retryPending(); toast(n ? `${n} uploaded` : 'Still offline or key not accepted'); return void paint(); }
       if (t.closest('[data-export]')) {
         const blob = new Blob([JSON.stringify(lifts.exportAll(), null, 1)], { type: 'application/json' });

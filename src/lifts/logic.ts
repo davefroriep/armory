@@ -133,13 +133,33 @@ export function swapExercise(se: SessionEx, exId: string, prev: SessionEx | null
   se.sets = Array.from({ length: n }, () => newSet());
   delete se.note;
   delete se.rest;
+  delete se.restAuto;
   prefill(se, prev);
 }
 
 export const hasLogged = (se: SessionEx): boolean => se.sets.some((s) => s.done);
 
+export interface SupersetSpan {
+  start: number;
+  end: number;
+  ssIdx: number | null;
+}
+
+/** Group consecutive exercises linked by `ss: true`; ssIdx increments 0, 1, 2… across superset groups. */
+export function supersetGroups(exs: { ss?: boolean }[]): SupersetSpan[] {
+  const out: SupersetSpan[] = [];
+  let ssCount = 0;
+  for (let i = 0; i < exs.length; ) {
+    let j = i;
+    while (exs[j].ss && j + 1 < exs.length) j++;
+    out.push({ start: i, end: j, ssIdx: j > i ? ssCount++ : null });
+    i = j + 1;
+  }
+  return out;
+}
+
 // ---------- superset labelling (1A, 1B, 2 ...) ----------
-export function labels(exs: SessionEx[]): string[] {
+export function labels(exs: { ss?: boolean }[]): string[] {
   const out: string[] = [];
   let group = 0;
   for (let i = 0; i < exs.length; ) {
@@ -155,6 +175,16 @@ export function labels(exs: SessionEx[]): string[] {
 
 /** True when logging a set on `exs[i]` should skip the rest timer (still mid-superset). */
 export const midSuperset = (exs: SessionEx[], i: number): boolean => !!exs[i]?.ss && i + 1 < exs.length;
+
+/** Effective auto-rest state for card `i` (session override -> mid-superset off default -> exercise row -> global). */
+export function effectiveRestAuto(exs: SessionEx[], i: number, rowRestAuto: boolean | undefined, globalRestAuto: boolean): boolean {
+  const se = exs[i];
+  if (!se) return false;
+  if (se.restAuto !== undefined) return se.restAuto;
+  if (midSuperset(exs, i)) return false;
+  if (rowRestAuto !== undefined) return rowRestAuto;
+  return globalRestAuto;
+}
 
 // ---------- finishing ----------
 /** Drops unlogged sets and any exercise left empty. Returns how many sets were dropped. */

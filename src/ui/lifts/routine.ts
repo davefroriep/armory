@@ -1,3 +1,4 @@
+import { labels, supersetGroups } from '../../lifts/logic';
 import { lifts } from '../../lifts/store';
 import { uid, type Routine } from '../../lifts/types';
 import { esc } from '../dom';
@@ -17,22 +18,33 @@ export function routineScreen(root: HTMLElement, args: string[]): () => void {
       ? { ...existing, items: existing.items.map((i) => ({ ...i })) }
       : { id: uid(), name: '', items: [], createdMs: Date.now(), order: lifts.routines.size };
 
+    const itemHtml = (i: number, labs: string[]): string => {
+      const it = draft.items[i];
+      const ex = lifts.exOrStub(it.exId);
+      return `<section class="ritem" data-i="${i}">
+        <div class="ri-h"><span class="xlab">${labs[i]}</span><b>${esc(ex.name)}</b><button class="xmore" data-act="rm" aria-label="Remove">${LI.trash}</button></div>
+        <div class="ri-c">
+          <span class="stepper"><button class="stp" data-act="minus">−</button><b>${it.sets}</b><button class="stp" data-act="plus">+</button><small>${ex.type === 'time' ? 'holds' : 'sets'}</small></span>
+          <button class="chipbtn${it.ss ? ' on' : ''}" data-act="ss" ${i === draft.items.length - 1 ? 'disabled' : ''}>Superset ↓</button>
+          <button class="stp" data-act="up" ${i === 0 ? 'disabled' : ''}>↑</button><button class="stp" data-act="down" ${i === draft.items.length - 1 ? 'disabled' : ''}>↓</button>
+        </div></section>`;
+    };
+
     const paint = (): void => {
+      const labs = labels(draft.items);
+      const itemsHtml = draft.items.length
+        ? supersetGroups(draft.items).map((g) => {
+            if (g.ssIdx == null) return itemHtml(g.start, labs);
+            const inner = Array.from({ length: g.end - g.start + 1 }, (_, k) => itemHtml(g.start + k, labs)).join('');
+            return `<div class="ss-group ss-c${g.ssIdx % 2}"><div class="ss-tag">SUPERSET</div>${inner}</div>`;
+          }).join('')
+        : '<div class="empty">Add the exercises for this day.</div>';
       root.innerHTML = `<header class="bar"><a class="icon-btn" href="#/strength" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a><h1>${isNew ? 'New day' : 'Edit day'}</h1>
         <div class="chips"><button class="btn sm primary" data-act="save" ${draft.name.trim() && draft.items.length ? '' : 'disabled'}>Save</button></div></header>
         <main class="page">
           <label class="field">DAY NAME<input class="lf-input" id="rn" value="${esc(draft.name)}" placeholder="Upper 1, Lower 2, Push…" autocomplete="off"></label>
           <div class="sec-row"><h2 class="sec">EXERCISES</h2></div>
-          ${draft.items.map((it, i) => {
-            const ex = lifts.exOrStub(it.exId);
-            return `<section class="ritem" data-i="${i}">
-              <div class="ri-h"><span class="xlab">${i + 1}</span><b>${esc(ex.name)}</b><button class="xmore" data-act="rm" aria-label="Remove">${LI.trash}</button></div>
-              <div class="ri-c">
-                <span class="stepper"><button class="stp" data-act="minus">−</button><b>${it.sets}</b><button class="stp" data-act="plus">+</button><small>${ex.type === 'time' ? 'holds' : 'sets'}</small></span>
-                <button class="chipbtn${it.ss ? ' on' : ''}" data-act="ss" ${i === draft.items.length - 1 ? 'disabled' : ''}>Superset ↓</button>
-                <button class="stp" data-act="up" ${i === 0 ? 'disabled' : ''}>↑</button><button class="stp" data-act="down" ${i === draft.items.length - 1 ? 'disabled' : ''}>↓</button>
-              </div></section>`;
-          }).join('') || '<div class="empty">Add the exercises for this day.</div>'}
+          ${itemsHtml}
           <button class="btn big addex" data-act="add">+ Add exercise</button>
           ${isNew ? '' : '<button class="btn danger big" data-act="del">Delete day</button>'}
         </main>`;

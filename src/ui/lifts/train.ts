@@ -86,7 +86,14 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
           <div class="chips"><button class="chip" data-chip="hr"></button><a class="icon-btn" href="#/strength/settings" aria-label="Lift settings">${LI.gear}</a></div></header>
         <main class="page has-tabs">
           ${resume}${act ? '' : plannedHtml}
-          ${act ? '' : '<button class="btn primary big" data-act="empty">Start empty workout</button>'}
+          <button class="custom-wk" type="button" data-act="custom">
+            <span class="cw-ico">${LI.plus}</span>
+            <span class="cw-txt">
+              <b>Custom Workout</b>
+              <small>Freestyle — add exercises &amp; sets live as you go</small>
+            </span>
+            <em class="cw-cta">${act && !act.routineId ? 'Open ›' : 'Start ›'}</em>
+          </button>
           <div class="sec-row"><h2 class="sec">MY DAYS</h2><a class="link" href="#/strength/routine/new">+ New day</a></div>
           ${days}
           <a class="hr-only" href="#/strength/hr">Heart-rate only session <small>(lift in another app)</small> ›</a>
@@ -116,7 +123,25 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
 
     root.addEventListener('click', async (e) => {
       const t = e.target as HTMLElement;
-      if (t.closest('[data-act="empty"]')) return void (await startWorkout({ name: 'Workout' }));
+      if (t.closest('[data-act="custom"]')) {
+        if (!lifts.active) return void (await startWorkout({ name: 'Custom Workout' }));
+        if (!lifts.active.routineId) { location.hash = '#/strength/session'; return; }
+        const curName = lifts.active.name;
+        const ok = await confirmSheet(
+          'Workout in progress',
+          `“${curName}” is currently active. Discard it to start a fresh Custom Workout, or resume ${curName}?`,
+          'Discard & start Custom',
+          true,
+          `Resume ${curName}`,
+        );
+        if (ok) {
+          await active.discard();
+          await startWorkout({ name: 'Custom Workout' });
+        } else {
+          location.hash = '#/strength/session';
+        }
+        return;
+      }
       const plan = t.closest<HTMLElement>('[data-plan]');
       if (plan) {
         const it = calendar.items.find((i) => i.ev.id === Number(plan.dataset.plan));

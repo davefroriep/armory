@@ -5,8 +5,8 @@ import {
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import {
-  addSet, buildExercise, canLog, editReps, editWeight, labels, midSuperset, newSet, prevSetFor, pruneUnlogged,
-  removeLastSet, routineFromSession, swapExercise, toggleDone,
+  addSet, buildExercise, canLog, editReps, editWeight, effectiveRestAuto, labels, midSuperset, newSet,
+  prevSetFor, pruneUnlogged, removeLastSet, routineFromSession, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
 import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
@@ -148,11 +148,41 @@ describe('auto-fill from last time + forward fill', () => {
 });
 
 describe('supersets & finishing', () => {
-  it('labels groups 1A/1B and singles', () => {
+  it('aligns 3 sets 1-to-1 regardless of session age and returns null for extra sets beyond previous', () => {
+    const now = new Date(2026, 6, 1, 9).getTime();
+    const ancient = sess('old', now - 180 * DAY_MS, [sx('bench', [set(100, 8), set(105, 8), set(110, 6)])]);
+    const prev = previousPerformance([ancient], 'bench', now)!;
+    const today4 = buildExercise('bench', 4, prev);
+    expect([0, 1, 2, 3].map((i) => prevSetFor(prev, today4, i)?.w ?? null)).toEqual([100, 105, 110, null]);
+  });
+  it('labels groups 1A/1B and singles and builds spanning superset groups for Upper 1', () => {
     const exs = [sx('a', [], { ss: true }), sx('b', []), sx('c', []), sx('d', [], { ss: true }), sx('e', [], { ss: true }), sx('f', [])];
     expect(labels(exs)).toEqual(['1A', '1B', '2', '3A', '3B', '3C']);
     expect(midSuperset(exs, 0)).toBe(true);
     expect(midSuperset(exs, 1)).toBe(false);
+    expect(supersetGroups(exs)).toEqual([
+      { start: 0, end: 1, ssIdx: 0 },
+      { start: 2, end: 2, ssIdx: null },
+      { start: 3, end: 5, ssIdx: 1 },
+    ]);
+    const upper1 = PHASE1_ROUTINES.find((r) => r.name === 'Upper 1')!;
+    expect(labels(upper1.items)).toEqual(['1', '2A', '2B', '3A', '3B', '4A', '4B']);
+    expect(supersetGroups(upper1.items)).toEqual([
+      { start: 0, end: 0, ssIdx: null },
+      { start: 1, end: 2, ssIdx: 0 },
+      { start: 3, end: 4, ssIdx: 1 },
+      { start: 5, end: 6, ssIdx: 2 },
+    ]);
+  });
+  it('computes effective auto-rest with mid-superset off default and explicit overrides', () => {
+    const exs = [sx('a', [], { ss: true }), sx('b', []), sx('c', [])];
+    expect(effectiveRestAuto(exs, 0, true, true)).toBe(false); // 1A mid-superset off by default
+    expect(effectiveRestAuto(exs, 1, undefined, true)).toBe(true); // 1B uses global
+    expect(effectiveRestAuto(exs, 2, false, true)).toBe(false); // row override beats global
+    exs[0].restAuto = true;
+    expect(effectiveRestAuto(exs, 0, undefined, false)).toBe(true); // explicit card toggle wins over mid-superset
+    exs[2].restAuto = true;
+    expect(effectiveRestAuto(exs, 2, false, false)).toBe(true); // explicit session override wins
   });
   it('prunes unlogged sets and empty exercises, and clears a dangling superset flag', () => {
     const s = sess('x', 0, [sx('bench', [set(lb(135), 5), set(null, null, { done: false })], { ss: true }), sx('curl', [set(null, null, { done: false })])], { status: 'active' });

@@ -28,6 +28,8 @@ export interface ExRow extends Partial<Exercise> {
   note?: string;
   /** Rest-timer length for this exercise (seconds). */
   restSec?: number;
+  /** Per-exercise auto-rest override (when checking a set). */
+  restAuto?: boolean;
 }
 
 export interface LiftSet {
@@ -58,6 +60,8 @@ export interface SessionEx {
   ss?: boolean;
   /** Rest override in seconds for this exercise in this session. */
   rest?: number;
+  /** Per-card auto-rest override for this session. */
+  restAuto?: boolean;
   /** Original 0-based index inside the routine this session was started from. */
   slot?: number;
 }

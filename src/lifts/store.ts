@@ -4,6 +4,7 @@ import { computePRs, doneSessions, previousPerformance, type PRHit } from './cal
 import { LIBRARY, LIBRARY_BY_ID } from './library';
 import { buildExercise } from './logic';
 import { PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from './seed';
+import { updateLiftSettings } from './settings';
 import type { ExRow, Exercise, LiftSession, Routine, SessionEx, VideoMeta } from './types';
 
 interface BlobRow {
@@ -132,6 +133,34 @@ class LiftStore {
     this.rows.set(row.id, row);
     this.touch();
     await idbPut('lift_ex', row);
+  }
+
+  /** Toggle global default auto-rest and clear per-exercise / active-card overrides so all cards align cleanly. */
+  async setMasterRestAuto(on: boolean): Promise<void> {
+    updateLiftSettings({ restAuto: on });
+    for (const row of this.rows.values()) {
+      if (row.restAuto !== undefined) {
+        const next = { ...row };
+        delete next.restAuto;
+        this.rows.set(next.id, next);
+        await idbPut('lift_ex', next);
+      }
+    }
+    const act = this.active;
+    if (act) {
+      let changed = false;
+      for (const se of act.exs) {
+        if (se.restAuto !== undefined) {
+          delete se.restAuto;
+          changed = true;
+        }
+      }
+      if (changed) {
+        this.saveSession(act);
+        return;
+      }
+    }
+    this.touch();
   }
 
   async createCustom(def: Omit<Exercise, 'id' | 'custom'>): Promise<Exercise> {

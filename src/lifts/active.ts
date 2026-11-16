@@ -7,7 +7,7 @@ import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
-import { hasLogged, midSuperset, pruneUnlogged } from './logic';
+import { effectiveRestAuto, hasLogged, midSuperset, pruneUnlogged } from './logic';
 import { liftSettings } from './settings';
 import { lifts } from './store';
 import type { LiftSession, SessionEx } from './types';
@@ -132,6 +132,13 @@ class ActiveWorkout {
     return se.rest ?? lifts.row(se.exId)?.restSec ?? liftSettings().restSec;
   }
 
+  /** Effective auto-rest state for card `i`. */
+  restAutoFor(s: LiftSession, i: number): boolean {
+    const se = s.exs[i];
+    if (!se) return false;
+    return effectiveRestAuto(s.exs, i, lifts.row(se.exId)?.restAuto, liftSettings().restAuto);
+  }
+
   startRest(sec: number, label: string): void {
     this.rest = { endMs: Date.now() + sec * 1000, totalSec: sec, label, fired: false };
     this.restChanged.emit();
@@ -151,15 +158,11 @@ class ActiveWorkout {
     this.restChanged.emit();
   }
 
-  /** A set was just logged: start the rest timer unless this is mid-superset or auto-rest is off. */
+  /** A set was just logged: start the rest timer unless disabled for this card (e.g. mid-superset or Auto off). */
   afterSetLogged(s: LiftSession, i: number): void {
     audio.unlock();
-    if (midSuperset(s.exs, i)) {
-      if (this.rest) this.clearRest();
-      return;
-    }
-    if (!liftSettings().restAuto) {
-      if (this.rest?.fired) this.clearRest();
+    if (!this.restAutoFor(s, i)) {
+      if (midSuperset(s.exs, i) ? this.rest : this.rest?.fired) this.clearRest();
       return;
     }
     const e = s.exs[i];
