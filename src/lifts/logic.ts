@@ -145,6 +145,22 @@ export const hasSessionActivity = (s: LiftSession): boolean => s.exs.some((e) =>
 
 export const isSessionStarted = (s: LiftSession): boolean => !!s.started || hasSessionActivity(s);
 
+/** Starts an unstarted workout clock from zero (`startMs = now`). */
+export function startSessionClock(s: LiftSession, now = Date.now()): boolean {
+  if (s.started) return false;
+  s.startMs = now;
+  s.started = true;
+  return true;
+}
+
+/** Resets the workout clock back to unstarted preview (`startMs = now`) when nothing is logged or video-linked. */
+export function resetSessionClock(s: LiftSession, now = Date.now()): boolean {
+  if (hasSessionActivity(s)) return false;
+  s.started = false;
+  s.startMs = now;
+  return true;
+}
+
 export interface SupersetSpan {
   start: number;
   end: number;

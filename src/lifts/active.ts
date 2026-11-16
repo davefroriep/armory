@@ -7,7 +7,7 @@ import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
-import { effectiveRestAuto, hasLogged, hasSessionActivity, isSessionStarted, midSuperset, pruneUnlogged } from './logic';
+import { effectiveRestAuto, hasLogged, hasSessionActivity, isSessionStarted, midSuperset, pruneUnlogged, resetSessionClock, startSessionClock } from './logic';
 import { liftSettings } from './settings';
 import { lifts } from './store';
 import type { LiftSession, SessionEx } from './types';
@@ -43,6 +43,7 @@ class ActiveWorkout {
   private lock: WakeLockSentinel | null = null;
   private lastSvc = 0;
   private booting: Promise<void> | null = null;
+  private runToken = 0;
 
   get session(): LiftSession | undefined {
     return lifts.active;
@@ -58,7 +59,10 @@ class ActiveWorkout {
     this.booting ??= (async () => {
       await lifts.ready;
       const s = lifts.active;
-      if (s && isSessionStarted(s) && !this.timer) await this.attach(s, true);
+      if (s && isSessionStarted(s) && !this.timer) {
+        if (!s.started) s.started = true;
+        await this.attach(s, true);
+      }
     })();
     return this.booting;
   }
@@ -77,12 +81,10 @@ class ActiveWorkout {
 
   /** Start the workout clock, HR recorder, wake lock and foreground service once a set or video starts. */
   ensureStarted(s: LiftSession): boolean {
-    if (isSessionStarted(s)) {
+    if (!startSessionClock(s)) {
       if (!this.timer) void this.attach(s, true);
       return false;
     }
-    s.startMs = Date.now();
-    s.started = true;
     lifts.saveSession(s, true);
     void this.attach(s, false);
     this.tick.emit();
@@ -91,8 +93,9 @@ class ActiveWorkout {
 
   /** If nothing is logged or video-linked, stop the clock/HR recording and return to 0:00 preview mode. */
   async resetIfNoneLogged(s: LiftSession): Promise<boolean> {
-    if (hasSessionActivity(s) || !s.started) return false;
-    s.started = false;
+    if (hasSessionActivity(s)) return false;
+    if (!s.started && !this.timer && !this.rec && !this.rest) return false;
+    resetSessionClock(s);
     this.teardown();
     lifts.saveSession(s, true);
     await discardWorkout(s.id);
@@ -100,11 +103,14 @@ class ActiveWorkout {
   }
 
   private async attach(s: LiftSession, resume: boolean): Promise<void> {
+    const tok = ++this.runToken;
     const hrMax = getSettings().hrMax;
     let rec: Recorder | null = null;
     if (resume) {
       const meta = await getMeta(s.id);
+      if (tok !== this.runToken || this.session?.id !== s.id || !s.started) return;
       if (meta) rec = new Recorder(s.id, 'strength', 'strength', s.name, s.eventId, hrMax, { meta, samples: await getSamples(s.id) });
+      if (tok !== this.runToken || this.session?.id !== s.id || !s.started) return;
     }
     if (!rec) {
       rec = new Recorder(s.id, 'strength', 'strength', s.name, s.eventId, hrMax);
@@ -230,6 +236,7 @@ class ActiveWorkout {
   }
 
   private teardown(): void {
+    this.runToken++;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.offRec?.();

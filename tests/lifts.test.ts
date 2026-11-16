@@ -6,8 +6,8 @@ import {
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import {
   addSet, buildExercise, canLog, driveUrlFor, editReps, editWeight, effectiveRestAuto, hasSessionActivity,
-  isSessionStarted, labels, midSuperset, newSet, prevSetFor, pruneUnlogged, removeLastSet, routineFromSession,
-  supersetGroups, swapExercise, toggleDone,
+  isSessionStarted, labels, midSuperset, newSet, prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock,
+  routineFromSession, startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import { extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs } from '../src/lifts/mp4';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
@@ -384,6 +384,24 @@ describe('Phase 1 routine seed', () => {
     expect(isSessionStarted(preview)).toBe(true);
     const checkedNoFlag = sess('chk', Date.now(), [sx('bench', [set(lb(135), 8, { done: true })])], { status: 'active' });
     expect(isSessionStarted(checkedNoFlag)).toBe(true);
+
+    // Clock check -> uncheck -> re-check must restart from 0 at the new check time (never resume old count)
+    const live = sess('clk', 1_000_000, [sx('bench', [set(lb(135), 8, { done: false })])], { status: 'active', started: false });
+    toggleDone(live.exs[0], 0, BENCH, 1_030_000);
+    expect(startSessionClock(live, 1_030_000)).toBe(true);
+    expect(live.started).toBe(true);
+    expect(live.startMs).toBe(1_030_000);
+    // Uncheck at +15s -> resets clock & clears started
+    toggleDone(live.exs[0], 0, BENCH, 1_045_000);
+    expect(resetSessionClock(live, 1_045_000)).toBe(true);
+    expect(live.started).toBe(false);
+    expect(live.startMs).toBe(1_045_000);
+    expect(isSessionStarted(live)).toBe(false);
+    // Re-check 20s later -> starts fresh at 1_065_000 (0:00 elapsed), not 0:35
+    toggleDone(live.exs[0], 0, BENCH, 1_065_000);
+    expect(startSessionClock(live, 1_065_000)).toBe(true);
+    expect(live.started).toBe(true);
+    expect(live.startMs).toBe(1_065_000);
     expect(driveUrlFor({ fileName: 'PXL_20261116_173012345.mp4' })).toBe('https://drive.google.com/drive/search?q=PXL_20261116_173012345.mp4');
     expect(driveUrlFor({ fileName: 'PXL_20261116_1856xx.mp4', driveQuery: 'PXL 20261116 1856 type:video' })).toBe('https://drive.google.com/drive/search?q=PXL%2020261116%201856%20type%3Avideo');
     expect(driveUrlFor({ fileName: 'clip.mp4', uri: 'https://drive.google.com/file/d/abc/view' })).toBe('https://drive.google.com/file/d/abc/view');
