@@ -18,13 +18,14 @@ export interface NativeRestEvent {
 }
 
 interface WorkoutServicePlugin {
-  start(o: { title: string; text: string }): Promise<void>;
-  update(o: { title: string; text: string }): Promise<void>;
+  start(o: { title: string; text: string; startMs?: number; wavBase64?: string }): Promise<void>;
+  update(o: { title: string; text: string; startMs?: number }): Promise<void>;
   stop(): Promise<void>;
   setRest(o: { remainingMs: number; totalSec: number; label: string; sound: boolean; volume: number; wavBase64?: string }): Promise<void>;
   clearRest(): Promise<void>;
   canOverlay(): Promise<{ granted: boolean }>;
   requestOverlayPermission(): Promise<void>;
+  openAppSettings(): Promise<void>;
   addListener(event: 'restSync', cb: (ev: NativeRestEvent) => void): Promise<PluginListenerHandle>;
   openApp(o: { pkg: string }): Promise<{ opened: boolean }>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
@@ -46,8 +47,10 @@ const BOOSTCAMP_WEB = 'https://www.boostcamp.app/';
  * No-ops in the browser build.
  */
 export const workoutService = {
-  start: (title: string, text: string) => plugin?.start({ title, text }).catch((e) => console.warn('svc start', e)),
-  update: (title: string, text: string) => plugin?.update({ title, text }).catch(() => {}),
+  start: (title: string, text: string, startMs?: number, wavBase64?: string) =>
+    plugin?.start({ title, text, ...(startMs ? { startMs } : {}), ...(wavBase64 ? { wavBase64 } : {}) }).catch((e) => console.warn('svc start', e)),
+  update: (title: string, text: string, startMs?: number) =>
+    plugin?.update({ title, text, ...(startMs ? { startMs } : {}) }).catch(() => {}),
   stop: () => plugin?.stop().catch(() => {}),
   setRest: (o: { remainingMs: number; totalSec: number; label: string; sound: boolean; volume: number; wavBase64?: string }) =>
     plugin?.setRest(o).catch(() => {}),
@@ -62,6 +65,11 @@ export async function canShowRestOverlay(): Promise<boolean> {
 export async function requestRestOverlayPermission(): Promise<void> {
   if (!plugin) return;
   try { await plugin.requestOverlayPermission(); } catch { /* ignore */ }
+}
+
+export async function openAppInfoSettings(): Promise<void> {
+  if (!plugin) return;
+  try { await plugin.openAppSettings(); } catch { /* ignore */ }
 }
 
 export function onNativeRestSync(cb: (ev: NativeRestEvent) => void): () => void {

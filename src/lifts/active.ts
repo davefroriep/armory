@@ -144,7 +144,9 @@ class ActiveWorkout {
     this.offRec = rec.attach(() => ({ elapsed: this.elapsedSec(), targetRpm: 0 }));
     this.timer = setInterval(() => this.onTick(), 250);
     if (!isNative()) this.requestLock();
-    void workoutService.start('Armory Fit · Strength', 'Lifting…');
+    const wav = isNative() && !this.wavCached ? audio.getWavBase64('chime') : undefined;
+    if (wav) this.wavCached = true;
+    void workoutService.start(`Armory Fit · ${s.name}`, 'Lifting…', s.startMs, wav);
     document.addEventListener('visibilitychange', this.onVis);
     this.tick.emit();
   }
@@ -164,17 +166,24 @@ class ActiveWorkout {
     this.rec?.tick(el, 0);
     const r = this.rest;
     if (r && !r.fired && Date.now() >= r.endMs) {
-      r.fired = true;
       if (!isNative()) {
+        r.fired = true;
         if (liftSettings().restSound) { audio.unlock(); audio.chime(); }
+        buzz([220, 90, 220]);
+      } else if (Date.now() >= r.endMs + 650) {
+        // Fallback only if the native foreground service didn't already report 'fired' within 650ms.
+        r.fired = true;
+        if (liftSettings().restSound) audio.chime();
         buzz([220, 90, 220]);
       }
     }
     if (Date.now() - this.lastSvc > 5000) {
       this.lastSvc = Date.now();
       const hr = hrFresh() ? live.hr : 0;
-      const txt = r && !r.fired ? `Rest ${mmss((r.endMs - Date.now()) / 1000)} · ${mmss(el)}` : `${mmss(el)} · ${hr || '--'} BPM`;
-      void workoutService.update(`Armory Fit · ${s.name}`, txt);
+      const txt = isNative()
+        ? (hr ? `${hr} BPM · Recording` : 'Workout active')
+        : (r && !r.fired ? `Rest ${mmss((r.endMs - Date.now()) / 1000)} · ${mmss(el)}` : `${mmss(el)} · ${hr || '--'} BPM`);
+      void workoutService.update(`Armory Fit · ${s.name}`, txt, s.startMs);
     }
     this.tick.emit();
   }
@@ -202,8 +211,8 @@ class ActiveWorkout {
     const wav = this.wavCached ? undefined : audio.getWavBase64('chime');
     this.wavCached = true;
     void workoutService.setRest({
-      remainingMs: r.endMs - Date.now(),
-      totalSec: r.totalSec,
+      remainingMs: Math.round(r.endMs - Date.now()),
+      totalSec: Math.round(r.totalSec),
       label: r.label,
       sound: liftSettings().restSound,
       volume: audio.volume,

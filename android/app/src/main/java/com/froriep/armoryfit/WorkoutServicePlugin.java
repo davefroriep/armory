@@ -62,10 +62,16 @@ public class WorkoutServicePlugin extends Plugin {
     @PluginMethod
     public void start(PluginCall call) {
         Context c = getContext();
+        String wavB64 = call.getString("wavBase64", "");
+        if (wavB64 != null && !wavB64.isEmpty()) {
+            WorkoutChime.cacheWav(c, wavB64);
+        }
+        long startMs = call.getDouble("startMs", 0.0).longValue();
         Intent i = new Intent(c, WorkoutForegroundService.class)
                 .setAction(WorkoutForegroundService.ACTION_START_WORKOUT)
                 .putExtra("title", call.getString("title", "Armory Fit"))
-                .putExtra("text", call.getString("text", "Workout active"));
+                .putExtra("text", call.getString("text", "Workout active"))
+                .putExtra("startMs", startMs);
         ContextCompat.startForegroundService(c, i);
         call.resolve();
     }
@@ -73,10 +79,12 @@ public class WorkoutServicePlugin extends Plugin {
     @PluginMethod
     public void update(PluginCall call) {
         Context c = getContext();
+        long startMs = call.getDouble("startMs", 0.0).longValue();
         Intent i = new Intent(c, WorkoutForegroundService.class)
                 .setAction(WorkoutForegroundService.ACTION_UPDATE_WORKOUT)
                 .putExtra("title", call.getString("title", "Armory Fit"))
-                .putExtra("text", call.getString("text", ""));
+                .putExtra("text", call.getString("text", ""))
+                .putExtra("startMs", startMs);
         if (WorkoutForegroundService.running) {
             c.startService(i);
         }
@@ -99,7 +107,7 @@ public class WorkoutServicePlugin extends Plugin {
         if (wavB64 != null && !wavB64.isEmpty()) {
             WorkoutChime.cacheWav(c, wavB64);
         }
-        long remainingMs = call.getLong("remainingMs", 90_000L);
+        long remainingMs = call.getDouble("remainingMs", 90_000.0).longValue();
         int totalSec = call.getInt("totalSec", 90);
         String label = call.getString("label", "");
         boolean sound = call.getBoolean("sound", true);
@@ -140,6 +148,16 @@ public class WorkoutServicePlugin extends Plugin {
             i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             getContext().startActivity(i);
         }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void openAppSettings(PluginCall call) {
+        Intent i = new Intent(
+                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.parse("package:" + getContext().getPackageName()));
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        getContext().startActivity(i);
         call.resolve();
     }
 

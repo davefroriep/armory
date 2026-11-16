@@ -1,6 +1,6 @@
 import { audio } from '../../audio/audio';
 import { hasKey } from '../../intervals/api';
-import { canShowRestOverlay, isNative, requestRestOverlayPermission } from '../../native/service';
+import { canShowRestOverlay, isNative, openAppInfoSettings, requestRestOverlayPermission } from '../../native/service';
 import { liftSettings, updateLiftSettings, type Unit } from '../../lifts/settings';
 import { lifts, type LiftBackup } from '../../lifts/store';
 import { shareImage } from '../../lifts/share';
@@ -8,7 +8,7 @@ import { allMeta } from '../../store/db';
 import { retryPending } from '../../workout/sync';
 import { revFooter } from '../chrome';
 import { esc } from '../dom';
-import { confirmSheet, mount, toast } from './kit';
+import { confirmSheet, mount, openSheet, toast } from './kit';
 
 /** Lift tracker settings: units, rest timer, camera, Intervals.icu status, backup. */
 export function liftSettingsScreen(root: HTMLElement): () => void {
@@ -68,7 +68,29 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
         return void paint();
       }
       if (t.closest('[data-test-chime]')) { audio.unlock(); audio.chime(); return; }
-      if (t.closest('[data-overlay]')) { await requestRestOverlayPermission(); return; }
+      if (t.closest('[data-overlay]')) {
+        if (await canShowRestOverlay()) {
+          await requestRestOverlayPermission();
+          return;
+        }
+        const sh = openSheet(
+          `<h3 class="sh-title">Unlock floating overlay</h3>
+           <p class="sh-text">Android blocks "Display over other apps" on sideloaded APKs until you allow it once:<br><br>
+           1. Tap <b>App Info</b> below -> tap <b>⋮</b> (top right) -> <b>Allow restricted settings</b><br>
+           2. Come back -> tap <b>Overlay Toggle</b> and switch it on</p>
+           <button class="btn primary big" type="button" data-ov="info">1. Open App Info</button>
+           <button class="btn big" type="button" data-ov="perm">2. Open Overlay Toggle</button>
+           <button class="btn big" type="button" data-ov="close">Done</button>`,
+        );
+        sh.body.addEventListener('click', (ev) => {
+          const b = (ev.target as HTMLElement).closest<HTMLElement>('[data-ov]');
+          if (!b) return;
+          if (b.dataset.ov === 'info') void openAppInfoSettings();
+          else if (b.dataset.ov === 'perm') void requestRestOverlayPermission();
+          else sh.close();
+        });
+        return;
+      }
       if (t.closest('[data-retry]')) { const n = await retryPending(); toast(n ? `${n} uploaded` : 'Still offline or key not accepted'); return void paint(); }
       if (t.closest('[data-export]')) {
         const blob = new Blob([JSON.stringify(lifts.exportAll(), null, 1)], { type: 'application/json' });

@@ -11,8 +11,8 @@ import android.os.Build;
 import androidx.core.app.NotificationCompat;
 
 /**
- * Shared notification builder for both the baseline workout foreground service (low importance)
- * and the top-priority live rest-timer bar (high importance, silent, live OS countdown).
+ * Shared notification builder for both the baseline workout foreground service (smooth OS
+ * chronometer clock) and the top-priority live rest-timer card (live OS countdown + tray actions).
  */
 final class WorkoutNotif {
     static final String CHANNEL = "workout";
@@ -49,8 +49,8 @@ final class WorkoutNotif {
         return PendingIntent.getService(c, reqCode, i, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
     }
 
-    static Notification build(Context c, String title, String text) {
-        return new NotificationCompat.Builder(c, CHANNEL)
+    static Notification build(Context c, String title, String text, long startEpochMs) {
+        NotificationCompat.Builder b = new NotificationCompat.Builder(c, CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
                 .setContentTitle(title)
                 .setContentText(text)
@@ -59,23 +59,26 @@ final class WorkoutNotif {
                 .setSilent(true)
                 .setCategory(NotificationCompat.CATEGORY_WORKOUT)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setContentIntent(openAppIntent(c))
-                .build();
+                .setContentIntent(openAppIntent(c));
+        if (startEpochMs > 0L) {
+            b.setWhen(startEpochMs).setShowWhen(true).setUsesChronometer(true);
+            if (Build.VERSION.SDK_INT >= 24) b.setChronometerCountDown(false);
+        }
+        return b.build();
     }
 
-    static Notification buildRest(Context c, String label, long endEpochMs, int totalSec, long remainingMs, boolean fired) {
-        long sec = fired ? Math.max(0L, (-remainingMs) / 1000L) : Math.max(0L, (remainingMs + 999L) / 1000L);
-        String clock = (fired ? "+" : "") + (sec / 60) + ":" + (sec % 60 < 10 ? "0" : "") + (sec % 60);
-        String title = (fired ? "GO! Rest complete" : "Rest " + clock)
-                + (label != null && !label.isEmpty() ? " · " + label : "");
-        String text = fired ? "Next set ready (" + clock + " over)" : "Armory Fit rest timer";
+    static Notification buildRest(Context c, String label, long endEpochMs, long remainingMs, boolean fired, boolean alertPop) {
+        String title = fired
+                ? ("GO! Rest complete" + (label != null && !label.isEmpty() ? " · " + label : ""))
+                : ("Rest" + (label != null && !label.isEmpty() ? " · " + label : " timer"));
+        String text = fired ? "Next set ready" : "Resting · live timer";
 
         NotificationCompat.Builder b = new NotificationCompat.Builder(c, REST_CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
                 .setContentTitle(title)
                 .setContentText(text)
                 .setOngoing(true)
-                .setOnlyAlertOnce(true)
+                .setOnlyAlertOnce(!alertPop)
                 .setSilent(true)
                 .setCategory(NotificationCompat.CATEGORY_STOPWATCH)
                 .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -86,11 +89,12 @@ final class WorkoutNotif {
                 .addAction(0, "+15s", serviceActionIntent(c, WorkoutForegroundService.ACTION_REST_ADJUST, 15, 102))
                 .addAction(0, "Skip", serviceActionIntent(c, WorkoutForegroundService.ACTION_REST_SKIP, 0, 103));
 
-        if (!fired && endEpochMs > System.currentTimeMillis()) {
+        if (!fired && endEpochMs > System.currentTimeMillis() && remainingMs > 0L) {
             b.setWhen(endEpochMs).setShowWhen(true).setUsesChronometer(true);
             if (Build.VERSION.SDK_INT >= 24) b.setChronometerCountDown(true);
-            int remSec = (int) Math.max(0L, Math.min(totalSec, sec));
-            b.setProgress(Math.max(1, totalSec), Math.max(0, totalSec - remSec), false);
+        } else if (fired) {
+            b.setWhen(System.currentTimeMillis()).setShowWhen(true).setUsesChronometer(true);
+            if (Build.VERSION.SDK_INT >= 24) b.setChronometerCountDown(false);
         }
         return b.build();
     }

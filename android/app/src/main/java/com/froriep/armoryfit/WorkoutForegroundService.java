@@ -15,8 +15,8 @@ import androidx.core.app.NotificationManagerCompat;
 
 /**
  * Keeps BLE, heart rate and the rest timer alive when Armory Fit is minimized or the screen is off.
- * Owns the native rest countdown, top-priority rest-timer notification, minimize floating overlay,
- * and MediaPlayer chime + vibration on timer expiry.
+ * Uses Android's native chronometer for smooth 1s workout/rest tray clocks, schedules an exact
+ * chime + heads-up transition on rest completion, and displays RestOverlay when minimized.
  */
 public class WorkoutForegroundService extends Service {
     static final String ACTION_START_WORKOUT = "com.froriep.armoryfit.START_WORKOUT";
@@ -38,6 +38,7 @@ public class WorkoutForegroundService extends Service {
     private boolean workoutActive = false;
     private String workoutTitle = "Armory Fit";
     private String workoutText = "Workout active";
+    private long workoutStartEpochMs = 0L;
 
     private boolean restActive = false;
     private long restEndElapsedMs = 0L;
@@ -48,25 +49,31 @@ public class WorkoutForegroundService extends Service {
     private float restVolume = 0.8f;
     private boolean restFired = false;
 
-    private final Runnable tickRunnable = new Runnable() {
+    private final Runnable fireRestRunnable = new Runnable() {
         @Override
         public void run() {
-            if (!restActive) return;
+            if (!restActive || restFired) return;
             long rem = restEndElapsedMs - SystemClock.elapsedRealtime();
-            if (!restFired && rem <= 0L) {
-                restFired = true;
-                if (restSound) WorkoutChime.playCached(WorkoutForegroundService.this, restVolume);
-                WorkoutChime.vibrateRestDone(WorkoutForegroundService.this);
-                WorkoutServicePlugin.emitRestSync("fired", rem, restTotalSec);
+            if (rem > 40L) {
+                handler.postDelayed(this, rem);
+                return;
             }
-            refreshRestUi(rem);
-            long nextDelay;
-            if (!restFired && rem > 0L && rem < 1000L) {
-                nextDelay = Math.max(20L, rem + 5L);
-            } else {
-                nextDelay = 1000L;
-            }
-            handler.postDelayed(this, nextDelay);
+            restFired = true;
+            if (restSound) WorkoutChime.playCached(WorkoutForegroundService.this, restVolume);
+            WorkoutChime.vibrateRestDone(WorkoutForegroundService.this);
+            WorkoutServicePlugin.emitRestSync("fired", rem, restTotalSec);
+            notifySafe(WorkoutNotif.buildRest(
+                    WorkoutForegroundService.this, restLabel, restEndEpochMs, rem, true, true));
+            updateOverlay();
+        }
+    };
+
+    private final Runnable overlayTickRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!restActive || appVisible) return;
+            updateOverlay();
+            handler.postDelayed(this, 1000L);
         }
     };
 
@@ -99,8 +106,10 @@ public class WorkoutForegroundService extends Service {
                 workoutActive = true;
                 String t = intent != null ? intent.getStringExtra("title") : null;
                 String x = intent != null ? intent.getStringExtra("text") : null;
+                long sm = intent != null ? intent.getLongExtra("startMs", 0L) : 0L;
                 if (t != null) workoutTitle = t;
                 if (x != null) workoutText = x;
+                if (sm > 0L) workoutStartEpochMs = sm;
                 ensureWakeLock();
                 promoteForeground();
                 break;
@@ -108,15 +117,18 @@ public class WorkoutForegroundService extends Service {
             case ACTION_UPDATE_WORKOUT: {
                 String t = intent != null ? intent.getStringExtra("title") : null;
                 String x = intent != null ? intent.getStringExtra("text") : null;
+                long sm = intent != null ? intent.getLongExtra("startMs", 0L) : 0L;
                 if (t != null) workoutTitle = t;
                 if (x != null) workoutText = x;
+                if (sm > 0L) workoutStartEpochMs = sm;
                 if (!restActive) {
-                    notifySafe(WorkoutNotif.build(this, workoutTitle, workoutText));
+                    notifySafe(WorkoutNotif.build(this, workoutTitle, workoutText, workoutStartEpochMs));
                 }
                 break;
             }
             case ACTION_STOP_WORKOUT: {
                 workoutActive = false;
+                workoutStartEpochMs = 0L;
                 if (!restActive) {
                     stopForeground(true);
                     stopSelf();
@@ -135,9 +147,9 @@ public class WorkoutForegroundService extends Service {
                 restFired = remMs <= 0L;
                 ensureWakeLock();
                 promoteForeground();
-                handler.removeCallbacks(tickRunnable);
-                refreshRestUi(remMs);
-                handler.postDelayed(tickRunnable, (!restFired && remMs < 1000L) ? Math.max(20L, remMs + 5L) : 1000L);
+                scheduleRestAlarm(remMs);
+                notifySafe(WorkoutNotif.buildRest(this, restLabel, restEndEpochMs, remMs, restFired, false));
+                syncOverlayLoop();
                 break;
             }
             case ACTION_REST_ADJUST: {
@@ -154,12 +166,36 @@ public class WorkoutForegroundService extends Service {
                 break;
             }
             case ACTION_APP_VISIBILITY: {
-                if (restActive) refreshRestUi(restEndElapsedMs - SystemClock.elapsedRealtime());
-                else overlay.hide();
+                syncOverlayLoop();
                 break;
             }
         }
         return START_NOT_STICKY;
+    }
+
+    private void scheduleRestAlarm(long remMs) {
+        handler.removeCallbacks(fireRestRunnable);
+        if (!restFired && remMs > 0L) {
+            handler.postDelayed(fireRestRunnable, remMs);
+        }
+    }
+
+    private void syncOverlayLoop() {
+        handler.removeCallbacks(overlayTickRunnable);
+        if (restActive && !appVisible) {
+            updateOverlay();
+            handler.postDelayed(overlayTickRunnable, 1000L);
+        } else {
+            overlay.hide();
+        }
+    }
+
+    private void updateOverlay() {
+        if (!restActive || appVisible) {
+            overlay.hide();
+            return;
+        }
+        overlay.showOrUpdate(restLabel, restEndElapsedMs - SystemClock.elapsedRealtime(), restFired);
     }
 
     private void adjustRest(int deltaSec, boolean emit) {
@@ -169,9 +205,9 @@ public class WorkoutForegroundService extends Service {
         restTotalSec = Math.max(5, restTotalSec + deltaSec);
         long rem = restEndElapsedMs - SystemClock.elapsedRealtime();
         restFired = rem <= 0L;
-        refreshRestUi(rem);
-        handler.removeCallbacks(tickRunnable);
-        handler.postDelayed(tickRunnable, (!restFired && rem > 0L && rem < 1000L) ? Math.max(20L, rem + 5L) : 1000L);
+        scheduleRestAlarm(rem);
+        notifySafe(WorkoutNotif.buildRest(this, restLabel, restEndEpochMs, rem, restFired, false));
+        updateOverlay();
         if (emit) WorkoutServicePlugin.emitRestSync("adjust", rem, restTotalSec);
     }
 
@@ -179,11 +215,12 @@ public class WorkoutForegroundService extends Service {
         restActive = false;
         restEndElapsedMs = 0L;
         restFired = false;
-        handler.removeCallbacks(tickRunnable);
+        handler.removeCallbacks(fireRestRunnable);
+        handler.removeCallbacks(overlayTickRunnable);
         overlay.hide();
         if (emit) WorkoutServicePlugin.emitRestSync("clear", 0L, 0);
         if (workoutActive) {
-            notifySafe(WorkoutNotif.build(this, workoutTitle, workoutText));
+            notifySafe(WorkoutNotif.build(this, workoutTitle, workoutText, workoutStartEpochMs));
         } else {
             stopForeground(true);
             stopSelf();
@@ -191,23 +228,14 @@ public class WorkoutForegroundService extends Service {
     }
 
     private void promoteForeground() {
+        long rem = restEndElapsedMs - SystemClock.elapsedRealtime();
         android.app.Notification n = restActive
-                ? WorkoutNotif.buildRest(this, restLabel, restEndEpochMs, restTotalSec,
-                        restEndElapsedMs - SystemClock.elapsedRealtime(), restFired)
-                : WorkoutNotif.build(this, workoutTitle, workoutText);
+                ? WorkoutNotif.buildRest(this, restLabel, restEndEpochMs, rem, restFired, false)
+                : WorkoutNotif.build(this, workoutTitle, workoutText, workoutStartEpochMs);
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(WorkoutNotif.ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
         } else {
             startForeground(WorkoutNotif.ID, n);
-        }
-    }
-
-    private void refreshRestUi(long remMs) {
-        notifySafe(WorkoutNotif.buildRest(this, restLabel, restEndEpochMs, restTotalSec, remMs, restFired));
-        if (!appVisible) {
-            overlay.showOrUpdate(restLabel, remMs, restFired);
-        } else {
-            overlay.hide();
         }
     }
 
@@ -234,7 +262,8 @@ public class WorkoutForegroundService extends Service {
     public void onDestroy() {
         running = false;
         restActive = false;
-        handler.removeCallbacks(tickRunnable);
+        handler.removeCallbacks(fireRestRunnable);
+        handler.removeCallbacks(overlayTickRunnable);
         if (overlay != null) overlay.hide();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         wakeLock = null;

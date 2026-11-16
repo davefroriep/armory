@@ -1,4 +1,5 @@
 import './style.css';
+import { App } from '@capacitor/app';
 import { retryPending } from './workout/sync';
 import { airbikeScreen, stubScreen } from './ui/equipment';
 import { homeScreen } from './ui/home';
@@ -8,6 +9,7 @@ import { liftsScreen } from './ui/lifts';
 import { initSetupLinks } from './setup';
 import { isNative } from './native/service';
 import { kickSensors, releaseBike } from './ble/sources';
+import { parentHash } from './nav';
 
 type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (() => void) | void;
 
@@ -79,6 +81,22 @@ initSetupLinks();
 // Coming back to the app (or the phone waking up) retries a stalled sensor link immediately.
 document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
 window.addEventListener('hashchange', route);
+if (isNative()) {
+  void App.addListener('backButton', () => {
+    const modals = document.querySelectorAll<HTMLElement>('.lmodal, .modal');
+    const topModal = modals[modals.length - 1];
+    if (topModal) {
+      topModal.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+      return;
+    }
+    const up = parentHash(routeKey);
+    if (up === null) {
+      void App.minimizeApp();
+      return;
+    }
+    location.hash = up;
+  });
+}
 route();
 
 // Retry any workouts that were saved while offline / before the API key was set.

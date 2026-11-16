@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ALERT_SAMPLE_RATE, ALERT_SPECS, encodeWav, synthesizeBellPcm } from '../src/audio/audio';
+import { parentHash } from '../src/nav';
 import {
   MAX_RM, computePRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
   setVolumeKg, weekStart, addWeeks, DAY_MS,
@@ -482,5 +483,23 @@ describe('Phase 1 routine seed', () => {
       peak = Math.max(peak, Math.abs(pdv.getInt16(i * 2, true)));
     }
     expect(peak).toBeGreaterThan(20_000);
+  });
+
+  it('resolves hierarchical parentHash toward main menu instead of random back history', () => {
+    expect(parentHash('')).toBeNull();
+    expect(parentHash('#/')).toBeNull();
+    expect(parentHash('#/strength')).toBe('#/');
+    expect(parentHash('#/strength/history')).toBe('#/');
+    expect(parentHash('#/strength/progress')).toBe('#/');
+    expect(parentHash('#/strength/exercises')).toBe('#/');
+    expect(parentHash('#/airbike')).toBe('#/');
+    expect(parentHash('#/settings')).toBe('#/');
+    expect(parentHash('#/strength/session')).toBe('#/strength');
+    expect(parentHash('#/strength/routine/r1')).toBe('#/strength');
+    expect(parentHash('#/strength/settings')).toBe('#/strength');
+    expect(parentHash('#/strength/summary/s1')).toBe('#/strength/history');
+    expect(parentHash('#/strength/workout/s1')).toBe('#/strength/history');
+    expect(parentHash('#/strength/exercise/bench')).toBe('#/strength/exercises');
+    expect(parentHash('#/airbike/p/1')).toBe('#/airbike');
   });
 });
