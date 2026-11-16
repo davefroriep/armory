@@ -13,6 +13,8 @@ export interface TcxInput {
   seconds: number;
   /** Mechanical work in kJ. Exported as Calories (1 kJ = 1 kcal, matching Bowflex / Intervals). */
   kj: number;
+  /** Energy in kcal when it is not mechanical work (strength: HR-based estimate). Overrides `kj`. */
+  kcal?: number;
   samples: TcxSample[];
   /** 'bike' = power/cadence/distance; 'hr' = heart-rate-only session (strength). */
   kind?: 'bike' | 'hr';
@@ -38,7 +40,7 @@ export function buildTcx(input: TcxInput, name: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2" xmlns:ns3="http://www.garmin.com/xmlschemas/ActivityExtension/v2">
 <Activities><Activity Sport="${input.kind === 'hr' ? 'Other' : 'Biking'}"><Id>${start}</Id><Notes>${esc(name)}</Notes>
-<Lap StartTime="${start}"><TotalTimeSeconds>${input.seconds}</TotalTimeSeconds>${input.kind === 'hr' ? '' : `<DistanceMeters>${dist.toFixed(1)}</DistanceMeters>`}<Calories>${Math.round(input.kj)}</Calories><Intensity>Active</Intensity><TriggerMethod>Manual</TriggerMethod>
+<Lap StartTime="${start}"><TotalTimeSeconds>${input.seconds}</TotalTimeSeconds>${input.kind === 'hr' ? '' : `<DistanceMeters>${dist.toFixed(1)}</DistanceMeters>`}<Calories>${Math.round(input.kcal ?? input.kj)}</Calories><Intensity>Active</Intensity><TriggerMethod>Manual</TriggerMethod>
 <Track>${pts}</Track></Lap></Activity></Activities>
 </TrainingCenterDatabase>`;
 }

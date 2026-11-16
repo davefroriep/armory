@@ -38,6 +38,9 @@ export interface AthleteFtpInfo {
   eftp: number | null;
   setFtp: number | null;
   maxHr: number | null;
+  sex: 'M' | 'F' | null;
+  weightKg: number | null;
+  birthDate: string | null;
 }
 
 interface SportSettingRaw {
@@ -60,6 +63,9 @@ export async function fetchAthleteProfile(): Promise<AthleteFtpInfo> {
     eftp: typeof rawEftp === 'number' && rawEftp > 0 ? Math.round(rawEftp) : null,
     setFtp: typeof rawSetFtp === 'number' && rawSetFtp > 0 ? Math.round(rawSetFtp) : null,
     maxHr: typeof ss?.max_hr === 'number' && ss.max_hr > 0 ? Math.round(ss.max_hr) : null,
+    sex: j.sex === 'M' || j.sex === 'F' ? j.sex : null,
+    weightKg: typeof j.icu_weight === 'number' && j.icu_weight > 0 ? j.icu_weight : typeof j.weight === 'number' && j.weight > 0 ? j.weight : null,
+    birthDate: typeof j.icu_date_of_birth === 'string' && /^\d{4}-\d{2}-\d{2}/.test(j.icu_date_of_birth) ? j.icu_date_of_birth.slice(0, 10) : null,
   };
 }
 
@@ -68,6 +74,9 @@ export async function syncAthleteFtp(forceUseEftp = false): Promise<AthleteFtpIn
   const patch: Partial<ReturnType<typeof getSettings>> = {
     intervalsEftp: info.eftp,
     intervalsSetFtp: info.setFtp,
+    ...(info.sex ? { sex: info.sex } : {}),
+    ...(info.weightKg ? { weightKg: info.weightKg } : {}),
+    ...(info.birthDate ? { birthDate: info.birthDate } : {}),
   };
   if ((forceUseEftp || getSettings().ftpAutoSync) && info.eftp) {
     patch.ftp = info.eftp;

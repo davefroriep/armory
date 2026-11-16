@@ -1,5 +1,7 @@
 import { buildTcx } from '../domain/tcx';
-import { patchActivity, uploadActivity } from '../intervals/api';
+import { bodyProfile, kcalFromSamples } from '../domain/energy';
+import { patchActivity, syncAthleteFtp, uploadActivity } from '../intervals/api';
+import { getSettings } from '../store/settings';
 import { calendar } from '../intervals/calendar';
 import { allMeta, deleteWorkout, getSamples, putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
@@ -13,12 +15,23 @@ export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
   try {
     if (!m.activityId) {
       const samples = await getSamples(m.id);
+      let kcal: number | undefined;
+      if (m.equipment === 'strength') {
+        // HR-only session: estimate energy from heart rate (Keytel et al. 2005). Needs weight / age / sex
+        // from the Intervals.icu profile; fetch it now if this device has not synced it yet.
+        let prof = bodyProfile(getSettings());
+        if (!prof) {
+          await syncAthleteFtp(false).catch(() => {});
+          prof = bodyProfile(getSettings());
+        }
+        if (prof) kcal = kcalFromSamples(samples, prof);
+      }
       const tcx = buildTcx(
-        { startEpochMs: m.startEpochMs, seconds: m.seconds, kj: m.kj, samples, kind: m.equipment === 'strength' ? 'hr' : 'bike' },
+        { startEpochMs: m.startEpochMs, seconds: m.seconds, kj: m.kj, kcal, samples, kind: m.equipment === 'strength' ? 'hr' : 'bike' },
         m.name,
       );
       const desc = m.equipment === 'strength'
-        ? `Armory Fit • ${fmt(m.seconds)} • avg HR ${Math.round(m.avgHr)} • max HR ${Math.round(m.maxHr)}` + (m.rpe ? ` • RPE ${m.rpe}/10` : '')
+        ? `Armory Fit • ${fmt(m.seconds)} • avg HR ${Math.round(m.avgHr)} • max HR ${Math.round(m.maxHr)}` + (kcal ? ` • ~${kcal} kcal` : '') + (m.rpe ? ` • RPE ${m.rpe}/10` : '')
         : `Armory Fit • ${fmt(m.seconds)} • avg ${Math.round(m.avgW)} W • ${Math.round(m.kj)} kJ` + (m.rpe ? ` • RPE ${m.rpe}/10` : '') + (m.notes ? ` • ${m.notes}` : '');
       m.activityId = await uploadActivity({
         tcx, name: m.name, description: desc, externalId: `armory-${m.id}`, pairedEventId: m.eventId,

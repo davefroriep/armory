@@ -3,6 +3,7 @@ import { hrFresh, live } from '../ble/telemetry';
 import { ensureSensors } from '../ble/sources';
 import { calendar } from '../intervals/calendar';
 import { isNative, openBoostcamp, workoutService } from '../native/service';
+import { bodyProfile, kcalFromSamples } from '../domain/energy';
 import { getSettings } from '../store/settings';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
@@ -29,6 +30,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
   let lastSvc = 0;
   let offChips: (() => void) | null = null;
   let offCal: (() => void) | null = null;
+  let offRec: (() => void) | null = null;
   const guard = new LeaveGuard(() => state === 'running' || state === 'paused');
 
   const elapsed = () => (accMs + (state === 'running' ? Date.now() - t0 : 0)) / 1000;
@@ -97,6 +99,9 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     rec = new Recorder(id, 'strength', 'strength', 'Strength Train', ev?.ev.id ?? null, getSettings().hrMax);
     state = 'running';
+    // Beat-driven recording: keeps logging while Android throttles this page's timers in the background.
+    offRec?.();
+    offRec = rec.attach(() => (state === 'running' ? { elapsed: elapsed(), targetRpm: 0 } : null));
     guard.arm();
     t0 = Date.now();
     accMs = 0;
@@ -118,6 +123,8 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
   const finish = () => {
     if (state === 'running') accMs += Date.now() - t0;
     rec?.tick(elapsed(), 0);
+    offRec?.();
+    offRec = null;
     state = 'summary';
     guard.disarm();
     void workoutService.stop();
@@ -134,13 +141,15 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
     const max = getSettings().hrMax;
     const secs = [0, 0, 0, 0, 0, 0];
     for (const s of rec.samples) if (s.hr > 0) secs[hrZone(s.hr, max).z]++;
+    const prof = bodyProfile(getSettings());
+    const kcal = prof ? kcalFromSamples(rec.samples, prof) : null;
     const total = Math.max(1, secs.reduce((a, b) => a + b, 0));
     const bars = [1, 2, 3, 4, 5].map((z) =>
       `<div class="zrow"><span>Z${z}</span><i><u style="width:${(secs[z] / total) * 100}%;background:${ZONE_COLOR[z]}"></u></i><b>${mmss(secs[z])}</b></div>`).join('');
     renderSummary(root, {
       title: 'Strength Train',
       meta,
-      stats: [['AVG HR', meta.avgHr ? String(Math.round(meta.avgHr)) : '--'], ['MAX HR', meta.maxHr ? String(Math.round(meta.maxHr)) : '--'], ['TIME', hms(meta.seconds)]],
+      stats: [['AVG HR', meta.avgHr ? String(Math.round(meta.avgHr)) : '--'], ['MAX HR', meta.maxHr ? String(Math.round(meta.maxHr)) : '--'], ['TIME', hms(meta.seconds)], ['KCAL', kcal != null ? `~${kcal}` : '--']],
       extra: `<section class="card zones"><div class="card-h"><span>TIME IN HR ZONE</span></div>${bars}</section>`,
       backHref: '#/',
     });
@@ -153,6 +162,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
   window.addEventListener('beforeunload', unload);
   return () => {
     if (timer) clearInterval(timer);
+    offRec?.();
     guard.dispose();
     offChips?.();
     offCal?.();

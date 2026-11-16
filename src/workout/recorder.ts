@@ -1,4 +1,4 @@
-import { bikeFresh, hrFresh, live } from '../ble/telemetry';
+import { bikeFrame, bikeFresh, hrAtTime, hrBeat, live } from '../ble/telemetry';
 import { putMeta, putSample } from '../store/db';
 import type { Equipment, Sample, WorkoutMeta } from '../types';
 
@@ -49,13 +49,32 @@ export class Recorder {
     this.frames++;
   }
 
-  /** Call from the HUD loop with the current active elapsed seconds; fills any missed seconds. */
-  tick(elapsed: number, targetRpm: number): void {
+  /**
+   * Drive the recorder from the sensors instead of a UI timer. Android throttles WebView timers once the
+   * app is in the background (switching to Boostcamp, screen off), but BLE callbacks keep arriving, so
+   * every heart-rate beat / bike frame advances the recording. `drive` returns the current active
+   * elapsed seconds, or null while not running. Returns an unsubscribe function.
+   */
+  attach(drive: () => { elapsed: number; targetRpm: number } | null): () => void {
+    const run = (): void => {
+      const d = drive();
+      if (d) this.tick(d.elapsed, d.targetRpm);
+    };
+    const offs = [hrBeat.on(run), bikeFrame.on(run)];
+    return () => offs.forEach((off) => off());
+  }
+
+  /**
+   * Fills every second up to `elapsed`. Heart rate comes from the beat nearest to that second's wall
+   * time, so a late call back-fills real data, and a stretch with no beats records 0 (a gap) rather than
+   * smearing the current value backwards.
+   */
+  tick(elapsed: number, targetRpm: number, now = Date.now()): void {
     const bike = bikeFresh();
     while (this.nextT <= Math.floor(elapsed)) {
       const w = this.frames && bike ? this.wSum / this.frames : bike ? live.w : 0;
       const cad = this.frames && bike ? this.cadSum / this.frames : bike ? live.cad : 0;
-      const hr = hrFresh() ? live.hr : 0;
+      const hr = hrAtTime(now - (elapsed - this.nextT) * 1000);
       const dist = this.base ? Math.max(0, live.dist - this.base.dist) : 0;
       const kcal = this.base ? Math.max(0, live.kcal - this.base.kcal) : 0;
       this.lastDist = dist;

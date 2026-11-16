@@ -44,6 +44,7 @@ class Hud {
   private goal: number;
   private timer: ReturnType<typeof setInterval> | null = null;
   private offFrame: (() => void) | null = null;
+  private offRec: (() => void) | null = null;
   private offSmooth: (() => void) | null = null;
   private offChips: (() => void) | null = null;
   private lock: WakeLockSentinel | null = null;
@@ -89,6 +90,7 @@ class Hud {
       if (this.timer) clearInterval(this.timer);
       this.guard.dispose();
       this.offFrame?.();
+      this.offRec?.();
       this.offSmooth?.();
       this.offChips?.();
       audio.setMetronome(false, null);
@@ -251,6 +253,14 @@ class Hud {
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     this.rec = new Recorder(id, 'airbike', this.p.id, this.p.intervalsName, ev?.ev.id ?? null, s.hrMax);
     this.offFrame = bikeFrame.on(() => { if (this.engine.state === 'running') this.rec?.onFrame(); });
+    // Sensor-driven recording (registered after onFrame so each frame is accumulated before the tick):
+    // keeps the log complete while Android throttles this page's timers in the background.
+    this.offRec = this.rec.attach(() => {
+      if (this.engine.state !== 'running') return null;
+      const now = Date.now();
+      const seg = this.engine.locate(now).seg;
+      return { elapsed: this.engine.elapsed(now), targetRpm: seg?.rpm ?? (this.p.segments.length === 0 ? this.p.paceRpm ?? 0 : 0) };
+    });
     this.engine.start(Date.now());
     this.guard.arm();
     this.lastIndex = -2;
@@ -280,6 +290,8 @@ class Hud {
     this.engine.finish(now);
     this.guard.disarm();
     if (this.rec) this.rec.tick(this.engine.elapsed(now), 0);
+    this.offRec?.();
+    this.offRec = null;
     audio.setMetronome(false, null);
     sim.setTarget(0);
     this.el.pauseModal.hidden = true;

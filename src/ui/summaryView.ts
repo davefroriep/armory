@@ -22,7 +22,7 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
   root.innerHTML = `<main class="page summary">
     <h1 class="sum-title">${esc(o.title)}</h1>
     <div class="sum-sub">${new Date(meta.startEpochMs).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })} · ${hms(meta.seconds)}</div>
-    <section class="stats">${stats}</section>
+    <section class="stats${o.stats.length === 4 ? ' four' : ''}">${stats}</section>
     ${o.extra ?? ''}
     <h2 class="sec">HOW HARD WAS IT?</h2>
     <section class="rpe" id="rpe">

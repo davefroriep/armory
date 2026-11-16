@@ -17,6 +17,11 @@ export interface Settings {
   /** Last manual FTP configured on Intervals.icu (`sportSettings.indoor_ftp` / `ftp`). */
   intervalsSetFtp: number | null;
   hrMax: number;
+  /** Body profile for HR-based strength calories (Keytel). Synced from the Intervals.icu profile; never committed. */
+  sex: 'M' | 'F';
+  weightKg: number | null;
+  /** ISO date (YYYY-MM-DD). */
+  birthDate: string | null;
   /** "gated": recoveries last until HR is back at the target (floor + ceiling apply); "timed": plain timers. */
   recoveryMode: RecoveryMode;
   /** Recovered once HR is at or below this % of HRmax. */
@@ -54,6 +59,9 @@ export const DEFAULTS: Settings = {
   intervalsEftp: null,
   intervalsSetFtp: null,
   hrMax: 180,
+  sex: 'M',
+  weightKg: null,
+  birthDate: null,
   recoveryMode: 'gated',
   recoveryHrPct: 72,
   programOrder: [],

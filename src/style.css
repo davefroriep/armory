@@ -198,6 +198,7 @@ a.cal-empty { color: var(--blue); }
 .sum-title { font-size: 1.7rem; font-weight: 800; }
 .sum-sub { color: var(--mut); margin-top: -8px; }
 .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.stats.four { grid-template-columns: repeat(4, 1fr); }
 .stats div { background: var(--card); border-radius: 14px; padding: 10px 8px; text-align: center; }
 .stats small { display: block; color: var(--mut); font-size: .6rem; font-weight: 800; letter-spacing: .1em; }
 .stats b { font-size: 1.25rem; font-variant-numeric: tabular-nums; }
