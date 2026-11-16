@@ -24,12 +24,47 @@ const root = document.getElementById('app')!;
 let cleanup: (() => void) | void;
 let routeKey = '';
 
+export type LeaveGuard = (targetHash: string) => Promise<boolean>;
+let leaveGuard: LeaveGuard | null = null;
+let bypassGuard = false;
+let guardBusy = false;
+
+/** Register an async confirmation guard before leaving the active route (e.g. running workout). */
+export function setLeaveGuard(fn: LeaveGuard | null): void {
+  leaveGuard = fn;
+}
+
+/** Allow the next programmatic hash navigation to bypass the active leave guard. */
+export function allowNextRoute(): void {
+  bypassGuard = true;
+}
+
 function route(): void {
   const raw = location.hash.replace(/^#\/?/, '');
   const [path, qs = ''] = raw.split('?');
   const [name = '', ...args] = path.split('/').filter(Boolean);
   const key = path;
   if (key === routeKey && cleanup) return;
+  if (bypassGuard) {
+    bypassGuard = false;
+  } else if (leaveGuard && routeKey) {
+    const restoreHash = `#/${routeKey}`;
+    const targetHash = `#/${raw}`;
+    history.pushState(null, '', restoreHash);
+    if (!guardBusy) {
+      guardBusy = true;
+      void leaveGuard(targetHash).then((allow) => {
+        guardBusy = false;
+        if (allow) {
+          leaveGuard = null;
+          bypassGuard = true;
+          location.hash = targetHash;
+        }
+      });
+    }
+    return;
+  }
+  leaveGuard = null;
   routeKey = key;
   cleanup?.();
   // The bike link lives across every AirBike screen (list <-> workout); only leaving AirBike drops it.

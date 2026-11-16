@@ -57,8 +57,8 @@ export function forward(se: SessionEx, from: number, fields: { w?: boolean; r?: 
   for (let j = from + 1; j < se.sets.length; j++) {
     const t = se.sets[j];
     if (t.done || t.kind === 'w') continue;
-    if (fields.w && src.w != null && (t.wAuto || t.w == null)) { t.w = src.w; t.wAuto = true; }
-    if (fields.r && src.r != null && (t.rAuto || t.r == null)) { t.r = src.r; t.rAuto = true; }
+    if (fields.w && (t.wAuto || t.w == null)) { t.w = src.w; t.wAuto = src.w != null; }
+    if (fields.r && (t.rAuto || t.r == null)) { t.r = src.r; t.rAuto = src.r != null; }
   }
 }
 

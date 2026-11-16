@@ -22,14 +22,6 @@ const VIDEO_EXT = /\.(mp4|mov|webm|mkv|m4v|3gp)$/i;
 const sessionFiles = new Map<string, Blob>();
 const isMobileWeb = (): boolean => !isNative() && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
-interface OpenFilePickerWin extends Window {
-  showOpenFilePicker?: (opts?: {
-    multiple?: boolean;
-    excludeAcceptAllOption?: boolean;
-    types?: { description?: string; accept: Record<string, string[]> }[];
-  }) => Promise<{ getFile(): Promise<File> }[]>;
-}
-
 const startTimerForVideo = (s: LiftSession): void => {
   if (s.status === 'active') active.ensureStarted(s);
 };
@@ -142,37 +134,8 @@ async function handlePickedFile(t: VideoTarget, f: File, mode: 'capture' | 'pick
   return meta;
 }
 
-/** Open the Files / DocumentsUI folder browser (Android Chrome 132+ via showOpenFilePicker, or input fallback). */
-async function browseFilesFolder(t: VideoTarget): Promise<VideoMeta | null> {
-  const picker = (window as OpenFilePickerWin).showOpenFilePicker;
-  if (typeof picker === 'function') {
-    try {
-      const [handle] = await picker({
-        multiple: false,
-        excludeAcceptAllOption: false,
-        types: [{
-          description: 'Video files',
-          accept: { 'application/octet-stream': ['.mp4', '.mov', '.webm', '.mkv', '.m4v', '.3gp'], 'video/mp4': ['.mp4'] },
-        }],
-      });
-      if (!handle) return null;
-      return await handlePickedFile(t, await handle.getFile(), 'pick');
-    } catch (e) {
-      if ((e as Error).name === 'AbortError') return null;
-    }
-  }
-  return new Promise((resolve) => {
-    const inp = document.createElement('input');
-    inp.type = 'file';
-    inp.accept = 'video/mp4,application/octet-stream';
-    inp.onchange = async () => resolve(inp.files?.[0] ? await handlePickedFile(t, inp.files[0], 'pick') : null);
-    inp.addEventListener('cancel', () => resolve(null));
-    inp.click();
-  });
-}
-
 /**
- * Pick a video from the phone (native DCIM/Camera on APK, or DocumentsUI/Video picker on Web)
+ * Pick a video from the phone (native DCIM/Camera on APK, or Video picker on Web)
  * preserving filename & Google Drive DCIM Backup link without copying the file into IndexedDB.
  */
 export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
@@ -199,21 +162,11 @@ export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
   });
 }
 
-/** Manually link a DCIM filename (`PXL_...mp4`) or a direct Google Drive share link. */
-export async function linkManualVideo(t: VideoTarget, initial = ''): Promise<VideoMeta | null> {
-  const raw = await promptSheet('Link video filename or URL', initial, 'PXL_20261116_173012345.mp4 or https://drive.google.com/…');
-  if (!raw) return null;
-  const isUrl = /^https?:\/\//i.test(raw);
-  const fileName = isUrl ? raw.split('/').pop()?.split('?')[0] || 'Drive video' : raw;
-  return storeLinkClip(t, { fileName, ...(isUrl ? { uri: raw } : {}) });
-}
-
 /** Legacy alias for callers. */
 export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDcimVideo(t);
 
 /**
- * Per-row video sheet: inspect linked videos on this set, launch Camera in video mode (starting workout timer),
- * open Visual Video Selector (with thumbnails), or browse DCIM/Files folder.
+ * Per-row video sheet: inspect linked videos on this set, then Record Video or Select Video (minimal 2-option menu).
  */
 export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promise<void> {
   const ex = lifts.exOrStub(t.se.exId);
@@ -236,26 +189,19 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   };
 
   const actionsHtml = native
-    ? `<div class="hint" id="vcam-hint" hidden style="color:#93c5fd">Camera app opened — once done recording, tap <b>Select file from DCIM</b> below to link its filename.</div>
-       <div class="fl">LINK VIDEO</div>
+    ? `<div class="hint" id="vcam-hint" hidden style="color:#93c5fd">Camera opened — tap <b>Select Video</b> when finished.</div>
        <div class="alist">
-         <button class="aitem" type="button" data-vact="cam"><b>Record Video (Camera)</b><small>Opens phone camera in video mode &amp; starts workout timer</small></button>
-         <button class="aitem" type="button" data-vact="pick"><b>Select file from DCIM</b><small>Opens DCIM/Camera directly (0 MB copied, links to Drive Backup)</small></button>
-         <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
+         <button class="aitem" type="button" data-vact="cam"><b>Record Video</b></button>
+         <button class="aitem" type="button" data-vact="pick"><b>Select Video</b></button>
        </div>`
     : mobile
-      ? `<div class="fl">LINK VIDEO</div>
-         <div class="alist">
-           <label class="aitem" data-vact="cam"><input type="file" accept="video/*" capture="environment" data-vinp="cam" hidden><b>Record Video (Camera)</b><small>Opens camera directly in video mode &amp; starts workout timer</small></label>
-           <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video (with Previews)</b><small>Opens video selector with thumbnails (links to Drive DCIM Backup)</small></label>
-           <button class="aitem" type="button" data-vact="files"><b>Browse DCIM / Files Folder</b><small>Opens folder browser directly (preserves exact PXL_… filename)</small></button>
-           <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
+      ? `<div class="alist">
+           <label class="aitem" data-vact="cam"><input type="file" accept="video/*" capture="environment" data-vinp="cam" hidden><b>Record Video</b></label>
+           <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video</b></label>
          </div>`
-      : `<div class="fl">LINK VIDEO</div>
-         <div class="alist">
-           <button class="aitem" type="button" data-vact="cam"><b>Record Video (Camera)</b><small>Opens webcam recorder &amp; starts workout timer</small></button>
-           <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video File</b><small>Pulls filename &amp; thumbnail for Google Drive DCIM Backup</small></label>
-           <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
+      : `<div class="alist">
+           <button class="aitem" type="button" data-vact="cam"><b>Record Video</b></button>
+           <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video</b></label>
          </div>`;
 
   const sh = openSheet(
@@ -315,12 +261,6 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       }
     } else if (act === 'pick' && native) {
       const meta = await linkDcimVideo(t);
-      if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
-    } else if (act === 'files') {
-      const meta = await browseFilesFolder(t);
-      if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
-    } else if (act === 'manual') {
-      const meta = await linkManualVideo(t);
       if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
     } else if (el.closest('[data-vok]')) {
       sh.close();

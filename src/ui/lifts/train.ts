@@ -77,7 +77,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
             ? planned.map((it) => {
                 const r = matchRoutineByTitle(it.ev.name ?? '', routines);
                 const mins = it.ev.moving_time ? Math.round(it.ev.moving_time / 60) : 0;
-                return `<div class="cal-item${evParam === it.ev.id ? ' hot' : ''}"><span class="cal-ico strength">${ICON.strength}</span>
+                return `<div class="cal-item${evParam === it.ev.id ? ' hot' : ''}" data-plan-card="${it.ev.id}"><span class="cal-ico strength">${ICON.strength}</span>
                   <span class="cal-txt"><b>${esc(it.ev.name ?? 'Strength')}</b><small>${r ? `Your “${esc(r.name)}” day` : 'No matching day yet'}${mins ? ` · ${mins} min` : ''}</small></span>
                   <button class="btn sm primary" data-plan="${it.ev.id}">Start</button><button class="cal-more" type="button" data-cal-menu="${it.ev.id}" aria-label="Workout options">⋯</button></div>`;
               }).join('')
@@ -159,9 +159,11 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         }
         return;
       }
-      const plan = t.closest<HTMLElement>('[data-plan]');
+      if (t.closest('[data-cal-menu]')) return;
+      const plan = t.closest<HTMLElement>('[data-plan], [data-plan-card]');
       if (plan) {
-        const it = calendar.items.find((i) => i.ev.id === Number(plan.dataset.plan));
+        const id = Number(plan.dataset.plan ?? plan.dataset.planCard);
+        const it = calendar.items.find((i) => i.ev.id === id);
         if (!it) return;
         const r = matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines());
         return void (await startWorkout({ name: r?.name ?? it.ev.name ?? 'Strength', routine: r, eventId: it.ev.id }));
@@ -169,7 +171,6 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       const card = t.closest<HTMLElement>('[data-rid]');
       if (!card) return;
       const r = lifts.routines.get(card.dataset.rid!)!;
-      if (t.closest('[data-act="start"]')) return void (await startWorkout({ name: r.name, routine: r }));
       if (t.closest('[data-act="rmenu"]')) {
         const k = await actionSheet(r.name, [
           { key: 'edit', label: 'Edit day' },
@@ -191,7 +192,9 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         } else if (k === 'del' && (await confirmSheet(`Delete “${r.name}”?`, 'Past workouts stay in History.', 'Delete day', true))) {
           await lifts.deleteRoutine(r.id);
         }
+        return;
       }
+      await startWorkout({ name: r.name, routine: r });
     });
 
     return () => { dead = true; offCal(); offChips(); offStore(); offClock(); };

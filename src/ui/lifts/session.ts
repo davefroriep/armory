@@ -11,6 +11,7 @@ import { lifts } from '../../lifts/store';
 import { resyncSession } from '../../lifts/intervals';
 import { setText } from '../../lifts/summary';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
+import { allowNextRoute, setLeaveGuard } from '../../main';
 import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
@@ -69,8 +70,8 @@ function build(root: HTMLElement, id?: string): () => void {
     return `<div class="srow${set.done ? ' done' : ''}${set.kind !== 'n' ? ' k-' + set.kind : ''}" data-i="${i}" data-sid="${set.id}">
       <button class="snum${set.rpe != null ? ' has-rpe' : ''}" data-act="setmenu" aria-label="Set options">${kind}${pr ? '<i class="prstar">★</i>' : ''}${rpeTag}${dot}</button>
       <button class="sprev" data-act="usePrev" ${prev ? '' : 'disabled'}>${prev ? esc(setText(prev, ex, unit())) : '–'}</button>
-      <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '0' : 'BW'}" aria-label="Weight">
-      <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${ex.type === 'time' ? 'sec' : '0'}" aria-label="${ex.type === 'time' ? 'Seconds' : 'Reps'}">
+      <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '–' : 'BW'}" aria-label="Weight">
+      <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${ex.type === 'time' ? 'sec' : '–'}" aria-label="${ex.type === 'time' ? 'Seconds' : 'Reps'}">
       <button class="svid${hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${hasVid ? 'Manage linked video' : 'Link or record lift video'}">${LI.video}</button>
       <button class="schk${set.done ? ' on' : ''}" data-act="done" aria-label="Log set">✓</button>
     </div>`;
@@ -115,7 +116,7 @@ function build(root: HTMLElement, id?: string): () => void {
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
     return `<header class="bar sbar">
-      <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
+      <a class="icon-btn" href="${back}" ${edit ? '' : 'data-act="back"'} aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
       <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
       <div class="chips"><button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
@@ -192,15 +193,38 @@ function build(root: HTMLElement, id?: string): () => void {
   // another screen/tab finished or deleted this workout
   const offStore = lifts.changed.on(() => {
     if (finishing) return;
-    if (!lifts.sessions.has(s.id)) location.replace('#/strength');
-    else if (!edit && lifts.sessions.get(s.id)!.status === 'done' && location.hash.startsWith('#/strength/session')) location.replace(`#/strength/summary/${s.id}`);
+    if (!lifts.sessions.has(s.id)) { allowNextRoute(); location.replace('#/strength'); }
+    else if (!edit && lifts.sessions.get(s.id)!.status === 'done' && location.hash.startsWith('#/strength/session')) {
+      allowNextRoute();
+      location.replace(`#/strength/summary/${s.id}`);
+    }
     else if (!dead) paintClock();
   });
 
   // ---------- dock (steppers & rep presets above the keyboard) ----------
   const REP_PRESETS = [8, 10, 12, 15];
   let focused: HTMLInputElement | null = null;
+  let scrollT1: ReturnType<typeof setTimeout> | null = null;
+  let scrollT2: ReturnType<typeof setTimeout> | null = null;
   const dock = (): HTMLElement => $('#dock', root);
+  const ensureFieldVisible = (inp: HTMLInputElement): void => {
+    if (dead || !document.body.contains(inp)) return;
+    const vv = window.visualViewport;
+    const vpTop = vv?.offsetTop ?? 0;
+    const vpH = vv?.height ?? window.innerHeight;
+    const dk = dock();
+    const dkH = dk.hidden ? 0 : dk.getBoundingClientRect().height || 62;
+    const rb = root.querySelector<HTMLElement>('#restbar');
+    const rbH = rb && !rb.hidden ? rb.getBoundingClientRect().height : 0;
+    const headerH = 58;
+    const safeH = Math.max(110, vpH - dkH - rbH - headerH);
+    const rect = inp.getBoundingClientRect();
+    const targetY = vpTop + headerH + safeH * 0.42;
+    const delta = rect.top + rect.height / 2 - targetY;
+    if (Math.abs(delta) > 10) window.scrollBy({ top: delta, behavior: 'smooth' });
+  };
+  const onVvResize = (): void => { if (focused) ensureFieldVisible(focused); };
+  window.visualViewport?.addEventListener('resize', onVvResize);
   const syncDockPreset = (): void => {
     if (!focused || !dock().classList.contains('reps')) return;
     const v = Number(focused.value);
@@ -224,6 +248,8 @@ function build(root: HTMLElement, id?: string): () => void {
     document.body.classList.add('dock-open');
   };
   const hideDock = (): void => {
+    if (scrollT1) { clearTimeout(scrollT1); scrollT1 = null; }
+    if (scrollT2) { clearTimeout(scrollT2); scrollT2 = null; }
     dock().hidden = true;
     dock().classList.remove('reps');
     document.body.classList.remove('dock-open');
@@ -239,7 +265,10 @@ function build(root: HTMLElement, id?: string): () => void {
     const t = e.target as HTMLElement;
     if (!(t instanceof HTMLInputElement) || !t.closest('.srow')) return;
     showDock(t);
-    setTimeout(() => { t.select(); t.scrollIntoView({ block: 'center', behavior: 'smooth' }); }, 60);
+    if (scrollT1) clearTimeout(scrollT1);
+    if (scrollT2) clearTimeout(scrollT2);
+    scrollT1 = setTimeout(() => { t.select(); ensureFieldVisible(t); }, 60);
+    scrollT2 = setTimeout(() => { if (focused === t) ensureFieldVisible(t); }, 280);
   });
   root.addEventListener('focusout', () => {
     setTimeout(() => { if (!(document.activeElement instanceof HTMLInputElement && document.activeElement.closest('.srow'))) hideDock(); }, 120);
@@ -336,8 +365,10 @@ function build(root: HTMLElement, id?: string): () => void {
       [s.exs[idx], s.exs[j]] = [s.exs[j], s.exs[idx]];
       s.exs.forEach((e, n) => { if (n === s.exs.length - 1) delete e.ss; });
       save(); paint();
-    } else if (k === 'records') location.hash = `#/strength/exercise/${se.exId}`;
-    else if (k === 'remove') {
+    } else if (k === 'records') {
+      allowNextRoute();
+      location.hash = `#/strength/exercise/${se.exId}`;
+    } else if (k === 'remove') {
       const snap = snapshot();
       s.exs.splice(idx, 1);
       if (s.exs.length) delete s.exs[s.exs.length - 1].ss;
@@ -521,26 +552,79 @@ function build(root: HTMLElement, id?: string): () => void {
     save(); paint();
   };
 
-  const finish = async (): Promise<void> => {
-    if (edit) { location.hash = `#/strength/workout/${s.id}`; return; }
+  const finish = async (skipConfirm = false): Promise<boolean> => {
+    if (edit) { allowNextRoute(); location.hash = `#/strength/workout/${s.id}`; return true; }
     if (!s.exs.some(hasLogged)) {
       if (await confirmSheet('Nothing logged', 'No sets are logged yet. Discard this workout?', 'Discard workout', true, 'Keep lifting')) {
+        finishing = true;
+        allowNextRoute();
         await active.discard();
         location.hash = '#/strength';
+        return true;
       }
-      return;
+      return false;
     }
-    const left = unloggedCount(s);
-    const ok = await confirmSheet(
-      'Finish workout?',
-      left ? `${left} set${left === 1 ? ' isn’t' : 's aren’t'} logged and will be dropped. It uploads to Intervals.icu automatically.` : 'It uploads to Intervals.icu automatically.',
-      'Finish & save', false, 'Keep lifting',
-    );
-    if (!ok) return;
+    if (!skipConfirm) {
+      const left = unloggedCount(s);
+      const ok = await confirmSheet(
+        'Finish workout?',
+        left ? `${left} set${left === 1 ? ' isn’t' : 's aren’t'} logged and will be dropped. It uploads to Intervals.icu automatically.` : 'It uploads to Intervals.icu automatically.',
+        'Finish & save', false, 'Keep lifting',
+      );
+      if (!ok) return false;
+    }
     finishing = true;
+    allowNextRoute();
     const done = await active.finish();
     location.replace(done ? `#/strength/summary/${done.session.id}` : '#/strength');
+    return true;
   };
+
+  const openLeaveSheet = async (): Promise<boolean> => {
+    if (finishing || !lifts.active || !isSessionStarted(s)) return true;
+    const left = unloggedCount(s);
+    const hasLog = s.exs.some(hasLogged);
+    const sub = hasLog
+      ? (left ? `${left} unlogged set${left === 1 ? '' : 's'} will be dropped. Uploads to Intervals.icu automatically.` : 'Saves workout and uploads to Intervals.icu automatically.')
+      : 'Workout timer is running, with no checked sets yet.';
+    const pick = await new Promise<'finish' | 'keep' | 'discard'>((resolve) => {
+      let choice: 'finish' | 'keep' | 'discard' = 'keep';
+      const sh = openSheet(
+        `<h3 class="sh-title">Workout in progress</h3>
+         <p class="sh-text">${sub}</p>
+         <button class="btn primary big" type="button" data-lv="finish">Finish &amp; save</button>
+         <button class="btn big" type="button" data-lv="keep">Keep lifting</button>
+         <button class="btn danger big" type="button" data-lv="discard">Discard workout</button>`,
+        { onClose: () => resolve(choice) },
+      );
+      sh.body.addEventListener('click', (e) => {
+        const b = (e.target as HTMLElement).closest<HTMLElement>('[data-lv]');
+        if (!b) return;
+        choice = b.dataset.lv as 'finish' | 'keep' | 'discard';
+        sh.close();
+      });
+    });
+    if (pick === 'keep') return false;
+    if (pick === 'finish') {
+      await finish(hasLog);
+      return false; // finish() handles routing directly to summary or staying put
+    }
+    const sure = await confirmSheet(
+      'Discard workout?',
+      'Are you sure you want to discard this workout?',
+      'Discard workout',
+      true,
+      'Keep lifting',
+    );
+    if (!sure) return false;
+    finishing = true;
+    await active.discard();
+    return true;
+  };
+
+  if (!edit) {
+    setLeaveGuard(async () => openLeaveSheet());
+  }
 
   const wkMenu = async (): Promise<void> => {
     const k = await actionSheet(s.name, [
@@ -554,6 +638,8 @@ function build(root: HTMLElement, id?: string): () => void {
       if (v != null) { if (v) s.note = v; else delete s.note; save(); }
     } else if (k === 'del') {
       if (!(await confirmSheet(edit ? 'Delete workout?' : 'Discard workout?', edit ? 'Removes it from history (not from Intervals.icu).' : 'Everything logged so far is lost.', edit ? 'Delete' : 'Discard', true))) return;
+      finishing = true;
+      allowNextRoute();
       if (edit) { await lifts.deleteSession(s.id); location.hash = '#/strength/history'; }
       else { await active.discard(); location.hash = '#/strength'; }
     }
@@ -598,6 +684,14 @@ function build(root: HTMLElement, id?: string): () => void {
     const a = t.closest<HTMLElement>('[data-act]');
     if (!a) return;
     const act = a.dataset.act!;
+    if (act === 'back') {
+      e.preventDefault();
+      if (await openLeaveSheet()) {
+        allowNextRoute();
+        location.hash = '#/strength';
+      }
+      return;
+    }
     if (act === 'addex') return void (await addEx());
     if (act === 'finish') return void (await finish());
     if (act === 'rename') return void (await rename());
@@ -662,6 +756,8 @@ function build(root: HTMLElement, id?: string): () => void {
 
   return () => {
     dead = true;
+    setLeaveGuard(null);
+    window.visualViewport?.removeEventListener('resize', onVvResize);
     offTick(); offRest(); offChips(); offStore();
     hideDock();
     void lifts.flush();

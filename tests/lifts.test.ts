@@ -101,6 +101,23 @@ describe('auto-fill from last time + forward fill', () => {
     editReps(e, 0, 10);
     expect(e.sets[1].r).toBe(6); // logged set untouched
   });
+  it('deleting a number clears later untouched auto suggestions in real time without touching user-typed or logged sets', () => {
+    const e = buildExercise('bench', 3, null);
+    editWeight(e, 0, lb(135));
+    editReps(e, 0, 10);
+    expect(e.sets.map((s) => toDisplay(s.w!, 'lb'))).toEqual([135, 135, 135]);
+    expect(e.sets.map((s) => s.r)).toEqual([10, 10, 10]);
+    editWeight(e, 0, null);
+    editReps(e, 0, null);
+    expect(e.sets.map((s) => s.w)).toEqual([null, null, null]);
+    expect(e.sets.map((s) => s.r)).toEqual([null, null, null]);
+    expect(e.sets.every((s) => !s.wAuto && !s.rAuto)).toBe(true);
+    // User-typed set 3 stays intact if set 1 is cleared
+    editWeight(e, 0, lb(135));
+    editWeight(e, 2, lb(185));
+    editWeight(e, 0, null);
+    expect(e.sets.map((s) => (s.w == null ? null : toDisplay(s.w, 'lb')))).toEqual([null, null, 185]);
+  });
   it('logging a set forwards both weight and reps', () => {
     const e = buildExercise('bench', 3, null);
     editWeight(e, 0, lb(135));

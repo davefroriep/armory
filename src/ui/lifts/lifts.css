@@ -31,7 +31,9 @@
 .card.resume em { font-style: normal; color: var(--blue); font-weight: 800; }
 .cal-item .btn.sm { flex: none; }
 .cal-item.hot { box-shadow: inset 3px 0 0 var(--blue); padding-left: 8px; }
-.rcard { background: var(--card); border-radius: 18px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.rcard { background: var(--card); border-radius: 18px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; cursor: pointer; transition: background .12s; }
+.rcard:active, .cal-item[data-plan-card]:active { background: #161c24; }
+.cal-item[data-plan-card] { cursor: pointer; border-radius: 10px; }
 .rc-h { display: flex; align-items: center; justify-content: space-between; }
 .rc-h b { font-size: 1.12rem; }
 .rc-ex { color: var(--mut); font-size: .84rem; line-height: 1.4; }
@@ -120,6 +122,7 @@ body.dock-open .ltoast { bottom: calc(134px + var(--sab)); }
 .stitle b { font-size: 1.02rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .stitle small { color: var(--mut); font-size: .78rem; font-weight: 700; font-variant-numeric: tabular-nums; }
 .lsession { padding-bottom: 150px; gap: 12px; }
+body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .xcard { background: var(--card); border-radius: 18px; padding: 10px 10px 10px; }
 .ss-group {
   --ss: var(--amber);
