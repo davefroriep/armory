@@ -6,9 +6,10 @@ import { hasKey, syncAthleteFtp, testConnection } from '../intervals/api';
 import { calendar } from '../intervals/calendar';
 import { audio } from '../audio/audio';
 import { recoveryLimitBpm } from '../domain/gate';
+import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { revFooter, topbar, wireChips } from './chrome';
-import { $ } from './dom';
+import { $, esc } from './dom';
 
 export function settingsScreen(root: HTMLElement): () => void {
   const s = getSettings();
@@ -41,6 +42,17 @@ export function settingsScreen(root: HTMLElement): () => void {
       <label class="field">API key<input id="key" type="password" value="${s.apiKey}" placeholder="Pre-configured" autocomplete="off" spellcheck="false"></label>
       <div class="row"><button class="btn sm" id="test">Test connection</button><span id="testout" class="hint"></span></div>
       <p class="hint">Pre-configured for your account on this device (Intervals → Settings → Developer Settings).</p>
+    </section>
+
+    <h2 class="sec">ROLLING PROGRAM · PHASE 1</h2>
+    <section class="card">
+      <div class="line"><span>Auto-stage next day<small>Stages your next workout on Intervals.icu and slides missed days forward automatically</small></span>${tog('autoStagePlan', s.autoStagePlan)}</div>
+      <div class="hint" id="planStepInfo"></div>
+      <div class="row">
+        <button class="btn sm" id="stepPrev">← Prev</button>
+        <button class="btn sm" id="stepNext">Next →</button>
+        <button class="btn sm" id="stepSync">Stage Now</button>
+      </div>
     </section>
 
     <h2 class="sec">RECOVERIES · AIRBIKE Z5</h2>
@@ -87,7 +99,12 @@ export function settingsScreen(root: HTMLElement): () => void {
     $('#ftpInfo', root).innerHTML = ftpStatus();
     $<HTMLButtonElement>('#useEftp', root).disabled = !cur.intervalsEftp;
     $<HTMLInputElement>('[data-num="ftp"]', root).value = String(cur.ftp);
+    const step = PHASE1_PLAN.steps[cur.queue.stepIndex];
+    $('#planStepInfo', root).innerHTML = step
+      ? `Current: <b>Step ${step.index + 1}/${PHASE1_PLAN.steps.length}</b> · ${esc(step.title)}${cur.queue.stagedDate ? ` (${esc(cur.queue.stagedDate)})` : ''}`
+      : '<b>Phase 1 complete!</b>';
   };
+  paintFtpBox();
   const offSet = settingsChanged.on(paintFtpBox);
   if (hasKey()) void syncAthleteFtp(false).catch(() => {});
 
@@ -101,18 +118,22 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'autoStagePlan';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
+      if (name === 'autoStagePlan' && on) void calendar.refresh();
       if (name === 'simulator') {
         if (on) { hrLink.release(); bikeLink.release(); }
         else sim.stop();
         ensureSensors({ bike: false });
       }
     }
+    if (t.closest('#stepPrev')) void calendar.setStep(getSettings().queue.stepIndex - 1);
+    if (t.closest('#stepNext')) void calendar.setStep(getSettings().queue.stepIndex + 1);
+    if (t.closest('#stepSync')) void calendar.refresh();
     if (t.closest('#useEftp')) {
       const ef = getSettings().intervalsEftp;
       if (ef) updateSettings({ ftp: ef });

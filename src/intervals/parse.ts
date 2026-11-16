@@ -9,6 +9,8 @@ export interface IntervalsEvent {
   start_date_local?: string;
   moving_time?: number;
   icu_training_load?: number;
+  external_id?: string | null;
+  paired_activity_id?: string | null;
 }
 
 export interface EventMatch {

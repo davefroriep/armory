@@ -1,6 +1,7 @@
 import { Emitter } from '../emitter';
 import type { MetroMode } from '../domain/pacer';
 import type { RecoveryMode } from '../domain/gate';
+import { defaultQueueState, type QueueState } from '../domain/plan';
 
 export interface Settings {
   /** Intervals.icu athlete id (not a secret). */
@@ -36,6 +37,10 @@ export interface Settings {
   needleSmooth: '0' | '1' | '2' | '3';
   /** Fake H10 + AirBike for testing the UI without hardware. */
   simulator: boolean;
+  /** Auto-stage the next rolling program day onto Intervals.icu and slide missed days forward. */
+  autoStagePlan: boolean;
+  /** Current position in the rolling training queue. */
+  queue: QueueState;
 }
 
 const KEY = 'armory.settings.v1';
@@ -63,18 +68,23 @@ export const DEFAULTS: Settings = {
   haptics: true,
   needleSmooth: '2',
   simulator: false,
+  autoStagePlan: true,
+  queue: defaultQueueState(),
 };
 
 function load(): Settings {
   try {
     const parsed = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<Settings>;
+    const defQ = defaultQueueState();
+    const q = parsed.queue && typeof parsed.queue === 'object' ? { ...defQ, ...parsed.queue } : defQ;
     return {
       ...DEFAULTS,
       ...parsed,
       apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
+      queue: q,
     };
   } catch {
-    return { ...DEFAULTS };
+    return { ...DEFAULTS, queue: defaultQueueState() };
   }
 }
 

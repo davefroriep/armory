@@ -1,6 +1,7 @@
 import { $, ICON, esc } from './dom';
 import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrFresh, live } from '../ble/telemetry';
+import { PHASE1_PLAN } from '../domain/plan';
 import { calendar, type TodayItem } from '../intervals/calendar';
 import { REV, REV_STAMP } from '../rev';
 import { EQUIPMENT_LABEL } from '../types';
@@ -73,11 +74,20 @@ const href = (it: TodayItem): string => {
 /** "Today" planner card from the Intervals.icu calendar. */
 export function calendarCard(items: TodayItem[], showUnmatched: boolean): string {
   const st = calendar.status;
+  const cur = calendar.currentStep();
+  const up = calendar.upcomingStep();
+  const pill = cur && showUnmatched ? `<span class="cal-pill">STEP ${cur.index + 1}/${PHASE1_PLAN.steps.length}</span>` : '';
   let body = '';
+  let foot = '';
   if (st === 'nokey') {
     body = `<a class="cal-empty" href="#/settings">Add your Intervals.icu API key to see today's plan →</a>`;
   } else if (items.length === 0) {
-    body = `<div class="cal-empty">${st === 'loading' ? 'Loading today’s plan…' : 'Nothing planned for today'}</div>`;
+    if (showUnmatched && up) {
+      body = `<div class="cal-empty"><b>✓ Today complete</b> · Up next: ${esc(up.step.title)}</div>`;
+      foot = `<div class="cal-foot"><span class="cal-sub">Staged for ${esc(up.date)}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
+    } else {
+      body = `<div class="cal-empty">${st === 'loading' ? 'Loading today’s plan…' : 'Nothing planned for today'}</div>`;
+    }
   } else {
     body = items
       .map((it) => {
@@ -89,14 +99,20 @@ export function calendarCard(items: TodayItem[], showUnmatched: boolean): string
         return eq || showUnmatched ? (eq ? `<a class="cal-item" href="${href(it)}">${inner}<span class="chev">›</span></a>` : `<div class="cal-item dim">${inner}</div>`) : '';
       })
       .join('');
+    if (showUnmatched && cur && !up) {
+      foot = `<div class="cal-foot"><span class="cal-sub">${esc(cur.title)}</span><button class="link" data-cal-done>Mark Done</button></div>`;
+    }
   }
   const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
-  return `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU</span><button class="link" data-refresh>Refresh</button></div>${body}${err}</section>`;
+  return `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU ${pill}</span><button class="link" data-refresh>Refresh</button></div>${body}${foot}${err}</section>`;
 }
 
 export function wireCalendar(root: HTMLElement, repaint: () => void): () => void {
   const click = (e: Event) => {
-    if ((e.target as HTMLElement).closest('[data-refresh]')) void calendar.refresh();
+    const t = e.target as HTMLElement;
+    if (t.closest('[data-refresh]')) void calendar.refresh();
+    else if (t.closest('[data-cal-done]')) void calendar.markCurrentDone();
+    else if (t.closest('[data-cal-pull]')) void calendar.pullTomorrowToToday();
   };
   root.addEventListener('click', click);
   const off = calendar.changed.on(repaint);
