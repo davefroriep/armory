@@ -615,6 +615,7 @@ function build(root: HTMLElement, id?: string): () => void {
       'Discard workout',
       true,
       'Keep lifting',
+      true,
     );
     if (!sure) return false;
     finishing = true;

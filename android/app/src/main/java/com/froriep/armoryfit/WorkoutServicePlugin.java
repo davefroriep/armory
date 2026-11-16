@@ -6,23 +6,16 @@ import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Bitmap;
-import android.media.AudioAttributes;
-import android.media.AudioFocusRequest;
-import android.media.AudioFormat;
-import android.media.AudioManager;
-import android.media.AudioTrack;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
-import android.os.Handler;
-import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
+import android.provider.Settings;
 import android.util.Base64;
 
 import androidx.activity.result.ActivityResult;
-import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.JSObject;
@@ -34,38 +27,119 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.io.ByteArrayOutputStream;
 
-/** JS bridge: WorkoutService.start / update / stop + camera/DCIM video linking. */
+/** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, chimes + camera/DCIM video linking. */
 @CapacitorPlugin(name = "WorkoutService")
 public class WorkoutServicePlugin extends Plugin {
+    private static volatile WorkoutServicePlugin instance;
+
+    @Override
+    public void load() {
+        instance = this;
+    }
+
+    static void setAppVisible(Context c, boolean visible) {
+        WorkoutForegroundService.appVisible = visible;
+        if (WorkoutForegroundService.running) {
+            Intent i = new Intent(c, WorkoutForegroundService.class)
+                    .setAction(WorkoutForegroundService.ACTION_APP_VISIBILITY);
+            try {
+                c.startService(i);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    static void emitRestSync(String action, long remainingMs, int totalSec) {
+        WorkoutServicePlugin p = instance;
+        if (p == null) return;
+        JSObject ret = new JSObject();
+        ret.put("action", action);
+        ret.put("remainingMs", remainingMs);
+        ret.put("totalSec", totalSec);
+        p.notifyListeners("restSync", ret);
+    }
 
     @PluginMethod
     public void start(PluginCall call) {
         Context c = getContext();
         Intent i = new Intent(c, WorkoutForegroundService.class)
+                .setAction(WorkoutForegroundService.ACTION_START_WORKOUT)
                 .putExtra("title", call.getString("title", "Armory Fit"))
                 .putExtra("text", call.getString("text", "Workout active"));
         ContextCompat.startForegroundService(c, i);
         call.resolve();
     }
 
-    @SuppressLint("MissingPermission")
     @PluginMethod
     public void update(PluginCall call) {
         Context c = getContext();
-        try {
-            WorkoutNotif.ensureChannel(c);
-            NotificationManagerCompat.from(c).notify(
-                    WorkoutNotif.ID,
-                    WorkoutNotif.build(c, call.getString("title", "Armory Fit"), call.getString("text", "")));
-        } catch (SecurityException ignored) {
-            // POST_NOTIFICATIONS not granted: the service still runs, just without live text.
+        Intent i = new Intent(c, WorkoutForegroundService.class)
+                .setAction(WorkoutForegroundService.ACTION_UPDATE_WORKOUT)
+                .putExtra("title", call.getString("title", "Armory Fit"))
+                .putExtra("text", call.getString("text", ""));
+        if (WorkoutForegroundService.running) {
+            c.startService(i);
         }
         call.resolve();
     }
 
     @PluginMethod
     public void stop(PluginCall call) {
-        getContext().stopService(new Intent(getContext(), WorkoutForegroundService.class));
+        Context c = getContext();
+        if (WorkoutForegroundService.running) {
+            c.startService(new Intent(c, WorkoutForegroundService.class).setAction(WorkoutForegroundService.ACTION_STOP_WORKOUT));
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void setRest(PluginCall call) {
+        Context c = getContext();
+        String wavB64 = call.getString("wavBase64", "");
+        if (wavB64 != null && !wavB64.isEmpty()) {
+            WorkoutChime.cacheWav(c, wavB64);
+        }
+        long remainingMs = call.getLong("remainingMs", 90_000L);
+        int totalSec = call.getInt("totalSec", 90);
+        String label = call.getString("label", "");
+        boolean sound = call.getBoolean("sound", true);
+        float vol = call.getDouble("volume", 0.8).floatValue();
+        Intent i = new Intent(c, WorkoutForegroundService.class)
+                .setAction(WorkoutForegroundService.ACTION_REST_SET)
+                .putExtra("remainingMs", remainingMs)
+                .putExtra("totalSec", totalSec)
+                .putExtra("label", label)
+                .putExtra("sound", sound)
+                .putExtra("volume", vol);
+        ContextCompat.startForegroundService(c, i);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void clearRest(PluginCall call) {
+        Context c = getContext();
+        if (WorkoutForegroundService.running) {
+            c.startService(new Intent(c, WorkoutForegroundService.class).setAction(WorkoutForegroundService.ACTION_REST_CLEAR));
+        }
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void canOverlay(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("granted", RestOverlay.canDraw(getContext()));
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void requestOverlayPermission(PluginCall call) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Intent i = new Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getContext().getPackageName()));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+        }
         call.resolve();
     }
 
@@ -209,94 +283,16 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    private AudioTrack activeChime;
-    private Object activeFocusReq;
-    private Runnable activeChimeDone;
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-
-    private void releaseChimeAudio() {
-        if (activeChimeDone != null) {
-            mainHandler.removeCallbacks(activeChimeDone);
-            activeChimeDone = null;
-        }
-        if (activeChime != null) {
-            try {
-                activeChime.stop();
-            } catch (Exception ignored) {
-            }
-            try {
-                activeChime.release();
-            } catch (Exception ignored) {
-            }
-            activeChime = null;
-        }
-        AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
-        if (am != null && activeFocusReq != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activeFocusReq instanceof AudioFocusRequest) {
-                am.abandonAudioFocusRequest((AudioFocusRequest) activeFocusReq);
-            } else if (activeFocusReq instanceof AudioManager.OnAudioFocusChangeListener) {
-                am.abandonAudioFocus((AudioManager.OnAudioFocusChangeListener) activeFocusReq);
-            }
-            activeFocusReq = null;
-        }
-    }
-
-    /** Plays a short PCM alert with transient ducking and releases AudioFocus immediately when done. */
+    /** Plays a short WAV alert with USAGE_MEDIA + transient ducking and abandons AudioFocus right after. */
     @PluginMethod
     public void playChime(PluginCall call) {
-        String b64 = call.getString("pcmBase64", "");
-        int sampleRate = call.getInt("sampleRate", 24000);
-        float vol = Math.max(0f, Math.min(1f, call.getFloat("volume", 0.8f)));
-        if (b64 == null || b64.isEmpty()) {
-            call.resolve();
-            return;
+        String wavB64 = call.getString("wavBase64", "");
+        float vol = call.getDouble("volume", 0.8).floatValue();
+        if (wavB64 == null || wavB64.isEmpty()) {
+            WorkoutChime.playCached(getContext(), vol);
+        } else {
+            WorkoutChime.playBase64(getContext(), wavB64, vol);
         }
-        byte[] pcm = Base64.decode(b64, Base64.DEFAULT);
-        if (pcm.length < 2) {
-            call.resolve();
-            return;
-        }
-        mainHandler.post(() -> {
-            releaseChimeAudio();
-            AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
-            AudioAttributes attrs = new AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build();
-            if (am != null) {
-                AudioManager.OnAudioFocusChangeListener afListener = focusChange -> {};
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                            .setAudioAttributes(attrs)
-                            .setOnAudioFocusChangeListener(afListener)
-                            .build();
-                    am.requestAudioFocus(req);
-                    activeFocusReq = req;
-                } else {
-                    am.requestAudioFocus(afListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
-                    activeFocusReq = afListener;
-                }
-            }
-            AudioFormat fmt = new AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build();
-            AudioTrack track = new AudioTrack(attrs, fmt, pcm.length, AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE);
-            if (track.getState() != AudioTrack.STATE_INITIALIZED) {
-                track.release();
-                releaseChimeAudio();
-                call.resolve();
-                return;
-            }
-            track.write(pcm, 0, pcm.length);
-            track.setVolume(vol);
-            activeChime = track;
-            track.play();
-            long durMs = Math.max(150L, (pcm.length / 2L) * 1000L / Math.max(8000, sampleRate)) + 90L;
-            activeChimeDone = this::releaseChimeAudio;
-            mainHandler.postDelayed(activeChimeDone, durMs);
-            call.resolve();
-        });
+        call.resolve();
     }
 }

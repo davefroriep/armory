@@ -127,7 +127,7 @@ class Audio {
   private alertCleanup: ReturnType<typeof setTimeout> | null = null;
   private silentUrl: string | null = null;
   private wavUrls = new Map<keyof typeof ALERT_SPECS, string>();
-  private pcmB64Cache = new Map<keyof typeof ALERT_SPECS, string>();
+  private wavB64Cache = new Map<keyof typeof ALERT_SPECS, string>();
   volume = 0.8;
 
   private ensureEl(): HTMLAudioElement | null {
@@ -159,11 +159,11 @@ class Audio {
     return u;
   }
 
-  private getPcmB64(kind: keyof typeof ALERT_SPECS): string {
-    let s = this.pcmB64Cache.get(kind);
+  getWavBase64(kind: keyof typeof ALERT_SPECS): string {
+    let s = this.wavB64Cache.get(kind);
     if (!s) {
-      s = bytesToBase64(this.getPcm(kind));
-      this.pcmB64Cache.set(kind, s);
+      s = bytesToBase64(encodeWav(this.getPcm(kind)));
+      this.wavB64Cache.set(kind, s);
     }
     return s;
   }
@@ -227,7 +227,7 @@ class Audio {
 
   private playAlert(kind: keyof typeof ALERT_SPECS): void {
     if (isNative()) {
-      void playNativeChime(this.getPcmB64(kind), ALERT_SAMPLE_RATE, this.volume).then((ok) => {
+      void playNativeChime(this.getWavBase64(kind), this.volume).then((ok) => {
         if (!ok) this.playWebAlert(kind);
       });
       return;

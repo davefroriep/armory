@@ -1,4 +1,6 @@
+import { audio } from '../../audio/audio';
 import { hasKey } from '../../intervals/api';
+import { canShowRestOverlay, isNative, requestRestOverlayPermission } from '../../native/service';
 import { liftSettings, updateLiftSettings, type Unit } from '../../lifts/settings';
 import { lifts, type LiftBackup } from '../../lifts/store';
 import { shareImage } from '../../lifts/share';
@@ -13,7 +15,7 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
   return mount(() => {
     const paint = async (): Promise<void> => {
       const s = liftSettings();
-      const metas = await allMeta();
+      const [metas, overlayOn] = await Promise.all([allMeta(), canShowRestOverlay()]);
       const pending = metas.filter((m) => m.status === 'saved' && m.upload === 'pending').length;
       const vidBytes = [...lifts.videos.values()].reduce((a, v) => a + v.bytes, 0);
       const seg = (name: string, val: string, opts: [string, string][]): string => `<div class="seg" data-seg="${name}">${opts.map(([v, l]) => `<button class="${v === val ? 'on' : ''}" data-v="${v}">${l}</button>`).join('')}</div>`;
@@ -25,7 +27,8 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
             <div class="line"><span>Units</span>${seg('unit', s.unit, [['lb', 'Pounds'], ['kg', 'Kilograms']])}</div>
             <div class="line"><span>Default rest<small>Between sets, unless an exercise has its own</small></span><select class="lf-input sel" id="rest">${[30, 45, 60, 90, 120, 150, 180, 240, 300].map((n) => `<option value="${n}" ${n === s.restSec ? 'selected' : ''}>${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}</option>`).join('')}</select></div>
             <div class="line"><span>Auto-timer<small>Start rest timer automatically when checking a set</small></span>${tog('restAuto', s.restAuto)}</div>
-            <div class="line"><span>Rest-over chime</span>${tog('restSound', s.restSound)}</div>
+            <div class="line"><span>Rest-over chime<small>Ducks music cleanly during 3-ding alert</small></span><div class="row">${tog('restSound', s.restSound)}<button class="btn sm" data-test-chime>Test</button></div></div>
+            ${isNative() ? `<div class="line"><span>Floating timer overlay<small>Top mini-bar over other apps when minimized</small></span><button class="btn sm${overlayOn ? '' : ' primary'}" data-overlay>${overlayOn ? 'Enabled' : 'Enable ›'}</button></div>` : ''}
           </section>
           <h2 class="sec">LIFT VIDEOS</h2>
           <section class="card">
@@ -64,6 +67,8 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
         else updateLiftSettings({ restSound: !liftSettings().restSound });
         return void paint();
       }
+      if (t.closest('[data-test-chime]')) { audio.unlock(); audio.chime(); return; }
+      if (t.closest('[data-overlay]')) { await requestRestOverlayPermission(); return; }
       if (t.closest('[data-retry]')) { const n = await retryPending(); toast(n ? `${n} uploaded` : 'Still offline or key not accepted'); return void paint(); }
       if (t.closest('[data-export]')) {
         const blob = new Blob([JSON.stringify(lifts.exportAll(), null, 1)], { type: 'application/json' });
@@ -86,5 +91,8 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
         toast(`Import failed: ${esc((err as Error).message)}`);
       }
     });
+    const refreshVis = () => { if (!document.hidden) void paint(); };
+    document.addEventListener('visibilitychange', refreshVis);
+    return () => document.removeEventListener('visibilitychange', refreshVis);
   });
 }

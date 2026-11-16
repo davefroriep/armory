@@ -1,7 +1,7 @@
 import { audio, buzz } from '../audio/audio';
 import { Emitter } from '../emitter';
 import { hrFresh, live } from '../ble/telemetry';
-import { isNative, workoutService } from '../native/service';
+import { isNative, onNativeRestSync, workoutService } from '../native/service';
 import { getMeta, getSamples, putMeta } from '../store/db';
 import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
@@ -44,6 +44,8 @@ class ActiveWorkout {
   private lastSvc = 0;
   private booting: Promise<void> | null = null;
   private runToken = 0;
+  private restSyncOff: (() => void) | null = null;
+  private wavCached = false;
 
   get session(): LiftSession | undefined {
     return lifts.active;
@@ -56,6 +58,26 @@ class ActiveWorkout {
 
   /** Call once at app start / when entering the lift tracker: resumes a workout the OS killed (only if started). */
   init(): Promise<void> {
+    this.restSyncOff ??= onNativeRestSync((ev) => {
+      if (ev.action === 'clear') {
+        if (this.rest) {
+          this.rest = null;
+          this.restChanged.emit();
+        }
+        return;
+      }
+      if (ev.action === 'fired') {
+        if (this.rest) this.rest.fired = true;
+        this.restChanged.emit();
+        return;
+      }
+      if (ev.action === 'adjust' && this.rest) {
+        this.rest.endMs = Date.now() + ev.remainingMs;
+        this.rest.totalSec = ev.totalSec;
+        this.rest.fired = ev.remainingMs <= 0;
+        this.restChanged.emit();
+      }
+    });
     this.booting ??= (async () => {
       await lifts.ready;
       const s = lifts.active;
@@ -143,8 +165,10 @@ class ActiveWorkout {
     const r = this.rest;
     if (r && !r.fired && Date.now() >= r.endMs) {
       r.fired = true;
-      if (liftSettings().restSound) { audio.unlock(); audio.chime(); }
-      buzz([220, 90, 220]);
+      if (!isNative()) {
+        if (liftSettings().restSound) { audio.unlock(); audio.chime(); }
+        buzz([220, 90, 220]);
+      }
     }
     if (Date.now() - this.lastSvc > 5000) {
       this.lastSvc = Date.now();
@@ -168,8 +192,28 @@ class ActiveWorkout {
     return effectiveRestAuto(s.exs, i, lifts.row(se.exId)?.restAuto, liftSettings().restAuto);
   }
 
+  private syncNativeRest(): void {
+    if (!isNative()) return;
+    const r = this.rest;
+    if (!r) {
+      void workoutService.clearRest();
+      return;
+    }
+    const wav = this.wavCached ? undefined : audio.getWavBase64('chime');
+    this.wavCached = true;
+    void workoutService.setRest({
+      remainingMs: r.endMs - Date.now(),
+      totalSec: r.totalSec,
+      label: r.label,
+      sound: liftSettings().restSound,
+      volume: audio.volume,
+      ...(wav ? { wavBase64: wav } : {}),
+    });
+  }
+
   startRest(sec: number, label: string): void {
     this.rest = { endMs: Date.now() + sec * 1000, totalSec: sec, label, fired: false };
+    this.syncNativeRest();
     this.restChanged.emit();
   }
 
@@ -179,11 +223,13 @@ class ActiveWorkout {
     r.endMs += deltaSec * 1000;
     r.totalSec = Math.max(5, r.totalSec + deltaSec);
     r.fired = Date.now() >= r.endMs;
+    this.syncNativeRest();
     this.restChanged.emit();
   }
 
   clearRest(): void {
     this.rest = null;
+    this.syncNativeRest();
     this.restChanged.emit();
   }
 
@@ -246,6 +292,7 @@ class ActiveWorkout {
     document.removeEventListener('visibilitychange', this.onVis);
     void this.lock?.release().catch(() => {});
     this.lock = null;
+    if (isNative()) void workoutService.clearRest();
     void workoutService.stop();
     this.restChanged.emit();
     this.tick.emit();

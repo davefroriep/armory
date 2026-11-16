@@ -94,13 +94,13 @@ export function actionSheet(title: string, items: { key: string; label: string; 
   });
 }
 
-export function confirmSheet(title: string, text: string, ok: string, danger = false, cancel = 'Cancel'): Promise<boolean> {
+export function confirmSheet(title: string, text: string, ok: string, danger = false, cancel = 'Cancel', flip = false): Promise<boolean> {
   return new Promise((resolve) => {
     let yes = false;
+    const yesBtn = `<button class="btn ${danger ? 'danger' : 'primary'} big" data-y="1">${esc(ok)}</button>`;
+    const noBtn = `<button class="btn big" data-y="0">${esc(cancel)}</button>`;
     const sh = openSheet(
-      `<h3 class="sh-title">${esc(title)}</h3>${text ? `<p class="sh-text">${esc(text)}</p>` : ''}
-       <button class="btn ${danger ? 'danger' : 'primary'} big" data-y="1">${esc(ok)}</button>
-       <button class="btn big" data-y="0">${esc(cancel)}</button>`,
+      `<h3 class="sh-title">${esc(title)}</h3>${text ? `<p class="sh-text">${esc(text)}</p>` : ''}${flip ? noBtn + yesBtn : yesBtn + noBtn}`,
       { onClose: () => resolve(yes) },
     );
     sh.body.addEventListener('click', (e) => {

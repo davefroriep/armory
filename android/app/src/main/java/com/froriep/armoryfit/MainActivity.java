@@ -17,4 +17,16 @@ public class MainActivity extends BridgeActivity {
             requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 1001);
         }
     }
+
+    @Override
+    public void onStart() {
+        super.onStart();
+        WorkoutServicePlugin.setAppVisible(this, true);
+    }
+
+    @Override
+    public void onStop() {
+        WorkoutServicePlugin.setAppVisible(this, false);
+        super.onStop();
+    }
 }
