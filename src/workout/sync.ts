@@ -5,12 +5,20 @@ import { getSettings } from '../store/settings';
 import { calendar } from '../intervals/calendar';
 import { allMeta, deleteWorkout, getSamples, putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
+import { syncLiftWorkout } from '../lifts/intervals';
+import { lifts } from '../lifts/store';
 
 /**
  * Uploads a saved workout to Intervals.icu. Two idempotent steps (TCX upload, then RPE/type patch)
  * so a failure at either one is retried later without duplicating the activity.
  */
 export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
+  // Lift-tracker sessions carry a full set-by-set log: they have their own (HR or manual) upload path.
+  if (meta.equipment === 'strength') {
+    await lifts.ready;
+    const lift = lifts.sessions.get(meta.id);
+    if (lift) return syncLiftWorkout(meta, lift);
+  }
   const m = { ...meta };
   try {
     if (!m.activityId) {

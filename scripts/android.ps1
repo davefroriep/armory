@@ -17,11 +17,15 @@ if ($LASTEXITCODE) { throw 'web build failed' }
 npx cap sync android
 if ($LASTEXITCODE) { throw 'cap sync failed' }
 
+$buildRoot = ($env:LOCALAPPDATA -replace '\\', '/') + '/armory-fit-build'
 Push-Location android
-.\gradlew.bat assembleDebug --console=plain
+.\gradlew.bat assembleDebug --console=plain "-ParmoryBuildRoot=$buildRoot"
 if ($LASTEXITCODE) { Pop-Location; throw 'gradle failed' }
 Pop-Location
 
+$builtApk = Join-Path $env:LOCALAPPDATA 'armory-fit-build\app\outputs\apk\debug\app-debug.apk'
 $apk = 'android\app\build\outputs\apk\debug\app-debug.apk'
+New-Item -ItemType Directory -Force -Path (Split-Path $apk) | Out-Null
+Copy-Item -Force $builtApk $apk
 Write-Host "APK: $((Resolve-Path $apk).Path)"
-if ($Install) { adb install -r $apk }
+if ($Install) { & "$env:ANDROID_HOME\platform-tools\adb.exe" install -r $apk }

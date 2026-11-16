@@ -7,11 +7,19 @@ let dbp: Promise<IDBDatabase> | null = null;
 function open(): Promise<IDBDatabase> {
   if (dbp) return dbp;
   dbp = new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
-      db.createObjectStore('workouts_meta', { keyPath: 'id' });
-      db.createObjectStore('workout_samples', { keyPath: ['id', 't'] });
+      const mk = (name: string, opts: IDBObjectStoreParameters): void => {
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, opts);
+      };
+      mk('workouts_meta', { keyPath: 'id' });
+      mk('workout_samples', { keyPath: ['id', 't'] });
+      // v2: lift tracker
+      mk('lift_sessions', { keyPath: 'id' });
+      mk('lift_routines', { keyPath: 'id' });
+      mk('lift_ex', { keyPath: 'id' });
+      mk('lift_videos', { keyPath: 'id' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -64,4 +72,43 @@ export async function deleteWorkout(id: string): Promise<void> {
     t.oncomplete = () => res();
     t.onerror = () => rej(t.error);
   });
+}
+
+// ---------- generic helpers (lift tracker stores) ----------
+export type LiftStoreName = 'lift_sessions' | 'lift_routines' | 'lift_ex' | 'lift_videos';
+
+async function done(t: IDBTransaction): Promise<void> {
+  await new Promise<void>((res, rej) => {
+    t.oncomplete = () => res();
+    t.onerror = () => rej(t.error);
+    t.onabort = () => rej(t.error);
+  });
+}
+
+export async function idbPut<T>(store: LiftStoreName, value: T): Promise<void> {
+  const t = await tx([store], 'readwrite');
+  t.objectStore(store).put(value);
+  await done(t);
+}
+
+export async function idbPutMany<T>(store: LiftStoreName, values: T[]): Promise<void> {
+  const t = await tx([store], 'readwrite');
+  for (const v of values) t.objectStore(store).put(v);
+  await done(t);
+}
+
+export async function idbGet<T>(store: LiftStoreName, key: string): Promise<T | undefined> {
+  const t = await tx([store], 'readonly');
+  return wrap(t.objectStore(store).get(key));
+}
+
+export async function idbAll<T>(store: LiftStoreName): Promise<T[]> {
+  const t = await tx([store], 'readonly');
+  return wrap(t.objectStore(store).getAll());
+}
+
+export async function idbDelete(store: LiftStoreName, key: string): Promise<void> {
+  const t = await tx([store], 'readwrite');
+  t.objectStore(store).delete(key);
+  await done(t);
 }

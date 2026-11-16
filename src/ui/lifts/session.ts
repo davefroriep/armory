@@ -1,0 +1,525 @@
+import { buzz } from '../../audio/audio';
+import { active } from '../../lifts/active';
+import { computePRs } from '../../lifts/calc';
+import {
+  addSet, buildExercise, deleteSet, editReps, editWeight, hasLogged, labels, prevSetFor, removeLastSet,
+  swapExercise, toggleDone, unloggedCount,
+} from '../../lifts/logic';
+import { MUSCLE_LABEL } from '../../lifts/muscles';
+import { fmtKg, fmtNum, fromDisplay, liftSettings, stepsFor } from '../../lifts/settings';
+import { lifts } from '../../lifts/store';
+import { resyncSession } from '../../lifts/intervals';
+import { setText } from '../../lifts/summary';
+import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
+import { wireChips } from '../chrome';
+import { $, esc } from '../dom';
+import { clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
+import { pickExercises } from './picker';
+import { attachVideo, playVideo, recordVideo } from './video';
+
+const KIND_LABEL: Record<SetKind, string> = { n: 'Normal', w: 'Warm-up', d: 'Drop set', f: 'To failure' };
+const KIND_CHAR: Record<SetKind, string> = { n: '', w: 'W', d: 'D', f: 'F' };
+const RPES = [6, 7, 7.5, 8, 8.5, 9, 9.5, 10];
+
+const num = (v: string): number | null => {
+  const n = parseFloat(v.replace(',', '.'));
+  return Number.isFinite(n) && n >= 0 ? n : null;
+};
+
+export function sessionScreen(root: HTMLElement, args: string[]): () => void {
+  return mount(() => build(root, args[0]));
+}
+
+function build(root: HTMLElement, id?: string): () => void {
+  const s: LiftSession | undefined = id ? lifts.sessions.get(id) : lifts.active;
+  if (!s) {
+    location.replace('#/strength');
+    return () => {};
+  }
+  const edit = s.status === 'done';
+  const exOf = lifts.exOrStub;
+  const unit = (): 'lb' | 'kg' => liftSettings().unit;
+  let dirty = false;
+  let finishing = false;
+  let hits = new Map<string, { n: number; kg: number }>();
+  const prevCache = new Map<string, SessionEx | null>();
+  const prevOf = (se: SessionEx): SessionEx | null => {
+    if (!prevCache.has(se.exId)) prevCache.set(se.exId, lifts.previous(se.exId, s.startMs, s.id));
+    return prevCache.get(se.exId)!;
+  };
+  const recomputePRs = (): void => {
+    hits = edit
+      ? lifts.prs()
+      : computePRs([...lifts.finished().filter((x) => x.id !== s.id), { ...s, status: 'done' as const, startMs: Date.now() + 1 }], exOf);
+  };
+  const save = (): void => { dirty = true; lifts.saveSession(s); };
+  const find = (uid: string): SessionEx => s.exs.find((e) => e.uid === uid)!;
+
+  // ---------- render ----------
+  const rowHtml = (se: SessionEx, ex: Exercise, i: number, labelMap: number[]): string => {
+    const set = se.sets[i];
+    const prev = prevSetFor(prevOf(se), se, i);
+    const kind = KIND_CHAR[set.kind] || String(labelMap[i]);
+    const pr = set.done && hits.has(set.id);
+    const wShow = set.w != null ? fmtKg(set.w) : '';
+    const hasVid = !!set.vids?.length;
+    const rpeTag = set.rpe != null ? `<u class="srpe">@${set.rpe}</u>` : '';
+    const dot = hasVid ? '<i class="vdot"></i>' : set.note ? '<i class="ndot"></i>' : '';
+    return `<div class="srow${set.done ? ' done' : ''}${set.kind !== 'n' ? ' k-' + set.kind : ''}" data-i="${i}" data-sid="${set.id}">
+      <button class="snum${set.rpe != null ? ' has-rpe' : ''}" data-act="setmenu" aria-label="Set options">${kind}${pr ? '<i class="prstar">★</i>' : ''}${rpeTag}${dot}</button>
+      <button class="sprev" data-act="usePrev" ${prev ? '' : 'disabled'}>${prev ? esc(setText(prev, ex, unit())) : '–'}</button>
+      <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '0' : 'BW'}" aria-label="Weight">
+      <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${ex.type === 'time' ? 'sec' : '0'}" aria-label="${ex.type === 'time' ? 'Seconds' : 'Reps'}">
+      <button class="schk${set.done ? ' on' : ''}" data-act="done" aria-label="Log set">✓</button>
+    </div>`;
+  };
+
+  const cardHtml = (se: SessionEx, idx: number, labs: string[]): string => {
+    const ex = exOf(se.exId);
+    let w = 0;
+    const labelMap = se.sets.map((x) => (x.kind === 'w' ? 0 : ++w));
+    const note = lifts.row(se.exId)?.note;
+    const wHead = ex.type === 'bodyweight' ? `+${unit().toUpperCase()}` : unit().toUpperCase();
+    const rHead = ex.type === 'time' ? 'SEC' : 'REPS';
+    return `<section class="xcard${se.ss ? ' ss' : ''}" data-uid="${se.uid}">
+      <div class="xhead">
+        <span class="xlab">${labs[idx]}</span>
+        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · ')}</small></button>
+        <button class="xmore" data-act="exmenu" aria-label="Exercise options">⋯</button>
+      </div>
+      ${note ? `<button class="xnote" data-act="exnote">${esc(note)}</button>` : ''}
+      <div class="xth"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span><span></span></div>
+      <div class="xrows">${se.sets.map((_, i) => rowHtml(se, ex, i, labelMap)).join('')}</div>
+      <div class="xfoot">
+        <button class="stp" data-act="rmset" aria-label="Remove set">−</button><span>SET</span><button class="stp" data-act="addset" aria-label="Add set">+</button>
+        <em class="xrest" data-act="restpick">${active.restSecFor(se) ? `Rest ${clock(active.restSecFor(se))}` : ''}</em>
+      </div>
+    </section>`;
+  };
+
+  const header = (): string => {
+    const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
+    return `<header class="bar sbar">
+      <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
+      <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
+      <div class="chips"><button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
+    </header>`;
+  };
+
+  const paint = (): void => {
+    recomputePRs();
+    prevCache.clear();
+    const labs = labels(s.exs);
+    root.innerHTML = `${header()}
+      <main class="page lsession">
+        ${s.exs.map((se, i) => cardHtml(se, i, labs)).join('') || '<div class="empty big">No exercises yet.<br>Add your first one below.</div>'}
+        <button class="btn big addex" data-act="addex">+ Add exercise</button>
+        ${edit ? '<button class="btn primary big" data-act="finish">Done</button>' : '<button class="btn primary big" data-act="finish">Finish workout</button>'}
+      </main>
+      <div class="restbar" id="restbar" hidden><i class="rb-fill"></i><span class="rb-lab"></span><b class="rb-time"></b><button data-rest="-15">−15</button><button data-rest="15">+15</button><button data-rest="0">Skip</button></div>
+      <div class="dock" id="dock" hidden></div>`;
+    paintRest();
+    paintClock();
+  };
+
+  // ---------- targeted refresh (never touches the focused input) ----------
+  const syncCard = (card: HTMLElement): void => {
+    const se = find(card.dataset.uid!);
+    const ex = exOf(se.exId);
+    card.querySelectorAll<HTMLElement>('.srow').forEach((row) => {
+      const i = Number(row.dataset.i);
+      const set = se.sets[i];
+      if (!set) return;
+      row.classList.toggle('done', set.done);
+      row.querySelector('.schk')!.classList.toggle('on', set.done);
+      const w = row.querySelector<HTMLInputElement>('.sw')!;
+      const r = row.querySelector<HTMLInputElement>('.sr')!;
+      if (document.activeElement !== w) w.value = set.w != null ? fmtKg(set.w) : '';
+      if (document.activeElement !== r) r.value = set.r != null ? String(set.r) : '';
+      w.classList.toggle('auto', !!set.wAuto);
+      r.classList.toggle('auto', !!set.rAuto);
+      const star = row.querySelector('.prstar');
+      const pr = set.done && hits.has(set.id);
+      if (pr && !star) row.querySelector('.snum')!.insertAdjacentHTML('beforeend', '<i class="prstar">★</i>');
+      if (!pr && star) star.remove();
+    });
+    void ex;
+  };
+
+  // ---------- clock + rest ----------
+  const paintClock = (): void => {
+    if (!edit) root.querySelectorAll<HTMLElement>('[data-clock]').forEach((e) => { e.textContent = clock(active.elapsedSec()); });
+  };
+  const paintRest = (): void => {
+    const bar = root.querySelector<HTMLElement>('#restbar');
+    if (!bar) return;
+    const r = active.rest;
+    bar.hidden = !r || edit;
+    if (!r) return;
+    const left = (r.endMs - Date.now()) / 1000;
+    bar.classList.toggle('over', left <= 0);
+    bar.querySelector('.rb-lab')!.textContent = left > 0 ? 'REST' : 'GO';
+    bar.querySelector('.rb-time')!.textContent = left > 0 ? clock(Math.ceil(left)) : `+${clock(-left)}`;
+    (bar.querySelector('.rb-fill') as HTMLElement).style.width = `${Math.max(0, Math.min(100, (1 - left / r.totalSec) * 100))}%`;
+  };
+  const offTick = active.tick.on(() => { paintClock(); paintRest(); });
+  const offRest = active.restChanged.on(paintRest);
+  const offChips = wireChips(root);
+  // another screen/tab finished or deleted this workout
+  const offStore = lifts.changed.on(() => {
+    if (finishing) return;
+    if (!lifts.sessions.has(s.id)) location.replace('#/strength');
+    else if (!edit && lifts.sessions.get(s.id)!.status === 'done' && location.hash.startsWith('#/strength/session')) location.replace(`#/strength/summary/${s.id}`);
+  });
+
+  // ---------- dock (steppers above the keyboard) ----------
+  let focused: HTMLInputElement | null = null;
+  const dock = (): HTMLElement => $('#dock', root);
+  const showDock = (inp: HTMLInputElement): void => {
+    focused = inp;
+    const isW = inp.classList.contains('sw');
+    const isTime = !isW && exOf(rowOf(inp).se.exId).type === 'time';
+    const steps = isW ? stepsFor() : isTime ? [-15, -5, 5, 15] : [-2, -1, 1, 2];
+    dock().innerHTML = `${steps.map((v) => `<button class="dk" data-step="${v}">${v > 0 ? '+' : '−'}${fmtNum(Math.abs(v))}</button>`).join('')}<button class="dk log" data-dock="log">LOG ✓</button>`;
+    dock().hidden = false;
+    document.body.classList.add('dock-open');
+  };
+  const hideDock = (): void => {
+    dock().hidden = true;
+    document.body.classList.remove('dock-open');
+    focused = null;
+  };
+  const rowOf = (el: Element): { card: HTMLElement; row: HTMLElement; se: SessionEx; i: number } => {
+    const row = el.closest<HTMLElement>('.srow')!;
+    const card = el.closest<HTMLElement>('.xcard')!;
+    return { card, row, se: find(card.dataset.uid!), i: Number(row.dataset.i) };
+  };
+
+  root.addEventListener('focusin', (e) => {
+    const t = e.target as HTMLElement;
+    if (!(t instanceof HTMLInputElement) || !t.closest('.srow')) return;
+    showDock(t);
+    setTimeout(() => { t.select(); t.scrollIntoView({ block: 'center', behavior: 'smooth' }); }, 60);
+  });
+  root.addEventListener('focusout', () => {
+    setTimeout(() => { if (!(document.activeElement instanceof HTMLInputElement && document.activeElement.closest('.srow'))) hideDock(); }, 120);
+  });
+  root.addEventListener('input', (e) => {
+    const t = e.target as HTMLInputElement;
+    if (!t.closest?.('.srow')) return;
+    const { card, se, i } = rowOf(t);
+    const v = num(t.value);
+    if (t.classList.contains('sw')) editWeight(se, i, v == null ? null : fromDisplay(v));
+    else editReps(se, i, v == null ? null : Math.round(v));
+    t.classList.remove('auto');
+    syncCard(card);
+    save();
+  });
+  root.addEventListener('keydown', (e) => {
+    const t = e.target as HTMLInputElement;
+    if (e.key !== 'Enter' || !t.closest?.('.srow')) return;
+    e.preventDefault();
+    const inputs = [...root.querySelectorAll<HTMLInputElement>('.srow input')];
+    const nxt = inputs[inputs.indexOf(t) + 1];
+    if (nxt) nxt.focus(); else t.blur();
+  });
+  // keep focus in the field while tapping the dock
+  root.addEventListener('pointerdown', (e) => { if ((e.target as HTMLElement).closest('.dock')) e.preventDefault(); });
+
+  const logSet = (card: HTMLElement, row: HTMLElement, fromDock: boolean): void => {
+    const { se, i } = rowOf(row);
+    const idx = s.exs.indexOf(se);
+    const ex = exOf(se.exId);
+    const set = se.sets[i];
+    const was = set.done;
+    const r = toggleDone(se, i, ex);
+    if (r === null) {
+      row.classList.remove('shake'); void row.offsetWidth; row.classList.add('shake');
+      buzz(40);
+      row.querySelector<HTMLInputElement>(!set.r || set.r < 1 ? '.sr' : '.sw')?.focus();
+      return;
+    }
+    if (r && !was) {
+      recomputePRs();
+      const h = hits.get(set.id);
+      if (!edit) active.afterSetLogged(s, idx);
+      if (h) {
+        const prW = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit()}`;
+        toast(`New ${h.n}RM PR · ${prW}`, { kind: 'pr', ms: 3200 });
+        buzz([60, 40, 60, 40, 120]);
+      } else buzz(25);
+    } else recomputePRs();
+    syncCard(card);
+    save();
+    if (r && fromDock) {
+      const next = card.querySelectorAll<HTMLElement>('.srow')[i + 1];
+      const nxtW = next && !se.sets[i + 1].done ? next.querySelector<HTMLInputElement>('.sw') : null;
+      if (nxtW) nxtW.focus(); else (document.activeElement as HTMLElement | null)?.blur();
+    }
+  };
+
+  // ---------- actions ----------
+  const snapshot = (): string => JSON.stringify(s.exs);
+  const restore = (snap: string): void => { s.exs = JSON.parse(snap); save(); paint(); };
+  const defaultSets = (ex: Exercise): number => (ex.type === 'time' ? 2 : 3);
+
+  const exMenu = async (se: SessionEx): Promise<void> => {
+    const ex = exOf(se.exId);
+    const idx = s.exs.indexOf(se);
+    const k = await actionSheet(ex.name, [
+      { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
+      { key: 'note', label: lifts.row(se.exId)?.note ? 'Edit note' : 'Add note', sub: 'Sticks to the exercise (seat height, handle…)' },
+      ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
+      { key: 'rest', label: 'Rest timer', sub: `${clock(active.restSecFor(se))} for this exercise` },
+      ...(idx > 0 ? [{ key: 'up', label: 'Move up' }] : []),
+      ...(idx < s.exs.length - 1 ? [{ key: 'down', label: 'Move down' }] : []),
+      { key: 'records', label: 'Records & history' },
+      { key: 'remove', label: 'Remove exercise', danger: true },
+    ]);
+    if (!k) return;
+    if (k === 'swap') await swap(se);
+    else if (k === 'note') await editNote(se);
+    else if (k === 'ss') { se.ss = !se.ss; save(); paint(); }
+    else if (k === 'rest') await pickRest(se);
+    else if (k === 'up' || k === 'down') {
+      const j = k === 'up' ? idx - 1 : idx + 1;
+      [s.exs[idx], s.exs[j]] = [s.exs[j], s.exs[idx]];
+      s.exs.forEach((e, n) => { if (n === s.exs.length - 1) delete e.ss; });
+      save(); paint();
+    } else if (k === 'records') location.hash = `#/strength/exercise/${se.exId}`;
+    else if (k === 'remove') {
+      const snap = snapshot();
+      s.exs.splice(idx, 1);
+      if (s.exs.length) delete s.exs[s.exs.length - 1].ss;
+      save(); paint();
+      toast(`${ex.name} removed`, { undo: () => restore(snap) });
+    }
+  };
+
+  const editNote = async (se: SessionEx): Promise<void> => {
+    const cur = lifts.row(se.exId)?.note ?? '';
+    const v = await promptSheet(`${exOf(se.exId).name} note`, cur, 'Seat 4, neutral handles, pin 7…', true);
+    if (v == null) return;
+    await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), note: v || undefined });
+    paint();
+  };
+
+  const pickRest = async (se: SessionEx): Promise<void> => {
+    const cur = active.restSecFor(se);
+    const opts = [30, 45, 60, 90, 120, 150, 180, 240, 300];
+    const items = [
+      ...(!edit ? [{ key: 'now', label: 'Start rest timer now', sub: clock(cur) }] : []),
+      ...opts.map((o) => ({ key: String(o), label: clock(o), on: o === cur })),
+    ];
+    const k = await actionSheet('Rest timer', items);
+    if (!k) return;
+    if (k === 'now') { active.startRest(cur, exOf(se.exId).name); return; }
+    await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), restSec: Number(k) });
+    paint();
+  };
+
+  /** Swap with scope: just today / this repeating day / everywhere. */
+  const swap = async (se: SessionEx): Promise<void> => {
+    const cur = exOf(se.exId);
+    const [pick] = await pickExercises({ mode: 'swap', current: cur });
+    if (!pick || pick.id === cur.id) return;
+    const routine = s.routineId ? lifts.routines.get(s.routineId) : undefined;
+    const rIdx = routine ? (se.slot != null && routine.items[se.slot] ? se.slot : routine.items.findIndex((it) => it.exId === cur.id)) : -1;
+    const scopes = [
+      { key: 'today', label: 'Just today', sub: 'This workout only' },
+      ...(routine && !edit && rIdx >= 0 ? [{ key: 'day', label: `This day · ${routine.name}`, sub: `Every ${routine.name} from now on` }] : []),
+      ...(!edit ? [{ key: 'all', label: 'Everywhere', sub: 'Every day that uses it' }] : []),
+    ];
+    const scope = edit ? 'today' : await actionSheet(`${cur.name} → ${pick.name}`, scopes);
+    if (!scope) return;
+    if (hasLogged(se) && !(await confirmSheet('Clear logged sets?', `${cur.name} has logged sets. Swapping resets them.`, 'Swap anyway', true))) return;
+    swapExercise(se, pick.id, lifts.previous(pick.id, s.startMs, s.id));
+    if (scope === 'day' && routine && rIdx >= 0) {
+      routine.items = routine.items.map((it, n) => (n === rIdx ? { ...it, exId: pick.id } : it));
+      await lifts.saveRoutine({ ...routine });
+      toast(`${routine.name} now uses ${pick.name}`);
+    } else if (scope === 'all') {
+      const n = await lifts.replaceEverywhere(cur.id, pick.id);
+      toast(`${pick.name} replaces ${cur.name} in ${n} day${n === 1 ? '' : 's'}`);
+    }
+    save(); paint();
+  };
+
+  const addEx = async (): Promise<void> => {
+    const picks = await pickExercises({ mode: 'add' });
+    if (!picks.length) return;
+    if (s.exs.length) delete s.exs[s.exs.length - 1].ss;
+    for (const ex of picks) s.exs.push(buildExercise(ex.id, defaultSets(ex), lifts.previous(ex.id, s.startMs, s.id)));
+    save(); paint();
+    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
+  };
+
+  const setSheet = async (se: SessionEx, i: number): Promise<void> => {
+    const set = se.sets[i];
+    const ex = exOf(se.exId);
+    const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
+    const vids = (): string => (set.vids ?? []).map((v) => lifts.videos.get(v)).filter(Boolean)
+      .map((v) => `<button class="vthumb" data-play="${v!.id}" style="background-image:url(${v!.thumb})"><i>▶</i></button>`).join('');
+    let sh!: Sheet;
+    let resolveClosed: () => void = () => {};
+    const closed = new Promise<void>((res) => { resolveClosed = res; });
+    sh = openSheet(`
+      <h3 class="sh-title">${esc(ex.name)} · ${set.kind === 'w' ? 'Warm-up' : `Set ${n}`}</h3>
+      <div class="fl">SET TYPE</div><div class="seg" id="sk"></div>
+      <div class="fl">EFFORT <small>RPE</small></div><div class="chips-row wrap" id="sr"></div>
+      <div class="fl">NOTE</div><input class="lf-input" id="sn" value="${esc(set.note ?? '')}" placeholder="Optional" autocomplete="off">
+      <div class="fl">VIDEO</div>
+      <div class="vrow"><div id="sv" class="vthumbs">${vids()}</div></div>
+      <div class="row2"><button class="btn" data-vrec>${'● Record'}</button><button class="btn" data-vatt>Attach</button></div>
+      <button class="btn danger big" data-del ${se.sets.length <= 1 ? 'disabled' : ''}>Delete set</button>
+      <button class="btn primary big" data-ok>Done</button>`, { onClose: resolveClosed });
+    const q = (x: string): HTMLElement => sh.body.querySelector<HTMLElement>(x)!;
+    const draw = (): void => {
+      q('#sk').innerHTML = (['n', 'w', 'd', 'f'] as SetKind[]).map((k) => `<button class="${set.kind === k ? 'on' : ''}" data-k="${k}">${KIND_LABEL[k]}</button>`).join('');
+      q('#sr').innerHTML = RPES.map((r) => `<button class="fchip${set.rpe === r ? ' on' : ''}" data-r="${r}">${r}</button>`).join('') + `<button class="fchip${set.rpe == null ? ' on' : ''}" data-r="0">–</button>`;
+      q('#sv').innerHTML = vids();
+    };
+    draw();
+    sh.body.addEventListener('click', async (e) => {
+      const t = e.target as HTMLElement;
+      const k = t.closest<HTMLElement>('[data-k]');
+      const r = t.closest<HTMLElement>('[data-r]');
+      const p = t.closest<HTMLElement>('[data-play]');
+      if (k) { set.kind = k.dataset.k as SetKind; draw(); }
+      else if (r) { const v = Number(r.dataset.r); if (v) set.rpe = v; else delete set.rpe; draw(); }
+      else if (p) await playVideo(p.dataset.play!);
+      else if (t.closest('[data-vrec]')) {
+        sh.el.style.visibility = 'hidden';
+        const meta = await recordVideo({ session: s, se, set });
+        sh.el.style.visibility = '';
+        if (meta) { draw(); toast('Video linked to this set'); }
+      } else if (t.closest('[data-vatt]')) {
+        const meta = await attachVideo({ session: s, se, set });
+        if (meta) { draw(); toast('Video linked to this set'); }
+      } else if (t.closest('[data-del]')) {
+        const snap = snapshot();
+        deleteSet(se, i);
+        sh.close();
+        save(); paint();
+        toast('Set deleted', { undo: () => restore(snap) });
+      } else if (t.closest('[data-ok]')) sh.close();
+    });
+    await closed;
+    const note = (sh.body.querySelector<HTMLInputElement>('#sn')?.value ?? set.note ?? '').trim();
+    if (note) set.note = note; else delete set.note;
+    save(); paint();
+  };
+
+  const finish = async (): Promise<void> => {
+    if (edit) { location.hash = `#/strength/workout/${s.id}`; return; }
+    if (!s.exs.some(hasLogged)) {
+      if (await confirmSheet('Nothing logged', 'No sets are logged yet. Discard this workout?', 'Discard workout', true, 'Keep lifting')) {
+        await active.discard();
+        location.hash = '#/strength';
+      }
+      return;
+    }
+    const left = unloggedCount(s);
+    const ok = await confirmSheet(
+      'Finish workout?',
+      left ? `${left} set${left === 1 ? ' isn’t' : 's aren’t'} logged and will be dropped. It uploads to Intervals.icu automatically.` : 'It uploads to Intervals.icu automatically.',
+      'Finish & save', false, 'Keep lifting',
+    );
+    if (!ok) return;
+    finishing = true;
+    const done = await active.finish();
+    location.replace(done ? `#/strength/summary/${done.session.id}` : '#/strength');
+  };
+
+  const wkMenu = async (): Promise<void> => {
+    const k = await actionSheet(s.name, [
+      { key: 'rename', label: 'Rename workout' },
+      { key: 'note', label: s.note ? 'Edit workout note' : 'Add workout note' },
+      { key: 'del', label: edit ? 'Delete workout' : 'Discard workout', danger: true },
+    ]);
+    if (k === 'rename') await rename();
+    else if (k === 'note') {
+      const v = await promptSheet('Workout note', s.note ?? '', 'How it felt…', true);
+      if (v != null) { if (v) s.note = v; else delete s.note; save(); }
+    } else if (k === 'del') {
+      if (!(await confirmSheet(edit ? 'Delete workout?' : 'Discard workout?', edit ? 'Removes it from history (not from Intervals.icu).' : 'Everything logged so far is lost.', edit ? 'Delete' : 'Discard', true))) return;
+      if (edit) { await lifts.deleteSession(s.id); location.hash = '#/strength/history'; }
+      else { await active.discard(); location.hash = '#/strength'; }
+    }
+  };
+  const rename = async (): Promise<void> => {
+    const v = await promptSheet('Workout name', s.name);
+    if (v) { s.name = v; save(); const b = root.querySelector('.stitle b'); if (b) b.textContent = v; }
+  };
+
+  root.addEventListener('click', async (e) => {
+    const t = e.target as HTMLElement;
+    const step = t.closest<HTMLElement>('[data-step]');
+    if (step && focused) {
+      const isW = focused.classList.contains('sw');
+      const cur = num(focused.value) ?? 0;
+      const nv = Math.max(0, Math.round((cur + Number(step.dataset.step)) * 100) / 100);
+      focused.value = fmtNum(isW ? nv : Math.round(nv));
+      focused.dispatchEvent(new Event('input', { bubbles: true }));
+      focused.select?.();
+      return;
+    }
+    if (t.closest('[data-dock="log"]') && focused) {
+      const row = focused.closest<HTMLElement>('.srow')!;
+      logSet(row.closest<HTMLElement>('.xcard')!, row, true);
+      return;
+    }
+    const rest = t.closest<HTMLElement>('[data-rest]');
+    if (rest) {
+      const v = Number(rest.dataset.rest);
+      if (v === 0) active.clearRest(); else active.adjustRest(v);
+      return;
+    }
+    const a = t.closest<HTMLElement>('[data-act]');
+    if (!a) return;
+    const act = a.dataset.act!;
+    if (act === 'addex') return void (await addEx());
+    if (act === 'finish') return void (await finish());
+    if (act === 'rename') return void (await rename());
+    if (act === 'wkmenu') return void (await wkMenu());
+    const card = a.closest<HTMLElement>('.xcard');
+    if (!card) return;
+    const se = find(card.dataset.uid!);
+    if (act === 'exmenu') return void (await exMenu(se));
+    if (act === 'exnote') return void (await editNote(se));
+    if (act === 'restpick') return void (await pickRest(se));
+    if (act === 'addset') {
+      addSet(se, lifts.previous(se.exId, s.startMs, s.id));
+      save(); paint();
+      return;
+    }
+    if (act === 'rmset') {
+      const snap = snapshot();
+      if (!removeLastSet(se)) return void toast('A card needs at least one set');
+      save(); paint();
+      toast('Set removed', { undo: () => restore(snap) });
+      return;
+    }
+    const row = a.closest<HTMLElement>('.srow')!;
+    const i = Number(row.dataset.i);
+    if (act === 'done') return logSet(card, row, false);
+    if (act === 'setmenu') return void (await setSheet(se, i));
+    if (act === 'usePrev') {
+      const p = prevSetFor(prevOf(se), se, i);
+      if (!p) return;
+      se.sets[i].w = p.w; se.sets[i].r = p.r;
+      se.sets[i].wAuto = false; se.sets[i].rAuto = false;
+      syncCard(card); save();
+    }
+  });
+
+  paint();
+  if (!edit && s.exs.length === 0) void addEx();
+
+  return () => {
+    offTick(); offRest(); offChips(); offStore();
+    hideDock();
+    void lifts.flush();
+    if (edit && dirty) void resyncSession(s.id);
+  };
+}

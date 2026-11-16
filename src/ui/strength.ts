@@ -16,7 +16,7 @@ import { renderSummary } from './summaryView';
  * Strength = heart-rate logging only. You lift in Boostcamp; this records the H10 for the session
  * (like Wahoo's "Strength Train"), asks how hard it was, and uploads it to Intervals.icu.
  */
-export function strengthScreen(root: HTMLElement, _args: string[], query: URLSearchParams): () => void {
+export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLSearchParams): () => void {
   ensureSensors({ bike: false });
   void calendar.refresh();
   const eventId = query.get('ev') ? Number(query.get('ev')) : null;
@@ -36,7 +36,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
   const elapsed = () => (accMs + (state === 'running' ? Date.now() - t0 : 0)) / 1000;
 
   const paintReady = () => {
-    root.innerHTML = `${topbar({ back: '#/', title: 'Strength', cog: true })}
+    root.innerHTML = `${topbar({ back: '#/strength', title: 'Heart-rate session', cog: true })}
       <main class="page">
         ${calendarCard(calendar.forEquipment('strength'), false)}
         <section class="card strength">
@@ -151,7 +151,7 @@ export function strengthScreen(root: HTMLElement, _args: string[], query: URLSea
       meta,
       stats: [['AVG HR', meta.avgHr ? String(Math.round(meta.avgHr)) : '--'], ['MAX HR', meta.maxHr ? String(Math.round(meta.maxHr)) : '--'], ['TIME', hms(meta.seconds)], ['KCAL', kcal != null ? `~${kcal}` : '--']],
       extra: `<section class="card zones"><div class="card-h"><span>TIME IN HR ZONE</span></div>${bars}</section>`,
-      backHref: '#/',
+      backHref: '#/strength',
     });
   };
 

@@ -111,12 +111,46 @@ export async function uploadActivity(a: UploadArgs): Promise<string> {
 }
 
 /** Patches RPE + sport type (VirtualRide, matching the existing Bowflex/AirBike history). */
-export async function patchActivity(id: string, fields: { icu_rpe?: number; type?: string }): Promise<void> {
+export async function patchActivity(id: string, fields: { icu_rpe?: number; type?: string; description?: string; name?: string; kg_lifted?: number }): Promise<void> {
   await call(`/activity/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(fields),
   });
+}
+
+export interface ManualActivityArgs {
+  startLocalIso: string;
+  name: string;
+  description: string;
+  seconds: number;
+  type: string;
+  externalId: string;
+  pairedEventId: number | null;
+  kgLifted?: number;
+}
+
+/** Creates an activity with no file (a lift session logged without a heart-rate strap). Returns the new id. */
+export async function createManualActivity(a: ManualActivityArgs): Promise<string> {
+  const res = await call(`/athlete/${aid()}/activities/manual`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      start_date_local: a.startLocalIso,
+      type: a.type,
+      name: a.name,
+      description: a.description,
+      moving_time: a.seconds,
+      elapsed_time: a.seconds,
+      external_id: a.externalId,
+      ...(a.kgLifted ? { kg_lifted: a.kgLifted } : {}),
+      ...(a.pairedEventId != null ? { paired_event_id: a.pairedEventId } : {}),
+    }),
+  });
+  const j = await res.json();
+  const id = j?.id ?? j?.activities?.[0]?.id ?? (Array.isArray(j) ? j[0]?.id : undefined);
+  if (!id) throw new IntervalsError('Manual activity returned no id');
+  return String(id);
 }
 
 export async function fetchEvents(oldest: string, newest: string): Promise<IntervalsEvent[]> {

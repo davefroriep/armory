@@ -4,7 +4,7 @@ import { airbikeScreen, stubScreen } from './ui/equipment';
 import { homeScreen } from './ui/home';
 import { hudScreen } from './ui/hud';
 import { settingsScreen } from './ui/settings';
-import { strengthScreen } from './ui/strength';
+import { liftsScreen } from './ui/lifts';
 import { initSetupLinks } from './setup';
 import { isNative } from './native/service';
 import { kickSensors, releaseBike } from './ble/sources';
@@ -16,7 +16,7 @@ const routes: Record<string, Screen> = {
   airbike: (root, args, q) => (args[0] === 'p' ? hudScreen(root, args.slice(1), q) : airbikeScreen(root)),
   spin: stubScreen('spin'),
   treadmill: stubScreen('treadmill'),
-  strength: strengthScreen,
+  strength: liftsScreen,
   settings: settingsScreen,
 };
 

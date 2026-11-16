@@ -28,7 +28,26 @@ export class Recorder {
   constructor(
     id: string, equipment: Equipment, programId: string, name: string, eventId: number | null,
     private readonly hrMax: number,
+    /** Continue a recording that was interrupted (app killed mid-workout) instead of starting a new one. */
+    resumeFrom?: { meta: WorkoutMeta; samples: Sample[] },
   ) {
+    if (resumeFrom) {
+      this.meta = { ...resumeFrom.meta };
+      for (const s of resumeFrom.samples) {
+        this.samples.push(s);
+        this.wTotal += s.w;
+        this.kjAcc += s.w / 1000;
+        this.meta.maxW = Math.max(this.meta.maxW, s.w);
+        if (s.hr > 0) {
+          this.hrTotal += s.hr;
+          this.hrCount++;
+          this.meta.maxHr = Math.max(this.meta.maxHr, s.hr);
+          if (s.hr >= 0.88 * hrMax) this.z5Seconds++;
+        }
+      }
+      this.nextT = resumeFrom.samples.length;
+      return;
+    }
     this.meta = {
       id, equipment, programId, name, startEpochMs: Date.now(), status: 'active', seconds: 0, kj: 0,
       avgW: 0, maxW: 0, avgHr: 0, maxHr: 0, rpe: null, eventId, upload: 'none', patched: false,

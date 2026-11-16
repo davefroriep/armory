@@ -22,6 +22,11 @@ allprojects {
         google()
         mavenCentral()
     }
+    if (project.hasProperty('armoryBuildRoot')) {
+        def root = project.property('armoryBuildRoot').toString()
+        def rel = project.path == ':' ? 'root' : project.path.substring(1).replace(':', '_')
+        layout.buildDirectory.set(file("${root}/${rel}"))
+    }
 }
 
 task clean(type: Delete) {

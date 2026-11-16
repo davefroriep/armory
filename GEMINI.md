@@ -1,9 +1,9 @@
 # Strength & Conditioning Hub ("The Armory" + Armory Fit App)
 
 ## 1. Umbrella Ecosystem & Deployment
-- **Workspace Scope:** Umbrella S&C hub (`N:\Documents\Antigravity\Strength and Conditioning`) unifying **Boostcamp** (strength programming), **Intervals.icu** (`i758105` endurance/wellness telemetry), and **Armory Fit** (cardio telemetry app).
+- **Workspace Scope:** Umbrella S&C hub (`N:\Documents\Antigravity\Strength and Conditioning`) unifying **Boostcamp** (strength programming), **Intervals.icu** (`i758105` endurance/wellness telemetry), and **Armory Fit** (cardio telemetry + built-in Strength Lift Tracker).
 - **Primary Client (Armory Fit):** Native Android `.apk` wrapped with **Capacitor** (`@capacitor-community/bluetooth-le` + custom Kotlin `WorkoutForegroundService`) for lockscreen/background-safe BLE and persistent notification telemetry, plus GitHub Pages web mirror (`https://davefroriep.github.io/armory/`).
-- **Storage & Sync:** Phone-side 1 Hz `IndexedDB` workout recording (`workouts_meta` + `workout_samples`) with crash/resume recovery and TCX export to Intervals.icu.
+- **Storage & Sync:** Phone-side 1 Hz `IndexedDB` (`workouts_meta`, `workout_samples`, plus v2 lift-tracker stores `lift_sessions`, `lift_routines`, `lift_ex`, `lift_videos`) with crash/resume recovery and automatic TCX/manual `WeightTraining` sync to Intervals.icu.
 
 ## 2. Primary 5 Hz Direct BLE (`NUS`) Protocol & Athlete Constants
 - **Unified Direct BLE (`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`):** Primary 5 Hz (`200 ms`) unquantized JSON `TX ...0003` + `RX ...0002` control/calibration across **all 3 machines** (`Spin`, `AirBike`, `Treadmill`); standard **BLE FTMS (`0x1826`)** runs passively only for external apps (e.g. **MyWhoosh**).
@@ -14,7 +14,7 @@
 - **Z5 Suite & Tactical HUD:** `[ZONE 5 VO2]` 4-protocol drawer (`Norwegian 4×4`, `Classic VO2 5×3`, `Cardiac Power 6×2`, `Billat/Rønnestad 60/30`) + 5 Hz Sweet-Spot Horizon HUD, split/lookahead timers, and auto-muting WebAudio `2×RPM` Lock-In Transition Metronome + Overshoot Chirp.
 
 ## 3. Canonical Directory Structure
-- `src/`: Modular TypeScript/JS UI, BLE transport adapters (`capacitor` / `web`), `IndexedDB` recorder, workout protocols, and TCX/Intervals uploader.
+- `src/`: Modular TypeScript/JS UI (`src/ui/`, `src/ui/lifts/`), lift-tracker domain/store (`src/lifts/`), BLE transport (`capacitor` / `web`), `IndexedDB` recorder, cardio protocols, and Intervals uploader.
 - `public/`: PWA manifest, icons (`192`, `512`), and service worker (`sw.js`).
 - `android/`: Generated Capacitor Android project + custom Kotlin `WorkoutForegroundService`.
 - `docs/`: `ARMORY_MASTER_PRIMER.md` and S&C / BLE protocol specs.

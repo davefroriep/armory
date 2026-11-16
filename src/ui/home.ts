@@ -4,12 +4,13 @@ import { pendingCount, retryPending, syncWorkout, discard } from '../workout/syn
 import { allMeta, getSamples, putMeta } from '../store/db';
 import { summarize } from '../workout/summary';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
+import { lifts } from '../lifts/store';
 import { ICON, esc, mmss } from './dom';
 import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
 
 const TILES: Equipment[] = ['strength', 'treadmill', 'spin', 'airbike'];
 const SUB: Record<Equipment, string> = {
-  strength: 'HR logging',
+  strength: 'Lift tracker',
   treadmill: 'Horizon T101',
   spin: 'Bowflex C7',
   airbike: 'Assault AirBike Elite',
@@ -19,8 +20,10 @@ export function homeScreen(root: HTMLElement): () => void {
   ensureSensors({ bike: false });
   void calendar.refresh();
 
+  let dead = false;
   let banners = '';
   const paint = () => {
+    if (dead) return;
     const tiles = TILES.map(
       (eq) => `<a class="tile ${eq}" href="#/${eq}">
         <span class="tile-ico">${ICON[eq]}</span>
@@ -39,9 +42,15 @@ export function homeScreen(root: HTMLElement): () => void {
 
   const loadBanners = async () => {
     const metas = await allMeta();
-    const active = metas.filter((m) => m.status === 'active' && m.seconds === 0);
+    await lifts.ready;
+    if (dead) return;
+    // A lift-tracker workout in progress is resumed from the Strength tile, never "recovered" as a bare HR file.
+    const live = lifts.active;
+    const active = metas.filter((m) => m.status === 'active' && m.seconds === 0 && !lifts.sessions.has(m.id));
     const pend = await pendingCount();
-    let h = '';
+    let h = live
+      ? `<section class="card warn"><b>Workout in progress</b><p>${esc(live.name)} — started ${new Date(live.startMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.</p><div class="row"><a class="btn primary sm" href="#/strength/session">Resume</a></div></section>`
+      : '';
     for (const m of active) {
       h += `<section class="card warn"><b>Unfinished workout</b>
         <p>${esc(m.name)} — started ${new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. The app closed before you finished.</p>
@@ -82,6 +91,7 @@ export function homeScreen(root: HTMLElement): () => void {
   const offCal = wireCalendar(root, paint);
 
   return () => {
+    dead = true;
     root.removeEventListener('click', click);
     offChips();
     offCal();

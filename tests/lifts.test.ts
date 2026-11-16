@@ -1,0 +1,308 @@
+import { describe, expect, it } from 'vitest';
+import {
+  MAX_RM, computePRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
+  setVolumeKg, weekStart, addWeeks, DAY_MS,
+} from '../src/lifts/calc';
+import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
+import {
+  addSet, buildExercise, canLog, editReps, editWeight, labels, midSuperset, newSet, prevSetFor, pruneUnlogged,
+  removeLastSet, routineFromSession, swapExercise, toggleDone,
+} from '../src/lifts/logic';
+import { EQUIPS, GROUPS } from '../src/lifts/muscles';
+import { KG_PER_LB, fmtNum, fromDisplay, toDisplay } from '../src/lifts/settings';
+import { condenseSets, intervalsDescription, shortLine } from '../src/lifts/summary';
+import { MUSCLES, type Exercise, type LiftSession, type LiftSet, type SessionEx } from '../src/lifts/types';
+
+const lb = (v: number): number => v * KG_PER_LB;
+const ex = (id: string, type: Exercise['type'] = 'weight', primary: Exercise['primary'] = ['ch'], secondary: Exercise['secondary'] = []): Exercise => ({ id, name: id, type, equip: 'bb', primary, secondary });
+const BENCH = ex('bench', 'weight', ['ch'], ['fd', 'tri']);
+const SQUAT = ex('squat', 'weight', ['qu', 'gl'], ['ad', 'lb']);
+const exOf = (id: string): Exercise | undefined => ({ bench: BENCH, squat: SQUAT, curl: ex('curl', 'weight', ['bi']), hold: ex('hold', 'time', ['tri']), pullup: ex('pullup', 'bodyweight', ['la']) } as Record<string, Exercise>)[id];
+
+let n = 0;
+const set = (w: number | null, r: number | null, o: Partial<LiftSet> = {}): LiftSet => ({ id: `s${++n}`, w, r, done: true, kind: 'n', ...o });
+const sx = (exId: string, sets: LiftSet[], o: Partial<SessionEx> = {}): SessionEx => ({ uid: `u${++n}`, exId, sets, ...o });
+const sess = (id: string, startMs: number, exs: SessionEx[], o: Partial<LiftSession> = {}): LiftSession => ({
+  id, name: id, routineId: null, eventId: null, startMs, endMs: startMs + 3_600_000, status: 'done', exs, rpe: null, bwKg: 88.5, ...o,
+});
+
+describe('exercise library', () => {
+  it('has unique ids, valid muscles/equipment and at least one primary muscle', () => {
+    const ids = new Set<string>();
+    for (const e of LIBRARY) {
+      expect(ids.has(e.id), `duplicate id ${e.id}`).toBe(false);
+      ids.add(e.id);
+      expect(e.primary.length, e.name).toBeGreaterThan(0);
+      for (const m of [...e.primary, ...e.secondary]) expect(MUSCLES).toContain(m);
+      expect(EQUIPS).toContain(e.equip);
+      expect(['weight', 'bodyweight', 'time']).toContain(e.type);
+      expect(e.secondary.filter((m) => e.primary.includes(m)), `${e.name} lists a muscle as both`).toEqual([]);
+    }
+    expect(LIBRARY.length).toBeGreaterThan(120);
+  });
+  it('covers every muscle in at least one display group and one exercise', () => {
+    const grouped = new Set(GROUPS.flatMap((g) => g.muscles));
+    for (const m of MUSCLES) {
+      expect(grouped.has(m), m).toBe(true);
+      expect(LIBRARY.some((e) => e.primary.includes(m)), m).toBe(true);
+    }
+  });
+  it('knows the home-gym staples', () => {
+    for (const id of ['belt-squat', 'lying-leg-curl', 'glute-ham-raise', 'triceps-isometric-hold', 'cable-leg-press', 'smith-machine-romanian-deadlift']) {
+      expect(LIBRARY_BY_ID.has(id), id).toBe(true);
+    }
+    expect(LIBRARY_BY_ID.get('triceps-isometric-hold')!.type).toBe('time');
+  });
+});
+
+describe('units', () => {
+  it('round-trips pounds without float noise', () => {
+    for (const v of [45, 135, 137.5, 225, 315, 2.5]) expect(toDisplay(fromDisplay(v, 'lb'), 'lb')).toBe(v);
+    expect(fmtNum(toDisplay(lb(135), 'lb'))).toBe('135');
+    expect(toDisplay(100, 'kg')).toBe(100);
+  });
+});
+
+describe('auto-fill from last time + forward fill', () => {
+  const prev = sx('bench', [set(lb(135), 8), set(lb(155), 6), set(lb(175), 5)]);
+
+  it('fills each set from the matching set last time, flagged as suggestions', () => {
+    const e = buildExercise('bench', 3, prev);
+    expect(e.sets.map((s) => [toDisplay(s.w!, 'lb'), s.r])).toEqual([[135, 8], [155, 6], [175, 5]]);
+    expect(e.sets.every((s) => s.wAuto && s.rAuto && !s.done)).toBe(true);
+  });
+  it('sets beyond last time reuse the final set; empty history stays blank', () => {
+    const e = buildExercise('bench', 5, prev);
+    expect(toDisplay(e.sets[4].w!, 'lb')).toBe(175);
+    const blank = buildExercise('bench', 3, null);
+    expect(blank.sets.every((s) => s.w == null && s.r == null)).toBe(true);
+  });
+  it('typing a weight flows forward into later untouched sets only', () => {
+    const e = buildExercise('bench', 4, prev);
+    editWeight(e, 1, lb(160));
+    expect(toDisplay(e.sets[0].w!, 'lb')).toBe(135); // before: untouched
+    expect(toDisplay(e.sets[2].w!, 'lb')).toBe(160);
+    expect(toDisplay(e.sets[3].w!, 'lb')).toBe(160);
+    editWeight(e, 2, lb(165)); // a later edit overrides the forwarded value, and flows on
+    expect(toDisplay(e.sets[3].w!, 'lb')).toBe(165);
+    expect(toDisplay(e.sets[1].w!, 'lb')).toBe(160);
+  });
+  it('never overwrites a value the user typed, nor a logged set', () => {
+    const e = buildExercise('bench', 3, prev);
+    editWeight(e, 2, lb(200)); // user typed set 3
+    editWeight(e, 0, lb(140));
+    expect(toDisplay(e.sets[2].w!, 'lb')).toBe(200);
+    toggleDone(e, 1, BENCH);
+    editReps(e, 0, 10);
+    expect(e.sets[1].r).toBe(6); // logged set untouched
+  });
+  it('logging a set forwards both weight and reps', () => {
+    const e = buildExercise('bench', 3, null);
+    editWeight(e, 0, lb(135));
+    editReps(e, 0, 10);
+    expect(toggleDone(e, 0, BENCH)).toBe(true);
+    expect(e.sets[1].w).toBeCloseTo(lb(135));
+    expect(e.sets[2].r).toBe(10);
+    expect(e.sets[0].done && e.sets[0].at).toBeTruthy();
+  });
+  it('refuses to log an incomplete weight set but allows bodyweight with reps only', () => {
+    const e = buildExercise('bench', 1, null);
+    expect(toggleDone(e, 0, BENCH)).toBeNull();
+    editReps(e, 0, 5);
+    expect(canLog(e.sets[0], BENCH)).toBe(false);
+    const pu = buildExercise('pullup', 1, null);
+    editReps(pu, 0, 8);
+    expect(toggleDone(pu, 0, exOf('pullup'))).toBe(true);
+    expect(pu.sets[0].w).toBe(0);
+  });
+  it('warm-ups pair with warm-ups and never forward into working sets', () => {
+    const p = sx('bench', [set(lb(95), 8, { kind: 'w' }), set(lb(135), 5), set(lb(135), 5)]);
+    const e: SessionEx = sx('bench', [newSet('w'), newSet('n'), newSet('n')]);
+    expect(toDisplay(prevSetFor(p, e, 0)!.w!, 'lb')).toBe(95);
+    expect(toDisplay(prevSetFor(p, e, 1)!.w!, 'lb')).toBe(135);
+    editWeight(e, 0, lb(65));
+    expect(e.sets[1].w).toBeNull();
+  });
+  it('+ Set copies the last working set; - Set refuses to empty the card', () => {
+    const e = buildExercise('bench', 2, prev);
+    editWeight(e, 1, lb(165));
+    addSet(e, prev);
+    expect(e.sets).toHaveLength(3);
+    expect(toDisplay(e.sets[2].w!, 'lb')).toBe(165);
+    expect(removeLastSet(e)).not.toBeNull();
+    removeLastSet(e);
+    expect(removeLastSet(e)).toBeNull();
+    expect(e.sets).toHaveLength(1);
+  });
+  it('swap keeps the shape, preserves slot, and pulls suggestions from the new exercise history', () => {
+    const e = buildExercise('bench', 3, prev, false, 2);
+    expect(e.slot).toBe(2);
+    toggleDone(e, 0, BENCH);
+    swapExercise(e, 'curl', sx('curl', [set(lb(30), 12)]));
+    expect(e.exId).toBe('curl');
+    expect(e.slot).toBe(2);
+    expect(e.sets).toHaveLength(3);
+    expect(e.sets.every((s) => !s.done && toDisplay(s.w!, 'lb') === 30 && s.r === 12)).toBe(true);
+  });
+});
+
+describe('supersets & finishing', () => {
+  it('labels groups 1A/1B and singles', () => {
+    const exs = [sx('a', [], { ss: true }), sx('b', []), sx('c', []), sx('d', [], { ss: true }), sx('e', [], { ss: true }), sx('f', [])];
+    expect(labels(exs)).toEqual(['1A', '1B', '2', '3A', '3B', '3C']);
+    expect(midSuperset(exs, 0)).toBe(true);
+    expect(midSuperset(exs, 1)).toBe(false);
+  });
+  it('prunes unlogged sets and empty exercises, and clears a dangling superset flag', () => {
+    const s = sess('x', 0, [sx('bench', [set(lb(135), 5), set(null, null, { done: false })], { ss: true }), sx('curl', [set(null, null, { done: false })])], { status: 'active' });
+    expect(pruneUnlogged(s)).toBe(2);
+    expect(s.exs).toHaveLength(1);
+    expect(s.exs[0].sets).toHaveLength(1);
+    expect(s.exs[0].ss).toBeUndefined();
+  });
+  it('turns a session into a day with logged working-set counts', () => {
+    const s = sess('x', 0, [sx('bench', [set(lb(95), 8, { kind: 'w' }), set(lb(135), 5), set(lb(135), 5)], { ss: true }), sx('curl', [set(lb(30), 10)])]);
+    const r = routineFromSession(s, 'Push', 3);
+    expect(r.items).toEqual([{ exId: 'bench', sets: 2, ss: true }, { exId: 'curl', sets: 1 }]);
+  });
+});
+
+describe('e1RM, rep records, PRs', () => {
+  it('estimates 1RM with Epley and refuses junk', () => {
+    expect(e1rm(100, 1)).toBe(100);
+    expect(e1rm(100, 5)).toBeCloseTo(116.67, 1);
+    expect(e1rm(100, MAX_RM + 1)).toBeNull();
+    expect(e1rm(0, 5)).toBeNull();
+  });
+
+  const t0 = new Date(2026, 0, 5, 9).getTime();
+  const s1 = sess('s1', t0, [sx('bench', [set(100, 5), set(100, 5), set(90, 8)])]);
+  const s2 = sess('s2', t0 + 7 * DAY_MS, [sx('bench', [set(105, 5), set(110, 3), set(60, 10, { kind: 'w' })])]);
+  const s3 = sess('s3', t0 + 14 * DAY_MS, [sx('bench', [set(105, 5), set(112, 3)])]);
+
+  it('"heaviest for at least n reps" bests, ties keep the earliest', () => {
+    const b = repBests(exerciseSessions([s1, s2, s3], 'bench'));
+    expect(b[1]!.kg).toBe(112);
+    expect(b[3]!.kg).toBe(112);
+    expect(b[4]!.kg).toBe(105);
+    expect(b[5]!.kg).toBe(105);
+    expect(b[5]!.sessionId).toBe('s2'); // 105x5 first done in s2 (s3 tied it)
+    expect(b[8]!.kg).toBe(90);
+    expect(b[9]).toBeNull();
+  });
+  it('warm-ups never count toward records', () => {
+    const b = repBests(exerciseSessions([s2], 'bench'));
+    expect(b[10]).toBeNull(); // the 60x10 was a warm-up
+  });
+  it('flags PRs chronologically; the first session and ties are not PRs', () => {
+    const prs = computePRs([s3, s1, s2], exOf); // order-independent input
+    const flagged = (s: LiftSession): number[] => s.exs.flatMap((e) => e.sets).filter((x) => prs.has(x.id)).map((x) => x.w!);
+    expect(flagged(s1)).toEqual([]);
+    expect(flagged(s2)).toEqual([105, 110]); // 105x5 beats 100x5; 110x3 beats 100x3
+    expect(flagged(s3)).toEqual([112]); // 105x5 ties, 112x3 beats 110
+    expect(prs.get(s3.exs[0].sets[1].id)).toEqual({ n: 3, kg: 112 });
+  });
+  it('a set only counts once per session (second identical set is not a PR)', () => {
+    const a = sess('a', t0, [sx('bench', [set(100, 5)])]);
+    const b = sess('b', t0 + DAY_MS, [sx('bench', [set(105, 5), set(105, 5)])]);
+    const prs = computePRs([a, b], exOf);
+    expect(b.exs[0].sets.filter((x) => prs.has(x.id))).toHaveLength(1);
+  });
+  it('time exercises have no weight PRs; trend takes the best e1RM per session', () => {
+    const h1 = sess('h1', t0, [sx('hold', [set(0, 45)])]);
+    const h2 = sess('h2', t0 + DAY_MS, [sx('hold', [set(0, 60)])]);
+    expect(computePRs([h1, h2], exOf).size).toBe(0);
+    const tr = e1rmTrend(exerciseSessions([s1, s2, s3], 'bench'), BENCH);
+    expect(tr).toHaveLength(3);
+    expect(tr[0].e1rm).toBeCloseTo(100 * (1 + 5 / 30), 1); // 100x5 beats 90x8 (=114)
+    expect(tr[2].topKg).toBe(112); // 112x3 (123.2) edges 105x5 (122.5)
+  });
+  it('flags unweighted bodyweight rep PRs while ignoring zero-kg weighted sets', () => {
+    const p1 = sess('p1', t0, [sx('pullup', [set(0, 8)]), sx('bench', [set(0, 8)])]);
+    const p2 = sess('p2', t0 + DAY_MS, [sx('pullup', [set(0, 8), set(0, 10)]), sx('bench', [set(0, 10)])]);
+    const prs = computePRs([p1, p2], exOf);
+    expect(prs.has(p2.exs[0].sets[0].id)).toBe(false); // tie
+    expect(prs.get(p2.exs[0].sets[1].id)).toEqual({ n: 10, kg: 0 }); // BW x 10 PR
+    expect(prs.has(p2.exs[1].sets[0].id)).toBe(false); // 0 kg bench is not a PR
+  });
+  it('attaches video from a later tied set while keeping the earliest PR date', () => {
+    const v1 = sess('v1', t0, [sx('bench', [set(100, 5)])]);
+    const v2 = sess('v2', t0 + 7 * DAY_MS, [sx('bench', [set(100, 5, { vids: ['vid-99'] })])]);
+    const b = repBests(exerciseSessions([v1, v2], 'bench'));
+    expect(b[5]!.sessionId).toBe('v1');
+    expect(b[5]!.ms).toBe(t0);
+    expect(b[5]!.vidId).toBe('vid-99');
+  });
+  it('previous performance is the latest finished session before the cutoff', () => {
+    const p = previousPerformance([s1, s2, s3], 'bench', s3.startMs)!;
+    expect(p).toBe(s2.exs[0]);
+    expect(previousPerformance([s1], 'curl')).toBeNull();
+    expect(previousPerformance([{ ...s2, status: 'active' }], 'bench')).toBeNull();
+  });
+});
+
+describe('volume & muscle sets', () => {
+  const wk = weekStart(new Date(2026, 0, 7, 12).getTime()); // Wed -> Mon 5 Jan
+  const s = sess('w1', wk + DAY_MS, [
+    sx('bench', [set(100, 5), set(100, 5), set(60, 10, { kind: 'w' }), set(100, 5, { done: false })]),
+    sx('squat', [set(140, 5), set(140, 5), set(140, 5)]),
+  ]);
+
+  it('week starts on Monday, local', () => {
+    expect(new Date(wk).getDay()).toBe(1);
+    expect(new Date(wk).getHours()).toBe(0);
+    expect(weekStart(wk + 6 * DAY_MS + 5 * 3_600_000)).toBe(wk);
+    expect(addWeeks(wk, 1)).toBe(weekStart(wk + 8 * DAY_MS));
+  });
+  it('counts primary movers 1.0 and secondary 0.5; warm-ups and unlogged sets never count', () => {
+    const m = muscleSets([s], exOf, wk, addWeeks(wk, 1));
+    expect(m.ch).toBe(2);
+    expect(m.fd).toBe(1);
+    expect(m.tri).toBe(1);
+    expect(m.qu).toBe(3);
+    expect(m.gl).toBe(3);
+    expect(m.ad).toBe(1.5);
+    expect(m.bi).toBe(0);
+  });
+  it('respects the date window', () => {
+    const none = muscleSets([s], exOf, addWeeks(wk, 1), addWeeks(wk, 2));
+    expect(Object.values(none).every((v) => v === 0)).toBe(true);
+  });
+  it('session stats: volume only from logged working sets; bodyweight adds body mass; time sets are volume-free', () => {
+    const st = sessionStats(s, exOf);
+    expect(st.sets).toBe(5);
+    expect(st.volumeKg).toBe(2 * 500 + 3 * 700);
+    expect(st.exercises).toBe(2);
+    const bw = sess('bw', wk, [sx('pullup', [set(10, 5)]), sx('hold', [set(0, 45)])], { bwKg: 90 });
+    expect(setVolumeKg(bw.exs[0].sets[0], exOf('pullup'), 90)).toBe(100 * 5);
+    expect(setVolumeKg(bw.exs[1].sets[0], exOf('hold'), 90)).toBe(0);
+  });
+});
+
+describe('summary text', () => {
+  const unit = 'lb' as const;
+  it('condenses uniform and mixed sets', () => {
+    expect(condenseSets(sx('bench', [set(lb(175), 5), set(lb(175), 5), set(lb(175), 5)]), BENCH, unit)).toBe('3×5 @ 175 lb');
+    expect(condenseSets(sx('bench', [set(lb(135), 8), set(lb(155), 6), set(lb(175), 5)]), BENCH, unit)).toBe('135×8 · 155×6 · 175×5 lb');
+    expect(condenseSets(sx('bench', [set(lb(95), 8, { kind: 'w' }), set(lb(135), 5)]), BENCH, unit)).toBe('1×5 @ 135 lb');
+    expect(condenseSets(sx('pullup', [set(0, 8), set(0, 8)]), exOf('pullup'), unit)).toBe('2×8 BW');
+    expect(condenseSets(sx('hold', [set(0, 45), set(0, 45)]), exOf('hold'), unit)).toBe('2×45s');
+  });
+  it('share-card line falls back to top set when long', () => {
+    const e = sx('bench', [set(lb(135), 8), set(lb(155), 6), set(lb(175), 5), set(lb(185), 3), set(lb(195), 1)]);
+    expect(shortLine(e, BENCH, unit)).toBe('5 sets · top 195×1');
+  });
+  it('writes the Intervals.icu description', () => {
+    const s = sess('d', new Date(2026, 0, 5, 7).getTime(), [sx('bench', [set(lb(175), 5), set(lb(175), 5)]), sx('curl', [set(lb(30), 12)])], { name: 'Upper 1', rpe: 8, endMs: new Date(2026, 0, 5, 7, 52).getTime() });
+    const desc = intervalsDescription(s, { unit, exOf, prs: new Map([[s.exs[0].sets[0].id, { n: 5, kg: lb(175) }]]), avgHr: 118, maxHr: 151, kcal: 310 });
+    expect(desc).toBe([
+      'Armory Fit · Upper 1',
+      '52 min · 3 sets · 2,110 lb · 1 PR',
+      '',
+      'bench: 2×5 @ 175 lb  ★ 5RM PR',
+      'curl: 1×12 @ 30 lb',
+      '',
+      'avg HR 118 · max HR 151 · ~310 kcal · RPE 8/10',
+    ].join('\n'));
+  });
+});
