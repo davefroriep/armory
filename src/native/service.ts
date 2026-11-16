@@ -19,6 +19,7 @@ interface WorkoutServicePlugin {
   launchVideoCamera(): Promise<{ opened: boolean }>;
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
+  playChime(o: { pcmBase64: string; sampleRate: number; volume: number }): Promise<void>;
 }
 
 export const isNative = (): boolean => Capacitor.isNativePlatform();
@@ -69,4 +70,9 @@ export async function pickNativeDcimVideo(): Promise<PickedNativeVideo | null> {
 export async function openNativeVideoUri(uri: string): Promise<boolean> {
   if (!plugin || !uri) return false;
   try { return (await plugin.openVideoUri({ uri })).opened; } catch { return false; }
+}
+
+export async function playNativeChime(pcmBase64: string, sampleRate: number, volume: number): Promise<boolean> {
+  if (!plugin || !pcmBase64) return false;
+  try { await plugin.playChime({ pcmBase64, sampleRate, volume }); return true; } catch { return false; }
 }

@@ -6,9 +6,16 @@ import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
 import android.graphics.Bitmap;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
@@ -200,5 +207,96 @@ public class WorkoutServicePlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("opened", opened);
         call.resolve(ret);
+    }
+
+    private AudioTrack activeChime;
+    private Object activeFocusReq;
+    private Runnable activeChimeDone;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private void releaseChimeAudio() {
+        if (activeChimeDone != null) {
+            mainHandler.removeCallbacks(activeChimeDone);
+            activeChimeDone = null;
+        }
+        if (activeChime != null) {
+            try {
+                activeChime.stop();
+            } catch (Exception ignored) {
+            }
+            try {
+                activeChime.release();
+            } catch (Exception ignored) {
+            }
+            activeChime = null;
+        }
+        AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        if (am != null && activeFocusReq != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activeFocusReq instanceof AudioFocusRequest) {
+                am.abandonAudioFocusRequest((AudioFocusRequest) activeFocusReq);
+            } else if (activeFocusReq instanceof AudioManager.OnAudioFocusChangeListener) {
+                am.abandonAudioFocus((AudioManager.OnAudioFocusChangeListener) activeFocusReq);
+            }
+            activeFocusReq = null;
+        }
+    }
+
+    /** Plays a short PCM alert with transient ducking and releases AudioFocus immediately when done. */
+    @PluginMethod
+    public void playChime(PluginCall call) {
+        String b64 = call.getString("pcmBase64", "");
+        int sampleRate = call.getInt("sampleRate", 24000);
+        float vol = Math.max(0f, Math.min(1f, call.getFloat("volume", 0.8f)));
+        if (b64 == null || b64.isEmpty()) {
+            call.resolve();
+            return;
+        }
+        byte[] pcm = Base64.decode(b64, Base64.DEFAULT);
+        if (pcm.length < 2) {
+            call.resolve();
+            return;
+        }
+        mainHandler.post(() -> {
+            releaseChimeAudio();
+            AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+            AudioAttributes attrs = new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build();
+            if (am != null) {
+                AudioManager.OnAudioFocusChangeListener afListener = focusChange -> {};
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    AudioFocusRequest req = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                            .setAudioAttributes(attrs)
+                            .setOnAudioFocusChangeListener(afListener)
+                            .build();
+                    am.requestAudioFocus(req);
+                    activeFocusReq = req;
+                } else {
+                    am.requestAudioFocus(afListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK);
+                    activeFocusReq = afListener;
+                }
+            }
+            AudioFormat fmt = new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build();
+            AudioTrack track = new AudioTrack(attrs, fmt, pcm.length, AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE);
+            if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+                track.release();
+                releaseChimeAudio();
+                call.resolve();
+                return;
+            }
+            track.write(pcm, 0, pcm.length);
+            track.setVolume(vol);
+            activeChime = track;
+            track.play();
+            long durMs = Math.max(150L, (pcm.length / 2L) * 1000L / Math.max(8000, sampleRate)) + 90L;
+            activeChimeDone = this::releaseChimeAudio;
+            mainHandler.postDelayed(activeChimeDone, durMs);
+            call.resolve();
+        });
     }
 }

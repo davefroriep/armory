@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { ALERT_SAMPLE_RATE, ALERT_SPECS, encodeWav, synthesizeBellPcm } from '../src/audio/audio';
 import {
   MAX_RM, computePRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
   setVolumeKg, weekStart, addWeeks, DAY_MS,
@@ -458,5 +459,28 @@ describe('Phase 1 routine seed', () => {
       fileName: 'PXL_20261116_1856xx.mp4',
       driveQuery: 'PXL 20261116 1856 type:video',
     });
+  });
+
+  it('builds a valid <5s 3-ding WAV alert with leading headroom and full-amplitude bell strikes', () => {
+    const { durSec, hits } = ALERT_SPECS.chime;
+    expect(durSec).toBeLessThan(5);
+    expect(hits).toHaveLength(3);
+    const pcm = synthesizeBellPcm(durSec, hits);
+    const wav = encodeWav(pcm);
+    expect(String.fromCharCode(...wav.slice(0, 4))).toBe('RIFF');
+    expect(String.fromCharCode(...wav.slice(8, 12))).toBe('WAVE');
+    expect(wav.length).toBe(44 + Math.round(durSec * ALERT_SAMPLE_RATE) * 2);
+    const dv = new DataView(wav.buffer, wav.byteOffset);
+    expect(dv.getUint32(24, true)).toBe(ALERT_SAMPLE_RATE);
+    // Lead-in silence (first 25ms) prevents Bluetooth A2DP wake clip, and peaks reach strong amplitude
+    const pdv = new DataView(pcm.buffer, pcm.byteOffset);
+    for (let i = 0; i < Math.round(0.025 * ALERT_SAMPLE_RATE); i++) {
+      expect(pdv.getInt16(i * 2, true)).toBe(0);
+    }
+    let peak = 0;
+    for (let i = 0; i < pcm.length / 2; i++) {
+      peak = Math.max(peak, Math.abs(pdv.getInt16(i * 2, true)));
+    }
+    expect(peak).toBeGreaterThan(20_000);
   });
 });
