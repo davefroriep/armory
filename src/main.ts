@@ -77,6 +77,28 @@ function route(): void {
   cleanup = (routes[name] ?? routes[''])(root, args, new URLSearchParams(qs));
 }
 
+function promptExit(): void {
+  if (document.querySelector('.modal[data-exit-sheet]')) return;
+  const el = document.createElement('div');
+  el.className = 'modal';
+  el.dataset.exitSheet = '1';
+  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">
+    <h2>Exit Armory Fit?</h2>
+    <p>Are you sure you want to exit?</p>
+    <button class="btn primary big" type="button" data-exit="0">No</button>
+    <button class="btn danger big" type="button" data-exit="1">Yes</button>
+  </div>`;
+  const close = (): void => el.remove();
+  el.addEventListener('pointerdown', (e) => { if (e.target === el) close(); });
+  el.addEventListener('click', (e) => {
+    const b = (e.target as HTMLElement).closest<HTMLElement>('[data-exit]');
+    if (!b) return;
+    close();
+    if (b.dataset.exit === '1') void App.exitApp();
+  });
+  document.body.appendChild(el);
+}
+
 initSetupLinks();
 // Coming back to the app (or the phone waking up) retries a stalled sensor link immediately.
 document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
@@ -91,7 +113,7 @@ if (isNative()) {
     }
     const up = parentHash(routeKey);
     if (up === null) {
-      void App.minimizeApp();
+      promptExit();
       return;
     }
     location.hash = up;
