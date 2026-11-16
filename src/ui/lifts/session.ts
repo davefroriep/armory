@@ -449,7 +449,7 @@ function build(root: HTMLElement, id?: string): () => void {
         updateLiftSettings({ restSound: !liftSettings().restSound });
         draw();
       } else if (t.closest('[data-tnow]')) {
-        audio.unlock();
+        if (liftSettings().restSound) audio.unlock();
         active.startRest(active.restSecFor(se), ex.name);
         sh.close();
       } else if (t.closest('[data-tok]')) {
@@ -592,8 +592,8 @@ function build(root: HTMLElement, id?: string): () => void {
       const sh = openSheet(
         `<h3 class="sh-title">Workout in progress</h3>
          <p class="sh-text">${sub}</p>
-         <button class="btn primary big" type="button" data-lv="finish">Finish &amp; save</button>
-         <button class="btn big" type="button" data-lv="keep">Keep lifting</button>
+         <button class="btn primary big" type="button" data-lv="keep" autofocus>Keep lifting</button>
+         <button class="btn big" type="button" data-lv="finish">Finish &amp; save</button>
          <button class="btn danger big" type="button" data-lv="discard">Discard workout</button>`,
         { onClose: () => resolve(choice) },
       );
@@ -702,7 +702,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'exmenu') return void (await exMenu(se));
     if (act === 'exnote') return void (await editNote(se));
     if (act === 'reststart') {
-      audio.unlock();
+      if (liftSettings().restSound) audio.unlock();
       active.startRest(active.restSecFor(se), exOf(se.exId).name);
       buzz(20);
       return;

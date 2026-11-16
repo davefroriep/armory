@@ -183,11 +183,11 @@ class ActiveWorkout {
 
   /** A set was just logged: start the rest timer unless disabled for this card (e.g. mid-superset or Auto off). */
   afterSetLogged(s: LiftSession, i: number): void {
-    audio.unlock();
     if (!this.restAutoFor(s, i)) {
       if (midSuperset(s.exs, i) ? this.rest : this.rest?.fired) this.clearRest();
       return;
     }
+    if (liftSettings().restSound) audio.unlock();
     const e = s.exs[i];
     this.startRest(this.restSecFor(e), lifts.exOrStub(e.exId).name);
   }
