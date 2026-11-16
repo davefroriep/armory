@@ -36,8 +36,12 @@ if ($Publish) {
   $gh = 'C:\Program Files\GitHub CLI\gh.exe'
   $stage = Join-Path ([System.IO.Path]::GetTempPath()) 'armory-fit.apk'
   Copy-Item -Force $apk $stage
+  $prevErr = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
   & $gh release view $tag *> $null
-  if ($LASTEXITCODE -eq 0) {
+  $exists = ($LASTEXITCODE -eq 0)
+  $ErrorActionPreference = $prevErr
+  if ($exists) {
     & $gh release upload $tag $stage --clobber
   } else {
     & $gh release create $tag $stage --title "Armory Fit $tag" --notes "Android APK build ($tag)" --latest
