@@ -53,9 +53,12 @@ h1, h2, h3, p { margin: 0; }
 .link { color: var(--blue); font-size: .75rem; font-weight: 700; letter-spacing: .02em; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 
-.cal-item { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+.cal-item { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-top: 1px solid var(--line); }
 .cal-item:first-of-type { border-top: 0; }
-.cal-item.dim { opacity: .55; }
+.cal-item.dim .cal-link { opacity: .55; }
+.cal-link { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+.cal-more { width: 36px; height: 36px; border-radius: 50%; background: var(--card2); color: var(--mut); font-size: 1.25rem; line-height: 1; display: grid; place-items: center; flex: none; }
+.cal-more:active { background: #26303c; }
 .cal-ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; background: var(--card2); color: var(--blue); flex: none; }
 .cal-ico svg { width: 26px; height: 26px; }
 .cal-txt { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }

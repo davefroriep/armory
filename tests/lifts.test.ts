@@ -9,6 +9,7 @@ import {
   removeLastSet, routineFromSession, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
+import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
 import { KG_PER_LB, fmtNum, fromDisplay, toDisplay } from '../src/lifts/settings';
 import { condenseSets, intervalsDescription, shortLine } from '../src/lifts/summary';
 import { MUSCLES, type Exercise, type LiftSession, type LiftSet, type SessionEx } from '../src/lifts/types';
@@ -304,5 +305,18 @@ describe('summary text', () => {
       '',
       'avg HR 118 · max HR 151 · ~310 kcal · RPE 8/10',
     ].join('\n'));
+  });
+});
+
+describe('Phase 1 routine seed', () => {
+  it('resolves every seeded exercise in the library, matches planned titles, and pre-fills the 45s iso hold', () => {
+    expect(PHASE1_ROUTINES.map((r) => r.name)).toEqual(['Lower 1', 'Upper 1', 'Lower 2', 'Upper 2']);
+    for (const r of PHASE1_ROUTINES) {
+      for (const it of r.items) expect(LIBRARY_BY_ID.has(it.exId), `${r.name}:${it.exId}`).toBe(true);
+    }
+    expect(matchRoutineByTitle('Strength Train — Wk 1 · Day 2 Upper 1', PHASE1_ROUTINES)?.name).toBe('Upper 1');
+    expect(matchRoutineByTitle('Strength Train — Wk 1 · Day 5 Upper 2', PHASE1_ROUTINES)?.name).toBe('Upper 2');
+    const hold = buildExercise('triceps-isometric-hold', 2, null);
+    expect(hold.sets.map((s) => [s.r, s.rAuto])).toEqual([[45, true], [45, true]]);
   });
 });

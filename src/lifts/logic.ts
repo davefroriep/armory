@@ -41,6 +41,9 @@ export function prefill(se: SessionEx, prev: SessionEx | null): void {
 export function buildExercise(exId: string, nSets: number, prev: SessionEx | null, ss = false, slot?: number): SessionEx {
   const se: SessionEx = { uid: uid(), exId, sets: Array.from({ length: Math.max(1, nSets) }, () => newSet()), ...(ss ? { ss } : {}), ...(slot != null ? { slot } : {}) };
   prefill(se, prev);
+  if (exId === 'triceps-isometric-hold' && !prev) {
+    for (const s of se.sets) if (s.r == null) { s.r = 45; s.rAuto = true; }
+  }
   return se;
 }
 

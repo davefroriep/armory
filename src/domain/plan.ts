@@ -33,6 +33,8 @@ export interface QueueState {
   completedSlots: number[];
   /** YYYY-MM-DD the active `stepIndex` is currently staged for (can be tomorrow if today finished). */
   stagedDate: string | null;
+  /** Optional per-slot YYYY-MM-DD override when individual slots are pushed to tomorrow. */
+  slotDates?: Record<number, string>;
   /** Intervals.icu activity IDs already consumed so we never double-advance. */
   consumedIds: string[];
 }
@@ -42,6 +44,7 @@ export interface IntervalsActivityLite {
   name?: string;
   type?: string;
   start_date_local?: string;
+  paired_event_id?: number | null;
 }
 
 export interface EventCreateSpec {
@@ -97,6 +100,7 @@ export const defaultQueueState = (): QueueState => ({
   stepIndex: 1,
   completedSlots: [],
   stagedDate: null,
+  slotDates: {},
   consumedIds: [],
 });
 
@@ -245,6 +249,7 @@ export function reconcileQueue(args: {
   let stepIndex = Math.max(0, Math.min(state.stepIndex, plan.steps.length));
   const consumed = new Set(state.consumedIds);
   let completedSlots = new Set(state.completedSlots);
+  let slotDates: Record<number, string> = { ...(state.slotDates ?? {}) };
   let stagedDate = state.stagedDate;
   let justAdvanced = false;
 
@@ -257,13 +262,14 @@ export function reconcileQueue(args: {
       if (ev?.paired_activity_id) {
         completedSlots.add(si);
         consumed.add(String(ev.paired_activity_id));
+        delete slotDates[si];
       }
     }
 
-    // 2. Check recent unconsumed activities matching any remaining slot on/after stagedDate (or today)
+    // 2. Check recent unpaired external activities matching any remaining slot on/after stagedDate (or today)
     const since = stagedDate && stagedDate <= today ? stagedDate : today;
     const recent = activities
-      .filter((a) => !consumed.has(String(a.id)) && (a.start_date_local ?? '').slice(0, 10) >= since)
+      .filter((a) => !a.paired_event_id && !consumed.has(String(a.id)) && (a.start_date_local ?? '').slice(0, 10) >= since)
       .sort((a, b) => (a.start_date_local ?? '').localeCompare(b.start_date_local ?? ''));
 
     for (const act of recent) {
@@ -271,6 +277,7 @@ export function reconcileQueue(args: {
       if (idx >= 0) {
         completedSlots.add(idx);
         consumed.add(String(act.id));
+        delete slotDates[idx];
       }
     }
 
@@ -278,9 +285,14 @@ export function reconcileQueue(args: {
     if (completedSlots.size >= step.slots.length) {
       stepIndex = Math.min(stepIndex + 1, plan.steps.length);
       completedSlots = new Set();
+      slotDates = {};
       stagedDate = stepIndex < plan.steps.length ? tomorrow : null;
       justAdvanced = true;
     }
+  }
+
+  for (const [k, d] of Object.entries(slotDates)) {
+    if (d <= today) delete slotDates[Number(k)];
   }
 
   // Decide targetDate for the resulting active step
@@ -294,12 +306,15 @@ export function reconcileQueue(args: {
     stagedDate = null;
   }
 
-  // Reconcile Intervals.icu events: keep only uncompleted slots of `stepIndex` on `targetDate`
-  const desired = new Map<string, PlanSlot>();
+  // Reconcile Intervals.icu events: keep only uncompleted slots of `stepIndex` on each slot's target date
+  const desired = new Map<string, { slot: PlanSlot; date: string }>();
   if (stepIndex < plan.steps.length && targetDate) {
     const step = plan.steps[stepIndex];
     step.slots.forEach((slot, si) => {
-      if (!completedSlots.has(si)) desired.set(planExternalId(plan.id, stepIndex, si), slot);
+      if (!completedSlots.has(si)) {
+        const d = slotDates[si] && slotDates[si] > targetDate ? slotDates[si] : targetDate;
+        desired.set(planExternalId(plan.id, stepIndex, si), { slot, date: d });
+      }
     });
   }
 
@@ -313,24 +328,25 @@ export function reconcileQueue(args: {
     const ext = ev.external_id!;
     seenExt.add(ext);
     if (ev.paired_activity_id) continue;
-    if (!desired.has(ext) || !targetDate) {
+    const want = desired.get(ext);
+    if (!want || !targetDate) {
       deletes.push(ev.id);
-    } else if ((ev.start_date_local ?? '').slice(0, 10) !== targetDate) {
-      moves.push({ id: ev.id, date: targetDate });
+    } else if ((ev.start_date_local ?? '').slice(0, 10) !== want.date) {
+      moves.push({ id: ev.id, date: want.date });
     }
   }
 
   if (targetDate) {
-    for (const [ext, slot] of desired) {
+    for (const [ext, want] of desired) {
       if (seenExt.has(ext)) continue;
       creates.push({
         external_id: ext,
-        start_date_local: `${targetDate}T00:00:00`,
+        start_date_local: `${want.date}T00:00:00`,
         category: 'WORKOUT',
-        type: slot.intervalsType,
-        name: slot.name,
-        description: slot.description,
-        moving_time: slot.seconds,
+        type: want.slot.intervalsType,
+        name: want.slot.name,
+        description: want.slot.description,
+        moving_time: want.slot.seconds,
       });
     }
   }
@@ -343,6 +359,7 @@ export function reconcileQueue(args: {
       stepIndex,
       completedSlots: Array.from(completedSlots).sort((a, b) => a - b),
       stagedDate,
+      slotDates,
       consumedIds: consumedList,
     },
     targetDate,

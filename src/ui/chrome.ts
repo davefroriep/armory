@@ -3,8 +3,11 @@ import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrFresh, live } from '../ble/telemetry';
 import { PHASE1_PLAN } from '../domain/plan';
 import { calendar, type TodayItem } from '../intervals/calendar';
+import { matchRoutineByTitle } from '../lifts/seed';
+import { lifts } from '../lifts/store';
 import { REV, REV_STAMP } from '../rev';
 import { EQUIPMENT_LABEL } from '../types';
+import { actionSheet, toast } from './lifts/kit';
 
 export interface BarOpts {
   title?: string;
@@ -68,6 +71,7 @@ const href = (it: TodayItem): string => {
   const eq = it.match.equipment;
   if (!eq) return '#/';
   const q = `?ev=${it.ev.id}`;
+  if (eq === 'strength') return `#/strength${q}&start=1`;
   return it.match.programId ? `#/${eq}/p/${it.match.programId}${q}` : `#/${eq}${q}`;
 };
 
@@ -83,7 +87,7 @@ export function calendarCard(items: TodayItem[], showUnmatched: boolean): string
     body = `<a class="cal-empty" href="#/settings">Add your Intervals.icu API key to see today's plan →</a>`;
   } else if (items.length === 0) {
     if (showUnmatched && up) {
-      body = `<div class="cal-empty"><b>✓ Today complete</b> · Up next: ${esc(up.step.title)}</div>`;
+      body = `<div class="cal-empty"><b>✓ Today complete</b> · Up next: ${esc(up.title)}</div>`;
       foot = `<div class="cal-foot"><span class="cal-sub">Staged for ${esc(up.date)}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
     } else {
       body = `<div class="cal-empty">${st === 'loading' ? 'Loading today’s plan…' : 'Nothing planned for today'}</div>`;
@@ -93,25 +97,52 @@ export function calendarCard(items: TodayItem[], showUnmatched: boolean): string
       .map((it) => {
         const eq = it.match.equipment;
         const mins = it.ev.moving_time ? Math.round(it.ev.moving_time / 60) : 0;
-        const sub = eq ? EQUIPMENT_LABEL[eq] + (it.match.programId ? ' · tap to start' : ' · pick a program') : 'Not linked to equipment';
+        const r = eq === 'strength' ? matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines()) : undefined;
+        const sub = eq === 'strength'
+          ? `Strength${r ? ` · ${r.name}` : ''} · tap to start`
+          : eq
+            ? EQUIPMENT_LABEL[eq] + (it.match.programId ? ' · tap to start' : ' · pick a program')
+            : 'Not linked to equipment';
         const inner = `<span class="cal-ico ${eq ?? ''}">${eq ? ICON[eq] : ''}</span>
-          <span class="cal-txt"><b>${esc(it.ev.name ?? 'Workout')}</b><small>${sub}${mins ? ` · ${mins} min` : ''}</small></span>`;
-        return eq || showUnmatched ? (eq ? `<a class="cal-item" href="${href(it)}">${inner}<span class="chev">›</span></a>` : `<div class="cal-item dim">${inner}</div>`) : '';
+          <span class="cal-txt"><b>${esc(it.ev.name ?? 'Workout')}</b><small>${esc(sub)}${mins ? ` · ${mins} min` : ''}</small></span>`;
+        const menu = `<button class="cal-more" type="button" data-cal-menu="${it.ev.id}" aria-label="Workout options">⋯</button>`;
+        if (!eq && !showUnmatched) return '';
+        return eq
+          ? `<div class="cal-item"><a class="cal-link" href="${href(it)}">${inner}<span class="chev">›</span></a>${menu}</div>`
+          : `<div class="cal-item dim"><div class="cal-link">${inner}</div>${menu}</div>`;
       })
       .join('');
-    if (showUnmatched && cur && !up) {
-      foot = `<div class="cal-foot"><span class="cal-sub">${esc(cur.title)}</span><button class="link" data-cal-done>Mark Done</button></div>`;
-    }
   }
   const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
   return `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU ${pill}</span><button class="link" data-refresh>Refresh</button></div>${body}${foot}${err}</section>`;
 }
 
+export async function openCalendarItemMenu(evId: number): Promise<void> {
+  const it = calendar.items.find((x) => x.ev.id === evId);
+  if (!it) return;
+  const k = await actionSheet(it.ev.name ?? 'Planned workout', [
+    { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — logs & pairs on Intervals.icu' },
+    { key: 'skip', label: 'Skip', sub: 'Removes just this workout from today' },
+    { key: 'push', label: 'Push to tomorrow', sub: 'Moves to tomorrow and shifts schedule back' },
+    { key: 'add', label: 'Add to tomorrow', sub: 'Moves to tomorrow and keeps tomorrow’s schedule' },
+  ]);
+  if (!k) return;
+  try {
+    if (k === 'done') { await calendar.markItemDone(evId); toast('Marked done'); }
+    else if (k === 'skip') { await calendar.skipItem(evId); toast('Workout skipped'); }
+    else if (k === 'push') { await calendar.pushItemToTomorrow(evId); toast('Pushed to tomorrow'); }
+    else if (k === 'add') { await calendar.addItemToTomorrow(evId); toast('Added to tomorrow'); }
+  } catch (e) {
+    toast((e as Error).message);
+  }
+}
+
 export function wireCalendar(root: HTMLElement, repaint: () => void): () => void {
   const click = (e: Event) => {
     const t = e.target as HTMLElement;
+    const menu = t.closest<HTMLElement>('[data-cal-menu]');
+    if (menu) { void openCalendarItemMenu(Number(menu.dataset.calMenu)); return; }
     if (t.closest('[data-refresh]')) void calendar.refresh();
-    else if (t.closest('[data-cal-done]')) void calendar.markCurrentDone();
     else if (t.closest('[data-cal-pull]')) void calendar.pullTomorrowToToday();
   };
   root.addEventListener('click', click);

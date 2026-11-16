@@ -2,6 +2,7 @@ import { ensureSensors } from '../../ble/sources';
 import { calendar } from '../../intervals/calendar';
 import { active } from '../../lifts/active';
 import { buildExercise } from '../../lifts/logic';
+import { matchRoutineByTitle } from '../../lifts/seed';
 import { lifts } from '../../lifts/store';
 import type { Routine, RoutineItem } from '../../lifts/types';
 import { ICON, esc } from '../dom';
@@ -9,10 +10,13 @@ import { revFooter, wireCalendar, wireChips } from '../chrome';
 import { LI, actionSheet, clock, confirmSheet, mount, relDay, tabBar, toast, wireClock } from './kit';
 
 /** Start a routine (or an empty workout) and open the session screen. */
-export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null }): Promise<void> {
+export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null; replace?: boolean }): Promise<void> {
   if (lifts.active) {
-    location.hash = '#/strength/session';
-    toast('Finish or discard the workout in progress first');
+    if (o.replace) location.replace('#/strength/session');
+    else {
+      location.hash = '#/strength/session';
+      toast('Finish or discard the workout in progress first');
+    }
     return;
   }
   const items = o.items ?? o.routine?.items ?? [];
@@ -23,7 +27,8 @@ export async function startWorkout(o: { name: string; routine?: Routine; items?:
   );
   if (exs.length) delete exs[exs.length - 1].ss;
   await active.start({ name: o.name, routineId: o.routine?.id ?? null, eventId: o.eventId ?? null, exs });
-  location.hash = '#/strength/session';
+  if (o.replace) location.replace('#/strength/session');
+  else location.hash = '#/strength/session';
 }
 
 const lastDone = (r: Routine): number | null => {
@@ -32,19 +37,18 @@ const lastDone = (r: Routine): number | null => {
   return best;
 };
 
-/** Planned-event title → the user's routine whose name appears in it ("... Day 2 Upper 1" → "Upper 1"). */
-function routineForEvent(name: string): Routine | undefined {
-  const n = name.toLowerCase();
-  return lifts.sortedRoutines().filter((r) => n.includes(r.name.toLowerCase())).sort((a, b) => b.name.length - a.name.length)[0];
-}
-
 export function trainScreen(root: HTMLElement, query: URLSearchParams): () => void {
   ensureSensors({ bike: false });
   void calendar.refresh();
   const evParam = query.get('ev') ? Number(query.get('ev')) : null;
+  const autoStart = query.get('start') === '1' && evParam != null;
 
   return mount(() => {
+    let dead = false;
+    let autoStarted = false;
+
     const paint = (): void => {
+      if (dead) return;
       const act = lifts.active;
       const routines = lifts.sortedRoutines();
       const planned = calendar.forEquipment('strength');
@@ -58,11 +62,11 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         : `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU</span><button class="link" data-refresh>Refresh</button></div>
           ${planned.length
             ? planned.map((it) => {
-                const r = routineForEvent(it.ev.name ?? '');
+                const r = matchRoutineByTitle(it.ev.name ?? '', routines);
                 const mins = it.ev.moving_time ? Math.round(it.ev.moving_time / 60) : 0;
                 return `<div class="cal-item${evParam === it.ev.id ? ' hot' : ''}"><span class="cal-ico strength">${ICON.strength}</span>
                   <span class="cal-txt"><b>${esc(it.ev.name ?? 'Strength')}</b><small>${r ? `Your “${esc(r.name)}” day` : 'No matching day yet'}${mins ? ` · ${mins} min` : ''}</small></span>
-                  <button class="btn sm primary" data-plan="${it.ev.id}">Start</button></div>`;
+                  <button class="btn sm primary" data-plan="${it.ev.id}">Start</button><button class="cal-more" type="button" data-cal-menu="${it.ev.id}" aria-label="Workout options">⋯</button></div>`;
               }).join('')
             : `<div class="cal-empty">${calendar.status === 'loading' ? 'Loading today’s plan…' : 'Nothing strength-related planned today'}</div>`}
           ${calendar.status === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : ''}</section>`;
@@ -91,6 +95,20 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
     };
     paint();
 
+    if (autoStart) {
+      void (async () => {
+        if (autoStarted) return;
+        autoStarted = true;
+        if (lifts.active) { location.replace('#/strength/session'); return; }
+        if (!calendar.items.length) await calendar.refresh();
+        if (dead) return;
+        const it = calendar.items.find((i) => i.ev.id === evParam);
+        if (!it) return;
+        const r = matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines());
+        if (r) await startWorkout({ name: r.name, routine: r, eventId: it.ev.id, replace: true });
+      })();
+    }
+
     const offCal = wireCalendar(root, paint);
     const offChips = wireChips(root);
     const offStore = lifts.changed.on(paint);
@@ -103,7 +121,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       if (plan) {
         const it = calendar.items.find((i) => i.ev.id === Number(plan.dataset.plan));
         if (!it) return;
-        const r = routineForEvent(it.ev.name ?? '');
+        const r = matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines());
         return void (await startWorkout({ name: r?.name ?? it.ev.name ?? 'Strength', routine: r, eventId: it.ev.id }));
       }
       const card = t.closest<HTMLElement>('[data-rid]');
@@ -134,6 +152,6 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       }
     });
 
-    return () => { offCal(); offChips(); offStore(); offClock(); };
+    return () => { dead = true; offCal(); offChips(); offStore(); offClock(); };
   });
 }

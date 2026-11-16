@@ -1,7 +1,7 @@
 import { Emitter } from '../emitter';
-import { PHASE1_PLAN, reconcileQueue, type PlanStep } from '../domain/plan';
+import { PHASE1_PLAN, parsePlanExternalId, reconcileQueue, type PlanStep } from '../domain/plan';
 import { getSettings, updateSettings } from '../store/settings';
-import { createEvent, deleteEvent, fetchActivities, fetchEvents, hasKey, moveEvent, syncAthleteFtp } from './api';
+import { createEvent, createManualActivity, deleteEvent, fetchActivities, fetchEvents, hasKey, moveEvent, syncAthleteFtp } from './api';
 import { classifyEvent, isPlannedWorkout, type EventMatch, type IntervalsEvent } from './parse';
 
 export interface TodayItem {
@@ -16,6 +16,20 @@ let lastFtpSync = 0;
 
 export const localDate = (d = new Date()): string =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+const localIsoNow = (d = new Date()): string => {
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `${localDate(d)}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+};
+
+function resolveSlotInSettings(parsed: ReturnType<typeof parsePlanExternalId>): void {
+  const s = getSettings();
+  if (!s.autoStagePlan || !parsed || parsed.stepIndex !== s.queue.stepIndex) return;
+  const completedSlots = Array.from(new Set([...s.queue.completedSlots, parsed.slotIndex])).sort((a, b) => a - b);
+  const slotDates = { ...(s.queue.slotDates ?? {}) };
+  delete slotDates[parsed.slotIndex];
+  updateSettings({ queue: { ...s.queue, completedSlots, slotDates } });
+}
 
 export function addDays(ymd: string, days: number): string {
   const [y, m, d] = ymd.split('-').map(Number);
@@ -49,14 +63,22 @@ class Calendar {
     return PHASE1_PLAN.steps[s.queue.stepIndex] ?? null;
   }
 
-  /** Non-null when today's step is done and the next step is staged for tomorrow (or a future date). */
-  upcomingStep(): { step: PlanStep; date: string } | null {
+  /** Non-null when today's remaining work is staged for tomorrow (or a future date). */
+  upcomingStep(): { title: string; date: string } | null {
     const s = getSettings();
     if (!s.autoStagePlan) return null;
     const step = PHASE1_PLAN.steps[s.queue.stepIndex];
+    if (!step) return null;
     const today = localDate();
-    if (!step || !s.queue.stagedDate || s.queue.stagedDate <= today) return null;
-    return { step, date: s.queue.stagedDate };
+    if (s.queue.stagedDate && s.queue.stagedDate > today) {
+      return { title: step.title, date: s.queue.stagedDate };
+    }
+    const pending = step.slots.map((sl, si) => ({ sl, si })).filter((x) => !s.queue.completedSlots.includes(x.si));
+    const dates = pending.map((x) => s.queue.slotDates?.[x.si] ?? '');
+    if (pending.length && dates.every((d) => d > today)) {
+      return { title: pending.map((x) => x.sl.name).join(' + '), date: dates.sort()[0] };
+    }
+    return null;
   }
 
   refresh(): Promise<void> {
@@ -127,20 +149,77 @@ class Calendar {
     this.changed.emit();
   }
 
-  /** Marks the current step complete manually (e.g., lifted in Boostcamp without Armory HR) and stages the next one for tomorrow. */
-  async markCurrentDone(): Promise<void> {
-    const s = getSettings();
-    if (s.queue.stepIndex >= PHASE1_PLAN.steps.length) return;
-    const nextIdx = Math.min(s.queue.stepIndex + 1, PHASE1_PLAN.steps.length);
-    const tomorrow = addDays(localDate(), 1);
-    updateSettings({
-      queue: {
-        ...s.queue,
-        stepIndex: nextIdx,
-        completedSlots: [],
-        stagedDate: nextIdx < PHASE1_PLAN.steps.length ? tomorrow : null,
-      },
+  /** Marks one planned workout complete externally (creates & pairs a manual activity on Intervals.icu). */
+  async markItemDone(evId: number): Promise<void> {
+    const it = this.items.find((x) => x.ev.id === evId);
+    if (!it) return;
+    const type = it.ev.type ?? (it.match.equipment === 'strength' ? 'WeightTraining' : it.match.equipment === 'treadmill' ? 'VirtualRun' : 'VirtualRide');
+    const seconds = it.ev.moving_time && it.ev.moving_time > 0 ? it.ev.moving_time : 2400;
+    await createManualActivity({
+      startLocalIso: localIsoNow(),
+      name: it.ev.name ?? 'Workout',
+      description: 'Marked done in Armory Fit (completed externally)',
+      seconds,
+      type,
+      externalId: `armory-done-${evId}`,
+      pairedEventId: evId,
     });
+    resolveSlotInSettings(parsePlanExternalId(it.ev.external_id));
+    await this.refresh();
+  }
+
+  /** Skips just this planned workout (deletes it from today without touching other workouts on the day). */
+  async skipItem(evId: number): Promise<void> {
+    const it = this.items.find((x) => x.ev.id === evId);
+    if (!it) return;
+    const s = getSettings();
+    const parsed = parsePlanExternalId(it.ev.external_id);
+    if (s.autoStagePlan && parsed && parsed.stepIndex === s.queue.stepIndex) {
+      resolveSlotInSettings(parsed);
+    } else {
+      await deleteEvent(evId);
+    }
+    await this.refresh();
+  }
+
+  /** Moves just this workout to tomorrow and holds the rolling schedule back until it is finished. */
+  async pushItemToTomorrow(evId: number): Promise<void> {
+    const it = this.items.find((x) => x.ev.id === evId);
+    if (!it) return;
+    const tomorrow = addDays(localDate(), 1);
+    const s = getSettings();
+    const parsed = parsePlanExternalId(it.ev.external_id);
+    if (s.autoStagePlan && parsed && parsed.stepIndex === s.queue.stepIndex) {
+      const slotDates = { ...(s.queue.slotDates ?? {}), [parsed.slotIndex]: tomorrow };
+      updateSettings({ queue: { ...s.queue, slotDates } });
+    } else {
+      await moveEvent(evId, tomorrow);
+    }
+    await this.refresh();
+  }
+
+  /** Moves just this workout onto tomorrow as a carry-over while letting tomorrow's regular schedule advance normally. */
+  async addItemToTomorrow(evId: number): Promise<void> {
+    const it = this.items.find((x) => x.ev.id === evId);
+    if (!it) return;
+    const tomorrow = addDays(localDate(), 1);
+    const s = getSettings();
+    const parsed = parsePlanExternalId(it.ev.external_id);
+    if (s.autoStagePlan && parsed && parsed.stepIndex === s.queue.stepIndex) {
+      const t = it.ev.type === 'WeightTraining' || it.ev.type === 'VirtualRun' || it.ev.type === 'VirtualRide' ? it.ev.type : 'VirtualRide';
+      await createEvent({
+        external_id: `armory-carry-${evId}-${Date.now().toString(36)}`,
+        start_date_local: `${tomorrow}T00:00:00`,
+        category: 'WORKOUT',
+        type: t,
+        name: it.ev.name ?? 'Workout',
+        description: it.ev.description ?? '',
+        moving_time: it.ev.moving_time ?? 1800,
+      });
+      resolveSlotInSettings(parsed);
+    } else {
+      await moveEvent(evId, tomorrow);
+    }
     await this.refresh();
   }
 
@@ -151,6 +230,7 @@ class Calendar {
       queue: {
         ...s.queue,
         stagedDate: localDate(),
+        slotDates: {},
       },
     });
     await this.refresh();
@@ -166,6 +246,7 @@ class Calendar {
         stepIndex: clamped,
         completedSlots: [],
         stagedDate: clamped < PHASE1_PLAN.steps.length ? localDate() : null,
+        slotDates: {},
       },
     });
     await this.refresh();

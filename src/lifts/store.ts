@@ -2,6 +2,8 @@ import { Emitter } from '../emitter';
 import { idbAll, idbDelete, idbGet, idbPut, idbPutMany } from '../store/db';
 import { computePRs, doneSessions, previousPerformance, type PRHit } from './calc';
 import { LIBRARY, LIBRARY_BY_ID } from './library';
+import { buildExercise } from './logic';
+import { PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from './seed';
 import type { ExRow, Exercise, LiftSession, Routine, SessionEx, VideoMeta } from './types';
 
 interface BlobRow {
@@ -54,6 +56,39 @@ class LiftStore {
     r.forEach((e) => this.routines.set(e.id, e));
     x.forEach((e) => this.rows.set(e.id, e));
     for (const e of v) if (!e.id.startsWith(BLOB_PREFIX)) this.videos.set(e.id, e as VideoMeta);
+
+    const SEED_KEY = 'armory.lifts.seeded.v1';
+    if (typeof localStorage !== 'undefined' && !localStorage.getItem(SEED_KEY)) {
+      if (this.routines.size === 0) {
+        PHASE1_ROUTINES.forEach((rt) => this.routines.set(rt.id, rt));
+        await idbPutMany('lift_routines', PHASE1_ROUTINES);
+      }
+      for (const row of SEED_EX_ROWS) {
+        if (!this.rows.has(row.id)) {
+          this.rows.set(row.id, row);
+          await idbPut('lift_ex', row);
+        }
+      }
+      localStorage.setItem(SEED_KEY, '1');
+    }
+
+    // Auto-heal an empty active workout launched from a planned day before routines were seeded.
+    const act = this.active;
+    if (act && act.exs.length === 0) {
+      const rt = matchRoutineByTitle(act.name, this.sortedRoutines());
+      if (rt) {
+        act.routineId = rt.id;
+        act.name = rt.name;
+        act.exs = rt.items.flatMap((it, i) =>
+          this.exercise(it.exId)
+            ? [buildExercise(it.exId, it.sets, this.previous(it.exId), !!it.ss, i)]
+            : [],
+        );
+        if (act.exs.length) delete act.exs[act.exs.length - 1].ss;
+        await idbPut('lift_sessions', act);
+      }
+    }
+
     this.touch(false);
   }
 
