@@ -7,7 +7,7 @@ import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
-import { effectiveRestAuto, hasLogged, isSessionStarted, midSuperset, pruneUnlogged } from './logic';
+import { effectiveRestAuto, hasLogged, hasSessionActivity, isSessionStarted, midSuperset, pruneUnlogged } from './logic';
 import { liftSettings } from './settings';
 import { lifts } from './store';
 import type { LiftSession, SessionEx } from './types';
@@ -75,7 +75,7 @@ class ActiveWorkout {
     return s;
   }
 
-  /** Start the workout clock, HR recorder, wake lock and foreground service once the first set is checked. */
+  /** Start the workout clock, HR recorder, wake lock and foreground service once a set or video starts. */
   ensureStarted(s: LiftSession): boolean {
     if (isSessionStarted(s)) {
       if (!this.timer) void this.attach(s, true);
@@ -85,12 +85,13 @@ class ActiveWorkout {
     s.started = true;
     lifts.saveSession(s, true);
     void this.attach(s, false);
+    this.tick.emit();
     return true;
   }
 
-  /** If the user unchecks the only checked set, stop the clock/HR recording and return to 0:00 preview mode. */
+  /** If nothing is logged or video-linked, stop the clock/HR recording and return to 0:00 preview mode. */
   async resetIfNoneLogged(s: LiftSession): Promise<boolean> {
-    if (s.exs.some(hasLogged) || !s.started) return false;
+    if (hasSessionActivity(s) || !s.started) return false;
     s.started = false;
     this.teardown();
     lifts.saveSession(s, true);

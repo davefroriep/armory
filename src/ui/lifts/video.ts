@@ -1,4 +1,7 @@
+import { active } from '../../lifts/active';
 import { driveUrlFor } from '../../lifts/logic';
+import { extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink } from '../../lifts/mp4';
+import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
 import type { LiftSession, LiftSet, SessionEx, VideoMeta } from '../../lifts/types';
@@ -15,16 +18,32 @@ export interface VideoTarget {
   set: LiftSet;
 }
 
-const MAX_BYTES = 400 * 1024 * 1024;
 const VIDEO_EXT = /\.(mp4|mov|webm|mkv|m4v|3gp)$/i;
 const sessionFiles = new Map<string, Blob>();
+const isMobileWeb = (): boolean => !isNative() && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
+interface OpenFilePickerWin extends Window {
+  showOpenFilePicker?: (opts?: {
+    multiple?: boolean;
+    excludeAcceptAllOption?: boolean;
+    types?: { description?: string; accept: Record<string, string[]> }[];
+  }) => Promise<{ getFile(): Promise<File> }[]>;
+}
+
+const startTimerForVideo = (s: LiftSession): void => {
+  if (s.status === 'active') active.ensureStarted(s);
+};
+
+const resetTimerIfIdle = async (s: LiftSession | undefined): Promise<void> => {
+  if (s?.status === 'active') await active.resetIfNoneLogged(s);
+};
 
 const pickMime = (): string => {
   const c = ['video/mp4;codecs=avc1', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
   return c.find((m) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(m)) ?? '';
 };
 
-/** Poster frame (small JPEG data URL) + duration so lists don't have to decode or store whole videos. */
+/** Poster frame (small JPEG data URL) + duration so lists don't have to decode or store large videos. */
 async function probeBlob(blob: Blob): Promise<{ thumb: string; durationSec: number }> {
   return new Promise((resolve) => {
     const url = URL.createObjectURL(blob);
@@ -53,12 +72,14 @@ async function probeBlob(blob: Blob): Promise<{ thumb: string; durationSec: numb
   });
 }
 
-async function storeBlobClip(t: VideoTarget, blob: Blob, mime: string): Promise<VideoMeta> {
+async function storeBlobClip(t: VideoTarget, blob: Blob, mime: string, fileName?: string): Promise<VideoMeta> {
   void navigator.storage?.persist?.();
+  startTimerForVideo(t.session);
   const { thumb, durationSec } = await probeBlob(blob);
   const meta: VideoMeta = {
     id: uid(), sessionId: t.session.id, exId: t.se.exId, setId: t.set.id, ms: Date.now(),
     mime: mime || blob.type || 'video/mp4', bytes: blob.size, thumb,
+    ...(fileName ? { fileName } : {}),
     ...(durationSec ? { durationSec } : {}),
   };
   await lifts.addVideo(meta, blob);
@@ -68,6 +89,7 @@ async function storeBlobClip(t: VideoTarget, blob: Blob, mime: string): Promise<
 }
 
 async function storeLinkClip(t: VideoTarget, o: Partial<VideoMeta> & { fileName?: string }): Promise<VideoMeta> {
+  startTimerForVideo(t.session);
   const meta: VideoMeta = {
     id: uid(),
     sessionId: t.session.id,
@@ -79,6 +101,7 @@ async function storeLinkClip(t: VideoTarget, o: Partial<VideoMeta> & { fileName?
     thumb: o.thumb ?? '',
     linkOnly: true,
     ...(o.fileName ? { fileName: o.fileName } : {}),
+    ...(o.driveQuery ? { driveQuery: o.driveQuery } : {}),
     ...(o.fileMs ? { fileMs: o.fileMs } : {}),
     ...(o.durationSec ? { durationSec: o.durationSec } : {}),
     ...(o.uri ? { uri: o.uri } : {}),
@@ -89,29 +112,68 @@ async function storeLinkClip(t: VideoTarget, o: Partial<VideoMeta> & { fileName?
   return meta;
 }
 
-/**
- * Launch the device Camera app directly in video mode (Android native/PWA) so it saves straight to DCIM,
- * or open the in-app camera on desktop browsers.
- */
-export async function launchCameraForSet(t: VideoTarget): Promise<VideoMeta | 'external' | null> {
-  if (isNative()) {
-    const ok = await launchNativeVideoCamera();
-    if (ok) return 'external';
+async function handlePickedFile(t: VideoTarget, f: File, mode: 'capture' | 'pick'): Promise<VideoMeta | null> {
+  if (!(f.type.startsWith('video/') || VIDEO_EXT.test(f.name))) {
+    toast('Pick a video file (.mp4, .mov, .webm)');
+    await resetTimerIfIdle(t.session);
+    return null;
   }
-  if (/Android/i.test(navigator.userAgent)) {
-    const a = document.createElement('a');
-    a.href = 'intent://#Intent;action=android.media.action.VIDEO_CAMERA;end';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    return 'external';
+  startTimerForVideo(t.session);
+  const { thumb, durationSec } = await probeBlob(f);
+  if (mode === 'capture') {
+    const startMs = Math.max(0, (f.lastModified || Date.now()) - durationSec * 1000);
+    const fileName = /^PXL_/i.test(f.name) ? f.name : formatPixelFilename(startMs);
+    const meta = await storeBlobClip(t, f, f.type, fileName);
+    if (!meta.thumb && thumb) { meta.thumb = thumb; await lifts.saveVideoMeta(meta); }
+    return meta;
   }
-  return recordVideo(t);
+  const endMs = (await extractMp4CreationMs(f)) ?? (f.lastModified || Date.now());
+  const { fileName, driveQuery } = inferPixelVideoLink(f.name, endMs, durationSec);
+  const meta = await storeLinkClip(t, {
+    fileName,
+    driveQuery,
+    bytes: f.size,
+    fileMs: f.lastModified || endMs,
+    mime: f.type || 'video/mp4',
+    durationSec,
+    thumb,
+  });
+  sessionFiles.set(meta.id, f);
+  return meta;
+}
+
+/** Open the Files / DocumentsUI folder browser (Android Chrome 132+ via showOpenFilePicker, or input fallback). */
+async function browseFilesFolder(t: VideoTarget): Promise<VideoMeta | null> {
+  const picker = (window as OpenFilePickerWin).showOpenFilePicker;
+  if (typeof picker === 'function') {
+    try {
+      const [handle] = await picker({
+        multiple: false,
+        excludeAcceptAllOption: false,
+        types: [{
+          description: 'Video files',
+          accept: { 'application/octet-stream': ['.mp4', '.mov', '.webm', '.mkv', '.m4v', '.3gp'], 'video/mp4': ['.mp4'] },
+        }],
+      });
+      if (!handle) return null;
+      return await handlePickedFile(t, await handle.getFile(), 'pick');
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return null;
+    }
+  }
+  return new Promise((resolve) => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'video/mp4,application/octet-stream';
+    inp.onchange = async () => resolve(inp.files?.[0] ? await handlePickedFile(t, inp.files[0], 'pick') : null);
+    inp.addEventListener('cancel', () => resolve(null));
+    inp.click();
+  });
 }
 
 /**
- * Pick a video from the phone's local storage (DCIM/Camera) and store only its filename + poster frame + URI
- * so Google Drive's DCIM Backup can always locate it later with zero duplicate blob storage.
+ * Pick a video from the phone (native DCIM/Camera on APK, or DocumentsUI/Video picker on Web)
+ * preserving filename & Google Drive DCIM Backup link without copying the file into IndexedDB.
  */
 export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
   if (isNative()) {
@@ -130,34 +192,8 @@ export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
   return new Promise((resolve) => {
     const inp = document.createElement('input');
     inp.type = 'file';
-    // On Android, `*/*` opens Files / DocumentsUI (remembering DCIM/Camera and preserving real PXL_* filenames)
-    // instead of the Android Photo Picker which strips filenames into numeric IDs.
-    inp.accept = /Android/i.test(navigator.userAgent) ? '*/*' : 'video/*';
-    inp.onchange = async () => {
-      const f = inp.files?.[0];
-      if (!f) return resolve(null);
-      if (!(f.type.startsWith('video/') || VIDEO_EXT.test(f.name))) {
-        toast('Pick a video file (e.g. .mp4 from DCIM/Camera)');
-        return resolve(null);
-      }
-      if (f.size > MAX_BYTES) toast('Large video linked by filename (0 MB copied)');
-      const { thumb, durationSec } = await probeBlob(f);
-      let fileName = f.name;
-      if (/^\d{6,}\.\w+$/.test(fileName)) {
-        const edited = await promptSheet('Confirm DCIM filename', fileName, 'PXL_YYYYMMDD_HHMMSSXXX.mp4');
-        if (edited) fileName = edited;
-      }
-      const meta = await storeLinkClip(t, {
-        fileName,
-        bytes: f.size,
-        fileMs: f.lastModified || Date.now(),
-        mime: f.type || 'video/mp4',
-        durationSec,
-        thumb,
-      });
-      sessionFiles.set(meta.id, f);
-      resolve(meta);
-    };
+    inp.accept = 'video/*';
+    inp.onchange = async () => resolve(inp.files?.[0] ? await handlePickedFile(t, inp.files[0], 'pick') : null);
     inp.addEventListener('cancel', () => resolve(null));
     inp.click();
   });
@@ -172,17 +208,20 @@ export async function linkManualVideo(t: VideoTarget, initial = ''): Promise<Vid
   return storeLinkClip(t, { fileName, ...(isUrl ? { uri: raw } : {}) });
 }
 
-/** Legacy helper alias kept for internal callers. */
+/** Legacy alias for callers. */
 export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDcimVideo(t);
 
 /**
- * Per-row video sheet: inspect linked videos on this set, launch phone Camera in video mode,
- * or select a file from DCIM/Camera to pull its filename for Drive DCIM Backup matching.
+ * Per-row video sheet: inspect linked videos on this set, launch Camera in video mode (starting workout timer),
+ * open Visual Video Selector (with thumbnails), or browse DCIM/Files folder.
  */
 export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promise<void> {
   const ex = lifts.exOrStub(t.se.exId);
+  const native = isNative();
+  const mobile = isMobileWeb();
   let resolveClosed: () => void = () => {};
   const closed = new Promise<void>((res) => { resolveClosed = res; });
+
   const linkedRows = (): string => {
     const items = (t.set.vids ?? []).map((id) => lifts.videos.get(id)).filter((v): v is VideoMeta => !!v);
     if (!items.length) return '';
@@ -195,52 +234,94 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
         <button class="vlink-rm" type="button" data-unlink="${v.id}" aria-label="Unlink video">✕</button>
       </div>`).join('')}`;
   };
+
+  const actionsHtml = native
+    ? `<div class="hint" id="vcam-hint" hidden style="color:#93c5fd">Camera app opened — once done recording, tap <b>Select file from DCIM</b> below to link its filename.</div>
+       <div class="fl">LINK VIDEO</div>
+       <div class="alist">
+         <button class="aitem" type="button" data-vact="cam"><b>Record Video (Camera)</b><small>Opens phone camera in video mode &amp; starts workout timer</small></button>
+         <button class="aitem" type="button" data-vact="pick"><b>Select file from DCIM</b><small>Opens DCIM/Camera directly (0 MB copied, links to Drive Backup)</small></button>
+         <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
+       </div>`
+    : mobile
+      ? `<div class="fl">LINK VIDEO</div>
+         <div class="alist">
+           <label class="aitem" data-vact="cam"><input type="file" accept="video/*" capture="environment" data-vinp="cam" hidden><b>Record Video (Camera)</b><small>Opens camera directly in video mode &amp; starts workout timer</small></label>
+           <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video (with Previews)</b><small>Opens video selector with thumbnails (links to Drive DCIM Backup)</small></label>
+           <button class="aitem" type="button" data-vact="files"><b>Browse DCIM / Files Folder</b><small>Opens folder browser directly (preserves exact PXL_… filename)</small></button>
+           <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
+         </div>`
+      : `<div class="fl">LINK VIDEO</div>
+         <div class="alist">
+           <button class="aitem" type="button" data-vact="cam"><b>Record Video (Camera)</b><small>Opens webcam recorder &amp; starts workout timer</small></button>
+           <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video File</b><small>Pulls filename &amp; thumbnail for Google Drive DCIM Backup</small></label>
+           <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
+         </div>`;
+
   const sh = openSheet(
     `<h3 class="sh-title">${esc(ex.name)} · ${esc(setLabel)}</h3>
      <div id="vlinked">${linkedRows()}</div>
-     <div class="hint" id="vcam-hint" hidden style="color:#93c5fd">Camera opened — once done recording, tap <b>Select file from DCIM</b> below to link its filename.</div>
-     <div class="fl">LINK VIDEO</div>
-     <div class="alist">
-       <button class="aitem" type="button" data-vact="cam"><b>Launch Camera (Video)</b><small>Open phone camera in video mode (saves to DCIM)</small></button>
-       <button class="aitem" type="button" data-vact="pick"><b>Select file from DCIM</b><small>Pulls filename only — matches Google Drive DCIM Backup even while still uploading</small></button>
-       <button class="aitem" type="button" data-vact="manual"><b>Paste link or filename</b><small>Enter PXL_…mp4 filename or Google Drive URL</small></button>
-     </div>
+     ${actionsHtml}
      <button class="btn big" type="button" data-vok>Done</button>`,
     { onClose: resolveClosed },
   );
   const redraw = (): void => { sh.body.querySelector('#vlinked')!.innerHTML = linkedRows(); };
+
+  sh.body.querySelectorAll<HTMLInputElement>('[data-vinp]').forEach((inp) => {
+    const kind = inp.dataset.vinp as 'cam' | 'pick';
+    if (kind === 'cam') inp.addEventListener('click', () => startTimerForVideo(t.session));
+    inp.addEventListener('cancel', () => { if (kind === 'cam') void resetTimerIfIdle(t.session); });
+    inp.addEventListener('change', async () => {
+      const f = inp.files?.[0];
+      if (!f) {
+        if (kind === 'cam') await resetTimerIfIdle(t.session);
+        return;
+      }
+      const meta = await handlePickedFile(t, f, kind === 'cam' ? 'capture' : 'pick');
+      if (meta) {
+        toast(kind === 'cam' ? 'Video recorded & linked' : `Linked ${meta.fileName ?? 'video'}`);
+        sh.close();
+      }
+    });
+  });
+
   sh.body.addEventListener('click', async (e) => {
     const el = e.target as HTMLElement;
+    if (el instanceof HTMLInputElement) return;
     const play = el.closest<HTMLElement>('[data-play]');
     if (play) { await playVideo(play.dataset.play!); redraw(); return; }
     const unlink = el.closest<HTMLElement>('[data-unlink]');
     if (unlink) {
       await lifts.deleteVideo(unlink.dataset.unlink!);
+      await resetTimerIfIdle(t.session);
       redraw();
       toast('Video unlinked');
       return;
     }
     const act = el.closest<HTMLElement>('[data-vact]')?.dataset.vact;
     if (act === 'cam') {
-      const res = await launchCameraForSet(t);
-      if (res === 'external') {
-        sh.body.querySelector<HTMLElement>('#vcam-hint')!.hidden = false;
-      } else if (res) {
-        redraw();
-        toast('Video linked to set');
+      if (native) {
+        startTimerForVideo(t.session);
+        const ok = await launchNativeVideoCamera();
+        if (ok) sh.body.querySelector<HTMLElement>('#vcam-hint')!.hidden = false;
+        else { await resetTimerIfIdle(t.session); toast('Could not open Camera app'); }
+      } else if (!mobile) {
+        startTimerForVideo(t.session);
+        sh.el.style.visibility = 'hidden';
+        const meta = await recordVideo(t);
+        sh.el.style.visibility = '';
+        if (meta) { toast('Video recorded & linked'); sh.close(); }
+        else await resetTimerIfIdle(t.session);
       }
-    } else if (act === 'pick') {
+    } else if (act === 'pick' && native) {
       const meta = await linkDcimVideo(t);
-      if (meta) {
-        redraw();
-        toast(`Linked ${meta.fileName ?? 'video'}`);
-      }
+      if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
+    } else if (act === 'files') {
+      const meta = await browseFilesFolder(t);
+      if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
     } else if (act === 'manual') {
       const meta = await linkManualVideo(t);
-      if (meta) {
-        redraw();
-        toast(`Linked ${meta.fileName ?? 'video'}`);
-      }
+      if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
     } else if (el.closest('[data-vok]')) {
       sh.close();
     }
@@ -250,7 +331,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
 /**
  * In-app camera: preview, countdown (time to step back to the bar), record, review, then link to the set.
- * Used as fallback on desktop browsers without native Android Intent camera launch.
+ * Used as fallback on desktop browsers without native camera capture.
  */
 export function recordVideo(t: VideoTarget): Promise<VideoMeta | null> {
   return new Promise((resolve) => {
@@ -301,7 +382,7 @@ export function recordVideo(t: VideoTarget): Promise<VideoMeta | null> {
         vid.srcObject = stream;
         msg('');
       } catch {
-        msg('Camera unavailable. Allow camera access, or use Select file from DCIM.');
+        msg('Camera unavailable. Allow camera access, or use Select Video.');
       }
     };
 
@@ -374,20 +455,20 @@ export function recordVideo(t: VideoTarget): Promise<VideoMeta | null> {
     q('[data-save]').addEventListener('click', async () => {
       if (!blob) return;
       (q('[data-save]') as HTMLButtonElement).disabled = true;
-      end(await storeBlobClip(t, blob, mime));
+      end(await storeBlobClip(t, blob, mime, formatPixelFilename(Date.now())));
     });
 
-    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') msg('Recording isn’t supported here. Use Select file from DCIM.');
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') msg('Recording isn’t supported here. Use Select Video.');
     else void open();
   });
 }
 
-/** Play or recall a stored/linked video with Google Drive DCIM Backup lookup and local phone playback. */
+/** Play or recall a stored/linked video with Google Drive DCIM Backup lookup and local playback. */
 export async function playVideo(id: string): Promise<void> {
   const meta = lifts.videos.get(id);
   if (!meta) return;
   const blob = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
-  if (!blob && !meta.linkOnly && !meta.fileName && !meta.uri) {
+  if (!blob && !meta.linkOnly && !meta.fileName && !meta.uri && !meta.driveQuery) {
     toast('Video file is missing');
     return;
   }
@@ -412,9 +493,10 @@ export async function playVideo(id: string): Promise<void> {
     `${preview}
      <h3 class="sh-title">${esc(ex.name)}</h3>
      <p class="sh-text">${setTxt}${setTxt ? ' · ' : ''}${dateTxt}${durTxt}${sizeTxt}</p>
-     ${meta.fileName ? `<div class="vfile"><small>LINKED FILE (DCIM BACKUP)</small><b>${esc(meta.fileName)}</b></div>` : ''}
+     ${meta.fileName ? `<div class="vfile"><small>LINKED FILE${meta.driveQuery ? ' · TIMESTAMP MATCHED' : ' (DCIM BACKUP)'}</small><b>${esc(meta.fileName)}</b></div>` : ''}
      ${driveUrl ? `<a class="btn primary big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>Open in Google Drive ↗</a>
-       <p class="hint" style="text-align:center">Searches your Google Drive backup for this exact filename (big videos may take a minute to finish syncing).</p>` : ''}
+       <p class="hint" style="text-align:center">Searches your Google Drive backup for this clip (give big videos a minute to finish syncing).</p>` : ''}
+     ${blob && !meta.linkOnly ? '<button class="btn big" type="button" data-vshare>Share / Save to Drive</button>' : ''}
      ${hasLocalUri ? '<button class="btn big" type="button" data-vlocal>▶ Play from phone DCIM</button>' : ''}
      <button class="btn sm" type="button" data-vedit>Edit filename / URL</button>
      <button class="btn danger big" type="button" data-del>${meta.linkOnly ? 'Unlink video' : 'Delete video'}</button>
@@ -424,7 +506,9 @@ export async function playVideo(id: string): Promise<void> {
   sh.body.addEventListener('click', async (e) => {
     const t = e.target as HTMLElement;
     if (t.closest('[data-ok]')) sh.close();
-    else if (t.closest('[data-vlocal]')) {
+    else if (t.closest('[data-vshare]') && blob) {
+      try { await shareImage(blob, meta.fileName || 'lift-video.mp4', `${ex.name} · ${setTxt}`); } catch { /* cancelled */ }
+    } else if (t.closest('[data-vlocal]')) {
       const ok = await openNativeVideoUri(meta.uri!);
       if (!ok) toast('Local file moved or unavailable — use Google Drive above');
     } else if (t.closest('[data-vedit]')) {
@@ -437,6 +521,7 @@ export async function playVideo(id: string): Promise<void> {
         fileName: isUrl ? v.split('/').pop()?.split('?')[0] || 'Drive video' : v,
         ...(isUrl ? { uri: v } : {}),
       };
+      delete next.driveQuery;
       await lifts.saveVideoMeta(next);
       sh.close();
       toast('Video link updated');
@@ -446,6 +531,7 @@ export async function playVideo(id: string): Promise<void> {
       if (await confirmSheet(meta.linkOnly ? 'Unlink this video?' : 'Delete this video?', msg, meta.linkOnly ? 'Unlink' : 'Delete', true)) {
         sessionFiles.delete(id);
         await lifts.deleteVideo(id);
+        await resetTimerIfIdle(lifts.sessions.get(meta.sessionId));
         sh.close();
         toast(meta.linkOnly ? 'Video unlinked' : 'Video deleted');
       }

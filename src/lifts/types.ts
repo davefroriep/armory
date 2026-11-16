@@ -120,6 +120,8 @@ export interface VideoMeta {
   uri?: string;
   /** True when only metadata + Drive/DCIM reference is stored (no video blob in IndexedDB). */
   linkOnly?: boolean;
+  /** Google Drive search query when filename was inferred from MP4 timestamp (e.g. "PXL 20261116 1856 type:video"). */
+  driveQuery?: string;
 }
 
 export const uid = (): string => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;

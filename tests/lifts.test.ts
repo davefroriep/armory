@@ -5,9 +5,11 @@ import {
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import {
-  addSet, buildExercise, canLog, driveUrlFor, editReps, editWeight, effectiveRestAuto, isSessionStarted, labels,
-  midSuperset, newSet, prevSetFor, pruneUnlogged, removeLastSet, routineFromSession, supersetGroups, swapExercise, toggleDone,
+  addSet, buildExercise, canLog, driveUrlFor, editReps, editWeight, effectiveRestAuto, hasSessionActivity,
+  isSessionStarted, labels, midSuperset, newSet, prevSetFor, pruneUnlogged, removeLastSet, routineFromSession,
+  supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
+import { extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs } from '../src/lifts/mp4';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
 import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
 import { KG_PER_LB, fmtNum, fromDisplay, stepsFor, toDisplay } from '../src/lifts/settings';
@@ -351,15 +353,75 @@ describe('Phase 1 routine seed', () => {
     const hold = buildExercise('triceps-isometric-hold', 2, null);
     expect(hold.sets.map((s) => [s.r, s.rAuto])).toEqual([[45, true], [45, true]]);
   });
-  it('treats active workouts as unstarted preview until started or a set is checked, and builds Drive DCIM URLs', () => {
+  it('treats active workouts as unstarted preview until started, set checked, or video linked; and builds Drive DCIM URLs', () => {
     const preview = sess('prev', Date.now(), [sx('bench', [set(lb(135), 8, { done: false })])], { status: 'active', started: false });
+    expect(hasSessionActivity(preview)).toBe(false);
+    expect(isSessionStarted(preview)).toBe(false);
+    preview.exs[0].sets[0].vids = ['vid-1'];
+    expect(hasSessionActivity(preview)).toBe(true);
+    expect(isSessionStarted(preview)).toBe(true);
+    preview.exs[0].sets[0].vids = [];
+    expect(hasSessionActivity(preview)).toBe(false);
     expect(isSessionStarted(preview)).toBe(false);
     preview.started = true;
     expect(isSessionStarted(preview)).toBe(true);
     const checkedNoFlag = sess('chk', Date.now(), [sx('bench', [set(lb(135), 8, { done: true })])], { status: 'active' });
     expect(isSessionStarted(checkedNoFlag)).toBe(true);
     expect(driveUrlFor({ fileName: 'PXL_20261116_173012345.mp4' })).toBe('https://drive.google.com/drive/search?q=PXL_20261116_173012345.mp4');
+    expect(driveUrlFor({ fileName: 'PXL_20261116_1856xx.mp4', driveQuery: 'PXL 20261116 1856 type:video' })).toBe('https://drive.google.com/drive/search?q=PXL%2020261116%201856%20type%3Avideo');
     expect(driveUrlFor({ fileName: 'clip.mp4', uri: 'https://drive.google.com/file/d/abc/view' })).toBe('https://drive.google.com/file/d/abc/view');
     expect(driveUrlFor({})).toBeNull();
+  });
+
+  it('extracts UTC creation time from MP4 mvhd (head or tail moov, v0 and v1) and infers Pixel Drive query', async () => {
+    const EPOCH_OFFSET = 2_082_844_800;
+    const targetMs = Date.UTC(2026, 10, 16, 18, 56, 35);
+    const mp4Sec = Math.floor(targetMs / 1000) + EPOCH_OFFSET;
+
+    // Build synthetic ftyp + huge mdat + tail moov(mvhd v0)
+    const buildMvhd = (version: 0 | 1): Uint8Array => {
+      const mvhdSize = version === 0 ? 108 : 120;
+      const b = new Uint8Array(mvhdSize);
+      const dv = new DataView(b.buffer);
+      dv.setUint32(0, mvhdSize);
+      dv.setUint32(4, 0x6d766864); // mvhd
+      dv.setUint8(8, version);
+      if (version === 0) {
+        dv.setUint32(12, mp4Sec);
+        dv.setUint32(20, 1000);
+      } else {
+        dv.setUint32(12, Math.floor(mp4Sec / 4294967296));
+        dv.setUint32(16, mp4Sec >>> 0);
+        dv.setUint32(28, 1000);
+      }
+      return b;
+    };
+
+    const mvhd0 = buildMvhd(0);
+    const moov = new Uint8Array(8 + mvhd0.length);
+    const mdv = new DataView(moov.buffer);
+    mdv.setUint32(0, moov.length);
+    mdv.setUint32(4, 0x6d6f6f76); // moov
+    moov.set(mvhd0, 8);
+
+    const ftyp = new Uint8Array(20);
+    new DataView(ftyp.buffer).setUint32(0, 20);
+    new DataView(ftyp.buffer).setUint32(4, 0x66747970);
+    const bigMdat = new Uint8Array(300_000);
+    new DataView(bigMdat.buffer).setUint32(0, bigMdat.length);
+    new DataView(bigMdat.buffer).setUint32(4, 0x6d646174);
+    const blob = new Blob([ftyp, bigMdat, moov]);
+    expect(await extractMp4CreationMs(blob)).toBe(targetMs);
+
+    const v1 = buildMvhd(1);
+    expect(parseMvhdCreationMs(v1.buffer as ArrayBuffer)).toBe(targetMs);
+
+    // Unmasked Pixel name passes straight through
+    expect(inferPixelVideoLink('PXL_20261116_185612345.mp4', targetMs, 20)).toEqual({ fileName: 'PXL_20261116_185612345.mp4' });
+    // Masked Android Photo Picker id uses MP4 timestamp window
+    expect(inferPixelVideoLink('1000048291.mp4', targetMs, 20)).toEqual({
+      fileName: 'PXL_20261116_1856xx.mp4',
+      driveQuery: 'PXL 20261116 1856 type:video',
+    });
   });
 });

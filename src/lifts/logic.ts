@@ -139,7 +139,11 @@ export function swapExercise(se: SessionEx, exId: string, prev: SessionEx | null
 
 export const hasLogged = (se: SessionEx): boolean => se.sets.some((s) => s.done);
 
-export const isSessionStarted = (s: LiftSession): boolean => !!s.started || s.exs.some(hasLogged);
+export const hasVideo = (se: SessionEx): boolean => se.sets.some((s) => (s.vids?.length ?? 0) > 0);
+
+export const hasSessionActivity = (s: LiftSession): boolean => s.exs.some((e) => hasLogged(e) || hasVideo(e));
+
+export const isSessionStarted = (s: LiftSession): boolean => !!s.started || hasSessionActivity(s);
 
 export interface SupersetSpan {
   start: number;
@@ -216,9 +220,10 @@ export function routineFromSession(s: LiftSession, name: string, order: number):
   };
 }
 
-/** URL that locates a linked clip in Google Drive (direct share URL or exact DCIM filename search). */
-export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri'>): string | null {
+/** URL that locates a linked clip in Google Drive (direct share URL, timestamp query, or exact filename). */
+export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri' | 'driveQuery'>): string | null {
   if (meta.uri && /^https?:\/\//i.test(meta.uri)) return meta.uri;
-  if (meta.fileName) return `https://drive.google.com/drive/search?q=${encodeURIComponent(meta.fileName)}`;
+  const q = meta.driveQuery || meta.fileName;
+  if (q) return `https://drive.google.com/drive/search?q=${encodeURIComponent(q)}`;
   return null;
 }

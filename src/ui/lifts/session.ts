@@ -15,7 +15,7 @@ import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
-import { launchCameraForSet, linkDcimVideo, openSetVideoSheet, playVideo } from './video';
+import { openSetVideoSheet, playVideo } from './video';
 
 const KIND_LABEL: Record<SetKind, string> = { n: 'Normal', w: 'Warm-up', d: 'Drop set', f: 'To failure' };
 const KIND_CHAR: Record<SetKind, string> = { n: '', w: 'W', d: 'D', f: 'F' };
@@ -194,6 +194,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (finishing) return;
     if (!lifts.sessions.has(s.id)) location.replace('#/strength');
     else if (!edit && lifts.sessions.get(s.id)!.status === 'done' && location.hash.startsWith('#/strength/session')) location.replace(`#/strength/summary/${s.id}`);
+    else if (!dead) paintClock();
   });
 
   // ---------- dock (steppers & rep presets above the keyboard) ----------
@@ -485,7 +486,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <div class="fl">NOTE</div><input class="lf-input" id="sn" value="${esc(set.note ?? '')}" placeholder="Optional" autocomplete="off">
       <div class="fl">VIDEO</div>
       <div class="vrow"><div id="sv" class="vthumbs">${vids()}</div></div>
-      <div class="row2"><button class="btn" data-vrec>Launch Camera</button><button class="btn" data-vatt>Select DCIM File</button></div>
+      <button class="btn big" type="button" data-vmanage>Link or Record Video…</button>
       <button class="btn danger big" data-del ${se.sets.length <= 1 ? 'disabled' : ''}>Delete set</button>
       <button class="btn primary big" data-ok>Done</button>`, { onClose: resolveClosed });
     const q = (x: string): HTMLElement => sh.body.querySelector<HTMLElement>(x)!;
@@ -503,15 +504,9 @@ function build(root: HTMLElement, id?: string): () => void {
       if (k) { set.kind = k.dataset.k as SetKind; draw(); }
       else if (r) { const v = Number(r.dataset.r); if (v) set.rpe = v; else delete set.rpe; draw(); }
       else if (p) { await playVideo(p.dataset.play!); draw(); }
-      else if (t.closest('[data-vrec]')) {
-        sh.el.style.visibility = 'hidden';
-        const res = await launchCameraForSet({ session: s, se, set });
-        sh.el.style.visibility = '';
-        if (res === 'external') toast('Camera opened — tap Select DCIM File after recording');
-        else if (res) { draw(); toast('Video linked to this set'); }
-      } else if (t.closest('[data-vatt]')) {
-        const meta = await linkDcimVideo({ session: s, se, set });
-        if (meta) { draw(); toast(`Linked ${meta.fileName ?? 'video'}`); }
+      else if (t.closest('[data-vmanage]')) {
+        await openSetVideoSheet({ session: s, se, set }, set.kind === 'w' ? 'Warm-up' : `Set ${n}`);
+        draw();
       } else if (t.closest('[data-del]')) {
         const snap = snapshot();
         deleteSet(se, i);

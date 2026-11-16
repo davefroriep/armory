@@ -74,6 +74,7 @@
 .sh-text { color: var(--mut); font-size: .9rem; line-height: 1.4; }
 .alist { display: flex; flex-direction: column; gap: 4px; }
 .aitem { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 13px 14px; border-radius: 14px; background: var(--card2); text-align: left; }
+label.aitem { cursor: pointer; width: 100%; }
 .aitem b { font-size: .98rem; }
 .aitem small { color: var(--mut); font-size: .76rem; }
 .aitem.danger b { color: #ff7a66; }
