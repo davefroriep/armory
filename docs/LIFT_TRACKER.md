@@ -22,7 +22,8 @@ Auto-progression, built-in programs, photos / social, how-to or demo content, pl
 * **Auto-fill:** every unlogged set is pre-filled from the matching set of the last time you did that exercise (warm-ups pair with warm-ups, working sets with working sets; extra sets reuse the last set). Suggestions render dim; typing or logging makes them real.
 * **Forward-fill:** a weight / reps value typed or logged in set *n* flows into later sets that are still untouched suggestions. Never overwrites something you typed or a logged set. Warm-ups neither push nor receive.
 * **Tap PREVIOUS** to copy last time's numbers into the set. **−/+ Set** under every card (with Undo).
-* **Dock** above the keyboard: weight −5 −2.5 +2.5 +5 (kg: 2.5 / 1.25), reps −2 −1 +1 +2, and **LOG ✓** (jumps to the next set).
+* **Clock:** stays in `0:00` preview mode until your first set `✓` is checked off so you can browse days freely without starting a session.
+* **Dock** above the keyboard: weight `−10 −5 +5 +10` (kg: `5 / 2.5`), reps `8 10 12 15` presets + `−1 / +1` (time lifts: `−15 −5 +5 +15`), and **LOG ✓** (jumps to the next set).
 * Set types: Normal, Warm-up, Drop, To failure. Warm-ups never count anywhere. Optional per-set RPE (6-10 in halves) and note.
 * Exercise types: weight × reps, bodyweight (+ optional load), time (seconds, e.g. triceps iso hold).
 * **Swap:** "Just today" / "This day · *name*" (updates that repeating day) / "Everywhere" (every day that uses it). Swap suggestions list similar exercises first (shared primary muscles).
@@ -57,9 +58,8 @@ avg HR 118 · max HR 151 · ~310 kcal · RPE 8/10
 ## Share card
 1080×1350 PNG: name, date, sets / volume / time / PRs, one condensed line per exercise (`3×5 @ 175`, or `5 sets · top 195×1` when sets differ a lot), ★ on PRs, HR line if recorded. Native share sheet on Android (Capacitor Share + Filesystem), Web Share in the browser, download fallback.
 
-## Record Lift (video)
-Set options → **Record** (in-app camera, video only, start delay 0/3/5/10 s, 2 min max, review/retake) or **Attach** (pick from the phone). The clip is linked to that exact set/attempt and is playable from: the set, workout history, the exercise's **Rep Records** rows (a camera icon appears when the record set has a clip), the exercise's Videos grid, and Progress → Lift videos. Videos live in IndexedDB on the phone (persistent storage is requested); they are not uploaded anywhere and are not in the JSON backup.
-Android needs the `CAMERA` permission (added to the manifest), so install a freshly built APK.
+## Lift Videos (DCIM & Google Drive)
+Every set row has a compact video icon (`📹`). Tapping it lets you **Launch Camera (Video)** directly in Android video mode, **Select file from DCIM** (captures only the real `PXL_...mp4` filename + tiny poster thumbnail without duplicating large video files into browser storage), or paste a link/filename. Linked videos stay attached to that set across Workout History, `1RM–5RM` Rep Records, Progress, and JSON backups with a 1-tap **Open in Google Drive** search link targeting your `DCIM Backup`.
 
 ## Data & backup
 IndexedDB `armory-fit` v2: `lift_sessions`, `lift_routines`, `lift_ex` (custom exercises + per-exercise note/rest/muscle overrides), `lift_videos` (meta + blobs). Settings → **Export backup** writes `{ app: "armory-lifts", v: 1, sessions, routines, exercises }` JSON; **Import** merges by id. Weights are stored in kg; the lb/kg switch is display only.

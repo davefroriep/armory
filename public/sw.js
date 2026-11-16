@@ -1,6 +1,6 @@
 // Network-first for the app shell (updates land as soon as you are online), cache fallback offline.
 // The cache name is bumped automatically by scripts/bump-rev.mjs on every build.
-const CACHE = 'armory-fit-v15';
+const CACHE = 'armory-fit-v16';
 
 self.addEventListener('install', () => self.skipWaiting());
 

@@ -4,6 +4,7 @@ import { pendingCount, retryPending, syncWorkout, discard } from '../workout/syn
 import { allMeta, getSamples, putMeta } from '../store/db';
 import { summarize } from '../workout/summary';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
+import { isSessionStarted } from '../lifts/logic';
 import { lifts } from '../lifts/store';
 import { ICON, esc, mmss } from './dom';
 import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
@@ -45,7 +46,7 @@ export function homeScreen(root: HTMLElement): () => void {
     await lifts.ready;
     if (dead) return;
     // A lift-tracker workout in progress is resumed from the Strength tile, never "recovered" as a bare HR file.
-    const live = lifts.active;
+    const live = lifts.active && isSessionStarted(lifts.active) ? lifts.active : undefined;
     const active = metas.filter((m) => m.status === 'active' && m.seconds === 0 && !lifts.sessions.has(m.id));
     const pend = await pendingCount();
     let h = live

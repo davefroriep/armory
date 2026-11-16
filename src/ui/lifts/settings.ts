@@ -27,10 +27,10 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
             <div class="line"><span>Auto-timer<small>Start rest timer automatically when checking a set</small></span>${tog('restAuto', s.restAuto)}</div>
             <div class="line"><span>Rest-over chime</span>${tog('restSound', s.restSound)}</div>
           </section>
-          <h2 class="sec">RECORD LIFT</h2>
+          <h2 class="sec">LIFT VIDEOS</h2>
           <section class="card">
-            <div class="line"><span>Start delay<small>Time to step back to the bar</small></span>${seg('videoDelay', String(s.videoDelay), [['0', 'None'], ['3', '3 s'], ['5', '5 s'], ['10', '10 s']])}</div>
-            <div class="hint">${lifts.videos.size} video${lifts.videos.size === 1 ? '' : 's'} on this phone · ${(vidBytes / 1048576).toFixed(0)} MB. Videos stay on the device (not in Intervals.icu or the backup).</div>
+            <div class="line"><span>In-app camera delay<small>Fallback countdown on desktop</small></span>${seg('videoDelay', String(s.videoDelay), [['0', 'None'], ['3', '3 s'], ['5', '5 s'], ['10', '10 s']])}</div>
+            <div class="hint">${lifts.videos.size} video${lifts.videos.size === 1 ? '' : 's'} linked${vidBytes ? ` · ${(vidBytes / 1048576).toFixed(0)} MB referenced` : ''}. DCIM filename links &amp; thumbnails are lightweight, stay synced in JSON backups, and search Google Drive DCIM Backup directly.</div>
           </section>
           <h2 class="sec">INTERVALS.ICU</h2>
           <section class="card">

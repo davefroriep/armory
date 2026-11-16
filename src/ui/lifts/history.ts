@@ -95,7 +95,7 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
           const label = set.kind === 'w' ? 'W' : set.kind === 'd' ? 'D' : set.kind === 'f' ? 'F' : String(++n);
           const h = prs.get(set.id);
           const w = ex.type === 'bodyweight' ? (set.w ? `+${fmtKg(set.w)}` : 'BW') : ex.type === 'time' ? (set.w ? fmtKg(set.w) : '–') : fmtKg(set.w ?? 0);
-          const v = (set.vids ?? []).map((vid) => `<button class="vmini" data-play="${vid}" aria-label="Play video">${LI.video}</button>`).join('');
+          const v = (set.vids ?? []).filter((vid) => lifts.videos.has(vid)).map((vid) => `<button class="vmini" data-play="${vid}" aria-label="Play video">${LI.video}</button>`).join('');
           return `<div class="wrow k-${set.kind}"><span class="snum">${label}</span><span class="wv">${w} <small>${ex.type === 'time' ? '' : unit}</small></span><span class="wr">× ${set.r ?? 0}${ex.type === 'time' ? 's' : ''}</span>
             <span class="wx">${set.rpe ? `<em>@${set.rpe}</em>` : ''}${h ? `<em class="prpill">★ ${h.n}RM</em>` : ''}${v}</span></div>${set.note ? `<div class="wnote">${esc(set.note)}</div>` : ''}`;
         }).join('');

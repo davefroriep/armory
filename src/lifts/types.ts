@@ -75,6 +75,8 @@ export interface LiftSession {
   startMs: number;
   endMs: number | null;
   status: 'active' | 'done';
+  /** True once at least one set has been checked off (starts elapsed clock & HR recording). */
+  started?: boolean;
   exs: SessionEx[];
   note?: string;
   /** Session effort 3-10 (same scale as the rest of the app). */
@@ -108,6 +110,16 @@ export interface VideoMeta {
   bytes: number;
   /** Small JPEG data URL poster frame. */
   thumb: string;
+  /** Original camera / DCIM filename (e.g. "PXL_20261116_173012345.mp4") for Google Drive DCIM Backup search. */
+  fileName?: string;
+  /** File's own lastModified epoch ms on device. */
+  fileMs?: number;
+  /** Clip duration in seconds if known. */
+  durationSec?: number;
+  /** Persistent Android content:// URI (Capacitor APK) or direct https:// video link. */
+  uri?: string;
+  /** True when only metadata + Drive/DCIM reference is stored (no video blob in IndexedDB). */
+  linkOnly?: boolean;
 }
 
 export const uid = (): string => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;

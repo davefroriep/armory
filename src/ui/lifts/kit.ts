@@ -1,5 +1,6 @@
 import { ICON, esc } from '../dom';
 import { active } from '../../lifts/active';
+import { isSessionStarted } from '../../lifts/logic';
 import { lifts } from '../../lifts/store';
 
 // ---------- icons ----------
@@ -40,7 +41,7 @@ export { mmss as clock };
 /** "Workout in progress" strip shown above the tab bar on every lift screen except the session itself. */
 export function resumeBar(): string {
   const s = lifts.active;
-  if (!s) return '';
+  if (!s || !isSessionStarted(s)) return '';
   return `<a class="resume-bar" href="#/strength/session"><i class="rec-dot"></i><b>${esc(s.name)}</b><span data-clock>${mmss(active.elapsedSec())}</span><em>Resume ›</em></a>`;
 }
 

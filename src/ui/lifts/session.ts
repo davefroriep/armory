@@ -2,7 +2,7 @@ import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import {
-  addSet, buildExercise, deleteSet, editReps, editWeight, hasLogged, labels, midSuperset,
+  addSet, buildExercise, deleteSet, editReps, editWeight, hasLogged, isSessionStarted, labels, midSuperset,
   prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
 } from '../../lifts/logic';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
@@ -15,7 +15,7 @@ import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
-import { attachVideo, playVideo, recordVideo } from './video';
+import { launchCameraForSet, linkDcimVideo, openSetVideoSheet, playVideo } from './video';
 
 const KIND_LABEL: Record<SetKind, string> = { n: 'Normal', w: 'Warm-up', d: 'Drop set', f: 'To failure' };
 const KIND_CHAR: Record<SetKind, string> = { n: '', w: 'W', d: 'D', f: 'F' };
@@ -41,6 +41,7 @@ function build(root: HTMLElement, id?: string): () => void {
   const unit = (): 'lb' | 'kg' => liftSettings().unit;
   let dirty = false;
   let finishing = false;
+  let dead = false;
   let hits = new Map<string, { n: number; kg: number }>();
   const prevCache = new Map<string, SessionEx | null>();
   const prevOf = (se: SessionEx): SessionEx | null => {
@@ -64,12 +65,13 @@ function build(root: HTMLElement, id?: string): () => void {
     const wShow = set.w != null ? fmtKg(set.w) : '';
     const hasVid = !!set.vids?.length;
     const rpeTag = set.rpe != null ? `<u class="srpe">@${set.rpe}</u>` : '';
-    const dot = hasVid ? '<i class="vdot"></i>' : set.note ? '<i class="ndot"></i>' : '';
+    const dot = set.note ? '<i class="ndot"></i>' : '';
     return `<div class="srow${set.done ? ' done' : ''}${set.kind !== 'n' ? ' k-' + set.kind : ''}" data-i="${i}" data-sid="${set.id}">
       <button class="snum${set.rpe != null ? ' has-rpe' : ''}" data-act="setmenu" aria-label="Set options">${kind}${pr ? '<i class="prstar">★</i>' : ''}${rpeTag}${dot}</button>
       <button class="sprev" data-act="usePrev" ${prev ? '' : 'disabled'}>${prev ? esc(setText(prev, ex, unit())) : '–'}</button>
       <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '0' : 'BW'}" aria-label="Weight">
       <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${ex.type === 'time' ? 'sec' : '0'}" aria-label="${ex.type === 'time' ? 'Seconds' : 'Reps'}">
+      <button class="svid${hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${hasVid ? 'Manage linked video' : 'Link or record lift video'}">${LI.video}</button>
       <button class="schk${set.done ? ' on' : ''}" data-act="done" aria-label="Log set">✓</button>
     </div>`;
   };
@@ -90,7 +92,7 @@ function build(root: HTMLElement, id?: string): () => void {
         <button class="xmore" data-act="exmenu" aria-label="Exercise options">⋯</button>
       </div>
       ${note ? `<button class="xnote" data-act="exnote">${esc(note)}</button>` : ''}
-      <div class="xth"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span><span></span></div>
+      <div class="xth"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span><span></span><span></span></div>
       <div class="xrows">${se.sets.map((_, i) => rowHtml(se, ex, i, labelMap)).join('')}</div>
       <div class="xfoot">
         <button class="stp" data-act="rmset" aria-label="Remove set">−</button><span>SET</span><button class="stp" data-act="addset" aria-label="Add set">+</button>
@@ -157,6 +159,7 @@ function build(root: HTMLElement, id?: string): () => void {
       if (document.activeElement !== r) r.value = set.r != null ? String(set.r) : '';
       w.classList.toggle('auto', !!set.wAuto);
       r.classList.toggle('auto', !!set.rAuto);
+      row.querySelector('.svid')?.classList.toggle('on', !!set.vids?.length);
       const star = row.querySelector('.prstar');
       const pr = set.done && hits.has(set.id);
       if (pr && !star) row.querySelector('.snum')!.insertAdjacentHTML('beforeend', '<i class="prstar">★</i>');
@@ -167,7 +170,9 @@ function build(root: HTMLElement, id?: string): () => void {
 
   // ---------- clock + rest ----------
   const paintClock = (): void => {
-    if (!edit) root.querySelectorAll<HTMLElement>('[data-clock]').forEach((e) => { e.textContent = clock(active.elapsedSec()); });
+    if (edit) return;
+    const txt = isSessionStarted(s) ? clock(active.elapsedSec()) : '0:00 · check ✓ to start';
+    root.querySelectorAll<HTMLElement>('[data-clock]').forEach((e) => { e.textContent = txt; });
   };
   const paintRest = (): void => {
     const bar = root.querySelector<HTMLElement>('#restbar');
@@ -191,20 +196,35 @@ function build(root: HTMLElement, id?: string): () => void {
     else if (!edit && lifts.sessions.get(s.id)!.status === 'done' && location.hash.startsWith('#/strength/session')) location.replace(`#/strength/summary/${s.id}`);
   });
 
-  // ---------- dock (steppers above the keyboard) ----------
+  // ---------- dock (steppers & rep presets above the keyboard) ----------
+  const REP_PRESETS = [8, 10, 12, 15];
   let focused: HTMLInputElement | null = null;
   const dock = (): HTMLElement => $('#dock', root);
+  const syncDockPreset = (): void => {
+    if (!focused || !dock().classList.contains('reps')) return;
+    const v = Number(focused.value);
+    dock().querySelectorAll<HTMLElement>('[data-rep]').forEach((b) => b.classList.toggle('on', Number(b.dataset.rep) === v));
+  };
   const showDock = (inp: HTMLInputElement): void => {
     focused = inp;
     const isW = inp.classList.contains('sw');
     const isTime = !isW && exOf(rowOf(inp).se.exId).type === 'time';
-    const steps = isW ? stepsFor() : isTime ? [-15, -5, 5, 15] : [-2, -1, 1, 2];
-    dock().innerHTML = `${steps.map((v) => `<button class="dk" data-step="${v}">${v > 0 ? '+' : '−'}${fmtNum(Math.abs(v))}</button>`).join('')}<button class="dk log" data-dock="log">LOG ✓</button>`;
-    dock().hidden = false;
+    const d = dock();
+    if (isW || isTime) {
+      const steps = isW ? stepsFor() : [-15, -5, 5, 15];
+      d.classList.remove('reps');
+      d.innerHTML = `${steps.map((v) => `<button class="dk" data-step="${v}">${v > 0 ? '+' : '−'}${fmtNum(Math.abs(v))}</button>`).join('')}<button class="dk log" data-dock="log">LOG ✓</button>`;
+    } else {
+      d.classList.add('reps');
+      const curV = Number(inp.value);
+      d.innerHTML = `${REP_PRESETS.map((p) => `<button class="dk pre${curV === p ? ' on' : ''}" data-rep="${p}">${p}</button>`).join('')}<button class="dk pm" data-step="-1">−1</button><button class="dk pm" data-step="1">+1</button><button class="dk log" data-dock="log">LOG ✓</button>`;
+    }
+    d.hidden = false;
     document.body.classList.add('dock-open');
   };
   const hideDock = (): void => {
     dock().hidden = true;
+    dock().classList.remove('reps');
     document.body.classList.remove('dock-open');
     focused = null;
   };
@@ -232,6 +252,7 @@ function build(root: HTMLElement, id?: string): () => void {
     else editReps(se, i, v == null ? null : Math.round(v));
     t.classList.remove('auto');
     syncCard(card);
+    syncDockPreset();
     save();
   });
   root.addEventListener('keydown', (e) => {
@@ -259,15 +280,24 @@ function build(root: HTMLElement, id?: string): () => void {
       return;
     }
     if (r && !was) {
+      if (!edit) active.ensureStarted(s);
       recomputePRs();
       const h = hits.get(set.id);
-      if (!edit) active.afterSetLogged(s, idx);
+      if (!edit) {
+        active.afterSetLogged(s, idx);
+        paintClock();
+      }
       if (h) {
         const prW = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit()}`;
         toast(`New ${h.n}RM PR · ${prW}`, { kind: 'pr', ms: 3200 });
         buzz([60, 40, 60, 40, 120]);
       } else buzz(25);
-    } else recomputePRs();
+    } else {
+      recomputePRs();
+      if (!r && was && !edit) {
+        void active.resetIfNoneLogged(s).then((reset) => { if (reset && !dead) paintClock(); });
+      }
+    }
     syncCard(card);
     save();
     if (r && fromDock) {
@@ -444,7 +474,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const ex = exOf(se.exId);
     const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
     const vids = (): string => (set.vids ?? []).map((v) => lifts.videos.get(v)).filter(Boolean)
-      .map((v) => `<button class="vthumb" data-play="${v!.id}" style="background-image:url(${v!.thumb})"><i>▶</i></button>`).join('');
+      .map((v) => `<button class="vthumb" data-play="${v!.id}" style="${v!.thumb ? `background-image:url(${v!.thumb})` : ''}"><i>▶</i></button>`).join('');
     let sh!: Sheet;
     let resolveClosed: () => void = () => {};
     const closed = new Promise<void>((res) => { resolveClosed = res; });
@@ -455,7 +485,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <div class="fl">NOTE</div><input class="lf-input" id="sn" value="${esc(set.note ?? '')}" placeholder="Optional" autocomplete="off">
       <div class="fl">VIDEO</div>
       <div class="vrow"><div id="sv" class="vthumbs">${vids()}</div></div>
-      <div class="row2"><button class="btn" data-vrec>${'● Record'}</button><button class="btn" data-vatt>Attach</button></div>
+      <div class="row2"><button class="btn" data-vrec>Launch Camera</button><button class="btn" data-vatt>Select DCIM File</button></div>
       <button class="btn danger big" data-del ${se.sets.length <= 1 ? 'disabled' : ''}>Delete set</button>
       <button class="btn primary big" data-ok>Done</button>`, { onClose: resolveClosed });
     const q = (x: string): HTMLElement => sh.body.querySelector<HTMLElement>(x)!;
@@ -472,15 +502,16 @@ function build(root: HTMLElement, id?: string): () => void {
       const p = t.closest<HTMLElement>('[data-play]');
       if (k) { set.kind = k.dataset.k as SetKind; draw(); }
       else if (r) { const v = Number(r.dataset.r); if (v) set.rpe = v; else delete set.rpe; draw(); }
-      else if (p) await playVideo(p.dataset.play!);
+      else if (p) { await playVideo(p.dataset.play!); draw(); }
       else if (t.closest('[data-vrec]')) {
         sh.el.style.visibility = 'hidden';
-        const meta = await recordVideo({ session: s, se, set });
+        const res = await launchCameraForSet({ session: s, se, set });
         sh.el.style.visibility = '';
-        if (meta) { draw(); toast('Video linked to this set'); }
+        if (res === 'external') toast('Camera opened — tap Select DCIM File after recording');
+        else if (res) { draw(); toast('Video linked to this set'); }
       } else if (t.closest('[data-vatt]')) {
-        const meta = await attachVideo({ session: s, se, set });
-        if (meta) { draw(); toast('Video linked to this set'); }
+        const meta = await linkDcimVideo({ session: s, se, set });
+        if (meta) { draw(); toast(`Linked ${meta.fileName ?? 'video'}`); }
       } else if (t.closest('[data-del]')) {
         const snap = snapshot();
         deleteSet(se, i);
@@ -539,6 +570,14 @@ function build(root: HTMLElement, id?: string): () => void {
 
   root.addEventListener('click', async (e) => {
     const t = e.target as HTMLElement;
+    const repBtn = t.closest<HTMLElement>('[data-rep]');
+    if (repBtn && focused) {
+      focused.value = repBtn.dataset.rep!;
+      focused.dispatchEvent(new Event('input', { bubbles: true }));
+      syncDockPreset();
+      focused.select?.();
+      return;
+    }
     const step = t.closest<HTMLElement>('[data-step]');
     if (step && focused) {
       const isW = focused.classList.contains('sw');
@@ -546,6 +585,7 @@ function build(root: HTMLElement, id?: string): () => void {
       const nv = Math.max(0, Math.round((cur + Number(step.dataset.step)) * 100) / 100);
       focused.value = fmtNum(isW ? nv : Math.round(nv));
       focused.dispatchEvent(new Event('input', { bubbles: true }));
+      syncDockPreset();
       focused.select?.();
       return;
     }
@@ -607,6 +647,12 @@ function build(root: HTMLElement, id?: string): () => void {
     const row = a.closest<HTMLElement>('.srow')!;
     const i = Number(row.dataset.i);
     if (act === 'done') return logSet(card, row, false);
+    if (act === 'vid') {
+      const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
+      await openSetVideoSheet({ session: s, se, set: se.sets[i] }, se.sets[i].kind === 'w' ? 'Warm-up' : `Set ${n}`);
+      if (!dead) { save(); paint(); }
+      return;
+    }
     if (act === 'setmenu') return void (await setSheet(se, i));
     if (act === 'usePrev') {
       const p = prevSetFor(prevOf(se), se, i);
@@ -620,6 +666,7 @@ function build(root: HTMLElement, id?: string): () => void {
   paint();
 
   return () => {
+    dead = true;
     offTick(); offRest(); offChips(); offStore();
     hideDock();
     void lifts.flush();

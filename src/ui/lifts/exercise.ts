@@ -80,7 +80,8 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
             <section class="card"><div class="card-h"><span>EST 1RM · ${unit.toUpperCase()}</span><div class="seg mini">${RANGES.map(([l], i) => `<button class="${i === range ? 'on' : ''}" data-range="${i}">${l}</button>`).join('')}</div></div>${lineChart(pts)}</section>`}
           ${clips.length ? `<section class="card"><div class="card-h"><span>VIDEOS</span></div><div class="vgrid">${clips.map((v) => {
             const set = lifts.sessions.get(v.sessionId)?.exs.flatMap((x) => x.sets).find((x) => x.id === v.setId);
-            return `<button class="vthumb lg" data-play="${v.id}" style="background-image:url(${v.thumb})"><i>▶</i><small>${set ? `${fmtKg(set.w ?? 0)}×${set.r ?? 0}` : ''} · ${new Date(v.ms).toLocaleDateString([], { month: 'short', day: 'numeric' })}</small></button>`;
+            const lbl = set ? `${fmtKg(set.w ?? 0)}×${set.r ?? 0}` : (v.fileName ?? '');
+            return `<button class="vthumb lg" data-play="${v.id}" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}"><i>▶</i><small>${esc(lbl)} · ${new Date(v.ms).toLocaleDateString([], { month: 'short', day: 'numeric' })}</small></button>`;
           }).join('')}</div></section>` : ''}
           <section class="card"><div class="card-h"><span>HISTORY</span></div>${sessList.length ? sessList.map(({ s, e }) => `<a class="ehr" href="#/strength/workout/${s.id}"><b>${new Date(s.startMs).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}</b><span>${esc(condenseSets(e, ex, unit))}</span></a>`).join('') : '<div class="empty">Not logged yet.</div>'}</section>
           <section class="card"><div class="line"><span>Rest timer<small>For this exercise</small></span><button class="btn sm" data-act="rest">${clock(row?.restSec ?? liftSettings().restSec)}</button></div></section>

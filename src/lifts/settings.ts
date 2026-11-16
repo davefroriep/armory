@@ -50,4 +50,4 @@ export const fmtKg = (kg: number | null | undefined, unit: Unit = cur.unit): str
   kg == null ? '' : fmtNum(toDisplay(kg, unit));
 
 /** Weight-field stepper buttons, in display units. */
-export const stepsFor = (unit: Unit = cur.unit): number[] => (unit === 'lb' ? [-5, -2.5, 2.5, 5] : [-2.5, -1.25, 1.25, 2.5]);
+export const stepsFor = (unit: Unit = cur.unit): number[] => (unit === 'lb' ? [-10, -5, 5, 10] : [-5, -2.5, 2.5, 5]);

@@ -1,4 +1,4 @@
-import { uid, type Exercise, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind } from './types';
+import { uid, type Exercise, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type VideoMeta } from './types';
 
 export const newSet = (kind: SetKind = 'n', w: number | null = null, r: number | null = null, auto = false): LiftSet => ({
   id: uid(), w, r, done: false, kind, wAuto: auto && w != null, rAuto: auto && r != null,
@@ -139,6 +139,8 @@ export function swapExercise(se: SessionEx, exId: string, prev: SessionEx | null
 
 export const hasLogged = (se: SessionEx): boolean => se.sets.some((s) => s.done);
 
+export const isSessionStarted = (s: LiftSession): boolean => !!s.started || s.exs.some(hasLogged);
+
 export interface SupersetSpan {
   start: number;
   end: number;
@@ -212,4 +214,11 @@ export function routineFromSession(s: LiftSession, name: string, order: number):
     order,
     items: s.exs.map((e) => ({ exId: e.exId, sets: Math.max(1, e.sets.filter((x) => x.kind !== 'w').length), ...(e.ss ? { ss: true } : {}) })),
   };
+}
+
+/** URL that locates a linked clip in Google Drive (direct share URL or exact DCIM filename search). */
+export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri'>): string | null {
+  if (meta.uri && /^https?:\/\//i.test(meta.uri)) return meta.uri;
+  if (meta.fileName) return `https://drive.google.com/drive/search?q=${encodeURIComponent(meta.fileName)}`;
+  return null;
 }

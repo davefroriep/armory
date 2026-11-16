@@ -1,10 +1,24 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
 
+export interface PickedNativeVideo {
+  picked?: boolean;
+  uri?: string;
+  fileName?: string;
+  bytes?: number;
+  fileMs?: number;
+  mime?: string;
+  durationSec?: number;
+  thumb?: string;
+}
+
 interface WorkoutServicePlugin {
   start(o: { title: string; text: string }): Promise<void>;
   update(o: { title: string; text: string }): Promise<void>;
   stop(): Promise<void>;
   openApp(o: { pkg: string }): Promise<{ opened: boolean }>;
+  launchVideoCamera(): Promise<{ opened: boolean }>;
+  pickDcimVideo(): Promise<PickedNativeVideo>;
+  openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
 }
 
 export const isNative = (): boolean => Capacitor.isNativePlatform();
@@ -40,4 +54,19 @@ export async function openBoostcamp(): Promise<void> {
     return;
   }
   window.open(BOOSTCAMP_WEB, '_blank', 'noopener');
+}
+
+export async function launchNativeVideoCamera(): Promise<boolean> {
+  if (!plugin) return false;
+  try { return (await plugin.launchVideoCamera()).opened; } catch { return false; }
+}
+
+export async function pickNativeDcimVideo(): Promise<PickedNativeVideo | null> {
+  if (!plugin) return null;
+  try { return await plugin.pickDcimVideo(); } catch { return null; }
+}
+
+export async function openNativeVideoUri(uri: string): Promise<boolean> {
+  if (!plugin || !uri) return false;
+  try { return (await plugin.openVideoUri({ uri })).opened; } catch { return false; }
 }

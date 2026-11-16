@@ -20,6 +20,7 @@ export interface LiftBackup {
   sessions: LiftSession[];
   routines: Routine[];
   exercises: ExRow[];
+  videos?: VideoMeta[];
 }
 
 /**
@@ -272,11 +273,17 @@ class LiftStore {
   }
 
   // ---------- videos ----------
-  async addVideo(meta: VideoMeta, blob: Blob): Promise<void> {
+  async addVideo(meta: VideoMeta, blob?: Blob): Promise<void> {
     this.videos.set(meta.id, meta);
     this.touch();
     await idbPut('lift_videos', meta);
-    await idbPut('lift_videos', { id: BLOB_PREFIX + meta.id, blob } as BlobRow);
+    if (blob) await idbPut('lift_videos', { id: BLOB_PREFIX + meta.id, blob } as BlobRow);
+  }
+
+  async saveVideoMeta(meta: VideoMeta): Promise<void> {
+    this.videos.set(meta.id, meta);
+    this.touch();
+    await idbPut('lift_videos', meta);
   }
 
   async videoBlob(id: string): Promise<Blob | null> {
@@ -310,6 +317,7 @@ class LiftStore {
       sessions: [...this.sessions.values()],
       routines: [...this.routines.values()],
       exercises: [...this.rows.values()],
+      videos: [...this.videos.values()].filter((v) => v.linkOnly || v.fileName || v.uri),
     };
   }
 
@@ -319,13 +327,16 @@ class LiftStore {
     const sessions = b.sessions.filter((s) => s?.id && Array.isArray(s.exs) && s.status !== 'active');
     const routines = (b.routines ?? []).filter((r) => r?.id && Array.isArray(r.items));
     const exercises = (b.exercises ?? []).filter((r) => r?.id);
+    const videos = (b.videos ?? []).filter((v) => v?.id && v?.sessionId && v?.exId && v?.setId);
     sessions.forEach((s) => this.sessions.set(s.id, s));
     routines.forEach((r) => this.routines.set(r.id, r));
     exercises.forEach((r) => this.rows.set(r.id, r));
+    videos.forEach((v) => this.videos.set(v.id, v));
     this.touch();
     await idbPutMany('lift_sessions', sessions);
     await idbPutMany('lift_routines', routines);
     await idbPutMany('lift_ex', exercises);
+    if (videos.length) await idbPutMany('lift_videos', videos);
     return { sessions: sessions.length, routines: routines.length, exercises: exercises.length };
   }
 }

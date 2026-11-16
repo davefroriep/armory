@@ -7,7 +7,7 @@ import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
-import { effectiveRestAuto, hasLogged, midSuperset, pruneUnlogged } from './logic';
+import { effectiveRestAuto, hasLogged, isSessionStarted, midSuperset, pruneUnlogged } from './logic';
 import { liftSettings } from './settings';
 import { lifts } from './store';
 import type { LiftSession, SessionEx } from './types';
@@ -50,15 +50,15 @@ class ActiveWorkout {
 
   elapsedSec(): number {
     const s = this.session;
-    return s ? Math.max(0, (Date.now() - s.startMs) / 1000) : 0;
+    return s && isSessionStarted(s) ? Math.max(0, (Date.now() - s.startMs) / 1000) : 0;
   }
 
-  /** Call once at app start / when entering the lift tracker: resumes a workout the OS killed. */
+  /** Call once at app start / when entering the lift tracker: resumes a workout the OS killed (only if started). */
   init(): Promise<void> {
     this.booting ??= (async () => {
       await lifts.ready;
       const s = lifts.active;
-      if (s && !this.timer) await this.attach(s, true);
+      if (s && isSessionStarted(s) && !this.timer) await this.attach(s, true);
     })();
     return this.booting;
   }
@@ -69,11 +69,33 @@ class ActiveWorkout {
     if (existing) return existing;
     const s: LiftSession = {
       id: uid(), name: o.name, routineId: o.routineId, eventId: o.eventId, startMs: Date.now(), endMs: null,
-      status: 'active', exs: o.exs, rpe: null, bwKg: getSettings().weightKg,
+      status: 'active', started: false, exs: o.exs, rpe: null, bwKg: getSettings().weightKg,
     };
     lifts.saveSession(s, true);
-    await this.attach(s, false);
     return s;
+  }
+
+  /** Start the workout clock, HR recorder, wake lock and foreground service once the first set is checked. */
+  ensureStarted(s: LiftSession): boolean {
+    if (isSessionStarted(s)) {
+      if (!this.timer) void this.attach(s, true);
+      return false;
+    }
+    s.startMs = Date.now();
+    s.started = true;
+    lifts.saveSession(s, true);
+    void this.attach(s, false);
+    return true;
+  }
+
+  /** If the user unchecks the only checked set, stop the clock/HR recording and return to 0:00 preview mode. */
+  async resetIfNoneLogged(s: LiftSession): Promise<boolean> {
+    if (s.exs.some(hasLogged) || !s.started) return false;
+    s.started = false;
+    this.teardown();
+    lifts.saveSession(s, true);
+    await discardWorkout(s.id);
+    return true;
   }
 
   private async attach(s: LiftSession, resume: boolean): Promise<void> {

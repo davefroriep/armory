@@ -1,7 +1,7 @@
 import { ensureSensors } from '../../ble/sources';
 import { calendar } from '../../intervals/calendar';
 import { active } from '../../lifts/active';
-import { buildExercise } from '../../lifts/logic';
+import { buildExercise, isSessionStarted } from '../../lifts/logic';
 import { matchRoutineByTitle } from '../../lifts/seed';
 import { lifts } from '../../lifts/store';
 import type { Routine, RoutineItem } from '../../lifts/types';
@@ -12,12 +12,24 @@ import { LI, actionSheet, clock, confirmSheet, mount, relDay, tabBar, toast, wir
 /** Start a routine (or an empty workout) and open the session screen. */
 export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null; replace?: boolean }): Promise<void> {
   if (lifts.active) {
-    if (o.replace) location.replace('#/strength/session');
-    else {
-      location.hash = '#/strength/session';
-      toast('Finish or discard the workout in progress first');
+    if (!isSessionStarted(lifts.active)) {
+      const same = o.routine
+        ? lifts.active.routineId === o.routine.id
+        : !o.items && !lifts.active.routineId && lifts.active.name === o.name;
+      if (same) {
+        if (o.replace) location.replace('#/strength/session');
+        else location.hash = '#/strength/session';
+        return;
+      }
+      await active.discard();
+    } else {
+      if (o.replace) location.replace('#/strength/session');
+      else {
+        location.hash = '#/strength/session';
+        toast('Finish or discard the workout in progress first');
+      }
+      return;
     }
-    return;
   }
   const items = o.items ?? o.routine?.items ?? [];
   const exs = items.flatMap((it, i) =>
@@ -50,11 +62,12 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
     const paint = (): void => {
       if (dead) return;
       const act = lifts.active;
+      const running = act && isSessionStarted(act) ? act : undefined;
       const routines = lifts.sortedRoutines();
       const planned = calendar.forEquipment('strength');
 
-      const resume = act
-        ? `<a class="card resume" href="#/strength/session"><i class="rec-dot"></i><span><b>${esc(act.name)}</b><small>Workout in progress · <span data-clock>${clock(active.elapsedSec())}</span></small></span><em>Resume ›</em></a>`
+      const resume = running
+        ? `<a class="card resume" href="#/strength/session"><i class="rec-dot"></i><span><b>${esc(running.name)}</b><small>Workout in progress · <span data-clock>${clock(active.elapsedSec())}</span></small></span><em>Resume ›</em></a>`
         : '';
 
       const plannedHtml = calendar.status === 'nokey'
@@ -85,14 +98,14 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       root.innerHTML = `<header class="bar"><a class="icon-btn" href="#/" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a><h1>Strength</h1>
           <div class="chips"><button class="chip" data-chip="hr"></button><a class="icon-btn" href="#/strength/settings" aria-label="Lift settings">${LI.gear}</a></div></header>
         <main class="page has-tabs">
-          ${resume}${act ? '' : plannedHtml}
+          ${resume}${running ? '' : plannedHtml}
           <button class="custom-wk" type="button" data-act="custom">
             <span class="cw-ico">${LI.plus}</span>
             <span class="cw-txt">
               <b>Custom Workout</b>
               <small>Freestyle — add exercises &amp; sets live as you go</small>
             </span>
-            <em class="cw-cta">${act && !act.routineId ? 'Open ›' : 'Start ›'}</em>
+            <em class="cw-cta">${running && !running.routineId ? 'Open ›' : 'Start ›'}</em>
           </button>
           <div class="sec-row"><h2 class="sec">MY DAYS</h2><a class="link" href="#/strength/routine/new">+ New day</a></div>
           ${days}
@@ -126,6 +139,10 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       if (t.closest('[data-act="custom"]')) {
         if (!lifts.active) return void (await startWorkout({ name: 'Custom Workout' }));
         if (!lifts.active.routineId) { location.hash = '#/strength/session'; return; }
+        if (!isSessionStarted(lifts.active)) {
+          await active.discard();
+          return void (await startWorkout({ name: 'Custom Workout' }));
+        }
         const curName = lifts.active.name;
         const ok = await confirmSheet(
           'Workout in progress',

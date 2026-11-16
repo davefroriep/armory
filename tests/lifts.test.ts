@@ -5,12 +5,12 @@ import {
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import {
-  addSet, buildExercise, canLog, editReps, editWeight, effectiveRestAuto, labels, midSuperset, newSet,
-  prevSetFor, pruneUnlogged, removeLastSet, routineFromSession, supersetGroups, swapExercise, toggleDone,
+  addSet, buildExercise, canLog, driveUrlFor, editReps, editWeight, effectiveRestAuto, isSessionStarted, labels,
+  midSuperset, newSet, prevSetFor, pruneUnlogged, removeLastSet, routineFromSession, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
 import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
-import { KG_PER_LB, fmtNum, fromDisplay, toDisplay } from '../src/lifts/settings';
+import { KG_PER_LB, fmtNum, fromDisplay, stepsFor, toDisplay } from '../src/lifts/settings';
 import { condenseSets, intervalsDescription, shortLine } from '../src/lifts/summary';
 import { MUSCLES, type Exercise, type LiftSession, type LiftSet, type SessionEx } from '../src/lifts/types';
 
@@ -57,10 +57,12 @@ describe('exercise library', () => {
 });
 
 describe('units', () => {
-  it('round-trips pounds without float noise', () => {
+  it('round-trips pounds without float noise and provides custom +/-5/+/-10 weight steps', () => {
     for (const v of [45, 135, 137.5, 225, 315, 2.5]) expect(toDisplay(fromDisplay(v, 'lb'), 'lb')).toBe(v);
     expect(fmtNum(toDisplay(lb(135), 'lb'))).toBe('135');
     expect(toDisplay(100, 'kg')).toBe(100);
+    expect(stepsFor('lb')).toEqual([-10, -5, 5, 10]);
+    expect(stepsFor('kg')).toEqual([-5, -2.5, 2.5, 5]);
   });
 });
 
@@ -348,5 +350,16 @@ describe('Phase 1 routine seed', () => {
     expect(matchRoutineByTitle('Strength Train — Wk 1 · Day 5 Upper 2', PHASE1_ROUTINES)?.name).toBe('Upper 2');
     const hold = buildExercise('triceps-isometric-hold', 2, null);
     expect(hold.sets.map((s) => [s.r, s.rAuto])).toEqual([[45, true], [45, true]]);
+  });
+  it('treats active workouts as unstarted preview until started or a set is checked, and builds Drive DCIM URLs', () => {
+    const preview = sess('prev', Date.now(), [sx('bench', [set(lb(135), 8, { done: false })])], { status: 'active', started: false });
+    expect(isSessionStarted(preview)).toBe(false);
+    preview.started = true;
+    expect(isSessionStarted(preview)).toBe(true);
+    const checkedNoFlag = sess('chk', Date.now(), [sx('bench', [set(lb(135), 8, { done: true })])], { status: 'active' });
+    expect(isSessionStarted(checkedNoFlag)).toBe(true);
+    expect(driveUrlFor({ fileName: 'PXL_20261116_173012345.mp4' })).toBe('https://drive.google.com/drive/search?q=PXL_20261116_173012345.mp4');
+    expect(driveUrlFor({ fileName: 'clip.mp4', uri: 'https://drive.google.com/file/d/abc/view' })).toBe('https://drive.google.com/file/d/abc/view');
+    expect(driveUrlFor({})).toBeNull();
   });
 });

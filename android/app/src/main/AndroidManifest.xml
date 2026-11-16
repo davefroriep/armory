@@ -64,6 +64,12 @@
 
     <queries>
         <package android:name="com.bpmhealth.boostcamp" />
+        <intent>
+            <action android:name="android.media.action.VIDEO_CAMERA" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.VIDEO_CAPTURE" />
+        </intent>
     </queries>
 </manifest>
 

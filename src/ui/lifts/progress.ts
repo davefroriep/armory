@@ -69,7 +69,7 @@ export function progressScreen(root: HTMLElement): () => void {
       const prHtml = recent.slice(0, 8).map((r) => {
         const ex = exOf(r.exId);
         const wTxt = ex.type === 'bodyweight' && r.kg === 0 ? 'BW' : `${fmtKg(r.kg)} ${unit}`;
-        return `<div class="prl"><i>★</i><b>${esc(ex.name)}</b><span>${r.n}RM · ${wTxt}</span><small>${relDay(r.ms)}</small>${r.vid ? `<button class="vmini" data-play="${r.vid}" aria-label="Play">${LI.video}</button>` : ''}</div>`;
+        return `<div class="prl"><i>★</i><b>${esc(ex.name)}</b><span>${r.n}RM · ${wTxt}</span><small>${relDay(r.ms)}</small>${r.vid && lifts.videos.has(r.vid) ? `<button class="vmini" data-play="${r.vid}" aria-label="Play">${LI.video}</button>` : ''}</div>`;
       }).join('');
 
       const clips = [...lifts.videos.values()].sort((a, b) => b.ms - a.ms).slice(0, 12);
@@ -85,7 +85,7 @@ export function progressScreen(root: HTMLElement): () => void {
           <section class="card"><div class="card-h"><span>WORKOUTS PER WEEK</span></div>${barChart(bars)}</section>
           ${top ? `<section class="card"><div class="card-h"><span>YOUR LIFTS</span><a class="link" href="#/strength/exercises">All exercises</a></div>${top}</section>` : ''}
           ${prHtml ? `<section class="card prs"><div class="card-h"><span>RECENT RECORDS</span></div>${prHtml}</section>` : ''}
-          ${clips.length ? `<section class="card"><div class="card-h"><span>LIFT VIDEOS</span></div><div class="vscroll">${clips.map((v) => `<button class="vthumb lg" data-play="${v.id}" style="background-image:url(${v.thumb})"><i>▶</i><small>${esc(exOf(v.exId).name)}</small></button>`).join('')}</div></section>` : ''}
+          ${clips.length ? `<section class="card"><div class="card-h"><span>LIFT VIDEOS</span></div><div class="vscroll">${clips.map((v) => `<button class="vthumb lg" data-play="${v.id}" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}"><i>▶</i><small>${esc(exOf(v.exId).name)}</small></button>`).join('')}</div></section>` : ''}
           ${sessions.length ? '' : '<div class="empty big">Nothing to chart yet.<br>Your numbers show up after the first workout.</div>'}
         </main>${resumeBar()}${tabBar('progress')}`;
     };
