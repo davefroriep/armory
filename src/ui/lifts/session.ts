@@ -247,7 +247,7 @@ function build(root: HTMLElement, id?: string): () => void {
             <small>${s.exs.length === 0 ? 'Pick from 120+ lifts or create custom — add exercises &amp; sets live as you go' : 'Pick or create another exercise in real time'}</small>
           </span>
         </button>
-        ${edit ? '<button class="btn primary big" data-act="finish">Done</button>' : '<button class="btn primary big" data-act="finish">Finish workout</button>'}
+        ${edit ? '<button class="btn primary big" data-act="finish">Done</button>' : '<button class="btn primary big" data-act="finish">Finish workout</button><button class="btn danger big" type="button" data-act="discard">Discard workout</button>'}
       </main>
       <div class="restbar" id="restbar" hidden><i class="rb-fill"></i><span class="rb-lab"></span><b class="rb-time"></b><button data-rest="-15">−15</button><button data-rest="15">+15</button><button data-rest="0">Skip</button></div>
       <div class="dock" id="dock" hidden></div>`;
@@ -751,37 +751,62 @@ function build(root: HTMLElement, id?: string): () => void {
     save(); paint();
   };
 
-  const promptUnfinishedAction = (title: string, msg: string): Promise<'today' | 'tomorrow' | 'delete' | 'cancel'> =>
+  const discardCurrentWorkout = async (): Promise<boolean> => {
+    const loggedAny = s.exs.some(hasLogged);
+    const ok = await confirmSheet(
+      'Discard workout?',
+      loggedAny
+        ? 'Everything logged so far will be deleted and nothing will be tracked.'
+        : 'Close this workout without saving anything?',
+      'Discard workout',
+      true,
+      'Keep lifting',
+    );
+    if (!ok) return false;
+    finishing = true;
+    allowNextRoute();
+    await active.discard();
+    location.hash = '#/';
+    return true;
+  };
+
+  const openChoiceSheet = <T extends string>(html: string, attr: string, fallback: T): Promise<T> =>
     new Promise((resolve) => {
-      let out: 'today' | 'tomorrow' | 'delete' | 'cancel' = 'cancel';
-      const sh = openSheet(
-        `<h3 class="sh-title">${esc(title)}</h3><p class="sh-text">${esc(msg)}</p>
-         <button class="btn primary big" type="button" data-uf="today">Do later today</button>
-         <button class="btn big" type="button" data-uf="tomorrow">Do tomorrow</button>
-         <button class="btn danger big" type="button" data-uf="delete">Delete unfinished sets &amp; finish</button>
-         <button class="btn big" type="button" data-uf="cancel">Keep lifting</button>`,
-        { onClose: () => resolve(out) },
-      );
+      let out: T = fallback;
+      const sh = openSheet(html, { onClose: () => resolve(out) });
       sh.body.addEventListener('click', (ev) => {
-        const uf = (ev.target as HTMLElement).closest<HTMLElement>('[data-uf]')?.dataset.uf as typeof out | undefined;
-        if (!uf) return;
-        out = uf;
+        const hit = (ev.target as HTMLElement).closest<HTMLElement>(`[data-${attr}]`)?.dataset[attr] as T | undefined;
+        if (!hit) return;
+        out = hit;
         sh.close();
       });
     });
 
+  const promptUnfinishedAction = (title: string, msg: string): Promise<'today' | 'tomorrow' | 'delete' | 'discard' | 'cancel'> =>
+    openChoiceSheet(
+      `<h3 class="sh-title">${esc(title)}</h3><p class="sh-text">${esc(msg)}</p>
+       <button class="btn primary big" type="button" data-uf="today">Do later today</button>
+       <button class="btn big" type="button" data-uf="tomorrow">Do tomorrow</button>
+       <button class="btn big" type="button" data-uf="delete">Delete unfinished sets &amp; finish</button>
+       <button class="btn danger big" type="button" data-uf="discard">Discard entire workout</button>
+       <button class="btn big" type="button" data-uf="cancel">Keep lifting</button>`,
+      'uf',
+      'cancel',
+    );
+
+  const promptFinishComplete = (): Promise<'save' | 'discard' | 'cancel'> =>
+    openChoiceSheet(
+      `<h3 class="sh-title">Finish workout?</h3><p class="sh-text">It uploads to Intervals.icu automatically.</p>
+       <button class="btn primary big" type="button" data-fc="save">Finish &amp; save</button>
+       <button class="btn danger big" type="button" data-fc="discard">Discard entire workout</button>
+       <button class="btn big" type="button" data-fc="cancel">Keep lifting</button>`,
+      'fc',
+      'cancel',
+    );
+
   const finish = async (skipConfirm = false): Promise<boolean> => {
     if (edit) { allowNextRoute(); location.hash = `#/strength/workout/${s.id}`; return true; }
-    if (!s.exs.some(hasLogged)) {
-      if (await confirmSheet('Nothing logged', 'No sets are logged yet. Discard this workout?', 'Discard workout', true, 'Keep lifting')) {
-        finishing = true;
-        allowNextRoute();
-        await active.discard();
-        location.hash = '#/';
-        return true;
-      }
-      return false;
-    }
+    if (!s.exs.some(hasLogged)) return discardCurrentWorkout();
     if (!skipConfirm) {
       const unfinished = collectUnfinishedItems(s);
       if (unfinished.length > 0) {
@@ -792,6 +817,7 @@ function build(root: HTMLElement, id?: string): () => void {
           `${leftSets} unfinished set${leftSets === 1 ? '' : 's'}: ${summary}. Delete them or do them later?`,
         );
         if (choice === 'cancel') return false;
+        if (choice === 'discard') return discardCurrentWorkout();
         if (choice === 'today' || choice === 'tomorrow') {
           calendar.scheduleSkippedMakeup({
             sessionId: s.id,
@@ -803,8 +829,9 @@ function build(root: HTMLElement, id?: string): () => void {
           toast(choice === 'today' ? 'Scheduled remaining sets for later today' : 'Scheduled remaining sets for tomorrow');
         }
       } else {
-        const ok = await confirmSheet('Finish workout?', 'It uploads to Intervals.icu automatically.', 'Finish & save', false, 'Keep lifting');
-        if (!ok) return false;
+        const fc = await promptFinishComplete();
+        if (fc === 'cancel') return false;
+        if (fc === 'discard') return discardCurrentWorkout();
       }
     }
     finishing = true;
@@ -847,11 +874,12 @@ function build(root: HTMLElement, id?: string): () => void {
         }
       });
     } else if (k === 'del') {
-      if (!(await confirmSheet(edit ? 'Delete workout?' : 'Discard workout?', edit ? 'Removes it from history (not from Intervals.icu).' : 'Everything logged so far is lost.', edit ? 'Delete' : 'Discard', true))) return;
+      if (!edit) { await discardCurrentWorkout(); return; }
+      if (!(await confirmSheet('Delete workout?', 'Removes it from history (not from Intervals.icu).', 'Delete', true))) return;
       finishing = true;
       allowNextRoute();
-      if (edit) { await lifts.deleteSession(s.id); location.hash = '#/strength/history'; }
-      else { await active.discard(); location.hash = '#/'; }
+      await lifts.deleteSession(s.id);
+      location.hash = '#/strength/history';
     }
   };
   const rename = async (): Promise<void> => {
@@ -896,6 +924,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const act = a.dataset.act!;
     if (act === 'addex') return void (await addEx());
     if (act === 'finish') return void (await finish());
+    if (act === 'discard') return void (await discardCurrentWorkout());
     if (act === 'rename') return void (await rename());
     if (act === 'wkmenu') return void (await wkMenu());
     if (act === 'start' || act === 'resume') {
