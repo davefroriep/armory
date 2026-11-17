@@ -121,7 +121,7 @@ export function homeScreen(root: HTMLElement): () => void {
       selectDay(shiftYmd(selectedYmd, Number(wkShift.dataset.wkShift)));
       return;
     }
-    if (t.closest('[data-back-today]') || t.closest('[data-today-zoom]')) {
+    if (t.closest('[data-back-today]') || t.closest('[data-snap-today]') || t.closest('[data-today-zoom]')) {
       selectDay(localDate());
       root.querySelector('.home-scroll')?.scrollTo({ top: 0, behavior: 'smooth' });
       return;

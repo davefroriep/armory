@@ -552,13 +552,15 @@ describe('Phase 1 routine seed', () => {
     expect(parentHash('#/strength/exercises')).toBe('#/');
     expect(parentHash('#/airbike')).toBe('#/');
     expect(parentHash('#/settings')).toBe('#/');
-    expect(parentHash('#/strength/session')).toBe('#/strength');
+    expect(parentHash('#/strength/session')).toBe('#/');
+    expect(parentHash('#/strength/hr')).toBe('#/');
+    expect(parentHash('#/strength/session/s1')).toBe('#/strength/workout/s1');
     expect(parentHash('#/strength/routine/r1')).toBe('#/strength');
     expect(parentHash('#/strength/settings')).toBe('#/strength');
     expect(parentHash('#/strength/summary/s1')).toBe('#/strength/history');
     expect(parentHash('#/strength/workout/s1')).toBe('#/strength/history');
     expect(parentHash('#/strength/exercise/bench')).toBe('#/strength/exercises');
-    expect(parentHash('#/airbike/p/1')).toBe('#/airbike');
+    expect(parentHash('#/airbike/p/1')).toBe('#/');
     expect(parentHash('#/airbike/w/w1')).toBe('#/airbike');
   });
 

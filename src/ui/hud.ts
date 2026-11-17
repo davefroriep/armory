@@ -160,7 +160,7 @@ class Hud {
       : '';
 
     this.root.innerHTML = `<div class="hud">
-      ${topbar({ back: '#/airbike', title: p.name, bike: true })}
+      ${topbar({ back: '#/', title: p.name, bike: true })}
       <div class="hud-top">
         <div class="overview"><span id="ovText">${overview}</span><span id="ovRight"></span></div>
         ${tl}

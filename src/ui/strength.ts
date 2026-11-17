@@ -49,7 +49,7 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     const chips = PACK_OPTIONS.map((w) =>
       `<button class="fchip${packLb === w ? ' on' : ''}" type="button" data-pack="${w}">${w === 0 ? 'No pack' : `${w} lb`}</button>`,
     ).join('');
-    root.innerHTML = `${topbar({ back: '#/strength', title: 'Ruck / Outdoor HR', cog: true })}
+    root.innerHTML = `${topbar({ back: '#/', title: 'Ruck / Outdoor HR', cog: true })}
       <main class="page">
         <section class="card">
           <div class="card-h"><span>PACK WEIGHT</span></div>

@@ -81,8 +81,8 @@ export class LeaveGuard {
     this.closeModal();
     if (this.pushed) {
       this.pushed = false;
-      // [... previous page, workout page, guard entry] -> previous page
-      history.go(-2);
+      // Return directly to Home instead of walking back through intermediate tabs.
+      location.hash = '#/';
     }
   }
 }

@@ -114,7 +114,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       void (async () => {
         if (autoStarted) return;
         autoStarted = true;
-        if (lifts.active) { location.replace('#/strength/session'); return; }
+        if (lifts.active && isSessionStarted(lifts.active)) { location.replace('#/strength/session'); return; }
         if (dead) return;
         const exId = parseExtraKey(pickParam);
         if (exId) {

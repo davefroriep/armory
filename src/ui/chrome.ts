@@ -157,24 +157,29 @@ function fmtPlanDate(ymd: string): string {
   return new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
-function calItemRow(it: TodayItem, actionMode: 'link' | 'strength' = 'link'): string {
+function calItemRow(it: TodayItem, actionMode: 'link' | 'strength' = 'link', compact = false): string {
   const eq = it.equipment;
-  const mins = it.slot.seconds ? Math.round(it.slot.seconds / 60) : 0;
   const r = eq === 'strength' && !it.items ? matchRoutineByTitle(it.slot.name, lifts.sortedRoutines()) : undefined;
-  const subParts = [
-    eq === 'strength'
-      ? `Strength${it.items ? ` · ${it.items.length} exercises` : r ? ` · ${r.name}` : ''}`
-      : EQUIPMENT_LABEL[eq] + (eq === 'airbike' && !it.programId ? ' · pick a program' : ''),
-    mins ? `${mins} min` : '',
-    it.carried ? 'carry-over' : '',
-  ].filter(Boolean);
-  const inner = `<span class="cal-ico ${eq}">${ICON[eq]}</span>
-    <span class="cal-txt"><b>${esc(it.slot.name)}</b><small>${esc(subParts.join(' · '))}</small></span>`;
+  const title = compact ? (r ? r.name : it.slot.name) : it.slot.name;
+  let sub = '';
+  if (!compact) {
+    const mins = it.slot.seconds ? Math.round(it.slot.seconds / 60) : 0;
+    const subParts = [
+      eq === 'strength'
+        ? `Strength${it.items ? ` · ${it.items.length} exercises` : r ? ` · ${r.name}` : ''}`
+        : EQUIPMENT_LABEL[eq] + (eq === 'airbike' && !it.programId ? ' · pick a program' : ''),
+      mins ? `${mins} min` : '',
+      it.carried ? 'carry-over' : '',
+    ].filter(Boolean);
+    sub = `<small>${esc(subParts.join(' · '))}</small>`;
+  }
+  const inner = `<span class="cal-ico ${compact ? 'sm ' : ''}${eq}">${ICON[eq]}</span>
+    <span class="cal-txt"><b>${esc(title)}</b>${sub}</span>`;
   const menu = `<button class="cal-more" type="button" data-cal-menu="${esc(it.planSlot)}" aria-label="Workout options">⋯</button>`;
   if (actionMode === 'strength') {
     return `<div class="cal-item" data-plan-card="${esc(it.planSlot)}"><div class="cal-link">${inner}</div><button class="btn sm primary" data-plan="${esc(it.planSlot)}">Start</button>${menu}</div>`;
   }
-  return `<div class="cal-item"><a class="cal-link" href="${href(it)}">${inner}<span class="btn sm primary">Start</span></a>${menu}</div>`;
+  return `<div class="cal-item${compact ? ' cal-compact' : ''}"><a class="cal-link" href="${href(it)}">${inner}<span class="btn sm primary">Start</span></a>${menu}</div>`;
 }
 
 /** Locked Sunday–Saturday swipable week strip header on Home. */
@@ -213,44 +218,43 @@ export function weekStripCard(cells: WeekDayCell[], selectedYmd?: string | null,
 export function machineDock(scheduled: Set<Equipment>): string {
   const SHORT: Record<Equipment, string> = { strength: 'Strength', treadmill: 'Treadmill', spin: 'Spin', airbike: 'AirBike' };
   const btns = (['strength', 'treadmill', 'spin', 'airbike'] as Equipment[]).map((eq) =>
-    `<a class="hd-btn ${eq}${scheduled.has(eq) ? ' has-today' : ''}" href="#/${eq}">
+    `<a class="hd-btn ${eq}${scheduled.has(eq) ? ' has-today' : ''}" href="#/${eq}" aria-label="${SHORT[eq]}">
       <span class="hd-ico">${ICON[eq]}</span>
-      <span class="hd-lbl">${SHORT[eq]}</span>
     </a>`,
   ).join('');
   return `<nav class="home-dock" aria-label="Equipment">${btns}</nav>`;
 }
 
-/** Local-first TODAY bar sitting inside the scrollable Home body above the always-open day zoom card. */
+/** Local-first TODAY bar pinned above the scrollable Day Zoom card. */
 export function programHeroCard(items: TodayItem[], completedToday: TodayCompletedItem[] = []): string {
   const s = getSettings();
   const cur = calendar.currentStep();
   const up = calendar.upcomingStep();
   const wk = cur?.week ?? PHASE1_PLAN.steps[Math.min(s.queue.stepIndex, PHASE1_PLAN.steps.length - 1)]?.week ?? 1;
   const stepNum = Math.min(s.queue.stepIndex + 1, PHASE1_PLAN.steps.length);
-  const completedRows = completedToday.map((c) => `<button class="cal-item cal-done-btn" type="button" data-today-zoom>
+  const completedRows = completedToday.map((c) => `<button class="cal-item cal-compact cal-done-btn" type="button" data-today-zoom>
     <span class="cal-link">
-      <span class="cal-ico done ${c.equipment}">${ICON[c.equipment]}</span>
-      <span class="cal-txt"><b>${esc(c.name)}</b><small>${esc(c.sub)}</small></span>
+      <span class="cal-ico sm done ${c.equipment}">${ICON[c.equipment]}</span>
+      <span class="cal-txt"><b>${esc(c.name)}</b></span>
     </span>
-    <span class="p-badge ok">✓ Details ›</span>
+    <span class="p-badge ok">✓ Done</span>
   </button>`).join('');
 
   let body = '';
   let foot = '';
   if (items.length > 0 || completedToday.length > 0) {
-    body = completedRows + items.map((it) => calItemRow(it, 'link')).join('');
+    body = completedRows + items.map((it) => calItemRow(it, 'link', true)).join('');
     if (items.length === 0 && up) {
       foot = `<div class="cal-foot"><span class="cal-sub">Next: ${esc(up.title)} (${esc(fmtPlanDate(up.date))})</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
     }
   } else if (up) {
-    body = `<button class="cal-empty cal-done-empty" type="button" data-today-zoom><b>✓ Today complete</b> · Next: ${esc(up.title)}<small>Tap to view today’s details ›</small></button>`;
-    foot = `<div class="cal-foot"><span class="cal-sub">Scheduled ${esc(fmtPlanDate(up.date))}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
+    body = `<button class="cal-empty cal-done-empty" type="button" data-today-zoom><b>✓ Today complete</b> · Next: ${esc(up.title)}</button>`;
+    foot = `<div class="cal-foot"><span class="cal-sub">${esc(fmtPlanDate(up.date))}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
   } else {
     body = `<div class="cal-empty"><b>Rest · Nothing scheduled</b></div>`;
   }
   return `<section class="card cal prog-hero">
-    <div class="card-h"><span><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</span><a class="prog-link" href="#/program?w=${wk}">Full Program ›</a></div>
+    <div class="card-h"><button class="today-snap" type="button" data-snap-today aria-label="Jump calendar to today"><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</button><a class="prog-link" href="#/program?w=${wk}">Full Program ›</a></div>
     ${body}${foot}
   </section>`;
 }
