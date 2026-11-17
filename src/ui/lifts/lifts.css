@@ -177,7 +177,7 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .xth { color: var(--mut); font-size: .6rem; font-weight: 800; letter-spacing: .1em; text-align: center; padding: 2px 0 4px; }
 .srow { padding: 3px 0; border-radius: 12px; transition: background .15s; }
 .srow.cur-target:not(.done) { background: rgba(56, 189, 248, .08); box-shadow: inset 0 0 0 1.5px rgba(56, 189, 248, .55); }
-.srow.done { background: rgba(34, 197, 94, .1); }
+.srow.done { background: transparent; }
 .snum { position: relative; height: 40px; border-radius: 10px; background: var(--card2); font-weight: 800; font-size: .95rem; display: grid; place-items: center; }
 .snum.has-rpe { padding-bottom: 8px; }
 .srow.k-w .snum { color: var(--amber); }
@@ -194,13 +194,17 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .srow input.auto { color: #6b7686; }
 .srow input::placeholder { color: #3e4857; }
 .srow input:focus { outline: none; border-color: var(--blue); background: #0f2233; color: #fff; }
-.srow.done input { background: transparent; color: #86efac; }
+.srow.done .snum { background: rgba(26, 31, 38, .55); color: #94a3b8; }
+.srow.done input:not(:focus) { background: rgba(26, 31, 38, .55); color: #cbd5e1; }
 .svid { width: 32px; height: 40px; border-radius: 10px; color: #4b5563; display: grid; place-items: center; padding: 0; }
 .svid svg { width: 16px; height: 16px; }
 .svid:active { background: var(--card2); color: #cbd5e1; }
 .svid.on { background: rgba(30, 155, 255, .15); color: var(--blue); box-shadow: inset 0 0 0 1px rgba(30, 155, 255, .45); }
-.schk { height: 40px; border-radius: 10px; background: var(--card2); color: #4b5563; font-size: 1.25rem; font-weight: 900; display: grid; place-items: center; }
-.schk.on { background: var(--green); color: #03140a; }
+.schk { height: 40px; border-radius: 10px; background: var(--card2); color: #4b5563; display: grid; place-items: center; padding: 0; transition: color .12s, background .12s, transform .1s; }
+.schk svg { width: 19px; height: 19px; }
+.schk:active { transform: scale(.92); }
+.schk.on { background: transparent; color: var(--green); }
+.schk.on svg { width: 22px; height: 22px; stroke-width: 3; }
 .shake { animation: shake .3s; }
 @keyframes shake { 20% { transform: translateX(-5px); } 50% { transform: translateX(5px); } 80% { transform: translateX(-3px); } }
 .xfoot { display: flex; align-items: center; gap: 6px; padding-top: 6px; }

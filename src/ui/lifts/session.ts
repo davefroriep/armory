@@ -143,7 +143,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${isTime ? 'sec' : '–'}" aria-label="${isTime ? 'Seconds' : 'Reps'}">
       ${holdBtn}
       <button class="svid${hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${hasVid ? 'Manage linked video' : 'Link or record lift video'}">${LI.video}</button>
-      <button class="schk${set.done ? ' on' : ''}" data-act="done" aria-label="Log set">✓</button>
+      <button class="schk${set.done ? ' on' : ''}" type="button" data-act="done" aria-label="Log set"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7.5"/></svg></button>
     </div>`;
   };
 
