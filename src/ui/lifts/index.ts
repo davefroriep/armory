@@ -1,4 +1,5 @@
 import './lifts.css';
+import { mountTopResume } from '../chrome';
 import { syncModalInert } from '../dom';
 import { strengthHrScreen } from '../strength';
 import { exerciseScreen } from './exercise';
@@ -37,7 +38,9 @@ export function liftsScreen(root: HTMLElement, args: string[], query: URLSearchP
   host.className = 'lhost';
   root.appendChild(host);
   const cleanup = (SUB[sub] ?? SUB[''])(host, rest, query);
+  const offResume = sub !== 'session' && sub !== 'summary' ? mountTopResume(host) : null;
   return () => {
+    offResume?.();
     cleanup?.();
     document.querySelectorAll('.lmodal').forEach((e) => e.dispatchEvent(new CustomEvent('armory:dismiss')));
     document.querySelectorAll('.lmodal, .camera, .ltoast').forEach((e) => e.remove());

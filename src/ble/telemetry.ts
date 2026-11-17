@@ -64,6 +64,45 @@ export function hrAtTime(atMs: number): number {
   return best && Math.abs(best.at - atMs) <= HR_MATCH_MS && best.hr > 0 ? best.hr : 0;
 }
 
+/** Recent valid H10 beats within `windowMs` ending at `now`. */
+export function recentHrPoints(windowMs: number, now = Date.now()): HrPoint[] {
+  const cutoff = now - windowMs;
+  const out: HrPoint[] = [];
+  for (let i = hrLog.length - 1; i >= 0; i--) {
+    const p = hrLog[i];
+    if (p.at < cutoff) break;
+    if (p.hr > 0 && p.at <= now) out.push(p);
+  }
+  out.reverse();
+  return out;
+}
+
+/** Contiguous current strap-session beats, breaking at any silence > `gapMs` (default 60s), resampled to <=1 per second. */
+export function currentStrapBeats(gapMs = 60_000): HrPoint[] {
+  if (!hrLog.length) return [];
+  const raw: HrPoint[] = [];
+  let prevAt = hrLog[hrLog.length - 1].at;
+  for (let i = hrLog.length - 1; i >= 0; i--) {
+    const p = hrLog[i];
+    if (prevAt - p.at > gapMs) break;
+    if (p.hr > 0) raw.push(p);
+    prevAt = p.at;
+  }
+  raw.reverse();
+  const out: HrPoint[] = [];
+  let lastSec = -1;
+  for (const p of raw) {
+    const sec = Math.floor(p.at / 1000);
+    if (sec !== lastSec) {
+      out.push(p);
+      lastSec = sec;
+    } else {
+      out[out.length - 1] = p;
+    }
+  }
+  return out;
+}
+
 /** Test hook. */
 export function clearHrLog(): void {
   hrLog.length = 0;

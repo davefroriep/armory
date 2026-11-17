@@ -6,12 +6,12 @@ import {
   prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
 } from '../../lifts/logic';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
-import { fmtKg, fmtNum, fromDisplay, liftSettings, stepsFor, updateLiftSettings } from '../../lifts/settings';
+import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { resyncSession } from '../../lifts/intervals';
 import { setText } from '../../lifts/summary';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
-import { allowNextRoute, setLeaveGuard } from '../../main';
+import { allowNextRoute } from '../../main';
 import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
@@ -86,6 +86,8 @@ function build(root: HTMLElement, id?: string): () => void {
     const rHead = ex.type === 'time' ? 'SEC' : 'REPS';
     const restSec = active.restSecFor(se);
     const autoOn = active.restAutoFor(s, idx);
+    const ls = liftSettings();
+    const showTimerGroup = !edit && (ls.showTimer || ls.showAutoTimer);
     return `<section class="xcard" data-idx="${idx}" data-uid="${se.uid}">
       <div class="xhead">
         <span class="xlab">${labs[idx]}</span>
@@ -97,11 +99,10 @@ function build(root: HTMLElement, id?: string): () => void {
       <div class="xrows">${se.sets.map((_, i) => rowHtml(se, ex, i, labelMap)).join('')}</div>
       <div class="xfoot">
         <button class="stp" data-act="rmset" aria-label="Remove set">−</button><span>SET</span><button class="stp" data-act="addset" aria-label="Add set">+</button>
-        ${edit ? '' : `<div class="xtimer">
-          <button class="xt-auto${autoOn ? ' on' : ''}" type="button" data-act="restauto" aria-pressed="${autoOn}" title="Auto-start rest timer on check">Auto</button>
-          <button class="xt-go" type="button" data-act="reststart" aria-label="Start rest timer">▶ ${clock(restSec)}</button>
-          <button class="xt-cog" type="button" data-act="restcfg" aria-label="Timer settings">${LI.gear}</button>
-        </div>`}
+        ${showTimerGroup ? `<div class="xtimer">
+          ${ls.showAutoTimer ? `<button class="xt-auto${autoOn ? ' on' : ''}" type="button" data-act="restauto" aria-pressed="${autoOn}" title="Auto-start rest timer on check">Auto</button>` : ''}
+          ${ls.showTimer ? `<button class="xt-go" type="button" data-act="reststart" aria-label="Start rest timer">▶ ${clock(restSec)}</button>` : ''}
+        </div>` : ''}
       </div>
     </section>`;
   };
@@ -117,7 +118,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
     const startBtn = edit ? '' : `<button class="sstart" type="button" data-act="start"${isSessionStarted(s) ? ' hidden' : ''}>▶ Start</button>`;
     return `<header class="bar sbar">
-      <a class="icon-btn" href="${back}" ${edit ? '' : 'data-act="back"'} aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
+      <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
       <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
       <div class="chips">${startBtn}<button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
@@ -193,7 +194,8 @@ function build(root: HTMLElement, id?: string): () => void {
   };
   const offTick = active.tick.on(() => { paintClock(); paintRest(); });
   const offRest = active.restChanged.on(paintRest);
-  const offChips = wireChips(root);
+  const offChips = wireChips(root, { resume: false });
+  const offCfg = liftSettingsChanged.on(() => { if (!dead) paint(); });
   // another screen/tab finished or deleted this workout
   const offStore = lifts.changed.on(() => {
     if (finishing) return;
@@ -370,7 +372,7 @@ function build(root: HTMLElement, id?: string): () => void {
       { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
       { key: 'note', label: lifts.row(se.exId)?.note ? 'Edit note' : 'Add note', sub: 'Sticks to the exercise (seat height, handle…)' },
       ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
-      { key: 'rest', label: 'Timer settings', sub: `${clock(active.restSecFor(se))} · Auto ${active.restAutoFor(s, idx) ? 'on' : 'off'}` },
+      { key: 'rest', label: 'Settings', sub: `${clock(active.restSecFor(se))} · Auto ${active.restAutoFor(s, idx) ? 'on' : 'off'}` },
       ...(idx > 0 ? [{ key: 'up', label: 'Move up' }] : []),
       ...(idx < s.exs.length - 1 ? [{ key: 'down', label: 'Move down' }] : []),
       { key: 'records', label: 'Records & history' },
@@ -413,7 +415,10 @@ function build(root: HTMLElement, id?: string): () => void {
     let resolveClosed: () => void = () => {};
     const closed = new Promise<void>((res) => { resolveClosed = res; });
     const sh = openSheet(
-      `<h3 class="sh-title">Timer · ${esc(ex.name)}</h3>
+      `<h3 class="sh-title">Settings · ${esc(ex.name)}</h3>
+       <div class="fl">CARD BUTTONS</div>
+       <div class="line"><span>Show timer<small>Show ▶ rest button on exercise cards</small></span><button class="switch" type="button" data-tcfg="showTimer" role="switch"><i></i></button></div>
+       <div class="line"><span>Show auto-timer<small>Show Auto toggle pill on exercise cards</small></span><button class="switch" type="button" data-tcfg="showAutoTimer" role="switch"><i></i></button></div>
        <div class="fl">REST DURATION <small>THIS EXERCISE</small></div>
        <div class="chips-row wrap" id="tdur"></div>
        <div class="fl">THIS CARD</div>
@@ -438,6 +443,8 @@ function build(root: HTMLElement, id?: string): () => void {
       sh.body.querySelector('#tdur')!.innerHTML = opts
         .map((o) => `<button class="fchip${o === cur ? ' on' : ''}" type="button" data-d="${o}">${clock(o)}</button>`)
         .join('');
+      syncTog('[data-tcfg="showTimer"]', ls.showTimer);
+      syncTog('[data-tcfg="showAutoTimer"]', ls.showAutoTimer);
       syncTog('[data-tcfg="cardAuto"]', active.restAutoFor(s, idx));
       syncTog('[data-tcfg="masterAuto"]', ls.restAuto);
       syncTog('[data-tcfg="sound"]', ls.restSound);
@@ -456,7 +463,13 @@ function build(root: HTMLElement, id?: string): () => void {
         return;
       }
       const cfg = t.closest<HTMLElement>('[data-tcfg]')?.dataset.tcfg;
-      if (cfg === 'cardAuto') {
+      if (cfg === 'showTimer') {
+        updateLiftSettings({ showTimer: !liftSettings().showTimer });
+        draw();
+      } else if (cfg === 'showAutoTimer') {
+        updateLiftSettings({ showAutoTimer: !liftSettings().showAutoTimer });
+        draw();
+      } else if (cfg === 'cardAuto') {
         const next = !active.restAutoFor(s, idx);
         se.restAuto = next;
         if (!midSuperset(s.exs, idx)) {
@@ -605,53 +618,6 @@ function build(root: HTMLElement, id?: string): () => void {
     return true;
   };
 
-  const openLeaveSheet = async (): Promise<boolean> => {
-    if (finishing || !lifts.active || !isSessionStarted(s)) return true;
-    const left = unloggedCount(s);
-    const hasLog = s.exs.some(hasLogged);
-    const sub = hasLog
-      ? (left ? `${left} unlogged set${left === 1 ? '' : 's'} will be dropped. Uploads to Intervals.icu automatically.` : 'Saves workout and uploads to Intervals.icu automatically.')
-      : 'Workout timer is running, with no checked sets yet.';
-    const pick = await new Promise<'finish' | 'keep' | 'discard'>((resolve) => {
-      let choice: 'finish' | 'keep' | 'discard' = 'keep';
-      const sh = openSheet(
-        `<h3 class="sh-title">Workout in progress</h3>
-         <p class="sh-text">${sub}</p>
-         <button class="btn primary big" type="button" data-lv="keep" autofocus>Keep lifting</button>
-         <button class="btn big" type="button" data-lv="finish">Finish &amp; save</button>
-         <button class="btn danger big" type="button" data-lv="discard">Discard workout</button>`,
-        { onClose: () => resolve(choice) },
-      );
-      sh.body.addEventListener('click', (e) => {
-        const b = (e.target as HTMLElement).closest<HTMLElement>('[data-lv]');
-        if (!b) return;
-        choice = b.dataset.lv as 'finish' | 'keep' | 'discard';
-        sh.close();
-      });
-    });
-    if (pick === 'keep') return false;
-    if (pick === 'finish') {
-      await finish(hasLog);
-      return false; // finish() handles routing directly to summary or staying put
-    }
-    const sure = await confirmSheet(
-      'Discard workout?',
-      'Are you sure you want to discard this workout?',
-      'Discard workout',
-      true,
-      'Keep lifting',
-      true,
-    );
-    if (!sure) return false;
-    finishing = true;
-    await active.discard();
-    return true;
-  };
-
-  if (!edit) {
-    setLeaveGuard(async () => openLeaveSheet());
-  }
-
   const wkMenu = async (): Promise<void> => {
     const k = await actionSheet(s.name, [
       { key: 'rename', label: 'Rename workout' },
@@ -710,14 +676,6 @@ function build(root: HTMLElement, id?: string): () => void {
     const a = t.closest<HTMLElement>('[data-act]');
     if (!a) return;
     const act = a.dataset.act!;
-    if (act === 'back') {
-      e.preventDefault();
-      if (await openLeaveSheet()) {
-        allowNextRoute();
-        location.hash = '#/strength';
-      }
-      return;
-    }
     if (act === 'addex') return void (await addEx());
     if (act === 'finish') return void (await finish());
     if (act === 'rename') return void (await rename());
@@ -755,7 +713,6 @@ function build(root: HTMLElement, id?: string): () => void {
       buzz(15);
       return;
     }
-    if (act === 'restcfg') return void (await openTimerSheet(se));
     if (act === 'addset') {
       addSet(se, lifts.previous(se.exId, s.startMs, s.id));
       save(); paint();
@@ -795,9 +752,8 @@ function build(root: HTMLElement, id?: string): () => void {
 
   return () => {
     dead = true;
-    setLeaveGuard(null);
     window.visualViewport?.removeEventListener('resize', onVvResize);
-    offTick(); offRest(); offChips(); offStore();
+    offTick(); offRest(); offChips(); offCfg(); offStore();
     hideDock();
     void lifts.flush();
     if (edit && dirty) void resyncSession(s.id);

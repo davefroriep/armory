@@ -9,7 +9,7 @@ import { settingsChanged } from '../../store/settings';
 import { esc } from '../dom';
 import { equipmentProgramCard, revFooter, wireCalendar, wireChips } from '../chrome';
 import { openStepSheet } from '../program';
-import { LI, actionSheet, clock, confirmSheet, mount, relDay, tabBar, toast, wireClock } from './kit';
+import { LI, actionSheet, confirmSheet, mount, relDay, tabBar, toast } from './kit';
 
 /** Start a routine (or an empty workout) and open the session screen. */
 export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null; planSlot?: string | null; replace?: boolean }): Promise<void> {
@@ -68,12 +68,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       const running = act && isSessionStarted(act) ? act : undefined;
       const routines = lifts.sortedRoutines();
       const planned = calendar.forEquipment('strength');
-
-      const resume = running
-        ? `<a class="card resume" href="#/strength/session"><i class="rec-dot"></i><span><b>${esc(running.name)}</b><small>Workout in progress · <span data-clock>${clock(active.elapsedSec())}</span></small></span><em>Resume ›</em></a>`
-        : '';
-
-      const plannedHtml = running ? '' : equipmentProgramCard('strength', planned, 'strength');
+      const plannedHtml = equipmentProgramCard('strength', planned, 'strength');
 
       const days = routines.length
         ? routines.map((r) => {
@@ -89,7 +84,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       root.innerHTML = `<header class="bar"><a class="icon-btn" href="#/" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a><h1>Strength</h1>
           <div class="chips"><button class="chip" data-chip="hr"></button><a class="icon-btn" href="#/strength/settings" aria-label="Lift settings">${LI.gear}</a></div></header>
         <main class="page has-tabs">
-          ${resume}${plannedHtml}
+          ${plannedHtml}
           <button class="custom-wk" type="button" data-act="custom">
             <span class="cw-ico">${LI.plus}</span>
             <span class="cw-txt">
@@ -130,7 +125,6 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
     const offChips = wireChips(root);
     const offStore = lifts.changed.on(paint);
     const offSet = settingsChanged.on(paint);
-    const offClock = wireClock(root);
 
     root.addEventListener('click', async (e) => {
       const t = e.target as HTMLElement;
@@ -201,6 +195,6 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       await startWorkout({ name: r.name, routine: r });
     });
 
-    return () => { dead = true; offCal(); offChips(); offStore(); offSet(); offClock(); };
+    return () => { dead = true; offCal(); offChips(); offStore(); offSet(); };
   });
 }

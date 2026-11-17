@@ -26,6 +26,8 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
           <section class="card">
             <div class="line"><span>Units</span>${seg('unit', s.unit, [['lb', 'Pounds'], ['kg', 'Kilograms']])}</div>
             <div class="line"><span>Default rest<small>Between sets, unless an exercise has its own</small></span><select class="lf-input sel" id="rest">${[30, 45, 60, 90, 120, 150, 180, 240, 300].map((n) => `<option value="${n}" ${n === s.restSec ? 'selected' : ''}>${Math.floor(n / 60)}:${String(n % 60).padStart(2, '0')}</option>`).join('')}</select></div>
+            <div class="line"><span>Show timer button<small>Show ▶ rest timer button on exercise cards</small></span>${tog('showTimer', s.showTimer)}</div>
+            <div class="line"><span>Show auto-timer<small>Show Auto toggle pill on exercise cards</small></span>${tog('showAutoTimer', s.showAutoTimer)}</div>
             <div class="line"><span>Auto-timer<small>Start rest timer automatically when checking a set</small></span>${tog('restAuto', s.restAuto)}</div>
             <div class="line"><span>Rest-over chime<small>Ducks music cleanly during 3-ding alert</small></span><div class="row">${tog('restSound', s.restSound)}<button class="btn sm" data-test-chime>Test</button></div></div>
             ${isNative() ? `<div class="line"><span>Floating timer overlay<small>Top mini-bar over other apps when minimized</small></span><button class="btn sm${overlayOn ? '' : ' primary'}" data-overlay>${overlayOn ? 'Enabled' : 'Enable ›'}</button></div>` : ''}
@@ -62,9 +64,9 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
       }
       const tog = t.closest<HTMLElement>('[data-tog]');
       if (tog) {
-        const k = tog.dataset.tog as 'restAuto' | 'restSound';
+        const k = tog.dataset.tog as 'restAuto' | 'restSound' | 'showTimer' | 'showAutoTimer';
         if (k === 'restAuto') await lifts.setMasterRestAuto(!liftSettings().restAuto);
-        else updateLiftSettings({ restSound: !liftSettings().restSound });
+        else updateLiftSettings({ [k]: !liftSettings()[k] });
         return void paint();
       }
       if (t.closest('[data-test-chime]')) { audio.unlock(); audio.chime(); return; }

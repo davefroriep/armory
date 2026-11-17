@@ -1,14 +1,17 @@
-import { $, ICON, esc } from './dom';
+import { $, ICON, esc, mmss } from './dom';
 import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
 import { PHASE1_PLAN, nextEquipmentSlot, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
 import { hasKey } from '../intervals/api';
 import { addDays, calendar, localDate, type TodayItem } from '../intervals/calendar';
+import { active } from '../lifts/active';
+import { isSessionStarted } from '../lifts/logic';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { lifts } from '../lifts/store';
 import { REV, REV_STAMP } from '../rev';
 import { getSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
+import { openHrSheet } from './hrSheet';
 import { actionSheet, toast } from './lifts/kit';
 
 export interface BarOpts {
@@ -30,8 +33,64 @@ export function topbar(o: BarOpts): string {
   </header>`;
 }
 
+const mountedResumeHosts = new WeakSet<HTMLElement>();
+
+/** Pins a sticky "Resume ›" strip directly below `.bar` across screens whenever a lift session has started. */
+export function mountTopResume(root: HTMLElement): () => void {
+  if (mountedResumeHosts.has(root)) return () => {};
+  mountedResumeHosts.add(root);
+
+  let dead = false;
+  let strip: HTMLAnchorElement | null = null;
+
+  const sync = (): void => {
+    if (dead) return;
+    const act = lifts.active;
+    const running = act && isSessionStarted(act) ? act : undefined;
+    if (!running) {
+      strip?.remove();
+      return;
+    }
+    if (!strip) {
+      strip = document.createElement('a');
+      strip.className = 'top-resume';
+      strip.href = '#/strength/session';
+      strip.innerHTML = '<i class="rec-dot"></i><b></b><span></span><em>Resume ›</em>';
+    }
+    const nameEl = strip.children[1] as HTMLElement;
+    const clockEl = strip.children[2] as HTMLElement;
+    if (nameEl.textContent !== running.name) nameEl.textContent = running.name;
+    const elapsed = mmss(active.elapsedSec());
+    if (clockEl.textContent !== elapsed) clockEl.textContent = elapsed;
+
+    const bar = root.querySelector<HTMLElement>('header.bar');
+    if (bar) {
+      const h = Math.round(bar.getBoundingClientRect().height);
+      if (h > 0) strip.style.top = `${h}px`;
+      if (bar.nextElementSibling !== strip) bar.after(strip);
+    } else if (strip.parentElement !== root) {
+      root.prepend(strip);
+    }
+  };
+
+  const offTick = active.tick.on(sync);
+  const offLifts = lifts.changed.on(sync);
+  const obs = new MutationObserver(sync);
+  obs.observe(root, { childList: true });
+  sync();
+
+  return () => {
+    dead = true;
+    mountedResumeHosts.delete(root);
+    offTick();
+    offLifts();
+    obs.disconnect();
+    strip?.remove();
+  };
+}
+
 /** Keeps the chips live and tappable. Returns a cleanup. */
-export function wireChips(root: HTMLElement): () => void {
+export function wireChips(root: HTMLElement, opts?: { resume?: boolean }): () => void {
   const paint = () => {
     root.querySelectorAll<HTMLElement>('[data-chip]').forEach((el) => {
       const v = chipView(el.dataset.chip as ChipKind);
@@ -41,7 +100,10 @@ export function wireChips(root: HTMLElement): () => void {
   };
   const click = (e: Event) => {
     const el = (e.target as HTMLElement).closest<HTMLElement>('[data-chip]');
-    if (el) chipTap(el.dataset.chip as ChipKind);
+    if (!el) return;
+    const kind = el.dataset.chip as ChipKind;
+    if (kind === 'hr') openHrSheet();
+    else chipTap(kind);
   };
   root.addEventListener('click', click);
   const off = linkStatus.on(paint);
@@ -59,6 +121,8 @@ export function wireChips(root: HTMLElement): () => void {
   const obs = new MutationObserver(paint);
   obs.observe(root, { childList: true });
   paint();
+  const wantResume = opts?.resume ?? !root.classList.contains('hud');
+  const offResume = wantResume ? mountTopResume(root) : null;
   return () => {
     root.removeEventListener('click', click);
     off();
@@ -66,6 +130,7 @@ export function wireChips(root: HTMLElement): () => void {
     offBike();
     obs.disconnect();
     clearInterval(t);
+    offResume?.();
   };
 }
 
@@ -126,7 +191,7 @@ export function weekStripCard(cells: WeekDayCell[]): string {
 }
 
 /** Double-wide Program Hero card sitting directly above the 4 equipment bays on Home. */
-export function programHeroCard(items: TodayItem[], liveLift?: { name: string; elapsed: string }): string {
+export function programHeroCard(items: TodayItem[]): string {
   const s = getSettings();
   const st = calendar.status;
   const cur = calendar.currentStep();
@@ -134,10 +199,6 @@ export function programHeroCard(items: TodayItem[], liveLift?: { name: string; e
   const wk = cur?.week ?? PHASE1_PLAN.steps[Math.min(s.queue.stepIndex, PHASE1_PLAN.steps.length - 1)]?.week ?? 1;
   const stepNum = Math.min(s.queue.stepIndex + 1, PHASE1_PLAN.steps.length);
   const pill = `<span class="cal-pill">WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</span>`;
-
-  const liveRow = liveLift
-    ? `<a class="prog-live" href="#/strength/session"><i class="rec-dot"></i><b>${esc(liveLift.name)}</b><span>${esc(liveLift.elapsed)}</span><em>Resume ›</em></a>`
-    : '';
 
   let body = '';
   let foot = '';
@@ -156,7 +217,7 @@ export function programHeroCard(items: TodayItem[], liveLift?: { name: string; e
   const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
   return `<section class="card cal prog-hero">
     <div class="card-h"><span>ARMORY HYBRID · PHASE 1 ${pill}</span><a class="prog-link" href="#/program">Program ›</a></div>
-    ${liveRow}${body}${foot}${err}
+    ${body}${foot}${err}
   </section>`;
 }
 

@@ -8,19 +8,43 @@ export interface LiftSettings {
   restSec: number;
   restAuto: boolean;
   restSound: boolean;
+  /** Show the manual rest timer button (`▶ 1:30`) on exercise cards. */
+  showTimer: boolean;
+  /** Show the per-card `Auto` timer toggle pill on exercise cards. */
+  showAutoTimer: boolean;
   /** Seconds of countdown before the camera starts recording (time to step back to the bar). */
   videoDelay: number;
 }
 
 const KEY = 'armory.lifts.settings.v1';
-const DEFAULTS: LiftSettings = { unit: 'lb', restSec: 90, restAuto: true, restSound: true, videoDelay: 5 };
+const CLEAN_TIMERS_KEY = 'armory.lifts.clean_timers_cfg.v1';
+const DEFAULTS: LiftSettings = {
+  unit: 'lb',
+  restSec: 90,
+  restAuto: false,
+  restSound: true,
+  showTimer: false,
+  showAutoTimer: false,
+  videoDelay: 5,
+};
 
 function load(): LiftSettings {
+  if (typeof localStorage === 'undefined') return { ...DEFAULTS };
+  let parsed: Partial<LiftSettings> = {};
   try {
-    return { ...DEFAULTS, ...(JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<LiftSettings>) };
+    parsed = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<LiftSettings>;
   } catch {
-    return { ...DEFAULTS };
+    parsed = {};
   }
+  const out: LiftSettings = { ...DEFAULTS, ...parsed };
+  if (!localStorage.getItem(CLEAN_TIMERS_KEY)) {
+    out.restAuto = false;
+    out.showTimer = false;
+    out.showAutoTimer = false;
+    localStorage.setItem(KEY, JSON.stringify(out));
+    localStorage.setItem(CLEAN_TIMERS_KEY, '1');
+  }
+  return out;
 }
 
 let cur = load();
@@ -28,7 +52,7 @@ export const liftSettingsChanged = new Emitter<LiftSettings>();
 export const liftSettings = (): LiftSettings => cur;
 export function updateLiftSettings(p: Partial<LiftSettings>): void {
   cur = { ...cur, ...p };
-  localStorage.setItem(KEY, JSON.stringify(cur));
+  if (typeof localStorage !== 'undefined') localStorage.setItem(KEY, JSON.stringify(cur));
   liftSettingsChanged.emit(cur);
 }
 

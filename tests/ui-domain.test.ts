@@ -4,6 +4,9 @@ import { RPE_STEPS, rpeLabel } from '../src/domain/rpe';
 import { buildTcx } from '../src/domain/tcx';
 import { intensityColor, profileBar } from '../src/domain/profile';
 import { PROGRAMS, resolveProgram, BASE_FTP } from '../src/domain/programs';
+import { clearHrLog, currentStrapBeats, pushHr, recentHrPoints } from '../src/ble/telemetry';
+import { liftSettings } from '../src/lifts/settings';
+import { hrDropStats } from '../src/ui/hr';
 
 describe('3 s smoothing', () => {
   it('averages the trailing window and drops old samples', () => {
@@ -81,5 +84,61 @@ describe('workout profile bars', () => {
   it('colours by power zone edges', () => {
     expect([40, 60, 80, 100, 115, 130].map((p) => intensityColor(p))).toEqual(
       ['#6b7a90', '#3b9cff', '#22c55e', '#facc15', '#fb923c', '#ef4444']);
+  });
+});
+
+describe('live HR sheet telemetry helpers', () => {
+  it('filters recent HR beats inside the window and ignores zeros', () => {
+    clearHrLog();
+    pushHr(110, 10_000);
+    pushHr(0, 70_000);
+    pushHr(142, 95_000);
+    pushHr(128, 125_000);
+    expect(recentHrPoints(60_000, 130_000)).toEqual([
+      { at: 95_000, hr: 142 },
+      { at: 125_000, hr: 128 },
+    ]);
+  });
+
+  it('extracts current contiguous strap session (breaking at >60s gap) at 1 Hz', () => {
+    clearHrLog();
+    pushHr(95, 1_000);
+    pushHr(130, 100_100);
+    pushHr(132, 100_800); // same UTC second -> deduplicated to latest
+    pushHr(135, 102_000);
+    const beats = currentStrapBeats(60_000);
+    expect(beats).toEqual([
+      { at: 100_800, hr: 132 },
+      { at: 102_000, hr: 135 },
+    ]);
+  });
+
+  it('computes 60s HR drop, peak, and low accurately', () => {
+    const pts = [
+      { at: 1_000, hr: 170 }, // outside 60s window for now=100_000
+      { at: 55_000, hr: 152 },
+      { at: 75_000, hr: 138 },
+      { at: 95_000, hr: 124 },
+    ];
+    expect(hrDropStats(pts, 124, 100_000, 60_000)).toEqual({
+      peak: 152,
+      peakAt: 55_000,
+      low: 124,
+      drop: 28,
+    });
+    expect(hrDropStats([], 0, 100_000, 60_000)).toBeNull();
+    expect(hrDropStats([{ at: 95_000, hr: 140 }], 145, 100_000, 60_000)).toEqual({
+      peak: 145,
+      peakAt: 100_000,
+      low: 140,
+      drop: 0,
+    });
+  });
+
+  it('defaults lift timer UI & auto-timer to clean off state', () => {
+    const s = liftSettings();
+    expect(s.restAuto).toBe(false);
+    expect(s.showTimer).toBe(false);
+    expect(s.showAutoTimer).toBe(false);
   });
 });

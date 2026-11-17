@@ -6,8 +6,6 @@ import { allMeta, getSamples, putMeta } from '../store/db';
 import { getSettings, settingsChanged } from '../store/settings';
 import { summarize } from '../workout/summary';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
-import { active } from '../lifts/active';
-import { isSessionStarted } from '../lifts/logic';
 import { lifts } from '../lifts/store';
 import { ICON, esc, mmss } from './dom';
 import { programHeroCard, revFooter, topbar, weekStripCard, wireCalendar, wireChips } from './chrome';
@@ -37,8 +35,6 @@ export function homeScreen(root: HTMLElement): () => void {
     const todayEquipment = calendar.items.map((i) => i.match.equipment).filter((e): e is Equipment => !!e);
     const weekCells = buildWeekGlimpse({ today, proj, todayEquipment, loggedByDate });
     const scheduled = new Set(todayEquipment);
-    const live = lifts.active && isSessionStarted(lifts.active) ? lifts.active : undefined;
-    const liveInfo = live ? { name: live.name, elapsed: mmss(active.elapsedSec()) } : undefined;
 
     const tiles = TILES.map(
       (eq) => `<a class="tile ${eq}${scheduled.has(eq) ? ' has-today' : ''}" href="#/${eq}">
@@ -51,7 +47,7 @@ export function homeScreen(root: HTMLElement): () => void {
       <main class="page">
         ${banners}
         ${weekStripCard(weekCells)}
-        ${programHeroCard(calendar.items, liveInfo)}
+        ${programHeroCard(calendar.items)}
         <div class="tiles4">${tiles}</div>
         ${revFooter()}
       </main>`;

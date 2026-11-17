@@ -386,3 +386,43 @@ a.metro { text-decoration: none; }
 .sh-rest { padding: 18px 12px; border-radius: 14px; background: var(--card2); text-align: center; display: flex; flex-direction: column; gap: 4px; }
 .sh-rest b { font-size: 1rem; }
 .sh-rest small { color: var(--mut); font-size: .78rem; line-height: 1.4; }
+
+/* ---------- unified top resume bar + live HR sheet ---------- */
+.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); flex: none; }
+.top-resume {
+  position: sticky;
+  top: calc(58px + var(--sat));
+  z-index: 24;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 16px;
+  background: rgba(15, 42, 64, .96);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(30, 155, 255, .45);
+}
+.top-resume b { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: .88rem; }
+.top-resume span { font-size: .82rem; font-weight: 800; font-variant-numeric: tabular-nums; color: #93c5fd; }
+.top-resume em { font-style: normal; font-size: .78rem; font-weight: 800; color: var(--blue); }
+
+[data-chip="hr"] { cursor: pointer; }
+.hr-sheet { text-align: left; max-height: 92dvh; overflow-y: auto; align-items: stretch; padding: 20px 18px calc(20px + var(--sab)); }
+#hrBody { display: flex; flex-direction: column; gap: 10px; }
+.hr-hero { background: var(--card2); border-radius: 18px; padding: 14px 16px; text-align: center; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05); }
+.hr-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.hr-conn { display: inline-flex; align-items: center; gap: 6px; font-size: .74rem; font-weight: 700; color: var(--mut); min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hr-conn i { width: 7px; height: 7px; border-radius: 50%; background: #4b5563; flex: none; }
+.hr-conn i.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.hr-zpill { font-size: .7rem; font-weight: 800; padding: 3px 9px; border-radius: 999px; white-space: nowrap; flex: none; }
+.hr-bpm { font-size: 3.9rem; font-weight: 900; line-height: 1; font-variant-numeric: tabular-nums; letter-spacing: -.03em; }
+.hr-bpm small { font-size: .95rem; font-weight: 800; color: var(--mut); letter-spacing: .08em; }
+.hr-spark-card { background: var(--card2); border-radius: 16px; padding: 11px 13px 10px; display: flex; flex-direction: column; gap: 6px; }
+.hr-spark-h { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: .68rem; font-weight: 800; letter-spacing: .1em; color: var(--mut); }
+.hr-spark-h b { font-size: .78rem; letter-spacing: 0; color: #e2e8f0; font-variant-numeric: tabular-nums; }
+.hr-spark { width: 100%; height: 74px; display: block; }
+.hr-spark-empty { color: var(--mut); font-size: .78rem; text-align: center; padding: 18px 6px; }
+.hr-sec-h { display: flex; justify-content: space-between; align-items: center; font-size: .66rem; font-weight: 800; letter-spacing: .12em; color: var(--mut); padding: 2px 2px 0; }
+.hr-stats div { background: var(--card2); }
+.hr-zones-card { background: var(--card2); border-radius: 16px; padding: 11px 13px; }
+.hr-acts { display: flex; flex-direction: column; gap: 8px; padding-top: 2px; }
