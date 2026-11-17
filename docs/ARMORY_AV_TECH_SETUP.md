@@ -27,15 +27,16 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so f
                                     └─▶ HDMI Out 2: [ Optional 32" TV / Pending check ]
 ```
 
-- **Display / TV:** **Hisense 43" 4K Fire TV** *(previously noted as `43U6GR`, though `U6GR` is a 55"+ Roku TV line — exact 43" Fire TV model label TBD; 43" Hisense 4K Fire TVs typically carry 3× HDMI incl. ARC + 1× Optical SPDIF)*.
-- **Streaming & Audio Source:** **Amazon Fire TV Cube** feeds the Denon AVR — serves as both **treadmill video display** (through Hisense HDMI 2) and **whole-gym music / audio-video streaming head** (voice control + familiar UI for wife/kids; raw PC browser streaming is a non-starter for family usability). *(Note: having both an external Fire TV Cube and a Fire TV-built-in Hisense can contribute to Alexa/CEC quirks.)*
+- **Display / TV:** **Hisense 43" E6 Cinema Series Hi-QLED 4K UHD Smart Fire TV (`43E6QF`, 2025 Model)** *(Amazon Order `#113-5238183-0153026`, delivered Feb 10, 2026)*.
+  - **TV Ports (`43E6QF`):** **3× HDMI 2.0** (with **ARC/eARC on HDMI 3**), **1× Optical Digital Audio Out (TOSLINK)**, Dolby Vision / HDR10+ Adaptive.
+- **Streaming & Audio Source:** **Amazon Fire TV Cube** feeds the Denon AVR — serves as both **treadmill video display** (through Hisense HDMI 2) and **whole-gym music / audio-video streaming head** (voice control + familiar UI for wife/kids; raw PC browser streaming is a non-starter for family usability). *(Note: having both an external Fire TV Cube and a Fire TV-built-in `43E6QF` can contribute to Alexa/CEC quirks.)*
 - **Receiver & Speaker Array:** **Denon AVR-3313CI** (HDMI 1.4a: max 4K@24/30Hz passthrough, no HDMI 2.0 4K/60 HDR or HDCP 2.2; supports **ARC** on HDMI Monitor Out 1, 2× Optical TOSLINK inputs, and 3 HDMI outputs: 2× main-zone + 1× Zone 2) driving **4 corner tower speakers** + **1 center-channel speaker** mounted over/in front of the treadmill (typically **5-channel / Multi-Ch Stereo** mode — *exact surround mode to confirm*).
-- **Known A/V Pain Points & Architecture Notes (No Extractor Wanted):**
-  - **4K HDR + CEC power bottleneck:** Routing Fire TV Cube → Denon AVR-3313CI → Hisense drops 4K/60 HDR and causes flaky HDMI-CEC TV turn-on. (Fire TV Cube built-in **IR blaster** for Hisense + Denon can bypass CEC power/volume flakiness.)
-  - **TV → Denon back-feed options without an audio extractor:**
-    - **Screen-on usage confirmed:** Dave always leaves the **Hisense TV ON** when streaming music, so TV → Denon audio pass-through requires **no** screen-off workaround.
-    - *Optical (TOSLINK — if present on your Hisense model, to confirm):* Clean 5.1/PCM audio from both Cube and OptiPlex to the Denon with zero CEC/ARC conflicts and doesn't consume an HDMI port (critical if the Hisense only has 2 HDMI inputs).
-    - *HDMI ARC (`Hisense ARC` ↔ Denon `Monitor 1 ARC`):* Single cable if Hisense has 3+ HDMI ports, though HDMI 1.4a ARC/CEC handshakes can conflict.
+- **Known A/V Pain Points & Architecture Notes (Zero Extractor Needed):**
+  - **4K HDR + CEC power bottleneck:** Routing Fire TV Cube → Denon AVR-3313CI → Hisense `43E6QF` drops 4K/60 HDR / Dolby Vision and causes flaky HDMI-CEC TV turn-on. (Fire TV Cube built-in **IR blaster** for Hisense + Denon can bypass CEC power/volume flakiness.)
+  - **Confirmed TV → Denon back-feed options (`43E6QF` supports BOTH with zero audio extractor):**
+    - **Screen-on usage confirmed:** Dave always leaves the **`43E6QF` ON** when streaming music, so TV → Denon audio pass-through requires **no** screen-off workaround.
+    - *Optical (`43E6QF` Optical Out → Denon `OPTICAL IN`):* Clean 5.1/PCM audio from both Fire TV Cube (HDMI 2) and OptiPlex (HDMI 1) with zero CEC/ARC conflicts while keeping all 3 TV HDMIs free for sources if desired.
+    - *HDMI ARC (`43E6QF` HDMI 3 eARC/ARC ↔ Denon `Monitor 1 ARC`):* Leaves OptiPlex on HDMI 1 and Cube on HDMI 2 while sending audio back to the Denon, though older HDMI 1.4a ARC/CEC handshakes on the 3313CI can conflict with Fire TV Cube power/input control.
   - **Fire TV Cube streaming flakiness:** Voice track-skip errors ("nothing playing"), launching wrong song/Amazon Music, splash-screen hangs, and Music app crashes after ~3 songs.
 - **Cardio & Lift BLE Sensors (Active Today / In-Flight):**
   - **Polar H10** chest strap (`0x180D` / `0x2A37`, supports 2 simultaneous BLE connections when dual-BLE is enabled in Polar Beat).
@@ -59,8 +60,8 @@ Goal for a future secondary display (no code changes yet): glanceable real-time 
 
 ## 4. Open Questions / To Verify Next
 
-- [x] *Music playback TV state:* Confirmed **Hisense TV is always ON** when streaming music.
-- [ ] Confirm exact **Hisense 43" 4K Fire TV** model number off rear sticker and verify back-panel **`Optical Out` + HDMI count/`ARC` port** *(note: `43U6GR` noted in earlier inventory doesn't match a 43" Fire TV SKU)*.
+- [x] *Hisense TV Model & Ports:* Confirmed **Hisense 43" E6 Cinema Series 4K Fire TV (`43E6QF`, 2025)** — **3× HDMI 2.0 (`HDMI 3 = eARC/ARC`)** + **1× Optical Digital Audio Out (TOSLINK)**.
+- [x] *Music playback TV state:* Confirmed **Hisense `43E6QF` is always ON** when streaming music.
 - [ ] Confirm exact Denon **5-channel stereo** mode and whether **HDMI Monitor Out 2** is free or wired.
 - [ ] Check video inputs on the **19" monitor** (HDMI vs. VGA/DVI/DisplayPort) and approximate rack/bench viewing distance.
 - [ ] Confirm whether the **spare 32" TV** is available and whether a **strength-area screen** feels worth hanging vs. a compact **ESP32 rack display / LED gym timer**.
