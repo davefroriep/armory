@@ -1,4 +1,4 @@
-import { ICON, esc } from '../dom';
+import { ICON, esc, syncModalInert, wireModalBackdrop } from '../dom';
 import { active } from '../../lifts/active';
 import { isSessionStarted } from '../../lifts/logic';
 import { lifts } from '../../lifts/store';
@@ -64,14 +64,18 @@ export function openSheet(html: string, o: { full?: boolean; onClose?: () => voi
   el.innerHTML = `<div class="sheet lsheet${o.full ? ' full' : ''}" role="dialog">${html}</div>`;
   const body = el.firstElementChild as HTMLElement;
   let closed = false;
+  let offBackdrop = () => {};
   const close = (): void => {
     if (closed) return;
     closed = true;
+    offBackdrop();
     el.remove();
+    syncModalInert();
     o.onClose?.();
   };
-  el.addEventListener('pointerdown', (e) => { if (e.target === el) close(); });
+  offBackdrop = wireModalBackdrop(el, close);
   document.body.appendChild(el);
+  syncModalInert();
   return { el, body, close };
 }
 

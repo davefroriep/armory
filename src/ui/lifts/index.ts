@@ -1,4 +1,5 @@
 import './lifts.css';
+import { syncModalInert } from '../dom';
 import { strengthHrScreen } from '../strength';
 import { exerciseScreen } from './exercise';
 import { exercisesScreen } from './exercises';
@@ -38,7 +39,9 @@ export function liftsScreen(root: HTMLElement, args: string[], query: URLSearchP
   const cleanup = (SUB[sub] ?? SUB[''])(host, rest, query);
   return () => {
     cleanup?.();
+    document.querySelectorAll('.lmodal').forEach((e) => e.dispatchEvent(new CustomEvent('armory:dismiss')));
     document.querySelectorAll('.lmodal, .camera, .ltoast').forEach((e) => e.remove());
+    syncModalInert();
     document.body.classList.remove('dock-open');
     host.remove();
   };

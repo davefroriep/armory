@@ -1,3 +1,5 @@
+import { syncModalInert, wireModalBackdrop } from './dom';
+
 /**
  * Stops an accidental system Back (Android edge swipe / back button, browser back) from silently ending a
  * running workout. While armed there is one extra history entry above the workout page; Back consumes it,
@@ -6,6 +8,7 @@
 export class LeaveGuard {
   private pushed = false;
   private modal: HTMLElement | null = null;
+  private offBackdrop: (() => void) | null = null;
 
   constructor(private readonly isActive: () => boolean) {}
 
@@ -59,13 +62,18 @@ export class LeaveGuard {
       if (b.dataset.leave === 'yes') this.leave();
       else this.closeModal();
     });
+    this.offBackdrop = wireModalBackdrop(m, () => this.closeModal());
     document.body.appendChild(m);
     this.modal = m;
+    syncModalInert();
   }
 
   private closeModal(): void {
+    this.offBackdrop?.();
+    this.offBackdrop = null;
     this.modal?.remove();
     this.modal = null;
+    syncModalInert();
   }
 
   private leave(): void {

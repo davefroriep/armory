@@ -28,3 +28,61 @@ export const ICON: Record<string, string> = {
   back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
   note: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6.5 20L10 4h4l3.5 16z" fill="currentColor" fill-opacity=".14"/><path d="M12 16.5L17.5 7"/><circle cx="12" cy="16.5" r="1.4" fill="currentColor"/></svg>',
 };
+
+/** Marks #app inert while any body-level modal sheet is visible so shaded controls cannot receive focus or taps. */
+export function syncModalInert(): void {
+  if (typeof document === 'undefined') return;
+  const app = document.getElementById('app');
+  if (app) app.inert = document.querySelector('body > .modal:not([hidden])') !== null;
+}
+
+/**
+ * Dismisses a modal on a completed backdrop click (pointerdown + click both on the backdrop, not the sheet),
+ * programmatic `armory:dismiss`, or Escape when this modal is topmost. Keeping the modal mounted until `click`
+ * prevents mobile WebViews from delivering pointerup/click to shaded controls underneath.
+ */
+export function wireModalBackdrop(
+  el: EventTarget,
+  close: () => void,
+  keyTarget: EventTarget | null = typeof window !== 'undefined' ? window : null,
+): () => void {
+  let armed = false;
+  const onDown = (e: Event): void => { armed = e.target === el; };
+  const onCancel = (): void => { armed = false; };
+  const onClick = (e: Event): void => {
+    const detail = (e as MouseEvent).detail ?? 1;
+    if (e.target === el && (armed || detail === 0)) {
+      e.preventDefault();
+      e.stopPropagation();
+      armed = false;
+      close();
+      return;
+    }
+    armed = false;
+  };
+  const onDismiss = (): void => { close(); };
+  const onKey = (e: Event): void => {
+    if ((e as KeyboardEvent).key !== 'Escape') return;
+    if (typeof document !== 'undefined') {
+      const modals = document.querySelectorAll('.lmodal:not([hidden]), .modal:not([hidden])');
+      if (modals.length && modals[modals.length - 1] !== el) return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    close();
+  };
+
+  el.addEventListener('pointerdown', onDown);
+  el.addEventListener('pointercancel', onCancel);
+  el.addEventListener('click', onClick);
+  el.addEventListener('armory:dismiss', onDismiss);
+  keyTarget?.addEventListener('keydown', onKey);
+
+  return () => {
+    el.removeEventListener('pointerdown', onDown);
+    el.removeEventListener('pointercancel', onCancel);
+    el.removeEventListener('click', onClick);
+    el.removeEventListener('armory:dismiss', onDismiss);
+    keyTarget?.removeEventListener('keydown', onKey);
+  };
+}

@@ -10,6 +10,7 @@ import { initSetupLinks } from './setup';
 import { isNative } from './native/service';
 import { kickSensors, releaseBike } from './ble/sources';
 import { parentHash } from './nav';
+import { syncModalInert, wireModalBackdrop } from './ui/dom';
 
 type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (() => void) | void;
 
@@ -69,6 +70,8 @@ function route(): void {
   leaveGuard = null;
   routeKey = key;
   cleanup?.();
+  document.querySelectorAll<HTMLElement>('.lmodal, [data-exit-sheet]').forEach((m) => m.dispatchEvent(new CustomEvent('armory:dismiss')));
+  syncModalInert();
   // The bike link lives across every AirBike screen (list <-> workout); only leaving AirBike drops it.
   if (name !== 'airbike') releaseBike();
   root.className = 'screen';
@@ -88,8 +91,16 @@ function promptExit(): void {
     <button class="btn primary big" type="button" data-exit="0">No</button>
     <button class="btn danger big" type="button" data-exit="1">Yes</button>
   </div>`;
-  const close = (): void => el.remove();
-  el.addEventListener('pointerdown', (e) => { if (e.target === el) close(); });
+  let closed = false;
+  let offBackdrop = () => {};
+  const close = (): void => {
+    if (closed) return;
+    closed = true;
+    offBackdrop();
+    el.remove();
+    syncModalInert();
+  };
+  offBackdrop = wireModalBackdrop(el, close);
   el.addEventListener('click', (e) => {
     const b = (e.target as HTMLElement).closest<HTMLElement>('[data-exit]');
     if (!b) return;
@@ -97,6 +108,7 @@ function promptExit(): void {
     if (b.dataset.exit === '1') void App.exitApp();
   });
   document.body.appendChild(el);
+  syncModalInert();
 }
 
 initSetupLinks();
@@ -105,10 +117,10 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) kick
 window.addEventListener('hashchange', route);
 if (isNative()) {
   void App.addListener('backButton', () => {
-    const modals = document.querySelectorAll<HTMLElement>('.lmodal, .modal');
+    const modals = document.querySelectorAll<HTMLElement>('.lmodal:not([hidden]), .modal:not([hidden])');
     const topModal = modals[modals.length - 1];
     if (topModal) {
-      topModal.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+      topModal.dispatchEvent(new CustomEvent('armory:dismiss'));
       return;
     }
     const up = parentHash(routeKey);
