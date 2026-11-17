@@ -32,7 +32,7 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so f
 - **Known A/V Pain Points & Architecture Notes (No Extractor Wanted):**
   - **4K HDR + CEC power bottleneck:** Routing Fire TV Cube → Denon AVR-3313CI → Hisense drops 4K/60 HDR and causes flaky HDMI-CEC TV turn-on. (Fire TV Cube built-in **IR blaster** for Hisense + Denon can bypass CEC power/volume flakiness.)
   - **TV → Denon back-feed options without an audio extractor:**
-    - *Optical (TOSLINK):* Clean 5.1/PCM audio from both Cube and OptiPlex to the Denon with zero CEC/ARC conflicts.
+    - *Optical (TOSLINK — if present on your Hisense model, to confirm):* Clean 5.1/PCM audio from both Cube and OptiPlex to the Denon with zero CEC/ARC conflicts.
     - *HDMI ARC (`Hisense ARC` ↔ Denon `Monitor 1 ARC`):* Single cable if Hisense has 3+ HDMI ports, though HDMI 1.4a ARC/CEC handshakes can conflict.
     - *Key Tradeoff:* Both Optical and ARC normally require the **Hisense TV powered ON** to pass audio (unless TV supports screen-off audio-only); **Cube → AVR → TV** allows playing music with the TV powered OFF.
   - **Fire TV Cube streaming flakiness:** Voice track-skip errors ("nothing playing"), launching wrong song/Amazon Music, splash-screen hangs, and Music app crashes after ~3 songs.
@@ -59,7 +59,7 @@ Goal for a future secondary display (no code changes yet): glanceable real-time 
 ## 4. Open Questions / To Verify Next
 
 - [ ] Confirm whether music on the Cube is often played with the **Hisense TV powered OFF** (determines whether TV → Denon Optical/ARC is viable vs. keeping Cube → AVR or adding screen-off audio handling).
-- [ ] Confirm total **HDMI input count** on the **Hisense TV** (and which port is labeled `ARC`).
+- [ ] Confirm exact **Hisense TV model**, total **HDMI input count** (`ARC` label), and whether it has a **`DIGITAL AUDIO OUT (Optical / TOSLINK)`** port.
 - [ ] Confirm exact Denon **5-channel stereo** mode and whether **HDMI Monitor Out 2** is free or wired.
 - [ ] Check video inputs on the **19" monitor** (HDMI vs. VGA/DVI/DisplayPort) and approximate rack/bench viewing distance.
 - [ ] Confirm whether the **spare 32" TV** is available and whether a **strength-area screen** feels worth hanging vs. a compact **ESP32 rack display / LED gym timer**.
