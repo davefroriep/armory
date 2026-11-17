@@ -1,6 +1,6 @@
 import { audio, buzz } from '../audio/audio';
 import { Emitter } from '../emitter';
-import { hrFresh, live } from '../ble/telemetry';
+import { hrBeat, hrFresh, live } from '../ble/telemetry';
 import { isNative, onNativeRestSync, workoutService } from '../native/service';
 import { getMeta, getSamples, putMeta } from '../store/db';
 import { getSettings } from '../store/settings';
@@ -40,6 +40,7 @@ class ActiveWorkout {
 
   private timer: ReturnType<typeof setInterval> | null = null;
   private offRec: (() => void) | null = null;
+  private offHrSvc: (() => void) | null = null;
   private lock: WakeLockSentinel | null = null;
   private lastSvc = 0;
   private booting: Promise<void> | null = null;
@@ -144,6 +145,8 @@ class ActiveWorkout {
     this.rec = rec;
     // Beat-driven so heart rate keeps logging while Android throttles this page's timers in the background.
     this.offRec = rec.attach(() => ({ elapsed: this.elapsedSec(), targetRpm: 0 }));
+    this.offHrSvc?.();
+    this.offHrSvc = hrBeat.on(() => this.pushServiceStatus(2000));
     this.timer = setInterval(() => this.onTick(), 250);
     if (!isNative()) this.requestLock();
     const wav = isNative() && !this.wavCached ? audio.getWavBase64('chime') : undefined;
@@ -159,6 +162,21 @@ class ActiveWorkout {
 
   private requestLock(): void {
     void navigator.wakeLock?.request('screen').then((l) => { this.lock = l; }).catch(() => {});
+  }
+
+  private pushServiceStatus(minIntervalMs: number): void {
+    const s = this.session;
+    if (!s || !s.started) return;
+    const now = Date.now();
+    if (now - this.lastSvc < minIntervalMs) return;
+    this.lastSvc = now;
+    const el = this.elapsedSec();
+    const r = this.rest;
+    const hr = hrFresh() ? live.hr : 0;
+    const txt = isNative()
+      ? (hr ? `♥ ${hr} BPM · Recording` : 'Workout active')
+      : (r && !r.fired ? `Rest ${mmss((r.endMs - now) / 1000)} · ${mmss(el)}` : `${mmss(el)} · ${hr || '--'} BPM`);
+    void workoutService.update(`Armory Fit · ${s.name}`, txt, s.startMs);
   }
 
   private onTick(): void {
@@ -179,14 +197,7 @@ class ActiveWorkout {
         buzz([220, 90, 220]);
       }
     }
-    if (Date.now() - this.lastSvc > 5000) {
-      this.lastSvc = Date.now();
-      const hr = hrFresh() ? live.hr : 0;
-      const txt = isNative()
-        ? (hr ? `${hr} BPM · Recording` : 'Workout active')
-        : (r && !r.fired ? `Rest ${mmss((r.endMs - Date.now()) / 1000)} · ${mmss(el)}` : `${mmss(el)} · ${hr || '--'} BPM`);
-      void workoutService.update(`Armory Fit · ${s.name}`, txt, s.startMs);
-    }
+    this.pushServiceStatus(5000);
     this.tick.emit();
   }
 
@@ -298,6 +309,8 @@ class ActiveWorkout {
     this.timer = null;
     this.offRec?.();
     this.offRec = null;
+    this.offHrSvc?.();
+    this.offHrSvc = null;
     this.rec = null;
     this.rest = null;
     document.removeEventListener('visibilitychange', this.onVis);

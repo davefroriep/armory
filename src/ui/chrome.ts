@@ -1,6 +1,6 @@
 import { $, ICON, esc } from './dom';
 import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
-import { bikeFrame, hrFresh, live } from '../ble/telemetry';
+import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
 import { PHASE1_PLAN } from '../domain/plan';
 import { calendar, type TodayItem } from '../intervals/calendar';
 import { matchRoutineByTitle } from '../lifts/seed';
@@ -43,6 +43,7 @@ export function wireChips(root: HTMLElement): () => void {
   };
   root.addEventListener('click', click);
   const off = linkStatus.on(paint);
+  const offHr = hrBeat.on(paint);
   const t = setInterval(paint, 1000);
   // Live RPM on the bike chip: repaint on bike frames, at most ~4x a second.
   let lastPaint = 0;
@@ -59,6 +60,7 @@ export function wireChips(root: HTMLElement): () => void {
   return () => {
     root.removeEventListener('click', click);
     off();
+    offHr();
     offBike();
     obs.disconnect();
     clearInterval(t);

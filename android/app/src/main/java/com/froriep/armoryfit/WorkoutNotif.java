@@ -67,11 +67,19 @@ final class WorkoutNotif {
         return b.build();
     }
 
-    static Notification buildRest(Context c, String label, long endEpochMs, long remainingMs, boolean fired, boolean alertPop) {
+    private static String bpmPrefix(String workoutText) {
+        if (workoutText == null || !workoutText.contains("BPM")) return null;
+        int sep = workoutText.indexOf(" · ");
+        return sep > 0 ? workoutText.substring(0, sep) : workoutText;
+    }
+
+    static Notification buildRest(Context c, String label, String workoutText, long endEpochMs, long remainingMs, boolean fired, boolean alertPop) {
         String title = fired
                 ? ("GO! Rest complete" + (label != null && !label.isEmpty() ? " · " + label : ""))
                 : ("Rest" + (label != null && !label.isEmpty() ? " · " + label : " timer"));
-        String text = fired ? "Next set ready" : "Resting · live timer";
+        String bpm = bpmPrefix(workoutText);
+        String baseText = fired ? "Next set ready" : "Resting · live timer";
+        String text = bpm != null ? (bpm + " · " + (fired ? "Next set ready" : "Resting")) : baseText;
 
         NotificationCompat.Builder b = new NotificationCompat.Builder(c, REST_CHANNEL)
                 .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
