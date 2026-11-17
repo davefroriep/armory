@@ -118,6 +118,9 @@ body.dock-open .ltoast { bottom: calc(134px + var(--sab)); }
 
 /* ---------- session ---------- */
 .sbar { padding-bottom: 6px; }
+.sbar .chips { gap: 6px; }
+.sstart { height: 34px; padding: 0 13px; border-radius: 999px; background: var(--green); color: #03140a; font-size: .78rem; font-weight: 900; letter-spacing: .04em; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex: none; }
+.sstart:active { transform: scale(.96); }
 .stitle { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; text-align: left; line-height: 1.15; }
 .stitle b { font-size: 1.02rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .stitle small { color: var(--mut); font-size: .78rem; font-weight: 700; font-variant-numeric: tabular-nums; }

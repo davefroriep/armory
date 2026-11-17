@@ -146,16 +146,17 @@ export const hasSessionActivity = (s: LiftSession): boolean => s.exs.some((e) =>
 export const isSessionStarted = (s: LiftSession): boolean => !!s.started || hasSessionActivity(s);
 
 /** Starts an unstarted workout clock from zero (`startMs = now`). */
-export function startSessionClock(s: LiftSession, now = Date.now()): boolean {
+export function startSessionClock(s: LiftSession, now = Date.now(), manual = false): boolean {
+  if (manual) s.manualStart = true;
   if (s.started) return false;
   s.startMs = now;
   s.started = true;
   return true;
 }
 
-/** Resets the workout clock back to unstarted preview (`startMs = now`) when nothing is logged or video-linked. */
+/** Resets the workout clock back to unstarted preview (`startMs = now`) when auto-started by check only and nothing remains logged or video-linked. */
 export function resetSessionClock(s: LiftSession, now = Date.now()): boolean {
-  if (hasSessionActivity(s)) return false;
+  if (hasSessionActivity(s) || s.manualStart) return false;
   s.started = false;
   s.startMs = now;
   return true;

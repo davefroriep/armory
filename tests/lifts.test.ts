@@ -404,6 +404,31 @@ describe('Phase 1 routine seed', () => {
     expect(startSessionClock(live, 1_065_000)).toBe(true);
     expect(live.started).toBe(true);
     expect(live.startMs).toBe(1_065_000);
+
+    // Explicit Start button or camera starts session with manualStart so unchecking Set 1 keeps clock running
+    const manual = sess('man', 2_000_000, [sx('bench', [set(lb(135), 8, { done: false })])], { status: 'active', started: false });
+    expect(startSessionClock(manual, 2_020_000, true)).toBe(true);
+    expect(manual.started).toBe(true);
+    expect(manual.manualStart).toBe(true);
+    expect(manual.startMs).toBe(2_020_000);
+    expect(isSessionStarted(manual)).toBe(true);
+    expect(resetSessionClock(manual, 2_030_000)).toBe(false);
+    toggleDone(manual.exs[0], 0, BENCH, 2_040_000);
+    toggleDone(manual.exs[0], 0, BENCH, 2_050_000);
+    expect(resetSessionClock(manual, 2_050_000)).toBe(false);
+    expect(manual.started).toBe(true);
+    expect(manual.startMs).toBe(2_020_000);
+
+    // Check auto-start upgraded by camera/Start preserves startMs and prevents subsequent reset on uncheck
+    const upgraded = sess('upg', 3_000_000, [sx('bench', [set(lb(135), 8, { done: false })])], { status: 'active', started: false });
+    toggleDone(upgraded.exs[0], 0, BENCH, 3_010_000);
+    expect(startSessionClock(upgraded, 3_010_000, false)).toBe(true);
+    expect(startSessionClock(upgraded, 3_015_000, true)).toBe(false);
+    expect(upgraded.manualStart).toBe(true);
+    expect(upgraded.startMs).toBe(3_010_000);
+    toggleDone(upgraded.exs[0], 0, BENCH, 3_020_000);
+    expect(resetSessionClock(upgraded, 3_020_000)).toBe(false);
+    expect(upgraded.started).toBe(true);
     expect(driveUrlFor({ fileName: 'PXL_20261116_173012345.mp4' })).toBe('https://drive.google.com/drive/search?q=PXL_20261116_173012345.mp4');
     expect(driveUrlFor({ fileName: 'PXL_20261116_1856xx.mp4', driveQuery: 'PXL 20261116 1856 type:video' })).toBe('https://drive.google.com/drive/search?q=PXL%2020261116%201856%20type%3Avideo');
     expect(driveUrlFor({ fileName: 'clip.mp4', uri: 'https://drive.google.com/file/d/abc/view' })).toBe('https://drive.google.com/file/d/abc/view');

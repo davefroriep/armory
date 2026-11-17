@@ -101,9 +101,11 @@ class ActiveWorkout {
     return s;
   }
 
-  /** Start the workout clock, HR recorder, wake lock and foreground service once a set or video starts. */
-  ensureStarted(s: LiftSession): boolean {
-    if (!startSessionClock(s)) {
+  /** Start the workout clock, HR recorder, wake lock and foreground service (via Start button, set check, or camera). */
+  ensureStarted(s: LiftSession, manual = false): boolean {
+    const prevManual = !!s.manualStart;
+    if (!startSessionClock(s, Date.now(), manual)) {
+      if (manual && !prevManual) lifts.saveSession(s, true);
       if (!this.timer) void this.attach(s, true);
       return false;
     }
@@ -115,7 +117,7 @@ class ActiveWorkout {
 
   /** If nothing is logged or video-linked, stop the clock/HR recording and return to 0:00 preview mode. */
   async resetIfNoneLogged(s: LiftSession): Promise<boolean> {
-    if (hasSessionActivity(s)) return false;
+    if (hasSessionActivity(s) || s.manualStart) return false;
     if (!s.started && !this.timer && !this.rec && !this.rest) return false;
     resetSessionClock(s);
     this.teardown();

@@ -75,8 +75,10 @@ export interface LiftSession {
   startMs: number;
   endMs: number | null;
   status: 'active' | 'done';
-  /** True once at least one set has been checked off (starts elapsed clock & HR recording). */
+  /** True once the workout has started (via Start button, set check, or camera). */
   started?: boolean;
+  /** True when started explicitly via Start button or camera (prevents unchecking Set 1 from resetting clock). */
+  manualStart?: boolean;
   exs: SessionEx[];
   note?: string;
   /** Session effort 3-10 (same scale as the rest of the app). */

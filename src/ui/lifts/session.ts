@@ -115,10 +115,11 @@ function build(root: HTMLElement, id?: string): () => void {
 
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
+    const startBtn = edit ? '' : `<button class="sstart" type="button" data-act="start"${isSessionStarted(s) ? ' hidden' : ''}>▶ Start</button>`;
     return `<header class="bar sbar">
       <a class="icon-btn" href="${back}" ${edit ? '' : 'data-act="back"'} aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
       <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
-      <div class="chips"><button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
+      <div class="chips">${startBtn}<button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
   };
 
@@ -172,8 +173,11 @@ function build(root: HTMLElement, id?: string): () => void {
   // ---------- clock + rest ----------
   const paintClock = (): void => {
     if (edit) return;
-    const txt = isSessionStarted(s) ? clock(active.elapsedSec()) : '0:00 · check ✓ to start';
+    const started = isSessionStarted(s);
+    const txt = started ? clock(active.elapsedSec()) : '0:00';
     root.querySelectorAll<HTMLElement>('[data-clock]').forEach((e) => { e.textContent = txt; });
+    const startBtn = root.querySelector<HTMLElement>('[data-act="start"]');
+    if (startBtn) startBtn.hidden = started;
   };
   const paintRest = (): void => {
     const bar = root.querySelector<HTMLElement>('#restbar');
@@ -536,6 +540,10 @@ function build(root: HTMLElement, id?: string): () => void {
       else if (r) { const v = Number(r.dataset.r); if (v) set.rpe = v; else delete set.rpe; draw(); }
       else if (p) { await playVideo(p.dataset.play!); draw(); }
       else if (t.closest('[data-vmanage]')) {
+        if (!edit) {
+          active.ensureStarted(s, true);
+          paintClock();
+        }
         await openSetVideoSheet({ session: s, se, set }, set.kind === 'w' ? 'Warm-up' : `Set ${n}`);
         draw();
       } else if (t.closest('[data-del]')) {
@@ -697,6 +705,15 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'finish') return void (await finish());
     if (act === 'rename') return void (await rename());
     if (act === 'wkmenu') return void (await wkMenu());
+    if (act === 'start') {
+      if (!edit) {
+        if (liftSettings().restSound) audio.unlock();
+        active.ensureStarted(s, true);
+        buzz(25);
+        paintClock();
+      }
+      return;
+    }
     const card = a.closest<HTMLElement>('.xcard');
     if (!card) return;
     const se = find(card.dataset.uid!);
@@ -738,6 +755,10 @@ function build(root: HTMLElement, id?: string): () => void {
     const i = Number(row.dataset.i);
     if (act === 'done') return logSet(card, row, false);
     if (act === 'vid') {
+      if (!edit) {
+        active.ensureStarted(s, true);
+        paintClock();
+      }
       const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
       await openSetVideoSheet({ session: s, se, set: se.sets[i] }, se.sets[i].kind === 'w' ? 'Warm-up' : `Set ${n}`);
       if (!dead) { save(); paint(); }

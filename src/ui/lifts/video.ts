@@ -23,7 +23,7 @@ const sessionFiles = new Map<string, Blob>();
 const isMobileWeb = (): boolean => !isNative() && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 const startTimerForVideo = (s: LiftSession): void => {
-  if (s.status === 'active') active.ensureStarted(s);
+  if (s.status === 'active') active.ensureStarted(s, true);
 };
 
 const resetTimerIfIdle = async (s: LiftSession | undefined): Promise<void> => {
