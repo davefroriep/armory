@@ -1,11 +1,11 @@
 import { Emitter } from '../emitter';
 import { idbAll, idbDelete, idbGet, idbPut, idbPutMany } from '../store/db';
-import { computePRs, doneSessions, previousPerformance, type PRHit } from './calc';
+import { computePRs, doneSessions, e1rm, exerciseSessions, previousPerformance, type PRHit } from './calc';
 import { LIBRARY, LIBRARY_BY_ID } from './library';
 import { buildExercise } from './logic';
 import { PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from './seed';
-import { updateLiftSettings } from './settings';
-import type { ExRow, Exercise, LiftSession, Routine, SessionEx, VideoMeta } from './types';
+import { liftSettings, updateLiftSettings } from './settings';
+import type { ExRow, Exercise, ExerciseRx, LiftSession, Routine, SessionEx, VideoMeta } from './types';
 
 interface BlobRow {
   id: string;
@@ -106,6 +106,48 @@ class LiftStore {
       localStorage.setItem(STRIP_EX_NOTES_KEY, '1');
     }
 
+    const SEED_RX_KEY = 'armory.lifts.seed_rx_phase1.v1';
+    if (typeof localStorage !== 'undefined' && !localStorage.getItem(SEED_RX_KEY)) {
+      const seedRxByEx = new Map<string, ExerciseRx>();
+      const seedByRoutine = new Map<string, Map<string, ExerciseRx>>();
+      for (const sr of PHASE1_ROUTINES) {
+        const m = new Map<string, ExerciseRx>();
+        for (const it of sr.items) {
+          if (it.rx) {
+            m.set(it.exId, it.rx);
+            if (!seedRxByEx.has(it.exId)) seedRxByEx.set(it.exId, it.rx);
+          }
+        }
+        seedByRoutine.set(sr.id, m);
+      }
+      for (const rt of this.routines.values()) {
+        const rtMap = seedByRoutine.get(rt.id);
+        let changed = false;
+        for (const it of rt.items) {
+          const rx = rtMap?.get(it.exId) ?? seedRxByEx.get(it.exId);
+          if (!it.rx && rx) {
+            it.rx = { ...rx };
+            changed = true;
+          }
+        }
+        if (changed) await idbPut('lift_routines', rt);
+      }
+      const actRx = this.active;
+      if (actRx) {
+        const rtMap = actRx.routineId ? seedByRoutine.get(actRx.routineId) : undefined;
+        let actChanged = false;
+        for (const se of actRx.exs) {
+          const rx = rtMap?.get(se.exId) ?? seedRxByEx.get(se.exId);
+          if (!se.rx && rx) {
+            se.rx = { ...rx };
+            actChanged = true;
+          }
+        }
+        if (actChanged) await idbPut('lift_sessions', actRx);
+      }
+      localStorage.setItem(SEED_RX_KEY, '1');
+    }
+
     // Auto-heal an empty active workout launched from a planned day before routines were seeded.
     const act = this.active;
     if (act && act.exs.length === 0) {
@@ -113,11 +155,13 @@ class LiftStore {
       if (rt) {
         act.routineId = rt.id;
         act.name = rt.name;
-        act.exs = rt.items.flatMap((it, i) =>
-          this.exercise(it.exId)
-            ? [buildExercise(it.exId, it.sets, this.previous(it.exId), !!it.ss, i)]
-            : [],
-        );
+        const unit = liftSettings().unit;
+        act.exs = rt.items.flatMap((it, i) => {
+          const ex = this.exercise(it.exId);
+          return ex
+            ? [buildExercise(it.exId, it.sets, this.previous(it.exId), !!it.ss, i, { rx: it.rx, ex, base1RmKg: this.bestE1rm(it.exId), unit })]
+            : [];
+        });
         if (act.exs.length) delete act.exs[act.exs.length - 1].ss;
         await idbPut('lift_sessions', act);
       }
@@ -264,6 +308,18 @@ class LiftStore {
 
   previous(exId: string, beforeMs = Infinity, excludeId?: string): SessionEx | null {
     return previousPerformance(this.sessions.values(), exId, beforeMs, excludeId);
+  }
+
+  bestE1rm(exId: string): number | null {
+    let best = 0;
+    for (const { e } of exerciseSessions(this.finished(), exId)) {
+      for (const s of e.sets) {
+        if (!s.done || s.kind === 'w' || !(s.w && s.w > 0) || !(s.r && s.r >= 1)) continue;
+        const val = e1rm(s.w, s.r);
+        if (val != null && val > best) best = val;
+      }
+    }
+    return best > 0 ? best : null;
   }
 
   prs(): Map<string, PRHit> {

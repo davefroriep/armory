@@ -8,8 +8,9 @@ import {
   advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
   jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
+import { buildExercise } from '../src/lifts/logic';
 import { parseVoiceTranscript } from '../src/lifts/voiceParser';
-import { prescriptionFor } from '../src/lifts/prescriptions';
+import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
 import { buildWallboardSnapshot } from '../src/wallboard/snapshot';
 import type { Exercise, LiftSession, LiftSet, SessionEx } from '../src/lifts/types';
@@ -182,6 +183,9 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('armory fifties for ten')).toEqual({ kind: 'log_current', weight: 50, reps: 10 });
     expect(parseVoiceTranscript('armory thirty fives for twelve')).toEqual({ kind: 'log_current', weight: 35, reps: 12 });
     expect(parseVoiceTranscript('armory 45s')).toEqual({ kind: 'log_current', seconds: 45 });
+    expect(parseVoiceTranscript('Armory, Done!')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armory, 135 for 12')).toEqual({ kind: 'log_current', weight: 135, reps: 12 });
+    expect(parseVoiceTranscript('Armory, for 15')).toEqual({ kind: 'log_current', reps: 15 });
   });
 });
 
@@ -319,8 +323,12 @@ describe('wallboard snapshot & routing', () => {
     expect(WALLBOARD_HTML).toMatch(/\.cur-body\s*\{[^}]*overflow:\s*hidden/);
     expect(WALLBOARD_HTML).toContain('@media (max-height:700px)');
     expect(WALLBOARD_HTML).toContain('.ex-ss');
+    expect(WALLBOARD_HTML).toContain('.ex-main');
+    expect(WALLBOARD_HTML).toContain('.wb-chk');
     expect(WALLBOARD_HTML).toContain('.hr-slim');
     expect(WALLBOARD_HTML).not.toContain("' ?'");
+    expect(WALLBOARD_HTML).not.toContain('SUGGESTED');
+    expect(WALLBOARD_HTML).not.toContain('PARTNER');
 
     expect(TV_W).toBe(1600);
     expect(TV_H).toBe(900);
@@ -412,8 +420,8 @@ describe('wallboard snapshot & routing', () => {
     expect(stSingle.stations).toHaveLength(1);
     expect(stSingle.stations[0].label).toBe('1');
     expect(stSingle.stations[0].voiceHint!.chips.map((c) => c.say)).toEqual([
-      '"Armory start hold"',
-      '"Armory done"',
+      '"Armory, start hold"',
+      '"Armory, Done!"',
     ]);
     expect(stSingle.onDeck!.isSuperset).toBe(true);
     expect(stSingle.onDeck!.label).toBe('2A + 2B');
@@ -446,9 +454,9 @@ describe('wallboard snapshot & routing', () => {
     expect(stSs.stations).toHaveLength(2);
     expect(stSs.stations[0].isActive).toBe(true);
     expect(stSs.stations[0].voiceHint!.chips.map((c) => c.say)).toEqual([
-      '"Armory done"',
-      '"Armory for 9"',
-      '"Armory 230 for 8"',
+      '"Armory, Done!"',
+      '"Armory, for 9"',
+      '"Armory, 230 for 8"',
     ]);
     expect(stSs.stations[0].sets[0].state).toBe('active');
     expect(stSs.stations[0].sets[0].isGhost).toBe(true);
@@ -483,8 +491,112 @@ describe('wallboard snapshot & routing', () => {
     expect(blankStation.sets[0].repsVal).toBe('');
     expect(blankStation.sets[0].isGhost).toBe(false);
     expect(blankStation.voiceHint!.chips.map((c) => c.say)).toEqual([
-      '"Armory 50 for 10"',
+      '"Armory, 50 for 10"',
     ]);
     expect(blankStation.voiceHint!.chips.some((c) => /done/i.test(c.say))).toBe(false);
+  });
+
+  it('resolves Universal ExerciseRx across RPE, % 1RM, and fixed/ramp setsRx in exercises & Wallboard 2-line roadmap', () => {
+    const squat = exOf('low-bar-squat');
+    const bench = exOf('barbell-bench-press');
+    const ohp = exOf('seated-dumbbell-shoulder-press');
+
+    // 1. RPE mode
+    const rpeRx = resolvePrescription(ohp, { rx: { reps: '8–10', rpe: 7.5 }, sets: 3, unit: 'lb' });
+    expect(rpeRx.repTarget).toBe('8–10 reps');
+    expect(rpeRx.rpeTarget).toBe('RPE 7.5');
+    expect(rpeRx.roadmapLine).toBe('3 × 8–10 · RPE 7.5');
+    expect(rpeRx.prescribedSets).toBeNull();
+
+    // 2. Percentage mode (75% of 420 lb = 315 lb x 12)
+    const pctSe = buildExercise('barbell-bench-press', 3, null, false, 0, {
+      rx: { pct: 75, reps: 12 },
+      ex: bench,
+      base1RmKg: 420 * KG_PER_LB,
+      unit: 'lb',
+    });
+    expect(pctSe.rx).toEqual({ pct: 75, reps: 12 });
+    expect(pctSe.sets).toHaveLength(3);
+    expect(Math.round((pctSe.sets[0].w ?? 0) / KG_PER_LB)).toBe(315);
+    expect(pctSe.sets[0].r).toBe(12);
+    expect(pctSe.sets[0].wAuto).toBe(true);
+    expect(pctSe.sets[0].rAuto).toBe(true);
+
+    // 3. Fixed/ramp setsRx mode (275x5, 295x5, 315x12)
+    const rampRx = {
+      setsRx: [
+        { loadLb: 275, reps: 5 },
+        { loadLb: 295, reps: 5 },
+        { loadLb: 315, reps: 12 },
+      ],
+    };
+    const rampSe = buildExercise('low-bar-squat', 3, null, false, 1, { rx: rampRx, ex: squat, unit: 'lb' });
+    expect(rampSe.sets.map((s) => [Math.round((s.w ?? 0) / KG_PER_LB), s.r])).toEqual([
+      [275, 5],
+      [295, 5],
+      [315, 12],
+    ]);
+
+    // 4. Right-column 2-line Wallboard roadmap shows completed, RPE, %, and ramp sets from 0:00
+    const completedOhp = buildExercise('seated-dumbbell-shoulder-press', 2, null, false, 2, {
+      rx: { reps: '8–10', rpe: 7.5 },
+      ex: ohp,
+      unit: 'lb',
+    });
+    completedOhp.sets[0] = { ...completedOhp.sets[0], w: 55 * KG_PER_LB, r: 10, done: true, wAuto: false, rAuto: false };
+    completedOhp.sets[1] = { ...completedOhp.sets[1], w: 55 * KG_PER_LB, r: 10, done: true, wAuto: false, rAuto: false };
+
+    const pendingRpe = buildExercise('seated-dumbbell-shoulder-press', 3, null, false, 3, {
+      rx: { reps: '8–10', rpe: 7.5 },
+      ex: ohp,
+      unit: 'lb',
+    });
+
+    const snap = buildWallboardSnapshot({
+      now: 4_000_000,
+      settings: {
+        hrMax: 180,
+        recoveryHrPct: 72,
+        voiceEnabled: true,
+        voiceWakeWord: 'armory',
+        queue: defaultQueueState(),
+      },
+      unit: 'lb',
+      hr: { bpm: 110, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: {
+        id: 's_rx',
+        name: 'Upper / Power Mix',
+        routineId: null,
+        eventId: null,
+        startMs: 3_500_000,
+        endMs: null,
+        status: 'active',
+        started: true,
+        exs: [pctSe, rampSe, completedOhp, pendingRpe],
+        rpe: null,
+        bwKg: 88.5,
+      },
+      elapsedSec: 120,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      e1rmOf: (id) => (id === 'barbell-bench-press' ? 420 * KG_PER_LB : null),
+      prevOf: () => null,
+    });
+
+    const roadmap = snap.lift!.exercises;
+    expect(roadmap[0].isPrescribedLoad).toBe(true);
+    expect(roadmap[0].subText).toBe('3 × 12 @ 315 lb (75%)');
+    expect(roadmap[1].isPrescribedLoad).toBe(true);
+    expect(roadmap[1].subText).toBe('275×5 · 295×5 · 315×12 lb');
+    expect(roadmap[2].isDone).toBe(true);
+    expect(roadmap[2].subText).toBe('2×10 @ 55 lb');
+    expect(roadmap[3].isPrescribedLoad).toBe(false);
+    expect(roadmap[3].subText).toBe('3 × 8–10 · RPE 7.5');
+    expect(JSON.stringify(snap)).not.toContain('RIR');
   });
 });

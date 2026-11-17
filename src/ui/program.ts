@@ -66,6 +66,7 @@ export function currentZoomLookup(): ZoomLookup {
     exOf: lifts.exOrStub,
     rowOf: (id) => lifts.row(id),
     prevOf: (id) => lifts.previous(id),
+    e1rmOf: (id) => lifts.bestE1rm(id),
     routines: lifts.sortedRoutines(),
     prs: lifts.prs(),
     unit: liftSettings().unit,

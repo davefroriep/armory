@@ -52,6 +52,7 @@ export function buildWallboardState(now = Date.now()): WallboardState {
     todayItems: calendar.items,
     routines: [...lifts.routines.values()],
     exOf: lifts.exOrStub,
+    e1rmOf: (exId) => lifts.bestE1rm(exId),
     prevOf: (se) => (s ? lifts.previous(se.exId, s.startMs, s.id) : null),
   });
 }

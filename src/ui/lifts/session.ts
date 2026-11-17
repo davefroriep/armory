@@ -8,7 +8,7 @@ import {
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
-import { prescriptionFor } from '../../lifts/prescriptions';
+import { resolvePrescription } from '../../lifts/prescriptions';
 import { PHASE1_PLAN } from '../../domain/plan';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
@@ -158,11 +158,12 @@ function build(root: HTMLElement, id?: string): () => void {
     const ls = liftSettings();
     const showTimerGroup = !edit && (ls.showTimer || ls.showAutoTimer);
     const curWeek = PHASE1_PLAN.steps[getSettings().queue.stepIndex]?.week ?? 2;
-    const rx = prescriptionFor(ex, curWeek);
+    const rx = resolvePrescription(ex, { rx: se.rx, sets: se.sets.length, week: curWeek, base1RmKg: lifts.bestE1rm(se.exId), unit: unit() });
+    const rxMeta = [rx.repTarget, rx.rpeTarget].filter(Boolean).join(' · ');
     return `<section class="xcard" data-idx="${idx}" data-uid="${se.uid}">
       <div class="xhead">
         <span class="xlab">${labs[idx]}</span>
-        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${esc(rx.repTarget)} · ${esc(rx.rpeTarget)}</small></button>
+        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${esc(rxMeta)}</small></button>
         <button class="xmore" data-act="exmenu" aria-label="Exercise options">⋯</button>
       </div>
       <div class="xth${ex.type === 'time' ? ' t-row' : ''}"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span>${ex.type === 'time' ? '<span>HOLD</span>' : ''}<span></span><span></span></div>

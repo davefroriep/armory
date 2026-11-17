@@ -1,4 +1,5 @@
-import { uid, type Exercise, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type VideoMeta } from './types';
+import { resolvePrescription } from './prescriptions';
+import { uid, type Exercise, type ExerciseRx, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type VideoMeta } from './types';
 
 export const newSet = (kind: SetKind = 'n', w: number | null = null, r: number | null = null, auto = false): LiftSet => ({
   id: uid(), w, r, done: false, kind, wAuto: auto && w != null, rAuto: auto && r != null,
@@ -38,8 +39,32 @@ export function prefill(se: SessionEx, prev: SessionEx | null): void {
   });
 }
 
-export function buildExercise(exId: string, nSets: number, prev: SessionEx | null, ss = false, slot?: number): SessionEx {
-  const se: SessionEx = { uid: uid(), exId, sets: Array.from({ length: Math.max(1, nSets) }, () => newSet()), ...(ss ? { ss } : {}), ...(slot != null ? { slot } : {}) };
+export interface BuildExerciseOpts {
+  rx?: ExerciseRx;
+  ex?: Exercise;
+  base1RmKg?: number | null;
+  unit?: 'lb' | 'kg';
+}
+
+export function buildExercise(
+  exId: string,
+  nSets: number,
+  prev: SessionEx | null,
+  ss = false,
+  slot?: number,
+  opts?: BuildExerciseOpts,
+): SessionEx {
+  const rx = opts?.rx;
+  const resolved = rx
+    ? resolvePrescription(
+        opts.ex ?? { id: exId, name: exId, type: exId === 'triceps-isometric-hold' ? 'time' : 'weight', equip: 'other', primary: [], secondary: [] },
+        { rx, sets: nSets, base1RmKg: opts.base1RmKg, unit: opts.unit },
+      )
+    : null;
+  const sets = resolved?.prescribedSets?.length
+    ? resolved.prescribedSets.map((ps) => newSet(ps.kind ?? 'n', ps.wKg, ps.r, true))
+    : Array.from({ length: Math.max(1, nSets) }, () => newSet());
+  const se: SessionEx = { uid: uid(), exId, sets, ...(ss ? { ss } : {}), ...(slot != null ? { slot } : {}), ...(rx ? { rx } : {}) };
   prefill(se, prev);
   if (exId === 'triceps-isometric-hold' && !prev) {
     for (const s of se.sets) if (s.r == null) { s.r = 45; s.rAuto = true; }

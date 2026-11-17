@@ -51,11 +51,31 @@ export interface LiftSet {
   at?: number;
 }
 
+export interface SetRxSpec {
+  reps?: number;
+  pct?: number;
+  loadLb?: number;
+  loadKg?: number;
+  rpe?: number;
+  kind?: SetKind;
+}
+
+export interface ExerciseRx {
+  reps?: string | number;
+  rpe?: number | string;
+  pct?: number;
+  loadLb?: number;
+  loadKg?: number;
+  tmLb?: number;
+  setsRx?: SetRxSpec[];
+}
+
 export interface SessionEx {
   uid: string;
   exId: string;
   sets: LiftSet[];
   note?: string;
+  rx?: ExerciseRx;
   /** Superset with the next exercise (no rest between them). */
   ss?: boolean;
   /** Rest override in seconds for this exercise in this session. */
@@ -104,6 +124,7 @@ export interface RoutineItem {
   exId: string;
   sets: number;
   ss?: boolean;
+  rx?: ExerciseRx;
 }
 
 /** A repeating training day ("Upper 1"). Built by the user; nothing ships pre-programmed. */

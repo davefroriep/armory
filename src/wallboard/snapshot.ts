@@ -4,10 +4,10 @@ import { sessionStats } from '../lifts/calc';
 import { peekNextTargetSet, resolveTargetSet, type CursorRef, type SetPointer } from '../lifts/cursor';
 import { canLog, labels, prevSetFor, supersetGroups } from '../lifts/logic';
 import { MUSCLE_LABEL } from '../lifts/muscles';
-import { prescriptionFor, type CoachPrescription } from '../lifts/prescriptions';
+import { resolvePrescription, type CoachPrescription } from '../lifts/prescriptions';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { fmtKg } from '../lifts/settings';
-import { fmtVolume, setText } from '../lifts/summary';
+import { condenseSets, fmtVolume, setText } from '../lifts/summary';
 import type { Exercise, LiftSession, LiftSet, Routine, SessionEx } from '../lifts/types';
 import { EQUIPMENT_LABEL } from '../types';
 import { hrDropStats, hrZone } from '../ui/hr';
@@ -62,6 +62,8 @@ export interface WallboardLiftExerciseSummary {
   isCurrent: boolean;
   isDone: boolean;
   ssGroup: number | null;
+  subText: string;
+  isPrescribedLoad: boolean;
 }
 
 export interface WallboardSetSlot {
@@ -188,6 +190,7 @@ export interface WallboardBuildInput {
   routines: Routine[];
   exOf: (exId: string) => Exercise;
   noteOf?: (exId: string) => string;
+  e1rmOf?: (exId: string) => number | null;
   prevOf: (se: SessionEx) => SessionEx | null;
 }
 
@@ -270,7 +273,7 @@ function buildVoiceHint(
 ): WallboardVoiceHint {
   const wakeRaw = (st.voiceWakeWord || 'armory').trim() || 'armory';
   const wakeDisp = wakeRaw.charAt(0).toUpperCase() + wakeRaw.slice(1);
-  const prefix = voice.armed ? '' : `${wakeDisp} `;
+  const prefix = voice.armed ? '' : `${wakeDisp}, `;
   const micState: WallboardVoiceHint['micState'] = voice.armed
     ? 'armed'
     : voice.listening
@@ -292,7 +295,7 @@ function buildVoiceHint(
       headline,
       chips: [
         { tag: '', say: `"${prefix}start hold"`, primary: true },
-        { tag: '', say: readyToConfirm ? `"${prefix}done"` : `"${prefix}${rx.sampleRep} seconds"` },
+        { tag: '', say: readyToConfirm ? `"${prefix}Done!"` : `"${prefix}${rx.sampleRep} seconds"` },
       ],
     };
   }
@@ -303,7 +306,7 @@ function buildVoiceHint(
         micState,
         headline,
         chips: [
-          { tag: '', say: `"${prefix}done"`, primary: true },
+          { tag: '', say: `"${prefix}Done!"`, primary: true },
           { tag: '', say: `"${prefix}for ${bumpR}"` },
           { tag: '', say: `"${prefix}25 for 6"` },
         ],
@@ -334,7 +337,7 @@ function buildVoiceHint(
       micState,
       headline,
       chips: [
-        { tag: '', say: `"${prefix}done"`, primary: true },
+        { tag: '', say: `"${prefix}Done!"`, primary: true },
         { tag: '', say: `"${prefix}for ${bumpR}"` },
         { tag: '', say: `"${prefix}${bumpW} for ${curR}"` },
       ],
@@ -369,7 +372,13 @@ function buildLiftStage(
     const se = s.exs[k];
     const ex = inp.exOf(se.exId);
     const isActive = k === curPtr.exIdx;
-    const rx = prescriptionFor(ex, planWeek);
+    const rx = resolvePrescription(ex, {
+      rx: se.rx,
+      sets: se.sets.length,
+      week: planWeek,
+      base1RmKg: inp.e1rmOf?.(se.exId) ?? null,
+      unit: u,
+    });
     const prevSe = inp.prevOf(se);
     const firstOpenIdx = se.sets.findIndex((x) => !x.done);
     const refIdx = isActive ? curPtr.setIdx : Math.max(0, firstOpenIdx);
@@ -415,7 +424,13 @@ function buildLiftStage(
     for (let k = cand.start; k <= cand.end; k++) {
       const se = s.exs[k];
       const ex = inp.exOf(se.exId);
-      const rx = prescriptionFor(ex, planWeek);
+      const rx = resolvePrescription(ex, {
+        rx: se.rx,
+        sets: se.sets.length,
+        week: planWeek,
+        base1RmKg: inp.e1rmOf?.(se.exId) ?? null,
+        unit: u,
+      });
       const prevSe = inp.prevOf(se);
       const lastText = formatPrevBenchmark(prevSe, se, ex, 0, u);
       items.push({
@@ -541,14 +556,46 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
 
     const exercises: WallboardLiftExerciseSummary[] = s.exs.map((se, i) => {
       const doneCount = se.sets.filter((x) => x.done).length;
+      const ex = inp.exOf(se.exId);
+      const rx = resolvePrescription(ex, {
+        rx: se.rx,
+        sets: se.sets.length,
+        week: planWeek,
+        base1RmKg: inp.e1rmOf?.(se.exId) ?? null,
+        unit: u,
+      });
+      const isDone = doneCount === se.sets.length && se.sets.length > 0;
+      const isPrescribedLoad = !!(rx.prescribedSets && rx.prescribedSets.some((ps) => ps.wKg != null));
+      let subText = '';
+      if (isDone) {
+        subText = condenseSets(se, ex, u) || rx.roadmapLine;
+      } else if (isPrescribedLoad) {
+        subText = rx.roadmapLine;
+      } else {
+        const hasFullNums = (x: LiftSet): boolean =>
+          ex.type === 'weight' ? (x.w != null && x.r != null && x.r > 0) : (x.r != null && x.r > 0);
+        const refSet = se.sets.find((x) => x.kind !== 'w' && x.done && hasFullNums(x))
+          ?? se.sets.find((x) => x.kind !== 'w' && hasFullNums(x));
+        let bench = '';
+        if (refSet) {
+          const txt = setText(refSet, ex, u);
+          bench = ex.type === 'weight' ? `${txt} ${u}` : txt;
+        } else {
+          bench = formatPrevBenchmark(inp.prevOf(se), se, ex, 0, u);
+        }
+        const dupTimeBench = ex.type === 'time' && (!refSet?.w || refSet.w <= 0) && !!bench && rx.roadmapLine.includes(bench);
+        subText = bench && !dupTimeBench ? `${rx.roadmapLine} · ${bench}` : rx.roadmapLine;
+      }
       return {
         label: labs[i] ?? String(i + 1),
-        name: inp.exOf(se.exId).name,
+        name: ex.name,
         doneSets: doneCount,
         totalSets: se.sets.length,
         isCurrent: curPtr?.exIdx === i,
-        isDone: doneCount === se.sets.length && se.sets.length > 0,
+        isDone,
         ssGroup: ssMap.get(i) ?? null,
+        subText,
+        isPrescribedLoad,
       };
     });
 

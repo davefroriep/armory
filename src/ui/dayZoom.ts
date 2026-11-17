@@ -4,10 +4,11 @@ import {
 } from '../domain/plan';
 import { sessionStats, type ExOf, type PRHit } from '../lifts/calc';
 import { labels } from '../lifts/logic';
+import { resolvePrescription } from '../lifts/prescriptions';
 import { matchRoutineByTitle } from '../lifts/seed';
 import type { Unit } from '../lifts/settings';
 import { condenseSets, fmtDuration, fmtVolume, sessionPRs, setText } from '../lifts/summary';
-import type { ExRow, LiftSession, Routine, SessionEx } from '../lifts/types';
+import type { ExRow, ExerciseRx, LiftSession, Routine, SessionEx } from '../lifts/types';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
 import { ICON, esc, hms } from './dom';
 
@@ -26,6 +27,7 @@ export interface ZoomLookup {
   exOf: ExOf;
   rowOf: (exId: string) => ExRow | undefined;
   prevOf: (exId: string) => SessionEx | null;
+  e1rmOf?: (exId: string) => number | null;
   routines: Routine[];
   prs: Map<string, PRHit>;
   unit: Unit;
@@ -138,7 +140,7 @@ export function renderCompletedLiftSlot(
     const hit = pr.byEx.get(e.uid);
     return `<div class="sh-ex">
       <span class="xlab">${labs[idx]}</span>
-      <span class="sh-ex-m"><b>${esc(ex?.name ?? e.exId)}</b><small>${esc(summary || `${e.sets.length} sets`)}${e.note ? ` · ${esc(e.note)}` : ''}</small></span>
+      <span class="sh-ex-m"><b>${esc(ex?.name ?? e.exId)}</b><small>${esc(summary || `${e.sets.length} sets`)}</small></span>
       ${hit ? `<em>★ ${hit.n}RM</em>` : ''}
     </div>`;
   }).join('');
@@ -176,17 +178,17 @@ export function renderCompletedCardioSlot(m: WorkoutMeta): string {
   </div>`;
 }
 
-function renderItemList(items: { exId: string; sets: number; ss?: boolean }[], lookup: ZoomLookup, templateId?: string): string {
+function renderItemList(items: { exId: string; sets: number; ss?: boolean; rx?: ExerciseRx }[], lookup: ZoomLookup, templateId?: string): string {
   const labs = labels(items);
   const rows = items.map((it, idx) => {
     const ex = lookup.exOf(it.exId);
-    const note = lookup.rowOf(it.exId)?.note;
+    const rx = resolvePrescription(ex, { rx: it.rx, sets: it.sets, base1RmKg: lookup.e1rmOf?.(it.exId) ?? null, unit: lookup.unit });
     const prev = lookup.prevOf(it.exId);
     const best = prev?.sets.filter((x) => x.done && x.kind !== 'w').slice(-1)[0];
     const prevTxt = best ? setText(best, ex, lookup.unit) : '';
     return `<div class="sh-ex">
       <span class="xlab">${labs[idx]}</span>
-      <span class="sh-ex-m"><b>${esc(ex?.name ?? it.exId)}</b><small>${it.sets} sets${note ? ` · ${esc(note)}` : ''}</small></span>
+      <span class="sh-ex-m"><b>${esc(ex?.name ?? it.exId)}</b><small>${esc(rx.roadmapLine)}</small></span>
       ${prevTxt ? `<em>Last: ${esc(prevTxt)}</em>` : ''}
     </div>`;
   }).join('');

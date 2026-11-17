@@ -56,7 +56,7 @@ export const WALLBOARD_HTML = `<!doctype html>
   .vtoast { padding:12px 18px; border-radius:14px; font-size:clamp(16px,2.2vw,28px); font-weight:800; letter-spacing:.02em; text-align:center; background:rgba(34,197,94,.18); border:2px solid var(--green); color:#dcfce7; flex-shrink:0; }
   .vtoast.info { background:rgba(56,189,248,.18); border-color:var(--blue); color:#e0f2fe; }
   .vtoast.warn { background:rgba(245,158,11,.18); border-color:var(--amber); color:#fef3c7; }
-  .grid { flex:1; min-height:0; display:grid; grid-template-columns:1.42fr 0.88fr; gap:clamp(12px,1.6vw,22px); }
+  .grid { flex:1; min-height:0; display:grid; grid-template-columns:1.28fr 1fr; gap:clamp(12px,1.6vw,22px); }
   .col { display:flex; flex-direction:column; gap:clamp(10px,1.4vh,16px); min-height:0; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:clamp(14px,1.8vh,22px); overflow:hidden; }
   .hero { flex:1; display:flex; flex-direction:column; justify-content:space-between; min-height:0; position:relative; }
@@ -96,7 +96,6 @@ export const WALLBOARD_HTML = `<!doctype html>
   .st-card.partner .st-lab { background:var(--card); color:var(--mut); border-color:var(--line); }
   .st-name { font-size:clamp(18px,2.1vw,30px); font-weight:800; line-height:1.12; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .st-card.single .st-name { font-size:clamp(24px,3vw,42px); }
-  .st-tag { font-size:clamp(10px,1vw,12px); font-weight:800; letter-spacing:.08em; padding:3px 8px; border-radius:999px; background:var(--card); border:1px solid var(--line); color:var(--mut); text-transform:uppercase; flex-shrink:0; }
   .rx-pills { display:flex; align-items:center; gap:6px; flex-shrink:0; }
   .rx-pill { font-size:clamp(11px,1.2vw,16px); font-weight:800; padding:4px 10px; border-radius:8px; white-space:nowrap; }
   .rx-pill.last { background:var(--card); border:1px solid var(--line); color:var(--mut); }
@@ -125,9 +124,10 @@ export const WALLBOARD_HTML = `<!doctype html>
   .slot-box.ghost { border:1.5px dashed rgba(148,163,184,.26); background:rgba(7,11,18,.55); color:rgba(148,163,184,.44); font-weight:700; }
   .slot-box.filled { border:2px solid rgba(56,189,248,.85); background:rgba(56,189,248,.16); color:#fff; }
   .slot-box.bw { border:1px solid var(--line); background:var(--card); color:var(--mut); }
-  .s-stat { font-size:clamp(11px,1.1vw,14px); font-weight:800; letter-spacing:.07em; color:var(--mut); text-transform:uppercase; white-space:nowrap; }
-  .s-stat.ok { font-size:clamp(16px,1.8vw,24px); color:#4ade80; }
-  .s-row.active .s-stat { color:#7dd3fc; }
+  .wb-chk { width:clamp(20px,2.1vw,26px); height:clamp(20px,2.1vw,26px); border-radius:7px; border:2px solid rgba(148,163,184,.38); background:rgba(7,11,18,.6); display:inline-flex; align-items:center; justify-content:center; font-size:clamp(13px,1.4vw,18px); font-weight:900; color:transparent; flex-shrink:0; }
+  .wb-chk.active { border-color:var(--blue); background:rgba(56,189,248,.12); }
+  .wb-chk.on { border-color:var(--green); background:rgba(34,197,94,.22); color:#4ade80; }
+  .wb-chk.sm { width:clamp(17px,1.7vw,22px); height:clamp(17px,1.7vw,22px); border-radius:6px; font-size:clamp(11px,1.2vw,15px); }
 
   /* Contextual Voice Strip */
   .vbar { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 12px; border-radius:11px; background:rgba(7,11,18,.82); border:1px solid rgba(56,189,248,.32); flex-shrink:0; }
@@ -161,13 +161,22 @@ export const WALLBOARD_HTML = `<!doctype html>
   .hr-ready.resting { background:rgba(56,189,248,.16); border:2px solid var(--blue); color:#bae6fd; }
   .hr-ready.idle { background:var(--card2); border:1px solid var(--line); color:var(--mut); }
   .ex-list { flex:1; min-height:0; overflow:hidden; display:flex; flex-direction:column; gap:7px; }
-  .ex-row { display:flex; align-items:center; gap:12px; padding:9px 13px; border-radius:11px; background:var(--card2); border:1px solid transparent; font-size:clamp(13px,1.5vw,20px); }
+  .ex-list.dense { gap:4px; }
+  .ex-row { display:flex; align-items:center; gap:10px; padding:8px 12px; border-radius:11px; background:var(--card2); border:1px solid transparent; flex-shrink:0; }
+  .ex-list.dense .ex-row { padding:5px 10px; gap:8px; }
   .ex-row.cur { border-color:var(--blue); background:rgba(56,189,248,.14); }
-  .ex-row.done { opacity:.55; }
-  .ex-row em { font-style:normal; font-weight:800; color:var(--blue); min-width:34px; }
-  .ex-row b { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .ex-row span { font-variant-numeric:tabular-nums; font-weight:700; color:var(--mut); }
-  .ex-row.done span { color:#86efac; }
+  .ex-row.done { opacity:.6; }
+  .ex-row em { font-style:normal; font-weight:800; color:var(--blue); min-width:32px; font-size:clamp(13px,1.4vw,18px); flex-shrink:0; }
+  .ex-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+  .ex-main b { font-size:clamp(14px,1.45vw,19px); font-weight:800; line-height:1.15; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .ex-list.dense .ex-main b { font-size:clamp(13px,1.3vw,17px); }
+  .ex-main small { font-size:clamp(11px,1.12vw,14px); font-weight:600; color:var(--mut); line-height:1.15; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-variant-numeric:tabular-nums; }
+  .ex-list.dense .ex-main small { font-size:clamp(10px,1.02vw,13px); }
+  .ex-main small.rx-hi { color:#bae6fd; font-weight:700; }
+  .ex-row.done .ex-main small { color:#86efac; opacity:.85; }
+  .ex-r { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+  .ex-r span { font-variant-numeric:tabular-nums; font-weight:700; font-size:clamp(12px,1.25vw,16px); color:var(--mut); }
+  .ex-row.done .ex-r span { color:#86efac; }
   .ex-ss { --ss:var(--amber); border-radius:12px; padding-left:4px; background:var(--card2); box-shadow:inset 4px 0 0 var(--ss), inset 0 0 0 1px rgba(245,158,11,.28); overflow:hidden; display:flex; flex-direction:column; flex-shrink:0; }
   .ex-ss.c1 { --ss:var(--cyan); box-shadow:inset 4px 0 0 var(--ss), inset 0 0 0 1px rgba(34,211,238,.28); }
   .ex-ss .ex-row { border-radius:0; background:transparent; border:0; }
@@ -209,8 +218,15 @@ export const WALLBOARD_HTML = `<!doctype html>
     .vchip { padding:2px 8px; font-size:clamp(10px,1.9vh,13px); }
     .hr-slim { padding:7px 12px; }
     .hr-bpm { font-size:clamp(32px,7vh,52px); }
+    .wb-chk { width:18px; height:18px; font-size:12px; border-width:1.5px; }
+    .wb-chk.sm { width:16px; height:16px; font-size:11px; }
     .ex-list { gap:4px; }
-    .ex-row { padding:5px 9px; font-size:clamp(11px,2.1vh,14px); }
+    .ex-list.dense { gap:3px; }
+    .ex-row { padding:4px 9px; gap:8px; }
+    .ex-row em { font-size:clamp(11px,2vh,14px); min-width:26px; }
+    .ex-main b { font-size:clamp(11px,2.15vh,14px); }
+    .ex-main small { font-size:clamp(10px,1.75vh,12px); }
+    .ex-r span { font-size:clamp(11px,2vh,13px); }
   }
 </style>
 </head>
@@ -265,7 +281,7 @@ function render(st) {
       return '<div class="s-row done"><span class="s-tag">' + esc(tagTxt) + '</span>'
         + '<div class="s-slots"><span class="s-logged">' + esc(valTxt) + '</span>'
         + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '')
-        + '</div><span class="s-stat ok">✓</span></div>';
+        + '</div><span class="wb-chk on">✓</span></div>';
     }
     if (slot.state === 'queued') {
       const qTxt = exType === 'time'
@@ -276,7 +292,7 @@ function render(st) {
       return '<div class="s-row queued"><span class="s-tag">' + esc(tagTxt) + '</span>'
         + '<div class="s-slots"><span class="s-queued">' + esc(qTxt) + '</span>'
         + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '')
-        + '</div><span class="s-stat">○</span></div>';
+        + '</div><span class="wb-chk"></span></div>';
     }
     const showWeightBox = exType !== 'time' || !!slot.weightVal;
     let wCls = 'slot-box ';
@@ -289,10 +305,9 @@ function render(st) {
     const slotsHtml = (showWeightBox ? '<span class="' + wCls + '">' + esc(wTxt) + '</span><span class="s-x">×</span>' : '')
       + '<span class="' + rCls + '">' + esc(rTxt) + '</span>'
       + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '');
-    const statTxt = slot.isGhost ? 'SUGGESTED' : exType === 'time' ? 'HOLD' : 'SPEAK SET';
     return '<div class="s-row active"><span class="s-tag">▶ ' + esc(tagTxt) + '</span>'
       + '<div class="s-slots">' + slotsHtml + '</div>'
-      + '<span class="s-stat">' + esc(statTxt) + '</span></div>';
+      + '<span class="wb-chk active"></span></div>';
   };
 
   const renderVoiceBar = (vh) => '<div class="vbar ' + esc(vh.micState) + '">'
@@ -302,11 +317,11 @@ function render(st) {
   const renderStation = (stCard, isSingle) => {
     const cls = 'st-card' + (isSingle ? ' card single' : '') + (stCard.isActive ? ' active' : ' partner');
     return '<section class="' + cls + '">'
-      + '<div class="st-top"><div class="st-title"><span class="st-lab">' + esc(stCard.label) + '</span><span class="st-name">' + esc(stCard.exName) + '</span>'
-      + (!isSingle && !stCard.isActive ? '<span class="st-tag">PARTNER</span>' : '') + '</div>'
+      + '<div class="st-top"><div class="st-title"><span class="st-lab">' + esc(stCard.label) + '</span><span class="st-name">' + esc(stCard.exName) + '</span></div>'
       + '<div class="rx-pills">'
       + (stCard.lastBenchmark ? '<span class="rx-pill last">Last ' + esc(stCard.lastBenchmark) + '</span>' : '')
-      + '<span class="rx-pill reps">' + esc(stCard.repTarget) + '</span><span class="rx-pill rpe">' + esc(stCard.rpeTarget) + '</span></div></div>'
+      + '<span class="rx-pill reps">' + esc(stCard.repTarget) + '</span>'
+      + (stCard.rpeTarget ? '<span class="rx-pill rpe">' + esc(stCard.rpeTarget) + '</span>' : '') + '</div></div>'
       + '<div class="set-rows cur-body">' + stCard.sets.map((s) => renderSetRow(s, stCard.exType)).join('') + '</div>'
       + (stCard.isActive && stCard.voiceHint ? renderVoiceBar(stCard.voiceHint) : '')
       + '</section>';
@@ -315,10 +330,15 @@ function render(st) {
   const renderOnDeck = (od) => '<section class="card ondeck"><div class="od-head"><div class="kicker">ON DECK NEXT</div>'
     + '<span class="od-tag">' + (od.isSuperset ? 'SUPERSET PAIR · ' : '') + esc(od.label) + '</span></div>'
     + '<div class="od-items">' + od.items.map((it) => '<div class="od-row"><em>' + esc(it.label) + '</em><b>' + esc(it.exName) + '</b><span>'
-      + it.sets + '× ' + esc(it.repTarget) + ' · ' + esc(it.rpeTarget) + (it.lastText ? ' · Last ' + esc(it.lastText) : '') + '</span></div>').join('')
+      + [it.sets + '× ' + esc(it.repTarget), it.rpeTarget ? esc(it.rpeTarget) : '', it.lastText ? 'Last ' + esc(it.lastText) : ''].filter(Boolean).join(' · ')
+      + '</span></div>').join('')
     + '</div></section>';
 
-  const renderExRow = (e) => '<div class="ex-row' + (e.isCurrent ? ' cur' : '') + (e.isDone ? ' done' : '') + '"><em>' + esc(e.label) + '</em><b>' + esc(e.name) + '</b><span>' + (e.isDone ? '✓ ' : '') + e.doneSets + '/' + e.totalSets + '</span></div>';
+  const renderExRow = (e) => '<div class="ex-row' + (e.isCurrent ? ' cur' : '') + (e.isDone ? ' done' : '') + '">'
+    + '<em>' + esc(e.label) + '</em>'
+    + '<div class="ex-main"><b>' + esc(e.name) + '</b>' + (e.subText ? '<small class="' + (e.isPrescribedLoad && !e.isDone ? 'rx-hi' : '') + '">' + esc(e.subText) + '</small>' : '') + '</div>'
+    + '<div class="ex-r"><span>' + e.doneSets + '/' + e.totalSets + '</span><span class="wb-chk sm' + (e.isDone ? ' on' : (e.isCurrent ? ' active' : '')) + '">' + (e.isDone ? '✓' : '') + '</span></div>'
+    + '</div>';
 
   let main = '';
   if (st.mode === 'lift' && st.lift) {
@@ -371,7 +391,7 @@ function render(st) {
       : '<section class="card hr-slim"><div class="kicker">POLAR H10</div><span class="hr-slim-st">Not connected</span></section>';
 
     main = '<div class="grid"><div class="col">' + timerBanner + leftStage + '</div>'
-      + '<div class="col">' + liftHrHtml + '<section class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px"><div class="kicker">' + esc(l.title) + ' · ' + l.setsDone + '/' + l.setsTotal + ' SETS' + (l.setsDone > 0 ? ' · ' + esc(l.volumeText) : '') + '</div><div class="ex-list">' + exRows + '</div></section></div></div>';
+      + '<div class="col">' + liftHrHtml + '<section class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px"><div class="kicker">' + esc(l.title) + ' · ' + l.setsDone + '/' + l.setsTotal + ' SETS' + (l.setsDone > 0 ? ' · ' + esc(l.volumeText) : '') + '</div><div class="ex-list' + (exArr.length >= 8 ? ' dense' : '') + '">' + exRows + '</div></section></div></div>';
   } else if (st.mode === 'cardio' && st.cardio) {
     const k = st.cardio;
     main = '<div class="grid"><div class="col"><section class="card hero">'

@@ -4,6 +4,7 @@ import { calendar } from '../../intervals/calendar';
 import { active } from '../../lifts/active';
 import { buildExercise, isSessionStarted } from '../../lifts/logic';
 import { matchRoutineByTitle } from '../../lifts/seed';
+import { liftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import type { Routine, RoutineItem } from '../../lifts/types';
 import { getSettings, settingsChanged } from '../../store/settings';
@@ -35,11 +36,13 @@ export async function startWorkout(o: { name: string; routine?: Routine; items?:
     }
   }
   const items = o.items ?? o.routine?.items ?? [];
-  const exs = items.flatMap((it, i) =>
-    lifts.exercise(it.exId)
-      ? [buildExercise(it.exId, it.sets, lifts.previous(it.exId), !!it.ss, o.routine ? i : undefined)]
-      : [],
-  );
+  const unit = liftSettings().unit;
+  const exs = items.flatMap((it, i) => {
+    const ex = lifts.exercise(it.exId);
+    return ex
+      ? [buildExercise(it.exId, it.sets, lifts.previous(it.exId), !!it.ss, o.routine ? i : undefined, { rx: it.rx, ex, base1RmKg: lifts.bestE1rm(it.exId), unit })]
+      : [];
+  });
   if (exs.length) delete exs[exs.length - 1].ss;
   await active.start({ name: o.name, routineId: o.routine?.id ?? null, eventId: o.eventId ?? null, planSlot: o.planSlot ?? null, exs });
   if (o.replace) location.replace('#/strength/session');

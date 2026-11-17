@@ -1,4 +1,5 @@
 import type { Equipment } from '../types';
+import type { ExerciseRx } from '../lifts/types';
 
 export interface PlanSlot {
   equipment: Equipment;
@@ -54,6 +55,7 @@ export interface ExtraWorkoutItem {
   exId: string;
   sets: number;
   ss?: boolean;
+  rx?: ExerciseRx;
 }
 
 export interface ExtraWorkout {
@@ -69,10 +71,10 @@ export interface ExtraWorkout {
 }
 
 export const UPPER1_FINISH_ITEMS: ExtraWorkoutItem[] = [
-  { exId: 'seated-dumbbell-shoulder-press', sets: 3, ss: true },
-  { exId: 'pull-up', sets: 3 },
-  { exId: 'dumbbell-lateral-raise', sets: 3, ss: true },
-  { exId: 'cable-triceps-pushdown', sets: 3 },
+  { exId: 'seated-dumbbell-shoulder-press', sets: 3, ss: true, rx: { reps: '8–10', rpe: 7.5 } },
+  { exId: 'pull-up', sets: 3, rx: { reps: '6–10', rpe: 7.5 } },
+  { exId: 'dumbbell-lateral-raise', sets: 3, ss: true, rx: { reps: '12–15', rpe: 8 } },
+  { exId: 'cable-triceps-pushdown', sets: 3, rx: { reps: '12–15', rpe: '7–7.5' } },
 ];
 
 export interface IntervalsActivityLite {
