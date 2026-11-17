@@ -16,9 +16,11 @@ import { getSettings, updateSettings } from '../store/settings';
 import { getMeta, getSamples, putMeta } from '../store/db';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
+import { allowNextRoute } from '../main';
 import { ICON, esc, hms, mmss } from './dom';
 import { topbar, wireChips } from './chrome';
 import { ZONE_COLOR, hrZone } from './hr';
+import { confirmSheet } from './lifts/kit';
 import { renderSummary } from './summaryView';
 import { LeaveGuard } from './leaveGuard';
 import { setWallboardCardioState } from '../wallboard/state';
@@ -197,7 +199,8 @@ class Hud {
     <div class="modal" id="pauseModal" hidden>
       <div class="sheet"><h2>Paused</h2><p id="pauseSub"></p>
         <button class="btn primary big" id="resume">Resume</button>
-        <button class="btn big" id="finish">Finish workout</button></div></div>
+        <button class="btn big" id="finish">Finish workout</button>
+        <button class="btn danger big" id="discardHud">Discard workout</button></div></div>
     <div class="modal" id="doneModal" hidden>
       <div class="sheet"><h2>Workout complete 🎉</h2><p>Nice work. Finish to rate it and save.</p>
         <button class="btn primary big" id="doneFinish">Finish &amp; rate</button>
@@ -232,6 +235,7 @@ class Hud {
     on('go', () => (this.engine.state === 'ready' ? this.start() : this.pause()));
     on('resume', () => this.resume());
     on('finish', () => this.finish());
+    on('discardHud', () => void this.discardActive());
     on('doneFinish', () => this.finish());
     on('doneKeep', () => { this.el.doneModal.hidden = true; this.engine.resume(Date.now()); });
     on('metro', () => {
@@ -334,6 +338,28 @@ class Hud {
     setWallboardCardioState(null);
     void workoutService.stop();
     this.showSummary();
+  }
+
+  private async discardActive(): Promise<void> {
+    if (!(await confirmSheet('Discard workout?', 'Everything recorded so far is lost.', 'Discard', true))) return;
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    this.engine.finish(Date.now());
+    this.guard.dispose();
+    this.offRec?.();
+    this.offRec = null;
+    audio.setMetronome(false, null);
+    sim.setTarget(0);
+    this.el.pauseModal.hidden = true;
+    this.el.doneModal.hidden = true;
+    this.releaseLock();
+    setWallboardCardioState(null);
+    void workoutService.stop();
+    if (this.rec) {
+      await discard(this.rec.meta.id);
+      this.rec = null;
+    }
+    allowNextRoute();
+    location.hash = '#/';
   }
 
   // ------------------------------------------------------------------ main loop (10 Hz)
@@ -606,7 +632,7 @@ class Hud {
     const meta = rec ? rec.finalize() : null;
     if (!rec || !meta || meta.seconds < 5) {
       this.root.innerHTML = `${topbar({})}<main class="page"><section class="card"><h3>Nothing recorded</h3><p>The workout ended before any data was captured.</p>
-        <a class="btn primary" href="#/airbike">Back to AirBike</a></section></main>`;
+        <a class="btn primary" href="#/">Back to Home</a></section></main>`;
       if (meta) void discard(meta.id);
       return;
     }

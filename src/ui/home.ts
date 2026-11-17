@@ -56,9 +56,9 @@ export function homeScreen(root: HTMLElement): () => void {
 
     root.innerHTML = `${topbar({ cog: true })}
       ${weekStripCard(weekCells, selectedYmd, today, weekAnim)}
+      <div class="home-today-dock">${programHeroCard(calendar.items, completedToday)}</div>
       <main class="page home-scroll">
         ${banners}
-        ${programHeroCard(calendar.items, completedToday)}
         ${zoomHtml}
         ${revFooter()}
       </main>
@@ -76,6 +76,7 @@ export function homeScreen(root: HTMLElement): () => void {
     zoomAnim = nextYmd > selectedYmd ? 'from-right' : 'from-left';
     selectedYmd = nextYmd;
     paint();
+    root.querySelector('.home-scroll')?.scrollTo({ top: 0 });
   };
 
   const loadDynamic = async () => {

@@ -139,16 +139,6 @@ export const PROGRAMS: Program[] = [
     blurb: '8 rounds of 10s all-out (65+ RPM) / 20s easy. Painless 4-minute hit.', segments: rounds(8, 10, 20, 65),
   },
   {
-    id: 'time', name: 'Target Time', intervalsName: 'AirBike Target Time', group: 'goal', zone: null,
-    blurb: 'Steady effort until the clock hits zero.', segments: [], paceRpm: FREE_PACE_RPM,
-    goal: { type: 'time', unit: 'min', def: 10, min: 1, max: 120, step: 1 },
-  },
-  {
-    id: 'cal', name: 'Target Calories', intervalsName: 'AirBike Target Cal', group: 'goal', zone: null,
-    blurb: 'Burn the goal in Assault calories, as fast as you like.', segments: [], paceRpm: FREE_PACE_RPM,
-    goal: { type: 'cal', unit: 'cal', def: 20, min: 5, max: 500, step: 5 },
-  },
-  {
     id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5', hidden: true,
     blurb: 'Jamieson-style · 6 × 2:00 @ 119% FTP, recover to HR ≤ target (2–5 min).', segments: repeats(6, 120, 54.0, 120, 300),
   },

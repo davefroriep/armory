@@ -6,9 +6,11 @@ import { bodyProfile, kcalFromSamples } from '../domain/energy';
 import { getSettings } from '../store/settings';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
+import { allowNextRoute } from '../main';
 import { revFooter, topbar, wireChips } from './chrome';
 import { $, esc, hms, mmss } from './dom';
 import { ZONE_COLOR, hrZone } from './hr';
+import { confirmSheet } from './lifts/kit';
 import { renderSummary } from './summaryView';
 import { setWallboardCardioState } from '../wallboard/state';
 
@@ -72,7 +74,8 @@ export function strengthHrScreen(root: HTMLElement): () => void {
       <div class="modal" id="pauseModal" hidden>
         <div class="sheet"><h2>Paused</h2><p id="pauseSub"></p>
           <button class="btn primary big" id="resume">Resume</button>
-          <button class="btn big" id="finish">Finish session</button></div></div>`;
+          <button class="btn big" id="finish">Finish session</button>
+          <button class="btn danger big" id="discardRuck">Discard workout</button></div></div>`;
     offChips?.();
     offChips = wireChips(root);
     root.querySelectorAll<HTMLElement>('[data-pack]').forEach((b) =>
@@ -87,6 +90,7 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     $('#go', root).addEventListener('click', () => (state === 'ready' ? start() : pause()));
     $('#resume', root).addEventListener('click', resume);
     $('#finish', root).addEventListener('click', finish);
+    $('#discardRuck', root).addEventListener('click', () => void discardSession());
   };
 
   const paintLive = () => {
@@ -157,6 +161,26 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     t0 = Date.now();
     state = 'running';
   };
+  const discardSession = async () => {
+    if (!(await confirmSheet('Discard workout?', 'Everything recorded so far is lost.', 'Discard', true))) return;
+    if (timer) { clearInterval(timer); timer = null; }
+    rec?.tick(elapsed(), 0);
+    offRec?.();
+    offRec = null;
+    state = 'summary';
+    guard.dispose();
+    setWallboardCardioState(null);
+    void workoutService.stop();
+    void lock?.release().catch(() => {});
+    lock = null;
+    $('#pauseModal', root).hidden = true;
+    if (rec) {
+      await discard(rec.meta.id);
+      rec = null;
+    }
+    allowNextRoute();
+    location.hash = '#/';
+  };
   const finish = () => {
     if (state === 'running') accMs += Date.now() - t0;
     rec?.tick(elapsed(), 0);
@@ -172,7 +196,7 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     offChips = null;
     const meta = rec?.finalize();
     if (!rec || !meta || meta.seconds < 5) {
-      root.innerHTML = `${topbar({})}<main class="page"><section class="card"><h3>Nothing recorded</h3><p>No heart-rate data was captured.</p><a class="btn primary" href="#/strength">Back</a></section>${revFooter()}</main>`;
+      root.innerHTML = `${topbar({})}<main class="page"><section class="card"><h3>Nothing recorded</h3><p>No heart-rate data was captured.</p><a class="btn primary" href="#/">Back to Home</a></section>${revFooter()}</main>`;
       if (meta) void discard(meta.id);
       return;
     }

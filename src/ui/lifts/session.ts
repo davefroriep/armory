@@ -777,7 +777,7 @@ function build(root: HTMLElement, id?: string): () => void {
         finishing = true;
         allowNextRoute();
         await active.discard();
-        location.hash = '#/strength';
+        location.hash = '#/';
         return true;
       }
       return false;
@@ -810,7 +810,7 @@ function build(root: HTMLElement, id?: string): () => void {
     finishing = true;
     allowNextRoute();
     const done = await active.finish();
-    location.replace(done ? `#/strength/summary/${done.session.id}` : '#/strength');
+    location.replace(done ? `#/strength/summary/${done.session.id}` : '#/');
     return true;
   };
 
@@ -851,7 +851,7 @@ function build(root: HTMLElement, id?: string): () => void {
       finishing = true;
       allowNextRoute();
       if (edit) { await lifts.deleteSession(s.id); location.hash = '#/strength/history'; }
-      else { await active.discard(); location.hash = '#/strength'; }
+      else { await active.discard(); location.hash = '#/'; }
     }
   };
   const rename = async (): Promise<void> => {

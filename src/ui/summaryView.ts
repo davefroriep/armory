@@ -3,6 +3,7 @@ import { calendar, localDate } from '../intervals/calendar';
 import { putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
 import { discard, syncWorkout } from '../workout/sync';
+import { allowNextRoute } from '../main';
 import { revFooter } from './chrome';
 import { esc, hms } from './dom';
 import { confirmSheet } from './lifts/kit';
@@ -14,7 +15,7 @@ export interface SummaryOpts {
   stats: [string, string][];
   /** Extra HTML between stats and the RPE picker (e.g. HR zone bars). */
   extra?: string;
-  backHref: string;
+  backHref?: string;
 }
 
 /** Shared end-of-workout screen: stats, effort rating, save & upload / discard. */
@@ -49,7 +50,8 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
   q('discard').addEventListener('click', async () => {
     if (!(await confirmSheet('Discard this workout?', 'It will not be saved or uploaded.', 'Discard', true))) return;
     await discard(meta.id);
-    location.hash = o.backHref;
+    allowNextRoute();
+    location.hash = '#/';
   });
   q('save').addEventListener('click', async () => {
     const box = q('saveBox');

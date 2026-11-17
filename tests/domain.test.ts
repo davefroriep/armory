@@ -299,7 +299,7 @@ describe('program library (order / hide)', () => {
   const ids = (a: { visible: { id: string }[] }) => a.visible.map((p) => p.id);
   it('defaults: preferred first, weak programs hidden, Free Ride is not part of the list', () => {
     const a = arrange(PROGRAMS, [], null);
-    expect(ids(a)).toEqual(['n4x4', 'v5x3', 'b6030', 'sprint1020', 'time', 'cal']);
+    expect(ids(a)).toEqual(['n4x4', 'v5x3', 'b6030', 'sprint1020']);
     expect(a.hidden.map((p) => p.id).sort()).toEqual(['p6x2', 'tabata', 'z2']);
   });
   it('moves, pins and hides without losing anything', () => {
@@ -309,9 +309,9 @@ describe('program library (order / hide)', () => {
     expect(ids(a)[0]).toBe('sprint1020');
     const down = moveProgram(a, 'sprint1020', 'down');
     expect(ids(arrange(PROGRAMS, down, a.hidden.map((p) => p.id))).slice(0, 2)).toEqual(['n4x4', 'sprint1020']);
-    const hid = toggleHidden(a, 'cal', true);
-    expect(ids(arrange(PROGRAMS, order, hid))).not.toContain('cal');
-    expect(arrange(PROGRAMS, order, hid).hidden.map((p) => p.id)).toContain('cal');
+    const hid = toggleHidden(a, 'b6030', true);
+    expect(ids(arrange(PROGRAMS, order, hid))).not.toContain('b6030');
+    expect(arrange(PROGRAMS, order, hid).hidden.map((p) => p.id)).toContain('b6030');
   });
   it('restoring puts the program at the bottom of the visible list', () => {
     const a = arrange(PROGRAMS, [], null);
