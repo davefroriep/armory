@@ -54,6 +54,7 @@ export async function collectLoggedByDate(): Promise<Map<string, { equipment: Eq
 
 function statusPillHtml(p: ProjectedStep, today: string): string {
   if (p.status === 'done') return `<span class="p-badge ok">✓ Done${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
+  if (p.status === 'skipped') return `<span class="p-badge sk">Skipped${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
   if (p.status === 'early') return `<span class="p-badge ok">✓ Done early${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
   if (p.status === 'current') return `<span class="p-badge cur">● Current · ${esc(p.date ? fmtShortDate(p.date, today) : 'Today')}</span>`;
   return `<span class="p-badge">~${esc(p.date ? fmtShortDate(p.date, today) : 'TBD')}</span>`;
@@ -76,11 +77,11 @@ export async function shiftScheduleToStep(stepIndex: number): Promise<boolean> {
   if (!step) return false;
   const ok = await confirmSheet(
     `Shift schedule to Wk ${step.week} · Day ${step.day}?`,
-    'Stages this day on Today in Intervals.icu and projects future weeks forward from here.',
+    'Makes this day Today and projects future weeks forward from here.',
     'Shift schedule to here',
   );
   if (!ok) return false;
-  await calendar.setStep(stepIndex);
+  calendar.setStep(stepIndex);
   toast(`Schedule shifted to Wk ${step.week} · Day ${step.day}`);
   return true;
 }
@@ -100,10 +101,10 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
   const savedCardio = metas.filter((m) => m.status === 'saved' && m.equipment !== 'strength');
 
   const slotsHtml = p.step.slots.map((slot, si) => {
-    const done = p.slotDone[si];
+    const state = p.slotStates[si];
     const slotDate = p.slotDates[si] ?? p.date;
     const key = slotKey(stepIndex, si);
-    if (done) {
+    if (state === 'done') {
       if (slot.equipment === 'strength') {
         const ls = finishedLifts.find((x) => x.planSlot === key || (!!slotDate && localYmdFromMs(x.startMs) === slotDate));
         if (ls) return renderCompletedLiftSlot(ls, lookup);
@@ -112,20 +113,20 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
         if (cm) return renderCompletedCardioSlot(cm);
       }
     }
-    return renderPlannedSlot(slot, done, lookup);
+    return renderPlannedSlot(slot, state, lookup);
   }).join('');
 
   const acts: string[] = [];
   if (p.status === 'current') {
     p.step.slots.forEach((slot, si) => {
-      if (p.slotDone[si]) return;
+      if (p.slotStates[si] !== 'pending') return;
       const r = slot.equipment === 'strength' ? matchRoutineByTitle(slot.name, routines) : undefined;
       const lbl = slot.equipment === 'strength' ? (r?.name ?? 'Lifting') : slot.name;
       acts.push(`<button class="btn primary big" type="button" data-sact="cur:${si}">Start ${esc(lbl)}</button>`);
     });
   } else if (p.status === 'upcoming') {
     p.step.slots.forEach((slot, si) => {
-      if (p.slotDone[si]) return;
+      if (p.slotStates[si] !== 'pending') return;
       const r = slot.equipment === 'strength' ? matchRoutineByTitle(slot.name, routines) : undefined;
       if (slot.equipment === 'strength') {
         acts.push(`<button class="btn primary big" type="button" data-sact="early:${si}">Do ${esc(r?.name ?? 'Lifting')} Today</button>`);
@@ -160,15 +161,15 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
     if (act.startsWith('cur:')) {
       const si = Number(act.slice(4));
       const slot = p.step.slots[si];
+      const pick = slotKey(stepIndex, si);
       sh.close();
-      const ev = calendar.items.find((x) => x.match.equipment === slot.equipment);
       if (slot.equipment === 'strength') {
         const r = matchRoutineByTitle(slot.name, routines);
-        await startWorkout({ name: r?.name ?? slot.name, routine: r, eventId: ev?.ev.id ?? null });
+        await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
       } else if (slot.equipment === 'airbike') {
-        location.hash = slot.programId ? `#/airbike/p/${slot.programId}${ev ? `?ev=${ev.ev.id}` : ''}` : '#/airbike';
+        location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
       } else {
-        location.hash = `#/${slot.equipment}`;
+        location.hash = `#/${slot.equipment}?pick=${pick}`;
       }
       return;
     }
@@ -182,7 +183,7 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
         const r = matchRoutineByTitle(slot.name, routines);
         await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
       } else if (slot.equipment === 'airbike') {
-        location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : '#/airbike';
+        location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
       }
       return;
     }
@@ -238,25 +239,14 @@ export async function launchDayZoomWorkout(ymd: string): Promise<void> {
   }
 
   const { p, slot, slotIndex } = chosen;
-  if (p.status === 'current') {
-    const ev = calendar.items.find((x) => x.match.equipment === slot.equipment);
-    if (slot.equipment === 'strength') {
-      const r = matchRoutineByTitle(slot.name, routines);
-      await startWorkout({ name: r?.name ?? slot.name, routine: r, eventId: ev?.ev.id ?? null });
-    } else if (slot.equipment === 'airbike') {
-      location.hash = slot.programId ? `#/airbike/p/${slot.programId}${ev ? `?ev=${ev.ev.id}` : ''}` : '#/airbike';
-    } else {
-      location.hash = `#/${slot.equipment}`;
-    }
-    return;
-  }
-
   const pick = slotKey(p.step.index, slotIndex);
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, routines);
     await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
   } else if (slot.equipment === 'airbike') {
-    location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : '#/airbike';
+    location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
+  } else if (p.status === 'current') {
+    location.hash = `#/${slot.equipment}?pick=${pick}`;
   } else {
     const ok = await confirmSheet(
       `Mark “${slot.name}” done today?`,
@@ -289,29 +279,42 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
       const w = selectedWeek >= 1 && selectedWeek <= 4 ? selectedWeek : activeWeek;
       selectedWeek = w;
 
-      const doneCount = proj.filter((p) => p.status === 'done' || p.status === 'early').length;
+      const doneCount = proj.filter((p) => p.slotStates.some((st) => st === 'done')).length;
       const total = PHASE1_PLAN.steps.length;
       const pct = Math.round((doneCount / total) * 100);
 
       const weekTabs = [1, 2, 3, 4].map((wk) => {
         const wkSteps = proj.filter((p) => p.step.week === wk);
-        const allDone = wkSteps.every((p) => p.status === 'done' || p.status === 'early');
+        const allResolved = wkSteps.every((p) => p.slotStates.every((st) => st !== 'pending'));
+        const anyDone = wkSteps.some((p) => p.slotStates.some((st) => st === 'done'));
         const hasCur = wkSteps.some((p) => p.status === 'current');
-        return `<button class="p-tab${wk === w ? ' on' : ''}${allDone ? ' done' : ''}" type="button" data-w="${wk}">
-          Wk ${wk}${allDone ? ' ✓' : hasCur ? ' ●' : ''}
+        return `<button class="p-tab${wk === w ? ' on' : ''}${allResolved && anyDone ? ' done' : ''}" type="button" data-w="${wk}">
+          Wk ${wk}${allResolved && anyDone ? ' ✓' : hasCur ? ' ●' : ''}
         </button>`;
       }).join('');
 
-      const stepsHtml = proj.filter((p) => p.step.week === w).map((p) => {
+      const weekSteps = proj.filter((p) => p.step.week === w);
+      const wkDates = weekSteps.map((p) => p.date).filter((d): d is string => !!d).sort();
+      const wkDateSpan = wkDates.length >= 2
+        ? `${fmtShortDate(wkDates[0], today)} – ${fmtShortDate(wkDates[wkDates.length - 1], today)}`
+        : wkDates[0]
+          ? fmtShortDate(wkDates[0], today)
+          : '';
+
+      const stepsHtml = weekSteps.map((p) => {
         const cleanTitle = p.step.title.replace(/^Wk \d+ · /, '');
         const slots = p.step.slots.map((sl, si) => {
           const mins = Math.round(sl.seconds / 60);
-          const done = p.slotDone[si];
-          const loggedToday = p.status === 'current' && p.slotDone[si] && loggedByDate.has(today);
-          return `<div class="p-slot${done ? ' done' : ''}">
+          const st = p.slotStates[si];
+          const loggedToday = p.status === 'current' && st === 'done' && loggedByDate.has(today);
+          const cls = st === 'skipped' ? ' skipped' : (st === 'done' || loggedToday) ? ' done' : '';
+          const tag = st === 'skipped'
+            ? '<small class="sk-tag">(skipped)</small>'
+            : `<small>${st === 'done' || loggedToday ? '✓' : `${mins}m`}</small>`;
+          return `<div class="p-slot${cls}">
             <span class="p-sico ${sl.equipment}">${ICON[sl.equipment]}</span>
             <span class="p-sname">${esc(sl.name)}</span>
-            <small>${done || loggedToday ? '✓' : `${mins}m`}</small>
+            ${tag}
           </div>`;
         }).join('');
         return `<button class="p-step ${p.status}" type="button" data-step="${p.step.index}">
@@ -320,7 +323,7 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
         </button>`;
       }).join('');
 
-      root.innerHTML = `${topbar({ back: '#/', title: 'Program Overview', cog: true })}
+      root.innerHTML = `${topbar({ back: '#/', title: 'Full Program', cog: true })}
         <main class="page">
           <section class="card p-block">
             <div class="card-h"><span>ARMORY HYBRID · PHASE 1</span><button class="link" data-rest-pick>Rest: ${esc(restDayLabel(s.restDay))} ▾</button></div>
@@ -328,13 +331,15 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
             <div class="p-bar"><u style="width:${pct}%"></u></div>
           </section>
           <div class="p-tabs">${weekTabs}</div>
-          <div class="p-theme"><b>Week ${w}</b> · ${esc(WEEK_THEMES[w] ?? '')}</div>
+          <div class="p-theme"><b>Week ${w}</b>${wkDateSpan ? ` <span class="p-dates">(${esc(wkDateSpan)})</span>` : ''} · ${esc(WEEK_THEMES[w] ?? '')}</div>
           <div class="p-list">${stepsHtml}</div>
           ${revFooter()}
         </main>`;
     };
 
     const load = async (): Promise<void> => {
+      const metas = await allMeta();
+      calendar.backfillLegacySkippedZ5(metas);
       loggedByDate = await collectLoggedByDate();
       paint();
     };

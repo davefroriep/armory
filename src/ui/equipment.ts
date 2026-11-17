@@ -8,7 +8,7 @@ import { ICON, esc } from './dom';
 import { equipmentProgramCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
 import { openStepSheet } from './program';
 
-function programCard(raw: Program, today: boolean, ftp: number, gated: boolean): string {
+function programCard(raw: Program, today: boolean, ftp: number, gated: boolean, todayPick?: string): string {
   const p = resolveProgram(raw, ftp);
   const total = totalSeconds(p);
   const work = workSeconds(p);
@@ -19,7 +19,8 @@ function programCard(raw: Program, today: boolean, ftp: number, gated: boolean):
   if (total) chips.push(fmtDur(total));
   if (gated && p.segments.some((g) => g.gate)) chips.push('HR-gated rest');
   if (p.goal) chips.push(`${p.goal.def} ${p.goal.unit}`);
-  return `<a class="prog ${p.group} ${today ? 'today' : ''}" data-id="${p.id}" href="#/airbike/p/${p.id}">
+  const q = todayPick ? `?pick=${encodeURIComponent(todayPick)}` : '';
+  return `<a class="prog ${p.group} ${today ? 'today' : ''}" data-id="${p.id}" href="#/airbike/p/${p.id}${q}">
     <span class="prog-h"><b>${esc(p.name)}</b>${today ? '<em>TODAY</em>' : ''}</span>
     <span class="prog-b">${esc(p.blurb)}</span>
     <span class="prog-c">${chips.map((c) => `<i>${esc(c)}</i>`).join('')}</span>
@@ -52,12 +53,15 @@ export function airbikeScreen(root: HTMLElement): () => void {
     const st = getSettings();
     const arranged = arrange(PROGRAMS, st.programOrder, st.programHidden);
     const todays = calendar.forEquipment('airbike');
-    const todayIds = new Set(todays.map((t) => t.match.programId).filter(Boolean));
+    const todaySlotById = new Map(todays.filter((t) => t.programId).map((t) => [t.programId!, t.planSlot]));
     const gated = st.recoveryMode === 'gated';
     const n = arranged.visible.length;
     const list = editing
       ? arranged.visible.map((p, i) => editRow(p, i, n)).join('')
-      : arranged.visible.map((p) => programCard(p, todayIds.has(p.id), st.ftp, gated)).join('');
+      : arranged.visible.map((p) => {
+          const pick = todaySlotById.get(p.id);
+          return programCard(p, !!pick, st.ftp, gated, pick);
+        }).join('');
     const hid = arranged.hidden.length
       ? `<details class="hid" ${editing ? 'open' : ''}><summary>HIDDEN · ${arranged.hidden.length}</summary>${arranged.hidden.map(hiddenRow).join('')}</details>`
       : '';

@@ -42,8 +42,6 @@ export interface Settings {
   needleSmooth: '0' | '1' | '2' | '3';
   /** Fake H10 + AirBike for testing the UI without hardware. */
   simulator: boolean;
-  /** Auto-stage the next rolling program day onto Intervals.icu and slide missed days forward. */
-  autoStagePlan: boolean;
   /** Preferred weekly off-day (`0` = Sun .. `6` = Sat, `null` = None). Skipped when projecting future plan dates. */
   restDay: number | null;
   /** Current position in the rolling training queue. */
@@ -78,7 +76,6 @@ export const DEFAULTS: Settings = {
   haptics: true,
   needleSmooth: '2',
   simulator: false,
-  autoStagePlan: true,
   restDay: 0,
   queue: defaultQueueState(),
 };
@@ -106,7 +103,7 @@ export const getSettings = (): Settings => current;
 
 export function updateSettings(patch: Partial<Settings>): Settings {
   current = { ...current, ...patch };
-  localStorage.setItem(KEY, JSON.stringify(current));
+  if (typeof localStorage !== 'undefined') localStorage.setItem(KEY, JSON.stringify(current));
   settingsChanged.emit(current);
   return current;
 }

@@ -1,5 +1,4 @@
 import type { Equipment } from '../types';
-import type { IntervalsEvent } from '../intervals/parse';
 
 export interface PlanSlot {
   equipment: Equipment;
@@ -39,6 +38,10 @@ export interface QueueState {
   doneEarly?: Record<string, string>;
   /** Actual completion dates by `stepIndex` -> `"YYYY-MM-DD"`. */
   stepDates?: Record<number, string>;
+  /** Skipped slots: key `"${stepIndex}:${slotIndex}"` -> `"YYYY-MM-DD"`. */
+  skippedSlots?: Record<string, string>;
+  /** Individual slots carried forward ("Add to tomorrow") independently of queue advancement. */
+  carryOver?: { planSlot: string; date: string }[];
   /** Intervals.icu activity IDs already consumed so we never double-advance. */
   consumedIds: string[];
 }
@@ -48,31 +51,28 @@ export interface IntervalsActivityLite {
   name?: string;
   type?: string;
   start_date_local?: string;
+  external_id?: string | null;
   paired_event_id?: number | null;
 }
 
-export interface EventCreateSpec {
-  external_id: string;
-  start_date_local: string;
-  category: 'WORKOUT';
-  type: 'WeightTraining' | 'VirtualRide' | 'VirtualRun';
-  name: string;
-  description: string;
-  moving_time: number;
+export type SlotState = 'pending' | 'done' | 'skipped';
+export type StepStatus = 'done' | 'skipped' | 'early' | 'current' | 'upcoming';
+
+export interface LocalTodayItem {
+  planSlot: string;
+  stepIndex: number;
+  slotIndex: number;
+  slot: PlanSlot;
+  equipment: Equipment;
+  programId: string | null;
+  carried?: boolean;
 }
 
 export interface QueueOps {
   nextState: QueueState;
-  targetDate: string | null;
-  deletes: number[];
-  moves: { id: number; date: string }[];
-  creates: EventCreateSpec[];
 }
 
 const PREFIX = 'armory-q-';
-
-export const planExternalId = (planId: string, stepIndex: number, slotIndex: number): string =>
-  `${PREFIX}${planId}-s${stepIndex}-${slotIndex}`;
 
 export function isPlanExternalId(extId: string | null | undefined, planId?: string): boolean {
   if (!extId || !extId.startsWith(PREFIX)) return false;
@@ -315,20 +315,19 @@ export const PHASE1_PLAN: RollingPlan = {
 };
 
 /**
- * Pure rolling-queue reconciliation: matches paired events or recent completed activities against the
- * current step, advances when all slots of the step are complete, and computes the exact Intervals.icu
- * event creates/moves/deletes needed so only the current active step is staged.
+ * Pure rolling-queue reconciliation: matches external completed activities (e.g. MyWhoosh rides) against
+ * the local queue, absorbs skipped/early/carried-over slots, and advances `stepIndex` cleanly.
  */
 export function reconcileQueue(args: {
   plan: RollingPlan;
   state: QueueState;
-  events: IntervalsEvent[];
-  activities: IntervalsActivityLite[];
+  activities?: IntervalsActivityLite[];
   today: string;
   tomorrow: string;
   restDay?: number | null;
 }): QueueOps {
-  const { plan, state, events, activities, today, tomorrow } = args;
+  const { plan, state, today, tomorrow } = args;
+  const activities = args.activities ?? [];
   const restDay = args.restDay ?? null;
   let stepIndex = Math.max(0, Math.min(state.stepIndex, plan.steps.length));
   const consumed = new Set(state.consumedIds);
@@ -336,8 +335,20 @@ export function reconcileQueue(args: {
   let slotDates: Record<number, string> = { ...(state.slotDates ?? {}) };
   const doneEarly: Record<string, string> = { ...(state.doneEarly ?? {}) };
   const stepDates: Record<number, string> = { ...(state.stepDates ?? {}) };
+  const skippedSlots: Record<string, string> = { ...(state.skippedSlots ?? {}) };
+  const carryOver: { planSlot: string; date: string }[] = (state.carryOver ?? []).map((c) => ({ ...c }));
   let stagedDate = state.stagedDate;
   let justAdvanced = false;
+
+  const isSlotResolvedOnStep = (si: number): boolean => {
+    const k = slotKey(stepIndex, si);
+    return completedSlots.has(si) || !!skippedSlots[k] || carryOver.some((c) => c.planSlot === k);
+  };
+
+  const allSlotsResolved = (): boolean => {
+    const step = plan.steps[stepIndex];
+    return !!step && step.slots.every((_, si) => isSlotResolvedOnStep(si));
+  };
 
   const absorbEarlyForCurrent = (): string => {
     let latest = '';
@@ -349,7 +360,10 @@ export function reconcileQueue(args: {
       if (d) {
         completedSlots.add(si);
         delete doneEarly[k];
+        delete skippedSlots[k];
         delete slotDates[si];
+        const ci = carryOver.findIndex((c) => c.planSlot === k);
+        if (ci >= 0) carryOver.splice(ci, 1);
         if (d > latest) latest = d;
       }
     }
@@ -358,28 +372,38 @@ export function reconcileQueue(args: {
 
   let curLatest = absorbEarlyForCurrent();
 
-  if (stepIndex < plan.steps.length) {
-    const step = plan.steps[stepIndex];
-    // 1. Check paired events for the current step
-    for (let si = 0; si < step.slots.length; si++) {
-      const ext = planExternalId(plan.id, stepIndex, si);
-      const ev = events.find((e) => e.external_id === ext);
-      if (ev?.paired_activity_id) {
-        completedSlots.add(si);
-        consumed.add(String(ev.paired_activity_id));
-        delete slotDates[si];
+  // Match recent external activities (non-Armory) against carried-over, current, or future audible slots
+  const since = stagedDate && stagedDate <= today ? stagedDate : today;
+  const recent = activities
+    .filter((a) => !(a.external_id ?? '').startsWith('armory-') && !a.paired_event_id && !consumed.has(String(a.id)) && (a.start_date_local ?? '').slice(0, 10) >= since)
+    .sort((a, b) => (a.start_date_local ?? '').localeCompare(b.start_date_local ?? ''));
+
+  for (const act of recent) {
+    const actDate = (act.start_date_local ?? today).slice(0, 10);
+    const carryIdx = carryOver.findIndex((c) => {
+      if (c.date > today) return false;
+      const p = parseSlotKey(c.planSlot);
+      const futSlot = p ? plan.steps[p.stepIndex]?.slots[p.slotIndex] : undefined;
+      return !!futSlot && activityMatchesSlot(act, futSlot) && !hasExplicitConflict(act.name, futSlot.name);
+    });
+    if (carryIdx >= 0) {
+      const [hit] = carryOver.splice(carryIdx, 1);
+      const p = parseSlotKey(hit.planSlot)!;
+      if (p.stepIndex === stepIndex) {
+        completedSlots.add(p.slotIndex);
+        delete slotDates[p.slotIndex];
+      } else {
+        doneEarly[hit.planSlot] = actDate;
       }
+      delete skippedSlots[hit.planSlot];
+      consumed.add(String(act.id));
+      continue;
     }
 
-    // 2. Check recent unpaired external activities matching any remaining slot (or future audible slot)
-    const since = stagedDate && stagedDate <= today ? stagedDate : today;
-    const recent = activities
-      .filter((a) => !a.paired_event_id && !consumed.has(String(a.id)) && (a.start_date_local ?? '').slice(0, 10) >= since)
-      .sort((a, b) => (a.start_date_local ?? '').localeCompare(b.start_date_local ?? ''));
-
-    for (const act of recent) {
+    if (stepIndex < plan.steps.length) {
+      const step = plan.steps[stepIndex];
       const idx = step.slots.findIndex(
-        (sl, si) => !completedSlots.has(si) && activityMatchesSlot(act, sl) && !hasExplicitConflict(act.name, sl.name),
+        (sl, si) => !isSlotResolvedOnStep(si) && activityMatchesSlot(act, sl) && !hasExplicitConflict(act.name, sl.name),
       );
       if (idx >= 0) {
         completedSlots.add(idx);
@@ -393,8 +417,8 @@ export function reconcileQueue(args: {
           const fut = plan.steps[sIdx];
           for (let slIdx = 0; slIdx < fut.slots.length; slIdx++) {
             const k = slotKey(sIdx, slIdx);
-            if (!doneEarly[k] && activityMatchesSlot(act, fut.slots[slIdx]) && matchesExplicitTag(act.name, fut.slots[slIdx].name)) {
-              doneEarly[k] = (act.start_date_local ?? today).slice(0, 10);
+            if (!doneEarly[k] && !skippedSlots[k] && activityMatchesSlot(act, fut.slots[slIdx]) && matchesExplicitTag(act.name, fut.slots[slIdx].name)) {
+              doneEarly[k] = actDate;
               consumed.add(String(act.id));
               matched = true;
               break;
@@ -403,27 +427,27 @@ export function reconcileQueue(args: {
         }
       }
     }
+  }
 
-    // 3. Advance to next incomplete step if all slots of the current step are done (auto-skipping steps finished early)
-    if (completedSlots.size >= step.slots.length) {
-      stepDates[stepIndex] = curLatest || today;
-      stepIndex = Math.min(stepIndex + 1, plan.steps.length);
-      completedSlots = new Set();
-      slotDates = {};
-      justAdvanced = true;
-      while (stepIndex < plan.steps.length) {
-        curLatest = absorbEarlyForCurrent();
-        if (completedSlots.size >= plan.steps[stepIndex].slots.length) {
-          stepDates[stepIndex] = curLatest || today;
-          stepIndex = Math.min(stepIndex + 1, plan.steps.length);
-          completedSlots = new Set();
-          slotDates = {};
-        } else {
-          break;
-        }
+  // Advance when every slot of the active step is resolved (completed, skipped, or carried over)
+  if (stepIndex < plan.steps.length && allSlotsResolved()) {
+    stepDates[stepIndex] = curLatest || today;
+    stepIndex = Math.min(stepIndex + 1, plan.steps.length);
+    completedSlots = new Set();
+    slotDates = {};
+    justAdvanced = true;
+    while (stepIndex < plan.steps.length) {
+      curLatest = absorbEarlyForCurrent();
+      if (allSlotsResolved()) {
+        stepDates[stepIndex] = curLatest || today;
+        stepIndex = Math.min(stepIndex + 1, plan.steps.length);
+        completedSlots = new Set();
+        slotDates = {};
+      } else {
+        break;
       }
-      stagedDate = stepIndex < plan.steps.length ? nextTrainingDate(tomorrow, restDay) : null;
     }
+    stagedDate = stepIndex < plan.steps.length ? nextTrainingDate(tomorrow, restDay) : null;
   }
 
   for (const [k, d] of Object.entries(slotDates)) {
@@ -431,62 +455,13 @@ export function reconcileQueue(args: {
   }
 
   // Decide targetDate for the resulting active step
-  let targetDate: string | null = null;
   if (stepIndex < plan.steps.length) {
-    if (justAdvanced) targetDate = stagedDate!;
-    else if (stagedDate && stagedDate > today) targetDate = stagedDate;
-    else targetDate = today;
-    stagedDate = targetDate;
+    if (!justAdvanced && (!stagedDate || stagedDate <= today)) stagedDate = today;
   } else {
     stagedDate = null;
   }
 
-  // Reconcile Intervals.icu events: keep only uncompleted slots of `stepIndex` on each slot's target date
-  const desired = new Map<string, { slot: PlanSlot; date: string }>();
-  if (stepIndex < plan.steps.length && targetDate) {
-    const step = plan.steps[stepIndex];
-    step.slots.forEach((slot, si) => {
-      if (!completedSlots.has(si)) {
-        const d = slotDates[si] && slotDates[si] > targetDate ? slotDates[si] : targetDate;
-        desired.set(planExternalId(plan.id, stepIndex, si), { slot, date: d });
-      }
-    });
-  }
-
-  const deletes: number[] = [];
-  const moves: { id: number; date: string }[] = [];
-  const creates: EventCreateSpec[] = [];
-  const seenExt = new Set<string>();
-
-  for (const ev of events) {
-    if (!isPlanExternalId(ev.external_id, plan.id)) continue;
-    const ext = ev.external_id!;
-    seenExt.add(ext);
-    if (ev.paired_activity_id) continue;
-    const want = desired.get(ext);
-    if (!want || !targetDate) {
-      deletes.push(ev.id);
-    } else if ((ev.start_date_local ?? '').slice(0, 10) !== want.date) {
-      moves.push({ id: ev.id, date: want.date });
-    }
-  }
-
-  if (targetDate) {
-    for (const [ext, want] of desired) {
-      if (seenExt.has(ext)) continue;
-      creates.push({
-        external_id: ext,
-        start_date_local: `${want.date}T00:00:00`,
-        category: 'WORKOUT',
-        type: want.slot.intervalsType,
-        name: want.slot.name,
-        description: want.slot.description,
-        moving_time: want.slot.seconds,
-      });
-    }
-  }
-
-  // Keep consumedIds bounded to the last 40 entries
+  const cleanCarry = carryOver.filter((c) => !doneEarly[c.planSlot] && !skippedSlots[c.planSlot]);
   const consumedList = Array.from(consumed).slice(-40);
   return {
     nextState: {
@@ -497,20 +472,66 @@ export function reconcileQueue(args: {
       slotDates,
       doneEarly,
       stepDates,
+      skippedSlots,
+      carryOver: cleanCarry,
       consumedIds: consumedList,
     },
-    targetDate,
-    deletes,
-    moves,
-    creates,
   };
+}
+
+/** Synchronously extracts today's active workouts (carry-overs + unresolved current-step slots). */
+export function todayItemsFromQueue(plan: RollingPlan, state: QueueState, today: string): LocalTodayItem[] {
+  const out: LocalTodayItem[] = [];
+  const seen = new Set<string>();
+
+  for (const c of state.carryOver ?? []) {
+    if (c.date > today || state.skippedSlots?.[c.planSlot] || state.doneEarly?.[c.planSlot]) continue;
+    const p = parseSlotKey(c.planSlot);
+    const slot = p ? plan.steps[p.stepIndex]?.slots[p.slotIndex] : undefined;
+    if (!p || !slot) continue;
+    seen.add(c.planSlot);
+    out.push({
+      planSlot: c.planSlot,
+      stepIndex: p.stepIndex,
+      slotIndex: p.slotIndex,
+      slot,
+      equipment: slot.equipment,
+      programId: slot.programId ?? null,
+      carried: true,
+    });
+  }
+
+  if (state.stepIndex < plan.steps.length) {
+    const step = plan.steps[state.stepIndex];
+    const baseDate = state.stagedDate && state.stagedDate > today ? state.stagedDate : today;
+    step.slots.forEach((slot, si) => {
+      const k = slotKey(state.stepIndex, si);
+      if (seen.has(k) || state.completedSlots.includes(si) || state.doneEarly?.[k] || state.skippedSlots?.[k]) return;
+      if ((state.carryOver ?? []).some((c) => c.planSlot === k)) return;
+      const ov = state.slotDates?.[si];
+      const d = ov && ov > baseDate ? ov : baseDate;
+      if (d <= today) {
+        out.push({
+          planSlot: k,
+          stepIndex: state.stepIndex,
+          slotIndex: si,
+          slot,
+          equipment: slot.equipment,
+          programId: slot.programId ?? null,
+        });
+      }
+    });
+  }
+
+  return out;
 }
 
 export interface ProjectedStep {
   step: PlanStep;
-  status: 'done' | 'early' | 'current' | 'upcoming';
+  status: StepStatus;
   date: string | null;
   slotDone: boolean[];
+  slotStates: SlotState[];
   slotDates: (string | null)[];
 }
 
@@ -518,59 +539,105 @@ export interface ProjectedStep {
 export function projectPlan(plan: RollingPlan, state: QueueState, today: string, restDay: number | null): ProjectedStep[] {
   const out: ProjectedStep[] = [];
   let cursor: string | null = null;
+  const carryMap = new Map((state.carryOver ?? []).map((c) => [c.planSlot, c.date]));
 
   for (let i = 0; i < plan.steps.length; i++) {
     const step = plan.steps[i];
     if (i < state.stepIndex) {
-      const d = state.stepDates?.[i] ?? null;
-      out.push({ step, status: 'done', date: d, slotDone: step.slots.map(() => true), slotDates: step.slots.map(() => d) });
+      const slotStates: SlotState[] = step.slots.map((_, si) => {
+        const k = slotKey(i, si);
+        if (state.skippedSlots?.[k]) return 'skipped';
+        if (carryMap.has(k)) return 'pending';
+        return 'done';
+      });
+      const slotDone = slotStates.map((st) => st === 'done');
+      const slotDates = step.slots.map((_, si) => {
+        const k = slotKey(i, si);
+        if (state.skippedSlots?.[k]) return state.skippedSlots[k];
+        if (carryMap.has(k)) return carryMap.get(k)!;
+        return state.doneEarly?.[k] ?? state.stepDates?.[i] ?? null;
+      });
+      const d = state.stepDates?.[i] ?? slotDates.find((x) => !!x) ?? null;
+      const status: StepStatus = slotStates.every((st) => st === 'skipped') ? 'skipped' : 'done';
+      out.push({ step, status, date: d, slotDone, slotStates, slotDates });
       continue;
     }
 
     if (i === state.stepIndex) {
-      const slotDone = step.slots.map((_, si) => state.completedSlots.includes(si) || !!state.doneEarly?.[slotKey(i, si)]);
+      const slotStates: SlotState[] = step.slots.map((_, si) => {
+        const k = slotKey(i, si);
+        if (state.skippedSlots?.[k]) return 'skipped';
+        if (state.completedSlots.includes(si) || state.doneEarly?.[k]) return 'done';
+        return 'pending';
+      });
+      const slotDone = slotStates.map((st) => st === 'done');
       const baseDate = state.stagedDate && state.stagedDate > today ? state.stagedDate : today;
       const slotDates = step.slots.map((_, si) => {
-        const early = state.doneEarly?.[slotKey(i, si)];
+        const k = slotKey(i, si);
+        if (carryMap.has(k)) return carryMap.get(k)!;
+        if (state.skippedSlots?.[k]) return state.skippedSlots[k];
+        const early = state.doneEarly?.[k];
         if (early) return early;
-        if (slotDone[si]) return today;
+        if (slotStates[si] === 'done') return today;
         const ov = state.slotDates?.[si];
         return ov && ov > baseDate ? ov : baseDate;
       });
-      const pendingDates = slotDates.filter((_, si) => !slotDone[si]) as string[];
+      const pendingDates = slotDates.filter((_, si) => slotStates[si] === 'pending' && !carryMap.has(slotKey(i, si))) as string[];
       const stepDate = pendingDates.length ? [...pendingDates].sort()[0] : baseDate;
       cursor = pendingDates.length ? [...pendingDates].sort()[pendingDates.length - 1] : baseDate;
-      out.push({ step, status: 'current', date: stepDate, slotDone, slotDates });
+      out.push({ step, status: 'current', date: stepDate, slotDone, slotStates, slotDates });
       continue;
     }
 
-    const earlyDates = step.slots.map((_, si) => state.doneEarly?.[slotKey(i, si)] ?? null);
-    const slotDone = earlyDates.map(Boolean);
-    if (slotDone.every(Boolean)) {
-      const latest = earlyDates.filter((d): d is string => !!d).sort().pop() ?? null;
-      out.push({ step, status: 'early', date: latest, slotDone, slotDates: earlyDates });
+    const slotStates: SlotState[] = step.slots.map((_, si) => {
+      const k = slotKey(i, si);
+      if (state.skippedSlots?.[k]) return 'skipped';
+      if (state.doneEarly?.[k]) return 'done';
+      return 'pending';
+    });
+    const slotDone = slotStates.map((st) => st === 'done');
+    const resolvedDates = step.slots.map((_, si) => {
+      const k = slotKey(i, si);
+      return state.skippedSlots?.[k] ?? state.doneEarly?.[k] ?? null;
+    });
+    if (slotStates.every((st) => st !== 'pending')) {
+      const latest = resolvedDates.filter((d): d is string => !!d).sort().pop() ?? null;
+      const status: StepStatus = slotStates.every((st) => st === 'skipped') ? 'skipped' : 'early';
+      out.push({ step, status, date: latest, slotDone, slotStates, slotDates: resolvedDates });
       continue;
     }
 
     cursor = cursor === null
       ? nextTrainingDate(shiftYmd(today, 1), restDay)
       : nextTrainingDate(shiftYmd(cursor, 1), restDay);
-    const slotDates = earlyDates.map((d) => d ?? cursor);
-    out.push({ step, status: 'upcoming', date: cursor, slotDone, slotDates });
+    const slotDates = resolvedDates.map((d, si) => carryMap.get(slotKey(i, si)) ?? d ?? cursor);
+    out.push({ step, status: 'upcoming', date: cursor, slotDone, slotStates, slotDates });
   }
   return out;
 }
 
 export function nextEquipmentSlot(proj: ProjectedStep[], eq: Equipment): { p: ProjectedStep; slot: PlanSlot; slotIndex: number } | null {
   for (const p of proj) {
-    if (p.status === 'done' || p.status === 'early') continue;
+    if (p.status === 'early' || p.status === 'skipped') continue;
     for (let si = 0; si < p.step.slots.length; si++) {
-      if (!p.slotDone[si] && p.step.slots[si].equipment === eq) {
+      if (p.slotStates[si] === 'pending' && p.step.slots[si].equipment === eq) {
         return { p, slot: p.step.slots[si], slotIndex: si };
       }
     }
   }
   return null;
+}
+
+const MONTHS_UP = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+
+/** Formats a Sun–Sat date span for the locked calendar strip header (e.g. "NOV 15 – 21"). */
+export function fmtWeekSpan(sunYmd: string): string {
+  const satYmd = shiftYmd(sunYmd, 6);
+  const s = parseYmd(sunYmd);
+  const e = parseYmd(satYmd);
+  const m1 = MONTHS_UP[s.m - 1] ?? '';
+  const m2 = MONTHS_UP[e.m - 1] ?? '';
+  return s.m === e.m ? `${m1} ${s.d} – ${e.d}` : `${m1} ${s.d} – ${m2} ${e.d}`;
 }
 
 export interface WeekDayCell {
@@ -619,9 +686,8 @@ export function buildWeekGlimpse(args: {
       for (const l of logged) eqSet.add(l.equipment);
       let remaining = 0;
       for (const p of proj) {
-        if (p.status !== 'current') continue;
         p.step.slots.forEach((sl, si) => {
-          if (!p.slotDone[si] && p.slotDates[si] === today) {
+          if (p.slotStates[si] === 'pending' && p.slotDates[si] === today) {
             eqSet.add(sl.equipment);
             stepSet.add(p.step.index);
             remaining++;
@@ -638,9 +704,8 @@ export function buildWeekGlimpse(args: {
     }
 
     for (const p of proj) {
-      if (p.status !== 'current' && p.status !== 'upcoming') continue;
       p.step.slots.forEach((sl, si) => {
-        if (!p.slotDone[si] && p.slotDates[si] === ymd) {
+        if (p.slotStates[si] === 'pending' && p.slotDates[si] === ymd) {
           eqSet.add(sl.equipment);
           stepSet.add(p.step.index);
         }

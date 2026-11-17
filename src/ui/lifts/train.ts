@@ -1,4 +1,5 @@
 import { ensureSensors } from '../../ble/sources';
+import { PHASE1_PLAN, parseSlotKey } from '../../domain/plan';
 import { calendar } from '../../intervals/calendar';
 import { active } from '../../lifts/active';
 import { buildExercise, isSessionStarted } from '../../lifts/logic';
@@ -54,8 +55,8 @@ const lastDone = (r: Routine): number | null => {
 export function trainScreen(root: HTMLElement, query: URLSearchParams): () => void {
   ensureSensors({ bike: false });
   void calendar.refresh();
-  const evParam = query.get('ev') ? Number(query.get('ev')) : null;
-  const autoStart = query.get('start') === '1' && evParam != null;
+  const pickParam = query.get('pick');
+  const autoStart = query.get('start') === '1' && !!pickParam;
 
   return mount(() => {
     let dead = false;
@@ -101,23 +102,25 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
           <a class="hr-only" href="#/strength/hr">Heart-rate only session <small>(lift in another app)</small> ›</a>
           ${revFooter()}
         </main>${tabBar('train')}`;
-      if (evParam != null) {
-        root.querySelector<HTMLElement>(`[data-plan-card="${evParam}"]`)?.classList.add('hot');
+      if (pickParam != null) {
+        for (const el of root.querySelectorAll<HTMLElement>('[data-plan-card]')) {
+          if (el.dataset.planCard === pickParam) el.classList.add('hot');
+        }
       }
     };
     paint();
 
-    if (autoStart) {
+    if (autoStart && pickParam) {
       void (async () => {
         if (autoStarted) return;
         autoStarted = true;
         if (lifts.active) { location.replace('#/strength/session'); return; }
-        if (!calendar.items.length) await calendar.refresh();
         if (dead) return;
-        const it = calendar.items.find((i) => i.ev.id === evParam);
-        if (!it) return;
-        const r = matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines());
-        if (r) await startWorkout({ name: r.name, routine: r, eventId: it.ev.id, replace: true });
+        const parsed = parseSlotKey(pickParam);
+        const slot = parsed ? PHASE1_PLAN.steps[parsed.stepIndex]?.slots[parsed.slotIndex] : undefined;
+        if (!slot) return;
+        const r = matchRoutineByTitle(slot.name, lifts.sortedRoutines());
+        await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pickParam, replace: true });
       })();
     }
 
@@ -160,11 +163,11 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       if (t.closest('[data-cal-menu]')) return;
       const plan = t.closest<HTMLElement>('[data-plan], [data-plan-card]');
       if (plan) {
-        const id = Number(plan.dataset.plan ?? plan.dataset.planCard);
-        const it = calendar.items.find((i) => i.ev.id === id);
+        const pick = plan.dataset.plan ?? plan.dataset.planCard ?? '';
+        const it = calendar.items.find((i) => i.planSlot === pick);
         if (!it) return;
-        const r = matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines());
-        return void (await startWorkout({ name: r?.name ?? it.ev.name ?? 'Strength', routine: r, eventId: it.ev.id }));
+        const r = matchRoutineByTitle(it.slot.name, lifts.sortedRoutines());
+        return void (await startWorkout({ name: r?.name ?? it.slot.name, routine: r, planSlot: it.planSlot }));
       }
       const card = t.closest<HTMLElement>('[data-rid]');
       if (!card) return;
@@ -192,7 +195,8 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         }
         return;
       }
-      await startWorkout({ name: r.name, routine: r });
+      const match = calendar.forEquipment('strength').find((it) => matchRoutineByTitle(it.slot.name, [r]));
+      await startWorkout({ name: r.name, routine: r, ...(match ? { planSlot: match.planSlot } : {}) });
     });
 
     return () => { dead = true; offCal(); offChips(); offStore(); offSet(); };

@@ -1,8 +1,7 @@
 import { $, ICON, esc, mmss } from './dom';
 import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
-import { PHASE1_PLAN, nextEquipmentSlot, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
-import { hasKey } from '../intervals/api';
+import { PHASE1_PLAN, fmtWeekSpan, nextEquipmentSlot, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
 import { addDays, calendar, localDate, type TodayItem } from '../intervals/calendar';
 import { active } from '../lifts/active';
 import { isSessionStarted } from '../lifts/logic';
@@ -138,11 +137,10 @@ export function wireChips(root: HTMLElement, opts?: { resume?: boolean }): () =>
 export const hrLive = () => (hrFresh() ? live.hr : 0);
 
 const href = (it: TodayItem): string => {
-  const eq = it.match.equipment;
-  if (!eq) return '#/';
-  const q = `?ev=${it.ev.id}`;
-  if (eq === 'strength') return `#/strength${q}&start=1`;
-  return it.match.programId ? `#/${eq}/p/${it.match.programId}${q}` : `#/${eq}${q}`;
+  const pick = `?pick=${encodeURIComponent(it.planSlot)}`;
+  if (it.equipment === 'strength') return `#/strength${pick}&start=1`;
+  if (it.equipment === 'airbike') return it.programId ? `#/airbike/p/${it.programId}${pick}` : `#/airbike${pick}`;
+  return `#/${it.equipment}${pick}`;
 };
 
 const DOW = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
@@ -156,27 +154,27 @@ function fmtPlanDate(ymd: string): string {
 }
 
 function calItemRow(it: TodayItem, actionMode: 'link' | 'strength' = 'link'): string {
-  const eq = it.match.equipment;
-  const mins = it.ev.moving_time ? Math.round(it.ev.moving_time / 60) : 0;
-  const r = eq === 'strength' ? matchRoutineByTitle(it.ev.name ?? '', lifts.sortedRoutines()) : undefined;
-  const sub = eq === 'strength'
-    ? `Strength${r ? ` · ${r.name}` : ''}`
-    : eq
-      ? EQUIPMENT_LABEL[eq] + (it.match.programId ? '' : ' · pick a program')
-      : 'Not linked to equipment';
-  const inner = `<span class="cal-ico ${eq ?? ''}">${eq ? ICON[eq] : ''}</span>
-    <span class="cal-txt"><b>${esc(it.ev.name ?? 'Workout')}</b><small>${esc(sub)}${mins ? ` · ${mins} min` : ''}</small></span>`;
-  const menu = `<button class="cal-more" type="button" data-cal-menu="${it.ev.id}" aria-label="Workout options">⋯</button>`;
+  const eq = it.equipment;
+  const mins = it.slot.seconds ? Math.round(it.slot.seconds / 60) : 0;
+  const r = eq === 'strength' ? matchRoutineByTitle(it.slot.name, lifts.sortedRoutines()) : undefined;
+  const subParts = [
+    eq === 'strength'
+      ? `Strength${r ? ` · ${r.name}` : ''}`
+      : EQUIPMENT_LABEL[eq] + (eq === 'airbike' && !it.programId ? ' · pick a program' : ''),
+    mins ? `${mins} min` : '',
+    it.carried ? 'carry-over' : '',
+  ].filter(Boolean);
+  const inner = `<span class="cal-ico ${eq}">${ICON[eq]}</span>
+    <span class="cal-txt"><b>${esc(it.slot.name)}</b><small>${esc(subParts.join(' · '))}</small></span>`;
+  const menu = `<button class="cal-more" type="button" data-cal-menu="${esc(it.planSlot)}" aria-label="Workout options">⋯</button>`;
   if (actionMode === 'strength') {
-    return `<div class="cal-item" data-plan-card="${it.ev.id}"><div class="cal-link">${inner}</div><button class="btn sm primary" data-plan="${it.ev.id}">Start</button>${menu}</div>`;
+    return `<div class="cal-item" data-plan-card="${esc(it.planSlot)}"><div class="cal-link">${inner}</div><button class="btn sm primary" data-plan="${esc(it.planSlot)}">Start</button>${menu}</div>`;
   }
-  return eq
-    ? `<div class="cal-item"><a class="cal-link" href="${href(it)}">${inner}<span class="btn sm primary">Start</span></a>${menu}</div>`
-    : `<div class="cal-item dim"><div class="cal-link">${inner}</div>${menu}</div>`;
+  return `<div class="cal-item"><a class="cal-link" href="${href(it)}">${inner}<span class="btn sm primary">Start</span></a>${menu}</div>`;
 }
 
-/** Top Sunday–Saturday week glimpse strip on Home. */
-export function weekStripCard(cells: WeekDayCell[], selectedYmd?: string | null): string {
+/** Locked Sunday–Saturday swipable week strip header on Home. */
+export function weekStripCard(cells: WeekDayCell[], selectedYmd?: string | null, today = localDate(), anim = ''): string {
   const cols = cells.map((c) => {
     const dayNum = Number(c.ymd.slice(8));
     const sel = selectedYmd === c.ymd;
@@ -192,13 +190,36 @@ export function weekStripCard(cells: WeekDayCell[], selectedYmd?: string | null)
       ${mid}
     </button>`;
   }).join('');
-  return `<section class="wk-strip" aria-label="Week glimpse">${cols}</section>`;
+  const spanTxt = cells.length ? fmtWeekSpan(cells[0].ymd) : '';
+  const offToday = selectedYmd != null && selectedYmd !== today;
+  return `<section class="cal-dock" id="calDock" aria-label="Calendar strip">
+    <div class="wk-bar-h">
+      <span class="wk-span">${esc(spanTxt)}</span>
+      <div class="wk-bar-r">
+        ${offToday ? '<button class="wk-today-btn" type="button" data-back-today>Today ↩</button>' : ''}
+        <button class="wk-arr" type="button" data-wk-shift="-7" aria-label="Previous week">‹</button>
+        <button class="wk-arr" type="button" data-wk-shift="7" aria-label="Next week">›</button>
+      </div>
+    </div>
+    <div class="wk-strip${anim ? ` ${anim}` : ''}" id="wkStrip">${cols}</div>
+  </section>`;
 }
 
-/** Double-wide Program Hero card sitting directly above the 4 equipment bays on Home. */
+/** Compact 4-icon machine dock pinned along the bottom of Home. */
+export function machineDock(scheduled: Set<Equipment>): string {
+  const SHORT: Record<Equipment, string> = { strength: 'Strength', treadmill: 'Treadmill', spin: 'Spin', airbike: 'AirBike' };
+  const btns = (['strength', 'treadmill', 'spin', 'airbike'] as Equipment[]).map((eq) =>
+    `<a class="hd-btn ${eq}${scheduled.has(eq) ? ' has-today' : ''}" href="#/${eq}">
+      <span class="hd-ico">${ICON[eq]}</span>
+      <span class="hd-lbl">${SHORT[eq]}</span>
+    </a>`,
+  ).join('');
+  return `<nav class="home-dock" aria-label="Equipment">${btns}</nav>`;
+}
+
+/** Local-first TODAY bar sitting inside the scrollable Home body above the always-open day zoom card. */
 export function programHeroCard(items: TodayItem[], completedToday: TodayCompletedItem[] = []): string {
   const s = getSettings();
-  const st = calendar.status;
   const cur = calendar.currentStep();
   const up = calendar.upcomingStep();
   const wk = cur?.week ?? PHASE1_PLAN.steps[Math.min(s.queue.stepIndex, PHASE1_PLAN.steps.length - 1)]?.week ?? 1;
@@ -213,9 +234,7 @@ export function programHeroCard(items: TodayItem[], completedToday: TodayComplet
 
   let body = '';
   let foot = '';
-  if (!hasKey() && items.length === 0 && completedToday.length === 0) {
-    body = `<a class="cal-empty" href="#/settings">Add your Intervals.icu API key to sync your plan →</a>`;
-  } else if (items.length > 0 || completedToday.length > 0) {
+  if (items.length > 0 || completedToday.length > 0) {
     body = completedRows + items.map((it) => calItemRow(it, 'link')).join('');
     if (items.length === 0 && up) {
       foot = `<div class="cal-foot"><span class="cal-sub">Next: ${esc(up.title)} (${esc(fmtPlanDate(up.date))})</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
@@ -223,15 +242,12 @@ export function programHeroCard(items: TodayItem[], completedToday: TodayComplet
   } else if (up) {
     body = `<button class="cal-empty cal-done-empty" type="button" data-today-zoom><b>✓ Today complete</b> · Next: ${esc(up.title)}<small>Tap to view today’s details ›</small></button>`;
     foot = `<div class="cal-foot"><span class="cal-sub">Scheduled ${esc(fmtPlanDate(up.date))}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
-  } else if (st === 'loading') {
-    body = `<div class="cal-empty">Loading today’s plan…</div>`;
   } else {
     body = `<div class="cal-empty"><b>Rest · Nothing scheduled</b></div>`;
   }
-  const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
   return `<section class="card cal prog-hero">
-    <div class="card-h"><span><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</span><a class="prog-link" href="#/program?w=${wk}">Program ›</a></div>
-    ${body}${foot}${err}
+    <div class="card-h"><span><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</span><a class="prog-link" href="#/program?w=${wk}">Full Program ›</a></div>
+    ${body}${foot}
   </section>`;
 }
 
@@ -242,7 +258,6 @@ export function equipmentProgramCard(eq: Equipment, items: TodayItem[], actionMo
   const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
   const nextSlot = nextEquipmentSlot(proj, eq);
   const wk = calendar.currentStep()?.week ?? nextSlot?.p.step.week ?? 1;
-  const st = calendar.status;
 
   let body = '';
   if (items.length > 0) {
@@ -256,55 +271,50 @@ export function equipmentProgramCard(eq: Equipment, items: TodayItem[], actionMo
   } else {
     body = `<div class="cal-empty">Nothing scheduled</div>`;
   }
-  const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
   return `<section class="card cal">
-    <div class="card-h"><span>${eq.toUpperCase()} · PROGRAM</span><span class="row"><button class="link" data-refresh>Refresh</button><a class="prog-link" href="#/program?w=${wk}">Wk ${wk} · Program ›</a></span></div>
-    ${body}${err}
+    <div class="card-h"><span>${eq.toUpperCase()} · PROGRAM</span><a class="prog-link" href="#/program?w=${wk}">Wk ${wk} · Full Program ›</a></div>
+    ${body}
   </section>`;
 }
 
-/** "Today" planner card from the Intervals.icu calendar. */
+/** "Today" planner card from the local rolling schedule. */
 export function calendarCard(items: TodayItem[], showUnmatched: boolean): string {
   if (!showUnmatched && items.length === 0) {
-    return `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU</span><button class="link" data-refresh>Refresh</button></div><div class="cal-empty">${calendar.status === 'loading' ? 'Loading today’s plan…' : 'Nothing scheduled today'}</div></section>`;
+    return `<section class="card cal"><div class="card-h"><span>TODAY · PROGRAM</span></div><div class="cal-empty">Nothing scheduled today</div></section>`;
   }
-  const st = calendar.status;
   const cur = calendar.currentStep();
   const up = calendar.upcomingStep();
   const pill = cur && showUnmatched ? `<span class="cal-pill">STEP ${cur.index + 1}/${PHASE1_PLAN.steps.length}</span>` : '';
   let body = '';
   let foot = '';
-  if (st === 'nokey') {
-    body = `<a class="cal-empty" href="#/settings">Add your Intervals.icu API key to see today's plan →</a>`;
-  } else if (items.length === 0) {
+  if (items.length === 0) {
     if (showUnmatched && up) {
       body = `<div class="cal-empty"><b>✓ Today complete</b> · Up next: ${esc(up.title)}</div>`;
-      foot = `<div class="cal-foot"><span class="cal-sub">Staged for ${esc(up.date)}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
+      foot = `<div class="cal-foot"><span class="cal-sub">Scheduled ${esc(fmtPlanDate(up.date))}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
     } else {
-      body = `<div class="cal-empty">${st === 'loading' ? 'Loading today’s plan…' : 'Nothing planned for today'}</div>`;
+      body = `<div class="cal-empty">Nothing planned for today</div>`;
     }
   } else {
-    body = items.filter((it) => it.match.equipment || showUnmatched).map((it) => calItemRow(it, 'link')).join('');
+    body = items.map((it) => calItemRow(it, 'link')).join('');
   }
-  const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
-  return `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU ${pill}</span><button class="link" data-refresh>Refresh</button></div>${body}${foot}${err}</section>`;
+  return `<section class="card cal"><div class="card-h"><span>TODAY · PROGRAM ${pill}</span></div>${body}${foot}</section>`;
 }
 
-export async function openCalendarItemMenu(evId: number): Promise<void> {
-  const it = calendar.items.find((x) => x.ev.id === evId);
+export async function openCalendarItemMenu(planSlot: string): Promise<void> {
+  const it = calendar.items.find((x) => x.planSlot === planSlot);
   if (!it) return;
-  const k = await actionSheet(it.ev.name ?? 'Planned workout', [
-    { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — logs & pairs on Intervals.icu' },
-    { key: 'skip', label: 'Skip', sub: 'Removes just this workout from today' },
-    { key: 'push', label: 'Push to tomorrow', sub: 'Moves to tomorrow and shifts schedule back' },
-    { key: 'add', label: 'Add to tomorrow', sub: 'Moves to tomorrow and keeps tomorrow’s schedule' },
+  const k = await actionSheet(it.slot.name, [
+    { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
+    { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
+    { key: 'push', label: 'Push to tomorrow', sub: 'Moves to tomorrow and holds schedule back' },
+    { key: 'add', label: 'Add to tomorrow', sub: 'Carries to tomorrow and keeps tomorrow’s schedule' },
   ]);
   if (!k) return;
   try {
-    if (k === 'done') { await calendar.markItemDone(evId); toast('Marked done'); }
-    else if (k === 'skip') { await calendar.skipItem(evId); toast('Workout skipped'); }
-    else if (k === 'push') { await calendar.pushItemToTomorrow(evId); toast('Pushed to tomorrow'); }
-    else if (k === 'add') { await calendar.addItemToTomorrow(evId); toast('Added to tomorrow'); }
+    if (k === 'done') { await calendar.markSlotDone(planSlot); toast('Marked done'); }
+    else if (k === 'skip') { calendar.skipSlot(planSlot); toast('Workout skipped'); }
+    else if (k === 'push') { calendar.pushSlotToTomorrow(planSlot); toast('Pushed to tomorrow'); }
+    else if (k === 'add') { calendar.addSlotToTomorrow(planSlot); toast('Added to tomorrow'); }
   } catch (e) {
     toast((e as Error).message);
   }
@@ -314,9 +324,9 @@ export function wireCalendar(root: HTMLElement, repaint: () => void): () => void
   const click = (e: Event) => {
     const t = e.target as HTMLElement;
     const menu = t.closest<HTMLElement>('[data-cal-menu]');
-    if (menu) { void openCalendarItemMenu(Number(menu.dataset.calMenu)); return; }
+    if (menu) { void openCalendarItemMenu(menu.dataset.calMenu!); return; }
     if (t.closest('[data-refresh]')) void calendar.refresh();
-    else if (t.closest('[data-cal-pull]')) void calendar.pullTomorrowToToday();
+    else if (t.closest('[data-cal-pull]')) calendar.pullTomorrowToToday();
   };
   root.addEventListener('click', click);
   const off = calendar.changed.on(repaint);

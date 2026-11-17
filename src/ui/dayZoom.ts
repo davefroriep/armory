@@ -1,6 +1,6 @@
 import {
   PHASE1_PLAN, dayOfWeek, parseYmd, shiftYmd,
-  type PlanSlot, type ProjectedStep,
+  type PlanSlot, type ProjectedStep, type SlotState,
 } from '../domain/plan';
 import { sessionStats, type ExOf, type PRHit } from '../lifts/calc';
 import { labels } from '../lifts/logic';
@@ -35,9 +35,11 @@ export interface ResolvedDayZoom {
   liftsDone: LiftSession[];
   cardioDone: WorkoutMeta[];
   externalDoneSlots: { p: ProjectedStep; slot: PlanSlot; slotIndex: number }[];
+  skippedSlots: { p: ProjectedStep; slot: PlanSlot; slotIndex: number }[];
   pendingSlots: { p: ProjectedStep; slot: PlanSlot; slotIndex: number }[];
   associatedStep: ProjectedStep | undefined;
   canShift: boolean;
+  afterPlanEnd: boolean;
   week: number;
 }
 
@@ -170,9 +172,15 @@ export function renderCompletedCardioSlot(m: WorkoutMeta): string {
   </div>`;
 }
 
-/** Planned (or externally completed) slot view with matched local routine exercises/sets/notes. */
-export function renderPlannedSlot(slot: PlanSlot, done: boolean, lookup: ZoomLookup): string {
+/** Planned, externally completed, or skipped slot view with matched local routine exercises/sets/notes. */
+export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: ZoomLookup): string {
   const mins = Math.round(slot.seconds / 60);
+  const badge = state === 'done'
+    ? '<span class="p-badge ok">✓ Done</span>'
+    : state === 'skipped'
+      ? '<span class="p-badge sk">(skipped)</span>'
+      : '';
+  const cls = state === 'done' ? ' done' : state === 'skipped' ? ' skipped' : '';
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, lookup.routines);
     let detail = `<p class="sh-text">${esc(slot.description)}</p>`;
@@ -193,26 +201,26 @@ export function renderPlannedSlot(slot: PlanSlot, done: boolean, lookup: ZoomLoo
       detail = `<div class="sh-exlist">${rows}</div>
         <div class="sh-subrow"><a class="link" href="#/strength/routine/${r.id}">Edit template ›</a></div>`;
     }
-    return `<div class="sh-slot${done ? ' done' : ''}">
+    return `<div class="sh-slot${cls}">
       <div class="sh-slot-h">
         <span class="cal-ico strength">${ICON.strength}</span>
         <span><b>${esc(r?.name ?? slot.name)}</b><small>Strength · ${mins} min</small></span>
-        ${done ? '<span class="p-badge ok">✓ Done</span>' : ''}
+        ${badge}
       </div>
       ${detail}
     </div>`;
   }
-  return `<div class="sh-slot${done ? ' done' : ''}">
+  return `<div class="sh-slot${cls}">
     <div class="sh-slot-h">
       <span class="cal-ico ${slot.equipment}">${ICON[slot.equipment]}</span>
       <span><b>${esc(slot.name)}</b><small>${EQUIPMENT_LABEL[slot.equipment]} · ${mins} min</small></span>
-      ${done ? '<span class="p-badge ok">✓ Done</span>' : ''}
+      ${badge}
     </div>
     <p class="sh-text">${esc(slot.description)}</p>
   </div>`;
 }
 
-/** Resolves completed workouts, externally completed slots, and pending slots for a specific calendar date. */
+/** Resolves completed workouts, externally completed slots, skipped slots, and pending slots for a specific date. */
 export function resolveDayZoom(args: {
   ymd: string;
   today: string;
@@ -228,14 +236,18 @@ export function resolveDayZoom(args: {
   for (const m of cardioDone) doneEqs.add(m.equipment);
 
   const externalDoneSlots: ResolvedDayZoom['externalDoneSlots'] = [];
+  const skippedSlots: ResolvedDayZoom['skippedSlots'] = [];
   const pendingSlots: ResolvedDayZoom['pendingSlots'] = [];
   for (const p of proj) {
     p.step.slots.forEach((slot, slotIndex) => {
-      const doneOnYmd = p.slotDone[slotIndex] && (p.slotDates[slotIndex] === ymd || (p.slotDates[slotIndex] == null && p.date === ymd));
-      if (doneOnYmd && !doneEqs.has(slot.equipment)) {
+      const state = p.slotStates[slotIndex];
+      const onYmd = p.slotDates[slotIndex] === ymd || (p.slotDates[slotIndex] == null && p.date === ymd);
+      if (state === 'done' && onYmd && !doneEqs.has(slot.equipment)) {
         externalDoneSlots.push({ p, slot, slotIndex });
+      } else if (state === 'skipped' && onYmd) {
+        skippedSlots.push({ p, slot, slotIndex });
       }
-      if (ymd >= today && (p.status === 'current' || p.status === 'upcoming') && !p.slotDone[slotIndex] && p.slotDates[slotIndex] === ymd) {
+      if (ymd >= today && state === 'pending' && p.slotDates[slotIndex] === ymd) {
         pendingSlots.push({ p, slot, slotIndex });
       }
     });
@@ -243,19 +255,31 @@ export function resolveDayZoom(args: {
 
   const associatedStep = pendingSlots[0]?.p
     ?? externalDoneSlots[0]?.p
+    ?? skippedSlots[0]?.p
     ?? proj.find((p) => p.slotDates.some((d) => d === ymd) || p.date === ymd);
   const canShift = !!associatedStep && (
     associatedStep.status === 'upcoming'
     || (associatedStep.status === 'current' && associatedStep.date != null && associatedStep.date > today)
-    || ((associatedStep.status === 'done' || associatedStep.status === 'early') && ymd < today)
+    || ((associatedStep.status === 'done' || associatedStep.status === 'early' || associatedStep.status === 'skipped') && ymd < today)
   );
+  const futureDates = proj
+    .flatMap((p) => p.slotDates)
+    .filter((d): d is string => !!d && d > today);
+  const maxFutureDate = futureDates.length ? futureDates.sort()[futureDates.length - 1] : null;
+  const afterPlanEnd = ymd > today
+    && !pendingSlots.length
+    && !externalDoneSlots.length
+    && !skippedSlots.length
+    && maxFutureDate != null
+    && ymd > maxFutureDate;
+
   const curStep = proj.find((p) => p.status === 'current');
   const week = associatedStep?.step.week
     ?? curStep?.step.week
     ?? PHASE1_PLAN.steps[PHASE1_PLAN.steps.length - 1]?.week
     ?? 1;
 
-  return { liftsDone, cardioDone, externalDoneSlots, pendingSlots, associatedStep, canShift, week };
+  return { liftsDone, cardioDone, externalDoneSlots, skippedSlots, pendingSlots, associatedStep, canShift, afterPlanEnd, week };
 }
 
 function dayStatusPill(ymd: string, today: string, res: ResolvedDayZoom): string {
@@ -267,11 +291,12 @@ function dayStatusPill(ymd: string, today: string, res: ResolvedDayZoom): string
   }
   if (ymd === shiftYmd(today, 1)) return '<span class="p-badge">Tomorrow</span>';
   if (hasDone) return '<span class="p-badge ok">✓ Done</span>';
+  if (res.skippedSlots.length > 0) return '<span class="p-badge sk">Skipped</span>';
   if (ymd < today) return '<span class="p-badge">Past</span>';
   return '<span class="p-badge">Projected</span>';
 }
 
-/** Inline expandable day-zoom card shown below the Today hero card on Home. */
+/** Inline always-open day-zoom card shown below the Today bar on Home. */
 export function renderDayZoomCard(args: {
   ymd: string;
   today: string;
@@ -286,21 +311,26 @@ export function renderDayZoomCard(args: {
   const { y, m, d } = parseYmd(ymd);
   const fullDate = new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
   const isRestPref = restDay != null && dayOfWeek(ymd) === restDay;
-  const sameWeek = shiftYmd(ymd, -dayOfWeek(ymd)) === shiftYmd(today, -dayOfWeek(today));
 
   const slotCards = [
     ...res.liftsDone.map((s) => renderCompletedLiftSlot(s, lookup)),
     ...res.cardioDone.map((cm) => renderCompletedCardioSlot(cm)),
-    ...res.externalDoneSlots.map(({ slot }) => renderPlannedSlot(slot, true, lookup)),
-    ...res.pendingSlots.map(({ slot }) => renderPlannedSlot(slot, false, lookup)),
+    ...res.externalDoneSlots.map(({ slot }) => renderPlannedSlot(slot, 'done', lookup)),
+    ...res.skippedSlots.map(({ slot }) => renderPlannedSlot(slot, 'skipped', lookup)),
+    ...res.pendingSlots.map(({ slot }) => renderPlannedSlot(slot, 'pending', lookup)),
   ];
 
   const body = slotCards.length
     ? slotCards.join('')
-    : `<div class="sh-rest">
-        <b>${ymd < today ? 'Rest · Nothing logged' : 'Rest · Nothing scheduled'}</b>
-        <small>${isRestPref ? 'Configured weekly rest day — skipped in future projections.' : ymd < today ? 'No workouts saved on this date.' : 'Open training day — swipe or open Program to pull ahead.'}</small>
-      </div>`;
+    : res.afterPlanEnd
+      ? `<div class="sh-rest">
+          <b>End of Phase 1 Block</b>
+          <small>All 4 weeks of Phase 1 finish before this date.</small>
+        </div>`
+      : `<div class="sh-rest">
+          <b>${ymd < today ? 'Rest · Nothing logged' : 'Rest · Nothing scheduled'}</b>
+          <small>${isRestPref ? 'Configured weekly rest day — skipped in future projections.' : ymd < today ? 'No workouts saved on this date.' : 'Open training day — tap or swipe to pull a future day ahead.'}</small>
+        </div>`;
 
   const acts: string[] = [];
   if (res.pendingSlots.length > 0) {
@@ -309,19 +339,18 @@ export function renderDayZoomCard(args: {
   if (res.canShift && res.associatedStep) {
     acts.push(`<button class="btn dz-btn" type="button" data-zact="shift" data-step-idx="${res.associatedStep.step.index}">Shift schedule to here</button>`);
   }
-  acts.push(`<a class="btn dz-btn" href="#/program?w=${res.week}">View Program</a>`);
+  acts.push(`<a class="btn dz-btn" href="#/program?w=${res.week}">View Full Program</a>`);
 
   return `<section class="card day-zoom${anim ? ` ${anim}` : ''}" id="dayZoom" data-zoom-ymd="${ymd}">
     <div class="dz-top">
       <div class="dz-top-l">
         ${dayStatusPill(ymd, today, res)}
         ${res.associatedStep ? `<span class="sh-week">Wk ${res.associatedStep.step.week} · Day ${res.associatedStep.step.day}</span>` : ''}
-        ${!sameWeek ? '<button class="link dz-today-jump" type="button" data-zact="today">Today ↩</button>' : ''}
+        ${ymd !== today ? '<button class="link dz-today-jump" type="button" data-back-today>Today ↩</button>' : ''}
       </div>
       <div class="dz-navs">
         <button class="dz-nav" type="button" data-znav="-1" aria-label="Previous day">‹</button>
         <button class="dz-nav" type="button" data-znav="1" aria-label="Next day">›</button>
-        <button class="dz-close" type="button" data-inline-dismiss aria-label="Close">✕</button>
       </div>
     </div>
     <div class="dz-head">

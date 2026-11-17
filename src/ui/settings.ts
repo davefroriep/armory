@@ -46,14 +46,13 @@ export function settingsScreen(root: HTMLElement): () => void {
 
     <h2 class="sec">ROLLING PROGRAM · PHASE 1</h2>
     <section class="card">
-      <div class="line"><span>Auto-stage next day<small>Stages your next workout on Intervals.icu and slides missed days forward automatically</small></span>${tog('autoStagePlan', s.autoStagePlan)}</div>
       <div class="line"><span>Rest day<small>Excluded from projected dates &amp; shown as Rest</small></span><select class="lf-input sel" id="restDay"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="none">None — every day</option></select></div>
       <div class="hint" id="planStepInfo"></div>
       <div class="row">
-        <a class="btn sm primary" href="#/program">Open Program Map ›</a>
+        <a class="btn sm primary" href="#/program">Open Full Program ›</a>
         <button class="btn sm" id="stepPrev">← Prev</button>
         <button class="btn sm" id="stepNext">Next →</button>
-        <button class="btn sm" id="stepSync">Stage Now</button>
+        <button class="btn sm" id="stepSync">Sync Activities</button>
       </div>
     </section>
 
@@ -104,7 +103,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     $<HTMLSelectElement>('#restDay', root).value = cur.restDay == null ? 'none' : String(cur.restDay);
     const step = PHASE1_PLAN.steps[cur.queue.stepIndex];
     $('#planStepInfo', root).innerHTML = step
-      ? `Current: <b>Step ${step.index + 1}/${PHASE1_PLAN.steps.length}</b> · ${esc(step.title)}${cur.queue.stagedDate ? ` (${esc(cur.queue.stagedDate)})` : ''}`
+      ? `Current: <b>Step ${step.index + 1}/${PHASE1_PLAN.steps.length}</b> · ${esc(step.title)} (local schedule)`
       : '<b>Phase 1 complete!</b>';
   };
   paintFtpBox();
@@ -121,13 +120,12 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'autoStagePlan';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
-      if (name === 'autoStagePlan' && on) void calendar.refresh();
       if (name === 'simulator') {
         if (on) { hrLink.release(); bikeLink.release(); }
         else sim.stop();

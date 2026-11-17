@@ -1,5 +1,5 @@
 import { getSettings, updateSettings } from '../store/settings';
-import type { EventCreateSpec, IntervalsActivityLite } from '../domain/plan';
+import type { IntervalsActivityLite } from '../domain/plan';
 import type { IntervalsEvent } from './parse';
 
 const BASE = 'https://intervals.icu/api/v1';
@@ -160,24 +160,6 @@ export async function fetchEvents(oldest: string, newest: string): Promise<Inter
 
 export async function fetchActivities(oldest: string, newest: string): Promise<IntervalsActivityLite[]> {
   const res = await call(`/athlete/${aid()}/activities?oldest=${encodeURIComponent(oldest)}&newest=${encodeURIComponent(newest)}`);
-  return res.json();
-}
-
-export async function createEvent(spec: EventCreateSpec): Promise<IntervalsEvent> {
-  const res = await call(`/athlete/${aid()}/events`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(spec),
-  });
-  return res.json();
-}
-
-export async function moveEvent(id: number, dateYmd: string): Promise<IntervalsEvent> {
-  const res = await call(`/athlete/${aid()}/events/${id}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ start_date_local: `${dateYmd}T00:00:00` }),
-  });
   return res.json();
 }
 

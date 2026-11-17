@@ -19,7 +19,7 @@ import { renderSummary } from './summaryView';
 export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLSearchParams): () => void {
   ensureSensors({ bike: false });
   void calendar.refresh();
-  const eventId = query.get('ev') ? Number(query.get('ev')) : null;
+  const planSlot = query.get('pick') ?? calendar.forEquipment('strength')[0]?.planSlot ?? null;
 
   let rec: Recorder | null = null;
   let state: 'ready' | 'running' | 'paused' | 'summary' = 'ready';
@@ -95,9 +95,8 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
   };
 
   const start = () => {
-    const ev = eventId == null ? undefined : calendar.items.find((i) => i.ev.id === eventId);
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    rec = new Recorder(id, 'strength', 'strength', 'Strength Train', ev?.ev.id ?? null, getSettings().hrMax);
+    rec = new Recorder(id, 'strength', 'strength', 'Strength Train', null, getSettings().hrMax, undefined, planSlot);
     state = 'running';
     // Beat-driven recording: keeps logging while Android throttles this page's timers in the background.
     offRec?.();

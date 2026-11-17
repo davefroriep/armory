@@ -224,7 +224,9 @@ describe('live HR sheet telemetry helpers', () => {
     });
     expect(tomorrowHtml).toContain('Do this workout now');
     expect(tomorrowHtml).toContain('Shift schedule to here');
-    expect(tomorrowHtml).toContain('View Program');
+    expect(tomorrowHtml).toContain('View Full Program');
+    expect(tomorrowHtml).toContain('data-back-today');
+    expect(tomorrowHtml).not.toContain('data-inline-dismiss');
     expect(tomorrowHtml).not.toContain('Move Queue Pointer Here');
 
     const todayPendingHtml = renderDayZoomCard({
@@ -235,7 +237,43 @@ describe('live HR sheet telemetry helpers', () => {
       lookup,
     });
     expect(todayPendingHtml).toContain('Do this workout now');
-    expect(todayPendingHtml).toContain('View Program');
+    expect(todayPendingHtml).toContain('View Full Program');
     expect(todayPendingHtml).not.toContain('Shift schedule to here');
+    expect(todayPendingHtml).not.toContain('data-back-today');
+
+    const projMixedSkipped = projectPlan(
+      PHASE1_PLAN,
+      { ...defaultQueueState(), stepIndex: 2, stagedDate: today, skippedSlots: { '1:1': '2026-11-16' }, stepDates: { 1: '2026-11-16' } },
+      today,
+      0,
+    );
+    const mixedHtml = renderDayZoomCard({
+      ymd: '2026-11-16',
+      today,
+      proj: projMixedSkipped,
+      restDay: 0,
+      lookup,
+    });
+    expect(mixedHtml).toContain('sh-slot done');
+    expect(mixedHtml).toContain('sh-slot skipped');
+    expect(mixedHtml).toContain('<span class="p-badge sk">(skipped)</span>');
+    const skippedBlock = mixedHtml.split('sh-slot skipped')[1] ?? '';
+    expect(skippedBlock).not.toContain('✓ Done');
+
+    const projAllSkipped = projectPlan(
+      PHASE1_PLAN,
+      { ...defaultQueueState(), stepIndex: 3, stagedDate: today, skippedSlots: { '2:0': '2026-11-16' }, stepDates: { 2: '2026-11-16' } },
+      today,
+      0,
+    );
+    const allSkippedHtml = renderDayZoomCard({
+      ymd: '2026-11-16',
+      today,
+      proj: projAllSkipped,
+      restDay: 0,
+      lookup,
+    });
+    expect(allSkippedHtml).toContain('(skipped)');
+    expect(allSkippedHtml).not.toContain('✓ Done');
   });
 });

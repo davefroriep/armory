@@ -132,9 +132,9 @@ if (isNative()) {
       topModal.dispatchEvent(new CustomEvent('armory:dismiss'));
       return;
     }
-    const inlineDismiss = document.querySelector<HTMLElement>('[data-inline-dismiss]');
-    if (inlineDismiss) {
-      inlineDismiss.click();
+    const backToday = document.querySelector<HTMLElement>('[data-back-today]');
+    if (backToday) {
+      backToday.click();
       return;
     }
     const up = parentHash(routeKey);

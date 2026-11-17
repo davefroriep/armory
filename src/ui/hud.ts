@@ -32,7 +32,7 @@ export function hudScreen(root: HTMLElement, args: string[], query: URLSearchPar
     location.hash = '#/airbike';
     return () => {};
   }
-  return new Hud(root, program, query.get('ev') ? Number(query.get('ev')) : null, query.get('pick')).mount();
+  return new Hud(root, program, query.get('pick')).mount();
 }
 
 class Hud {
@@ -63,7 +63,7 @@ class Hud {
   private gateState: { waiting: boolean; timerOnly: boolean; into: number; minSec: number; nominal: number; hrLimit: number } | null = null;
   private el!: Record<string, HTMLElement>;
 
-  constructor(private root: HTMLElement, baseProgram: Program, private eventId: number | null, private planSlot: string | null = null) {
+  constructor(private root: HTMLElement, baseProgram: Program, private planSlot: string | null = null) {
     this.baseProgram = baseProgram;
     this.p = resolveProgram(baseProgram, getSettings().ftp, 0);
     this.engine = new WorkoutEngine(this.p);
@@ -249,9 +249,9 @@ class Hud {
     audio.unlock();
     audio.setVolume(getSettings().metroVolume);
     const s = getSettings();
-    const ev = this.eventId == null ? undefined : calendar.items.find((i) => i.ev.id === this.eventId);
+    const slot = this.planSlot ?? calendar.forEquipment('airbike').find((i) => i.programId === this.p.id)?.planSlot ?? null;
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    this.rec = new Recorder(id, 'airbike', this.p.id, this.p.intervalsName, ev?.ev.id ?? null, s.hrMax, undefined, this.planSlot);
+    this.rec = new Recorder(id, 'airbike', this.p.id, this.p.intervalsName, null, s.hrMax, undefined, slot);
     this.offFrame = bikeFrame.on(() => { if (this.engine.state === 'running') this.rec?.onFrame(); });
     // Sensor-driven recording (registered after onFrame so each frame is accumulated before the tick):
     // keeps the log complete while Android throttles this page's timers in the background.
