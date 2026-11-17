@@ -2,7 +2,7 @@
 
 ## 1. Umbrella Ecosystem & Deployment
 - **Workspace Scope:** Umbrella S&C hub (`N:\Documents\Antigravity\Strength and Conditioning`) unifying **Boostcamp** (strength programming), **Intervals.icu** (`i758105` endurance/wellness telemetry), and **Armory Fit** (cardio telemetry + built-in Strength Lift Tracker).
-- **Primary Client (Armory Fit):** Native Android `.apk` wrapped with **Capacitor** (`@capacitor-community/bluetooth-le` + custom Kotlin `WorkoutForegroundService`) for lockscreen/background-safe BLE and persistent notification telemetry, plus GitHub Pages web mirror (`https://davefroriep.github.io/armory/`).
+- **Primary Client (Armory Fit):** Native Android `.apk` ONLY wrapped with **Capacitor** (`@capacitor-community/bluetooth-le` + native `WorkoutForegroundService` / `WorkoutChime` / `RestOverlay`). **No PWA deployment or PWA dev-testing** — always deliver the direct GitHub Release APK link (`https://github.com/davefroriep/armory/releases/latest/download/armory-fit.apk`).
 - **Storage & Sync:** Phone-side 1 Hz `IndexedDB` (`workouts_meta`, `workout_samples`, plus v2 lift-tracker stores `lift_sessions`, `lift_routines`, `lift_ex`, `lift_videos`) with crash/resume recovery and automatic TCX/manual `WeightTraining` sync to Intervals.icu.
 
 ## 2. Primary 5 Hz Direct BLE (`NUS`) Protocol & Athlete Constants
@@ -18,11 +18,11 @@
 - `public/`: PWA manifest, icons (`192`, `512`), and service worker (`sw.js`).
 - `android/`: Generated Capacitor Android project + custom Kotlin `WorkoutForegroundService`.
 - `docs/`: `ARMORY_MASTER_PRIMER.md` and S&C / BLE protocol specs.
-- `.github/workflows/`: Automated CI build for Android `.apk` releases + GitHub Pages deployment.
+- `.github/workflows/`: CI checks/manual Pages workflow (disabled on push — APK releases only).
 *(Root policy: Keep build scripts in `package.json` or `scripts/`; zero hardcoded API keys or Wi-Fi credentials in repo.)*
 
-## 4. Build & Android (Capacitor)
-- Web: `npm run build` (auto-bumps `Rev` badge + `sw.js` cache; push `main` -> Pages workflow deploys). Tests: `npm test`.
-- Android debug APK: `.\scripts\android.ps1 -Install` (portable JDK 21 in `C:\Users\davef\Tools\jdk-21`, SDK in `%LOCALAPPDATA%\Android\Sdk`, phone via adb).
+## 4. Build & Android APK Workflow (No PWA)
+- Tests & checks: `npx tsc --noEmit && npm test` (plus local UI check if UI changed). Do NOT deploy, watch, verify, or link GitHub Pages PWA.
+- Build & publish APK: `.\scripts\android.ps1 -Publish` (bumps `rev.json`, builds Vite bundle, syncs Capacitor, builds `app-debug.apk` with portable JDK 21 in `C:\Users\davef\Tools\jdk-21` + SDK in `%LOCALAPPDATA%\Android\Sdk`, uploads `armory-fit.apk` to GitHub Release `vX.Y`). Add `-Install` for local USB adb.
 - One-time Intervals.icu hookup: `python scripts\make_setup_qr.py` -> scan QR (key never in repo; `local-secrets/` is git-ignored).
 - Names: `Assault AirBike Elite` (Assault Fitness). Effort scale = 8 words -> RPE 3-10.
