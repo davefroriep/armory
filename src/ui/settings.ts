@@ -47,8 +47,10 @@ export function settingsScreen(root: HTMLElement): () => void {
     <h2 class="sec">ROLLING PROGRAM · PHASE 1</h2>
     <section class="card">
       <div class="line"><span>Auto-stage next day<small>Stages your next workout on Intervals.icu and slides missed days forward automatically</small></span>${tog('autoStagePlan', s.autoStagePlan)}</div>
+      <div class="line"><span>Rest day<small>Excluded from projected dates &amp; shown as Rest</small></span><select class="lf-input sel" id="restDay"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="none">None — every day</option></select></div>
       <div class="hint" id="planStepInfo"></div>
       <div class="row">
+        <a class="btn sm primary" href="#/program">Open Program Map ›</a>
         <button class="btn sm" id="stepPrev">← Prev</button>
         <button class="btn sm" id="stepNext">Next →</button>
         <button class="btn sm" id="stepSync">Stage Now</button>
@@ -99,6 +101,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     $('#ftpInfo', root).innerHTML = ftpStatus();
     $<HTMLButtonElement>('#useEftp', root).disabled = !cur.intervalsEftp;
     $<HTMLInputElement>('[data-num="ftp"]', root).value = String(cur.ftp);
+    $<HTMLSelectElement>('#restDay', root).value = cur.restDay == null ? 'none' : String(cur.restDay);
     const step = PHASE1_PLAN.steps[cur.queue.stepIndex];
     $('#planStepInfo', root).innerHTML = step
       ? `Current: <b>Step ${step.index + 1}/${PHASE1_PLAN.steps.length}</b> · ${esc(step.title)}${cur.queue.stagedDate ? ` (${esc(cur.queue.stagedDate)})` : ''}`
@@ -149,7 +152,10 @@ export function settingsScreen(root: HTMLElement): () => void {
   const onInput = (e: Event) => {
     const t = e.target as HTMLInputElement;
     if (t.id === 'aid') updateSettings({ athleteId: t.value.trim() });
-    else if (t.id === 'key') {
+    else if (t.id === 'restDay') {
+      updateSettings({ restDay: t.value === 'none' ? null : Number(t.value) });
+      void calendar.refresh();
+    } else if (t.id === 'key') {
       updateSettings({ apiKey: t.value.trim() });
       void calendar.refresh();
     } else if (t.id === 'vol') {

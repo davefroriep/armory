@@ -1,4 +1,5 @@
 import { RPE_STEPS, rpeLabel } from '../domain/rpe';
+import { calendar, localDate } from '../intervals/calendar';
 import { putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
 import { discard, syncWorkout } from '../workout/sync';
@@ -55,6 +56,7 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
     meta.status = 'saved';
     meta.upload = 'pending';
     await putMeta(meta);
+    if (meta.planSlot) calendar.markSlotDoneEarly(meta.planSlot, null, localDate(new Date(meta.startEpochMs)));
     box.innerHTML = `<div class="status busy"><span class="spinner"></span> Saving &amp; uploading…</div>`;
     const r = await syncWorkout(meta);
     if (r.upload === 'done') {

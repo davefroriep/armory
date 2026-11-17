@@ -1,7 +1,7 @@
 import { bodyProfile, kcalFromSamples } from '../domain/energy';
 import { buildTcx } from '../domain/tcx';
 import { createManualActivity, patchActivity, syncAthleteFtp, uploadActivity } from '../intervals/api';
-import { calendar } from '../intervals/calendar';
+import { calendar, localDate } from '../intervals/calendar';
 import { getSettings } from '../store/settings';
 import { getMeta, getSamples, putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
@@ -85,7 +85,10 @@ async function runSync(meta: WorkoutMeta, s: LiftSession): Promise<WorkoutMeta> 
     m.lastError = (e as Error).message;
   }
   await putMeta(m);
-  if (m.upload === 'done') void calendar.refresh();
+  if (m.upload === 'done') {
+    if (s.planSlot) calendar.markSlotDoneEarly(s.planSlot, m.activityId, localDate(new Date(s.startMs)));
+    void calendar.refresh();
+  }
   return m;
 }
 

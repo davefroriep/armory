@@ -513,6 +513,7 @@ describe('Phase 1 routine seed', () => {
   it('resolves hierarchical parentHash toward main menu instead of random back history', () => {
     expect(parentHash('')).toBeNull();
     expect(parentHash('#/')).toBeNull();
+    expect(parentHash('#/program')).toBe('#/');
     expect(parentHash('#/strength')).toBe('#/');
     expect(parentHash('#/strength/history')).toBe('#/');
     expect(parentHash('#/strength/progress')).toBe('#/');

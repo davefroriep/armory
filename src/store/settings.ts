@@ -44,6 +44,8 @@ export interface Settings {
   simulator: boolean;
   /** Auto-stage the next rolling program day onto Intervals.icu and slide missed days forward. */
   autoStagePlan: boolean;
+  /** Preferred weekly off-day (`0` = Sun .. `6` = Sat, `null` = None). Skipped when projecting future plan dates. */
+  restDay: number | null;
   /** Current position in the rolling training queue. */
   queue: QueueState;
 }
@@ -77,6 +79,7 @@ export const DEFAULTS: Settings = {
   needleSmooth: '2',
   simulator: false,
   autoStagePlan: true,
+  restDay: 0,
   queue: defaultQueueState(),
 };
 

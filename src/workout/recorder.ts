@@ -30,6 +30,7 @@ export class Recorder {
     private readonly hrMax: number,
     /** Continue a recording that was interrupted (app killed mid-workout) instead of starting a new one. */
     resumeFrom?: { meta: WorkoutMeta; samples: Sample[] },
+    planSlot: string | null = null,
   ) {
     if (resumeFrom) {
       this.meta = { ...resumeFrom.meta };
@@ -50,7 +51,9 @@ export class Recorder {
     }
     this.meta = {
       id, equipment, programId, name, startEpochMs: Date.now(), status: 'active', seconds: 0, kj: 0,
-      avgW: 0, maxW: 0, avgHr: 0, maxHr: 0, rpe: null, eventId, upload: 'none', patched: false,
+      avgW: 0, maxW: 0, avgHr: 0, maxHr: 0, rpe: null, eventId,
+      ...(planSlot ? { planSlot } : {}),
+      upload: 'none', patched: false,
       activityId: null, lastError: null,
     };
     void putMeta(this.meta);

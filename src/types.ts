@@ -40,6 +40,8 @@ export interface WorkoutMeta {
   maxHr: number;
   rpe: number | null;
   eventId: number | null;
+  /** Out-of-order / cherry-picked rolling plan slot (`"${stepIndex}:${slotIndex}"`). */
+  planSlot?: string | null;
   upload: UploadState;
   /** True once the Intervals activity has its RPE / type patched. */
   patched: boolean;

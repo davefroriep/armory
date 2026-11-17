@@ -1,5 +1,5 @@
 import { Emitter } from '../emitter';
-import { PHASE1_PLAN, parsePlanExternalId, reconcileQueue, type PlanStep } from '../domain/plan';
+import { PHASE1_PLAN, parsePlanExternalId, parseSlotKey, reconcileQueue, slotKey, type PlanStep } from '../domain/plan';
 import { getSettings, updateSettings } from '../store/settings';
 import { createEvent, createManualActivity, deleteEvent, fetchActivities, fetchEvents, hasKey, moveEvent, syncAthleteFtp } from './api';
 import { classifyEvent, isPlannedWorkout, type EventMatch, type IntervalsEvent } from './parse';
@@ -117,6 +117,7 @@ class Calendar {
           activities,
           today,
           tomorrow,
+          restDay: s.restDay,
         });
 
         for (const id of ops.deletes) await deleteEvent(id);
@@ -240,6 +241,11 @@ class Calendar {
   async setStep(stepIndex: number): Promise<void> {
     const clamped = Math.max(0, Math.min(stepIndex, PHASE1_PLAN.steps.length));
     const s = getSettings();
+    const doneEarly = { ...(s.queue.doneEarly ?? {}) };
+    const targetStep = PHASE1_PLAN.steps[clamped];
+    if (targetStep) {
+      for (let si = 0; si < targetStep.slots.length; si++) delete doneEarly[slotKey(clamped, si)];
+    }
     updateSettings({
       queue: {
         ...s.queue,
@@ -247,9 +253,54 @@ class Calendar {
         completedSlots: [],
         stagedDate: clamped < PHASE1_PLAN.steps.length ? localDate() : null,
         slotDates: {},
+        doneEarly,
       },
     });
     await this.refresh();
+  }
+
+  /** Marks a specific plan slot (`stepIndex:slotIndex`) done locally and triggers queue reconciliation. */
+  markSlotDoneEarly(planSlot: string, activityId?: string | null, date = localDate()): void {
+    const parsed = parseSlotKey(planSlot);
+    if (!parsed) return;
+    const s = getSettings();
+    const consumedIds = activityId
+      ? Array.from(new Set([...s.queue.consumedIds, String(activityId)])).slice(-40)
+      : s.queue.consumedIds;
+    if (parsed.stepIndex === s.queue.stepIndex) {
+      const completedSlots = Array.from(new Set([...s.queue.completedSlots, parsed.slotIndex])).sort((a, b) => a - b);
+      const slotDates = { ...(s.queue.slotDates ?? {}) };
+      delete slotDates[parsed.slotIndex];
+      updateSettings({ queue: { ...s.queue, completedSlots, slotDates, consumedIds } });
+    } else if (parsed.stepIndex > s.queue.stepIndex) {
+      const doneEarly = { ...(s.queue.doneEarly ?? {}), [planSlot]: date };
+      updateSettings({ queue: { ...s.queue, doneEarly, consumedIds } });
+    } else {
+      return;
+    }
+    this.changed.emit();
+    if (hasKey()) void this.refresh();
+  }
+
+  /** Logs an external completion on Intervals.icu for a cherry-picked future cardio slot and records it locally. */
+  async completeFutureSlotExternally(stepIndex: number, slotIndex: number): Promise<void> {
+    const slot = PHASE1_PLAN.steps[stepIndex]?.slots[slotIndex];
+    if (!slot) return;
+    let actId: string | null = null;
+    if (hasKey()) {
+      try {
+        actId = await createManualActivity({
+          startLocalIso: localIsoNow(),
+          name: slot.name,
+          description: 'Completed early in Armory Fit',
+          seconds: slot.seconds || 2400,
+          type: slot.intervalsType,
+          externalId: `armory-early-${stepIndex}-${slotIndex}-${Date.now().toString(36)}`,
+          pairedEventId: null,
+        });
+      } catch { /* offline fallback still records locally */ }
+    }
+    this.markSlotDoneEarly(slotKey(stepIndex, slotIndex), actId, localDate());
   }
 }
 

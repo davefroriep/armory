@@ -4,6 +4,7 @@ import { retryPending } from './workout/sync';
 import { airbikeScreen, stubScreen } from './ui/equipment';
 import { homeScreen } from './ui/home';
 import { hudScreen } from './ui/hud';
+import { programScreen } from './ui/program';
 import { settingsScreen } from './ui/settings';
 import { liftsScreen } from './ui/lifts';
 import { initSetupLinks } from './setup';
@@ -16,6 +17,7 @@ type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (()
 
 const routes: Record<string, Screen> = {
   '': homeScreen,
+  program: programScreen,
   airbike: (root, args, q) => (args[0] === 'p' ? hudScreen(root, args.slice(1), q) : airbikeScreen(root)),
   spin: stubScreen('spin'),
   treadmill: stubScreen('treadmill'),

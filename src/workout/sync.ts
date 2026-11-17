@@ -2,7 +2,7 @@ import { buildTcx } from '../domain/tcx';
 import { bodyProfile, kcalFromSamples } from '../domain/energy';
 import { patchActivity, syncAthleteFtp, uploadActivity } from '../intervals/api';
 import { getSettings } from '../store/settings';
-import { calendar } from '../intervals/calendar';
+import { calendar, localDate } from '../intervals/calendar';
 import { allMeta, deleteWorkout, getSamples, putMeta } from '../store/db';
 import type { WorkoutMeta } from '../types';
 import { syncLiftWorkout } from '../lifts/intervals';
@@ -57,7 +57,10 @@ export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
     m.lastError = (e as Error).message;
   }
   await putMeta(m);
-  if (m.upload === 'done') void calendar.refresh();
+  if (m.upload === 'done') {
+    if (m.planSlot) calendar.markSlotDoneEarly(m.planSlot, m.activityId, localDate(new Date(m.startEpochMs)));
+    void calendar.refresh();
+  }
   return m;
 }
 

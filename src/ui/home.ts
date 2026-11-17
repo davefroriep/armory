@@ -1,17 +1,21 @@
 import { ensureSensors } from '../ble/sources';
-import { calendar } from '../intervals/calendar';
+import { PHASE1_PLAN, buildWeekGlimpse, projectPlan } from '../domain/plan';
+import { calendar, localDate } from '../intervals/calendar';
 import { pendingCount, retryPending, syncWorkout, discard } from '../workout/sync';
 import { allMeta, getSamples, putMeta } from '../store/db';
+import { getSettings, settingsChanged } from '../store/settings';
 import { summarize } from '../workout/summary';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
+import { active } from '../lifts/active';
 import { isSessionStarted } from '../lifts/logic';
 import { lifts } from '../lifts/store';
 import { ICON, esc, mmss } from './dom';
-import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
+import { programHeroCard, revFooter, topbar, weekStripCard, wireCalendar, wireChips } from './chrome';
+import { collectLoggedByDate, openStepSheet, openWeekDayPeek } from './program';
 
 const TILES: Equipment[] = ['strength', 'treadmill', 'spin', 'airbike'];
 const SUB: Record<Equipment, string> = {
-  strength: 'Lift tracker',
+  strength: 'Rack · Barbell · Cables',
   treadmill: 'Horizon T101',
   spin: 'Bowflex C7',
   airbike: 'Assault AirBike Elite',
@@ -23,10 +27,21 @@ export function homeScreen(root: HTMLElement): () => void {
 
   let dead = false;
   let banners = '';
+  let loggedByDate = new Map<string, { equipment: Equipment; name: string }[]>();
+
   const paint = () => {
     if (dead) return;
+    const s = getSettings();
+    const today = localDate();
+    const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+    const todayEquipment = calendar.items.map((i) => i.match.equipment).filter((e): e is Equipment => !!e);
+    const weekCells = buildWeekGlimpse({ today, proj, todayEquipment, loggedByDate });
+    const scheduled = new Set(todayEquipment);
+    const live = lifts.active && isSessionStarted(lifts.active) ? lifts.active : undefined;
+    const liveInfo = live ? { name: live.name, elapsed: mmss(active.elapsedSec()) } : undefined;
+
     const tiles = TILES.map(
-      (eq) => `<a class="tile ${eq}" href="#/${eq}">
+      (eq) => `<a class="tile ${eq}${scheduled.has(eq) ? ' has-today' : ''}" href="#/${eq}">
         <span class="tile-ico">${ICON[eq]}</span>
         <span class="tile-name">${EQUIPMENT_LABEL[eq]}</span>
         <span class="tile-sub">${SUB[eq]}</span>
@@ -35,24 +50,22 @@ export function homeScreen(root: HTMLElement): () => void {
     root.innerHTML = `${topbar({ cog: true })}
       <main class="page">
         ${banners}
-        ${calendarCard(calendar.items, true)}
+        ${weekStripCard(weekCells)}
+        ${programHeroCard(calendar.items, liveInfo)}
         <div class="tiles4">${tiles}</div>
         ${revFooter()}
       </main>`;
   };
 
-  const loadBanners = async () => {
-    const metas = await allMeta();
-    await lifts.ready;
+  const loadDynamic = async () => {
+    const [metas, logged] = await Promise.all([allMeta(), collectLoggedByDate()]);
     if (dead) return;
-    // A lift-tracker workout in progress is resumed from the Strength tile, never "recovered" as a bare HR file.
-    const live = lifts.active && isSessionStarted(lifts.active) ? lifts.active : undefined;
-    const active = metas.filter((m) => m.status === 'active' && m.seconds === 0 && !lifts.sessions.has(m.id));
+    loggedByDate = logged;
+    // A lift-tracker workout in progress is resumed from the hero banner, never "recovered" as a bare HR file.
+    const activeIncomplete = metas.filter((m) => m.status === 'active' && m.seconds === 0 && !lifts.sessions.has(m.id));
     const pend = await pendingCount();
-    let h = live
-      ? `<section class="card warn"><b>Workout in progress</b><p>${esc(live.name)} — started ${new Date(live.startMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.</p><div class="row"><a class="btn primary sm" href="#/strength/session">Resume</a></div></section>`
-      : '';
-    for (const m of active) {
+    let h = '';
+    for (const m of activeIncomplete) {
       h += `<section class="card warn"><b>Unfinished workout</b>
         <p>${esc(m.name)} — started ${new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. The app closed before you finished.</p>
         <div class="row"><button class="btn primary sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
@@ -68,34 +81,48 @@ export function homeScreen(root: HTMLElement): () => void {
 
   const click = async (e: Event) => {
     const t = e.target as HTMLElement;
+    const wkDay = t.closest<HTMLElement>('[data-wk-ymd]');
+    if (wkDay) {
+      await openWeekDayPeek(wkDay.dataset.wkYmd!);
+      return;
+    }
+    const peek = t.closest<HTMLElement>('[data-step-peek]');
+    if (peek) {
+      await openStepSheet(Number(peek.dataset.stepPeek));
+      return;
+    }
     const rec = t.closest<HTMLElement>('[data-recover]');
     if (rec) {
       const m = (await allMeta()).find((x) => x.id === rec.dataset.recover);
       if (m) await recover(m);
-      await loadBanners();
+      await loadDynamic();
     }
     const drop = t.closest<HTMLElement>('[data-drop]');
     if (drop && confirm('Discard this unfinished workout?')) {
       await discard(drop.dataset.drop!);
-      await loadBanners();
+      await loadDynamic();
     }
     if (t.closest('[data-retry]')) {
       await retryPending();
-      await loadBanners();
+      await loadDynamic();
     }
   };
   root.addEventListener('click', click);
 
   paint();
-  void loadBanners();
+  void loadDynamic();
   const offChips = wireChips(root);
-  const offCal = wireCalendar(root, paint);
+  const offCal = wireCalendar(root, () => void loadDynamic());
+  const offSet = settingsChanged.on(paint);
+  const offLifts = lifts.changed.on(() => void loadDynamic());
 
   return () => {
     dead = true;
     root.removeEventListener('click', click);
     offChips();
     offCal();
+    offSet();
+    offLifts();
   };
 }
 

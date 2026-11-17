@@ -1,6 +1,7 @@
 import { audio, buzz } from '../audio/audio';
 import { Emitter } from '../emitter';
 import { hrBeat, hrFresh, live } from '../ble/telemetry';
+import { calendar, localDate } from '../intervals/calendar';
 import { isNative, onNativeRestSync, workoutService } from '../native/service';
 import { getMeta, getSamples, putMeta } from '../store/db';
 import { getSettings } from '../store/settings';
@@ -90,12 +91,14 @@ class ActiveWorkout {
     return this.booting;
   }
 
-  async start(o: { name: string; routineId: string | null; eventId: number | null; exs: SessionEx[] }): Promise<LiftSession> {
+  async start(o: { name: string; routineId: string | null; eventId: number | null; planSlot?: string | null; exs: SessionEx[] }): Promise<LiftSession> {
     await this.init();
     const existing = this.session;
     if (existing) return existing;
     const s: LiftSession = {
-      id: uid(), name: o.name, routineId: o.routineId, eventId: o.eventId, startMs: Date.now(), endMs: null,
+      id: uid(), name: o.name, routineId: o.routineId, eventId: o.eventId,
+      ...(o.planSlot ? { planSlot: o.planSlot } : {}),
+      startMs: Date.now(), endMs: null,
       status: 'active', started: false, exs: o.exs, rpe: null, bwKg: getSettings().weightKg,
     };
     lifts.saveSession(s, true);
@@ -138,7 +141,7 @@ class ActiveWorkout {
       if (tok !== this.runToken || this.session?.id !== s.id || !s.started) return;
     }
     if (!rec) {
-      rec = new Recorder(s.id, 'strength', 'strength', s.name, s.eventId, hrMax);
+      rec = new Recorder(s.id, 'strength', 'strength', s.name, s.eventId, hrMax, undefined, s.planSlot ?? null);
       rec.meta.startEpochMs = s.startMs;
       void putMeta(rec.meta);
     }
@@ -283,12 +286,14 @@ class ActiveWorkout {
     rec?.tick(el, 0, s.endMs);
     const meta = rec ? rec.finalize() : ((await getMeta(s.id)) as WorkoutMeta);
     meta.name = s.name;
+    meta.planSlot = s.planSlot ?? null;
     meta.status = 'saved';
     meta.upload = 'pending';
     meta.rpe = null;
     meta.patched = false;
     await putMeta(meta);
     lifts.saveSession(s, true);
+    if (s.planSlot) calendar.markSlotDoneEarly(s.planSlot, null, localDate(new Date(s.startMs)));
     this.teardown();
     const sync = syncWorkout(meta);
     return { session: s, meta, sync };

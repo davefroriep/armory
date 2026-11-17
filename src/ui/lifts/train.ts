@@ -5,12 +5,14 @@ import { buildExercise, isSessionStarted } from '../../lifts/logic';
 import { matchRoutineByTitle } from '../../lifts/seed';
 import { lifts } from '../../lifts/store';
 import type { Routine, RoutineItem } from '../../lifts/types';
-import { ICON, esc } from '../dom';
-import { revFooter, wireCalendar, wireChips } from '../chrome';
+import { settingsChanged } from '../../store/settings';
+import { esc } from '../dom';
+import { equipmentProgramCard, revFooter, wireCalendar, wireChips } from '../chrome';
+import { openStepSheet } from '../program';
 import { LI, actionSheet, clock, confirmSheet, mount, relDay, tabBar, toast, wireClock } from './kit';
 
 /** Start a routine (or an empty workout) and open the session screen. */
-export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null; replace?: boolean }): Promise<void> {
+export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null; planSlot?: string | null; replace?: boolean }): Promise<void> {
   if (lifts.active) {
     if (!isSessionStarted(lifts.active)) {
       const same = o.routine
@@ -38,7 +40,7 @@ export async function startWorkout(o: { name: string; routine?: Routine; items?:
       : [],
   );
   if (exs.length) delete exs[exs.length - 1].ss;
-  await active.start({ name: o.name, routineId: o.routine?.id ?? null, eventId: o.eventId ?? null, exs });
+  await active.start({ name: o.name, routineId: o.routine?.id ?? null, eventId: o.eventId ?? null, planSlot: o.planSlot ?? null, exs });
   if (o.replace) location.replace('#/strength/session');
   else location.hash = '#/strength/session';
 }
@@ -58,6 +60,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
   return mount(() => {
     let dead = false;
     let autoStarted = false;
+    let templatesOpen = false;
 
     const paint = (): void => {
       if (dead) return;
@@ -70,19 +73,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         ? `<a class="card resume" href="#/strength/session"><i class="rec-dot"></i><span><b>${esc(running.name)}</b><small>Workout in progress · <span data-clock>${clock(active.elapsedSec())}</span></small></span><em>Resume ›</em></a>`
         : '';
 
-      const plannedHtml = calendar.status === 'nokey'
-        ? ''
-        : `<section class="card cal"><div class="card-h"><span>TODAY · INTERVALS.ICU</span><button class="link" data-refresh>Refresh</button></div>
-          ${planned.length
-            ? planned.map((it) => {
-                const r = matchRoutineByTitle(it.ev.name ?? '', routines);
-                const mins = it.ev.moving_time ? Math.round(it.ev.moving_time / 60) : 0;
-                return `<div class="cal-item${evParam === it.ev.id ? ' hot' : ''}" data-plan-card="${it.ev.id}"><span class="cal-ico strength">${ICON.strength}</span>
-                  <span class="cal-txt"><b>${esc(it.ev.name ?? 'Strength')}</b><small>${r ? `Your “${esc(r.name)}” day` : 'No matching day yet'}${mins ? ` · ${mins} min` : ''}</small></span>
-                  <button class="btn sm primary" data-plan="${it.ev.id}">Start</button><button class="cal-more" type="button" data-cal-menu="${it.ev.id}" aria-label="Workout options">⋯</button></div>`;
-              }).join('')
-            : `<div class="cal-empty">${calendar.status === 'loading' ? 'Loading today’s plan…' : 'Nothing strength-related planned today'}</div>`}
-          ${calendar.status === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : ''}</section>`;
+      const plannedHtml = running ? '' : equipmentProgramCard('strength', planned, 'strength');
 
       const days = routines.length
         ? routines.map((r) => {
@@ -93,12 +84,12 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
               <div class="rc-ex">${esc(names.slice(0, 4).join(' · '))}${names.length > 4 ? ` · +${names.length - 4}` : ''}</div>
               <div class="rc-f"><small>${r.items.length} exercises${ld ? ` · last ${relDay(ld).toLowerCase()}` : ''}</small><button class="btn sm primary" data-act="start">Start</button></div></section>`;
           }).join('')
-        : `<div class="card empty-card"><b>No days yet</b><p>A day is a repeating workout, like “Upper 1”. Build one, or run a workout and save it as a day when you finish.</p></div>`;
+        : `<div class="empty">No templates yet — add one or finish a custom workout and save it as a day.</div>`;
 
       root.innerHTML = `<header class="bar"><a class="icon-btn" href="#/" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a><h1>Strength</h1>
           <div class="chips"><button class="chip" data-chip="hr"></button><a class="icon-btn" href="#/strength/settings" aria-label="Lift settings">${LI.gear}</a></div></header>
         <main class="page has-tabs">
-          ${resume}${running ? '' : plannedHtml}
+          ${resume}${plannedHtml}
           <button class="custom-wk" type="button" data-act="custom">
             <span class="cw-ico">${LI.plus}</span>
             <span class="cw-txt">
@@ -107,11 +98,17 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
             </span>
             <em class="cw-cta">${running && !running.routineId ? 'Open ›' : 'Start ›'}</em>
           </button>
-          <div class="sec-row"><h2 class="sec">MY DAYS</h2><a class="link" href="#/strength/routine/new">+ New day</a></div>
-          ${days}
+          <details class="hid tpl-drawer" id="tplDrawer"${templatesOpen ? ' open' : ''}>
+            <summary>DAY TEMPLATES · ${routines.length}</summary>
+            <div class="tpl-head"><span class="hint">Reusable lifting templates</span><a class="link" href="#/strength/routine/new">+ New day</a></div>
+            <div class="tpl-list">${days}</div>
+          </details>
           <a class="hr-only" href="#/strength/hr">Heart-rate only session <small>(lift in another app)</small> ›</a>
           ${revFooter()}
         </main>${tabBar('train')}`;
+      if (evParam != null) {
+        root.querySelector<HTMLElement>(`[data-plan-card="${evParam}"]`)?.classList.add('hot');
+      }
     };
     paint();
 
@@ -132,10 +129,17 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
     const offCal = wireCalendar(root, paint);
     const offChips = wireChips(root);
     const offStore = lifts.changed.on(paint);
+    const offSet = settingsChanged.on(paint);
     const offClock = wireClock(root);
 
     root.addEventListener('click', async (e) => {
       const t = e.target as HTMLElement;
+      if (t.closest('#tplDrawer > summary')) {
+        setTimeout(() => { templatesOpen = !!root.querySelector<HTMLDetailsElement>('#tplDrawer')?.open; }, 0);
+        return;
+      }
+      const peek = t.closest<HTMLElement>('[data-step-peek]');
+      if (peek) return void (await openStepSheet(Number(peek.dataset.stepPeek)));
       if (t.closest('[data-act="custom"]')) {
         if (!lifts.active) return void (await startWorkout({ name: 'Custom Workout' }));
         if (!lifts.active.routineId) { location.hash = '#/strength/session'; return; }
@@ -197,6 +201,6 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
       await startWorkout({ name: r.name, routine: r });
     });
 
-    return () => { dead = true; offCal(); offChips(); offStore(); offClock(); };
+    return () => { dead = true; offCal(); offChips(); offStore(); offSet(); offClock(); };
   });
 }

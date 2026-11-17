@@ -5,7 +5,8 @@ import { PROGRAMS, fmtDur, fmtRpm, resolveProgram, targetWatts, totalSeconds, wo
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import { ICON, esc } from './dom';
-import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
+import { equipmentProgramCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
+import { openStepSheet } from './program';
 
 function programCard(raw: Program, today: boolean, ftp: number, gated: boolean): string {
   const p = resolveProgram(raw, ftp);
@@ -62,7 +63,7 @@ export function airbikeScreen(root: HTMLElement): () => void {
       : '';
     root.innerHTML = `${topbar({ back: '#/', title: 'AirBike', bike: true, cog: true })}
       <main class="page">
-        ${calendarCard(todays, false)}
+        ${equipmentProgramCard('airbike', todays)}
         <div class="sec-row"><h2 class="sec">PROGRAMS</h2><button class="btn sm ${editing ? 'primary' : ''}" id="reorder">${editing ? 'Done' : 'Reorder'}</button></div>
         <div class="progs">${list}</div>
         ${editing ? '' : `<a class="free" href="#/airbike/p/free"><span>${ICON.airbike}</span><b>Free Ride</b><small>Just ride &amp; record</small><i>›</i></a>`}
@@ -74,6 +75,8 @@ export function airbikeScreen(root: HTMLElement): () => void {
 
   const click = (e: Event) => {
     const t = e.target as HTMLElement;
+    const peek = t.closest<HTMLElement>('[data-step-peek]');
+    if (peek) { void openStepSheet(Number(peek.dataset.stepPeek)); return; }
     if (t.closest('#reorder')) {
       editing = !editing;
       paint();
@@ -132,15 +135,21 @@ export function stubScreen(eq: Exclude<Equipment, 'airbike' | 'strength'>) {
     const paint = () => {
       root.innerHTML = `${topbar({ back: '#/', title: EQUIPMENT_LABEL[eq], cog: true })}
         <main class="page">
-          ${calendarCard(calendar.forEquipment(eq), false)}
+          ${equipmentProgramCard(eq, calendar.forEquipment(eq))}
           <section class="card soon"><span class="soon-ico ${eq}">${ICON[eq]}</span><h3>${n.head}</h3><p>${n.body}</p>
 </section>
           ${revFooter()}
         </main>`;
     };
     paint();
+    const click = (e: Event) => {
+      const peek = (e.target as HTMLElement).closest<HTMLElement>('[data-step-peek]');
+      if (peek) void openStepSheet(Number(peek.dataset.stepPeek));
+    };
+    root.addEventListener('click', click);
     const cleanup = wireChips(root);
     const offCal = wireCalendar(root, paint);
-    return () => { cleanup(); offCal(); };
+    const offSet = settingsChanged.on(paint);
+    return () => { root.removeEventListener('click', click); cleanup(); offCal(); offSet(); };
   };
 }

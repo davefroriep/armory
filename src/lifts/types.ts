@@ -72,6 +72,8 @@ export interface LiftSession {
   routineId: string | null;
   /** Intervals.icu planned-workout id this session fulfils. */
   eventId: number | null;
+  /** Out-of-order / cherry-picked rolling plan slot (`"${stepIndex}:${slotIndex}"`). */
+  planSlot?: string | null;
   startMs: number;
   endMs: number | null;
   status: 'active' | 'done';
