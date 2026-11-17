@@ -32,9 +32,9 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so f
 - **Known A/V Pain Points & Architecture Notes (No Extractor Wanted):**
   - **4K HDR + CEC power bottleneck:** Routing Fire TV Cube → Denon AVR-3313CI → Hisense drops 4K/60 HDR and causes flaky HDMI-CEC TV turn-on. (Fire TV Cube built-in **IR blaster** for Hisense + Denon can bypass CEC power/volume flakiness.)
   - **TV → Denon back-feed options without an audio extractor:**
-    - *Optical (TOSLINK — if present on your Hisense model, to confirm):* Clean 5.1/PCM audio from both Cube and OptiPlex to the Denon with zero CEC/ARC conflicts.
+    - **Screen-on usage confirmed:** Dave always leaves the **Hisense TV ON** when streaming music, so TV → Denon audio pass-through requires **no** screen-off workaround.
+    - *Optical (TOSLINK — if present on your Hisense model, to confirm):* Clean 5.1/PCM audio from both Cube and OptiPlex to the Denon with zero CEC/ARC conflicts and doesn't consume an HDMI port (critical if the Hisense only has 2 HDMI inputs).
     - *HDMI ARC (`Hisense ARC` ↔ Denon `Monitor 1 ARC`):* Single cable if Hisense has 3+ HDMI ports, though HDMI 1.4a ARC/CEC handshakes can conflict.
-    - *Key Tradeoff:* Both Optical and ARC normally require the **Hisense TV powered ON** to pass audio (unless TV supports screen-off audio-only); **Cube → AVR → TV** allows playing music with the TV powered OFF.
   - **Fire TV Cube streaming flakiness:** Voice track-skip errors ("nothing playing"), launching wrong song/Amazon Music, splash-screen hangs, and Music app crashes after ~3 songs.
 - **Cardio & Lift BLE Sensors (Active Today / In-Flight):**
   - **Polar H10** chest strap (`0x180D` / `0x2A37`, supports 2 simultaneous BLE connections when dual-BLE is enabled in Polar Beat).
@@ -58,7 +58,7 @@ Goal for a future secondary display (no code changes yet): glanceable real-time 
 
 ## 4. Open Questions / To Verify Next
 
-- [ ] Confirm whether music on the Cube is often played with the **Hisense TV powered OFF** (determines whether TV → Denon Optical/ARC is viable vs. keeping Cube → AVR or adding screen-off audio handling).
+- [x] *Music playback TV state:* Confirmed **Hisense TV is always ON** when streaming music.
 - [ ] Confirm exact **Hisense TV model**, total **HDMI input count** (`ARC` label), and whether it has a **`DIGITAL AUDIO OUT (Optical / TOSLINK)`** port.
 - [ ] Confirm exact Denon **5-channel stereo** mode and whether **HDMI Monitor Out 2** is free or wired.
 - [ ] Check video inputs on the **19" monitor** (HDMI vs. VGA/DVI/DisplayPort) and approximate rack/bench viewing distance.
