@@ -9,6 +9,7 @@ import {
   jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
 import { parseVoiceTranscript } from '../src/lifts/voiceParser';
+import { prescriptionFor } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
 import { buildWallboardSnapshot } from '../src/wallboard/snapshot';
 import type { Exercise, LiftSession, LiftSet, SessionEx } from '../src/lifts/types';
@@ -172,9 +173,15 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('armory finish workout')).toEqual({ kind: 'finish_workout' });
     expect(parseVoiceTranscript('armory undo')).toEqual({ kind: 'undo' });
 
-    // Two-beat wake flow
+    // Two-beat wake flow & natural dumbbell/same shortcuts
     expect(parseVoiceTranscript('Armory')).toEqual({ kind: 'arm_wake' });
     expect(parseVoiceTranscript('one thirty five for twelve', { armed: true })).toEqual({ kind: 'log_current', weight: 135, reps: 12 });
+    expect(parseVoiceTranscript('armory same')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('armory repeat')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('armory 50s for 10')).toEqual({ kind: 'log_current', weight: 50, reps: 10 });
+    expect(parseVoiceTranscript('armory fifties for ten')).toEqual({ kind: 'log_current', weight: 50, reps: 10 });
+    expect(parseVoiceTranscript('armory thirty fives for twelve')).toEqual({ kind: 'log_current', weight: 35, reps: 12 });
+    expect(parseVoiceTranscript('armory 45s')).toEqual({ kind: 'log_current', seconds: 45 });
   });
 });
 
@@ -330,5 +337,140 @@ describe('wallboard snapshot & routing', () => {
     const landscapeFs = computeTvPreviewFit(915, 412, true);
     expect(landscapeFs.rotated).toBe(false);
     expect(landscapeFs.scale).toBeCloseTo((412 - 48) / 900, 5);
+  });
+
+  it('provides week-aware RPE/rep prescriptions and builds single vs superset cockpit stages', () => {
+    expect(prescriptionFor(exOf('seated-dumbbell-shoulder-press'), 1).rpeTarget).toBe('RPE 7 (3 RIR)');
+    expect(prescriptionFor(exOf('seated-dumbbell-shoulder-press'), 2)).toMatchObject({
+      repTarget: '8–10 reps',
+      rpeTarget: 'RPE 7.5 (2–3 RIR)',
+      cue: 'Smooth press · match right triceps',
+    });
+    expect(prescriptionFor(exOf('triceps-isometric-hold'), 3).rpeTarget).toBe('RPE 5 (primer)');
+    expect(prescriptionFor(exOf('cable-triceps-pushdown'), 4).cue).toContain('1:1:1');
+    expect(prescriptionFor(exOf('low-bar-squat'), 4)).toMatchObject({
+      repTarget: '6–8 reps',
+      rpeTarget: 'RPE 8 (2 RIR)',
+    });
+    expect(prescriptionFor(exOf('dumbbell-curl'), 2)).toMatchObject({
+      repTarget: '10–12 reps',
+      rpeTarget: 'RPE 8 (1–2 RIR)',
+    });
+
+    const now = 3_000_000;
+    const settings = {
+      hrMax: 180,
+      recoveryHrPct: 72,
+      voiceEnabled: true,
+      voiceWakeWord: 'armory',
+      queue: defaultQueueState(),
+    };
+
+    // 1. Straight-set single stage (Triceps Iso Primer) with On-Deck superset pair 2A + 2B
+    const singleExs = mkUpper1();
+    const singleSession: LiftSession = {
+      id: 's_single',
+      name: 'Upper 1',
+      routineId: null,
+      eventId: null,
+      startMs: 1_000_000,
+      endMs: null,
+      status: 'active',
+      started: false,
+      exs: singleExs,
+      rpe: null,
+      bwKg: 88.5,
+    };
+    const singleSnap = buildWallboardSnapshot({
+      now,
+      settings,
+      unit: 'lb',
+      hr: { bpm: 92, fresh: true, recentPoints: [{ at: now, hr: 92 }] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: singleSession,
+      elapsedSec: 0,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      noteOf: () => '',
+      prevOf: () => null,
+    });
+    const stSingle = singleSnap.lift!.stage!;
+    expect(stSingle.kind).toBe('single');
+    expect(stSingle.stations).toHaveLength(1);
+    expect(stSingle.stations[0].label).toBe('1');
+    expect(stSingle.stations[0].voiceHint!.chips[0].say).toBe('"Armory start hold"');
+    expect(stSingle.onDeck!.isSuperset).toBe(true);
+    expect(stSingle.onDeck!.label).toBe('2A + 2B');
+
+    // 2. Superset shared workspace (2A + 2B) with auto pre-fill suggestions
+    const ssExs = mkUpper1();
+    ssExs[0].sets.forEach((s) => { s.done = true; });
+    ssExs[1].sets.forEach((s) => { s.wAuto = true; s.rAuto = true; });
+    ssExs[2].sets.forEach((s) => { s.wAuto = true; s.rAuto = true; });
+    const ssSession: LiftSession = { ...singleSession, id: 's_ss', started: true, exs: ssExs };
+    const ssSnap = buildWallboardSnapshot({
+      now,
+      settings,
+      unit: 'lb',
+      hr: { bpm: 120, fresh: true, recentPoints: [{ at: now, hr: 120 }] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: ssSession,
+      elapsedSec: 240,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      noteOf: () => '',
+      prevOf: () => null,
+    });
+    const stSs = ssSnap.lift!.stage!;
+    expect(stSs.kind).toBe('superset');
+    expect(stSs.stations).toHaveLength(2);
+    expect(stSs.stations[0].isActive).toBe(true);
+    expect(stSs.stations[0].voiceHint!.chips[0].say).toBe('"Armory done"');
+    expect(stSs.stations[0].sets[0].state).toBe('active');
+    expect(stSs.stations[0].sets[0].isGhost).toBe(true);
+    expect(stSs.stations[1].isActive).toBe(false);
+    expect(stSs.stations[1].voiceHint).toBeNull();
+    expect(stSs.stations[1].sets[0].state).toBe('queued');
+    expect(stSs.stations[1].sets[0].isGhost).toBe(true);
+
+    // 3. Blank un-prefilled weighted exercise never suggests "done"
+    const blankExs: SessionEx[] = [
+      { uid: 'b_ohp', exId: 'seated-dumbbell-shoulder-press', sets: [mkSet(null, null), mkSet(null, null)] },
+    ];
+    const blankSession: LiftSession = { ...singleSession, id: 's_blank', exs: blankExs };
+    const blankSnap = buildWallboardSnapshot({
+      now,
+      settings,
+      unit: 'lb',
+      hr: { bpm: 112, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: blankSession,
+      elapsedSec: 30,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      noteOf: () => '',
+      prevOf: () => null,
+    });
+    const blankStation = blankSnap.lift!.stage!.stations[0];
+    expect(blankStation.sets[0].weightVal).toBe('');
+    expect(blankStation.sets[0].repsVal).toBe('');
+    expect(blankStation.sets[0].isGhost).toBe(false);
+    expect(blankStation.voiceHint!.chips.map((c) => c.say)).toEqual([
+      '"Armory 50 for 10"',
+      '"Armory 50 for 10 RPE 8"',
+    ]);
+    expect(blankStation.voiceHint!.chips.some((c) => /done/i.test(c.say))).toBe(false);
   });
 });

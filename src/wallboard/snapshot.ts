@@ -1,13 +1,14 @@
 import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN, type LocalTodayItem } from '../domain/plan';
 import { sessionStats } from '../lifts/calc';
-import { peekNextTargetSet, resolveTargetSet, type CursorRef } from '../lifts/cursor';
-import { labels, prevSetFor, supersetGroups } from '../lifts/logic';
+import { peekNextTargetSet, resolveTargetSet, type CursorRef, type SetPointer } from '../lifts/cursor';
+import { canLog, labels, prevSetFor, supersetGroups } from '../lifts/logic';
 import { MUSCLE_LABEL } from '../lifts/muscles';
+import { prescriptionFor, type CoachPrescription } from '../lifts/prescriptions';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { fmtKg } from '../lifts/settings';
 import { fmtVolume, setText } from '../lifts/summary';
-import type { Exercise, LiftSession, Routine, SessionEx } from '../lifts/types';
+import type { Exercise, LiftSession, LiftSet, Routine, SessionEx } from '../lifts/types';
 import { EQUIPMENT_LABEL } from '../types';
 import { hrDropStats, hrZone } from '../ui/hr';
 import type { Settings } from '../store/settings';
@@ -63,6 +64,62 @@ export interface WallboardLiftExerciseSummary {
   ssGroup: number | null;
 }
 
+export interface WallboardSetSlot {
+  label: string;
+  state: 'done' | 'active' | 'queued';
+  kind: 'n' | 'w' | 'd' | 'f';
+  exType: 'weight' | 'bodyweight' | 'time';
+  weightVal: string;
+  weightPlaceholder: string;
+  repsVal: string;
+  repsPlaceholder: string;
+  isGhost: boolean;
+  rpeText: string;
+  hasPrev: boolean;
+  prevText: string;
+}
+
+export interface WallboardVoiceHint {
+  micState: 'armed' | 'ready' | 'standby' | 'off';
+  headline: string;
+  chips: { tag: string; say: string; primary?: boolean }[];
+}
+
+export interface WallboardStationCard {
+  label: string;
+  exName: string;
+  muscles: string;
+  exType: 'weight' | 'bodyweight' | 'time';
+  isActive: boolean;
+  repTarget: string;
+  rpeTarget: string;
+  cue: string;
+  note: string;
+  lastBenchmark: string;
+  sets: WallboardSetSlot[];
+  voiceHint: WallboardVoiceHint | null;
+}
+
+export interface WallboardOnDeckBlock {
+  label: string;
+  isSuperset: boolean;
+  items: {
+    label: string;
+    exName: string;
+    sets: number;
+    repTarget: string;
+    rpeTarget: string;
+    lastText: string;
+  }[];
+}
+
+export interface WallboardLiftStage {
+  kind: 'single' | 'superset';
+  kicker: string;
+  stations: WallboardStationCard[];
+  onDeck: WallboardOnDeckBlock | null;
+}
+
 export interface WallboardState {
   ts: number;
   mode: 'lift' | 'cardio' | 'standby';
@@ -107,6 +164,7 @@ export interface WallboardState {
       totalSets: number;
       targetText: string;
     } | null;
+    stage: WallboardLiftStage | null;
     exercises: WallboardLiftExerciseSummary[];
   };
   cardio?: WallboardCardioSnapshot;
@@ -149,6 +207,246 @@ function formatWeightReps(wKg: number | null, r: number | null, type: Exercise['
     weightText: wKg != null ? `${fmtKg(wKg)} ${u}` : '—',
     repsText: r != null ? `${r} reps` : '—',
   };
+}
+
+function formatPrevBenchmark(prevSe: SessionEx | null, se: SessionEx, ex: Exercise, refIdx: number, u: 'lb' | 'kg'): string {
+  if (!prevSe) return '';
+  const ref = prevSetFor(prevSe, se, refIdx)
+    ?? [...prevSe.sets].reverse().find((x) => x.done && x.kind !== 'w')
+    ?? [...prevSe.sets].reverse().find((x) => x.done);
+  if (!ref) return '';
+  const txt = setText(ref, ex, u);
+  return ex.type === 'weight' ? `${txt} ${u}` : txt;
+}
+
+function formatSetSlot(
+  x: LiftSet,
+  label: string,
+  state: WallboardSetSlot['state'],
+  ex: Exercise,
+  rx: CoachPrescription,
+  prev: LiftSet | null,
+  u: 'lb' | 'kg',
+): WallboardSetSlot {
+  let weightVal = '';
+  let weightPlaceholder = `___ ${u}`;
+  let repsVal = '';
+  let repsPlaceholder = '___ reps';
+
+  if (ex.type === 'time') {
+    weightVal = x.w && x.w > 0 ? `${fmtKg(x.w)} ${u}` : (x.done ? 'HOLD' : '');
+    weightPlaceholder = 'HOLD';
+    repsVal = x.r != null ? `${x.r}s` : '';
+    repsPlaceholder = `${rx.sampleRep}s`;
+  } else if (ex.type === 'bodyweight') {
+    weightVal = x.w && x.w > 0 ? `+${fmtKg(x.w)} ${u}` : 'BW';
+    weightPlaceholder = 'BW';
+    repsVal = x.r != null ? `${x.r} reps` : '';
+  } else {
+    weightVal = x.w != null ? `${fmtKg(x.w)} ${u}` : '';
+    repsVal = x.r != null ? `${x.r} reps` : '';
+  }
+
+  return {
+    label,
+    state,
+    kind: x.kind,
+    exType: ex.type,
+    weightVal,
+    weightPlaceholder,
+    repsVal,
+    repsPlaceholder,
+    isGhost: !x.done && !!(x.wAuto || x.rAuto),
+    rpeText: x.rpe != null ? `@${x.rpe}` : '',
+    hasPrev: !!prev,
+    prevText: prev ? setText(prev, ex, u) : '',
+  };
+}
+
+function buildVoiceHint(
+  ex: Exercise,
+  activeSet: LiftSet,
+  curPtr: SetPointer,
+  rx: CoachPrescription,
+  st: Pick<Settings, 'voiceEnabled' | 'voiceWakeWord'>,
+  voice: { listening: boolean; armed: boolean },
+  u: 'lb' | 'kg',
+): WallboardVoiceHint {
+  const wakeRaw = (st.voiceWakeWord || 'armory').trim() || 'armory';
+  const wakeDisp = wakeRaw.charAt(0).toUpperCase() + wakeRaw.slice(1);
+  const prefix = voice.armed ? '' : `${wakeDisp} `;
+  const micState: WallboardVoiceHint['micState'] = voice.armed
+    ? 'armed'
+    : voice.listening
+      ? 'ready'
+      : st.voiceEnabled
+        ? 'standby'
+        : 'off';
+
+  const readyToConfirm = canLog(activeSet, ex);
+  const headline = micState === 'armed'
+    ? 'LISTENING NOW — SPEAK WITHOUT WAKE WORD'
+    : micState === 'ready'
+      ? (readyToConfirm ? `MIC LIVE · CONFIRM OR UPDATE SET ${curPtr.setNumber}` : `MIC LIVE · SPEAK WEIGHT & REPS FOR SET ${curPtr.setNumber}`)
+      : micState === 'standby'
+        ? `VOICE READY ON WORKOUT SCREEN · SET ${curPtr.setNumber}`
+        : `TAP MIC ON PIXEL (OR LOG ON PHONE) · SET ${curPtr.setNumber}`;
+
+  if (ex.type === 'time') {
+    return {
+      micState,
+      headline,
+      chips: [
+        { tag: 'Countdown', say: `"${prefix}start hold"`, primary: true },
+        { tag: 'Log hold', say: readyToConfirm ? `"${prefix}done"` : `"${prefix}${rx.sampleRep} seconds"` },
+      ],
+    };
+  }
+  if (ex.type === 'bodyweight') {
+    if (readyToConfirm) {
+      const lbl = activeSet.w && activeSet.w > 0 ? `+${fmtKg(activeSet.w)}×${activeSet.r}` : `BW×${activeSet.r}`;
+      return {
+        micState,
+        headline,
+        chips: [
+          { tag: `Same (${lbl})`, say: `"${prefix}done"`, primary: true },
+          { tag: 'Diff reps', say: `"${prefix}for ${rx.sampleRep}"` },
+          { tag: '+ Weight', say: `"${prefix}25 for 6"` },
+        ],
+      };
+    }
+    return {
+      micState,
+      headline,
+      chips: [
+        { tag: 'Bodyweight', say: `"${prefix}bodyweight for ${rx.sampleRep}"`, primary: true },
+        { tag: '+ Weight', say: `"${prefix}25 for 6"` },
+      ],
+    };
+  }
+
+  const exW = activeSet.w != null
+    ? fmtKg(activeSet.w)
+    : ex.equip === 'db'
+      ? '50'
+      : (ex.equip === 'bb' || ex.equip === 'smith')
+        ? '135'
+        : '70';
+  if (readyToConfirm) {
+    return {
+      micState,
+      headline,
+      chips: [
+        { tag: `Same (${fmtKg(activeSet.w!)}×${activeSet.r})`, say: `"${prefix}done"`, primary: true },
+        { tag: `Keep ${fmtKg(activeSet.w!)} ${u}`, say: `"${prefix}for ${activeSet.r ?? rx.sampleRep}"` },
+        { tag: 'New load × reps', say: `"${prefix}${exW} for ${rx.sampleRep}"` },
+      ],
+    };
+  }
+  return {
+    micState,
+    headline,
+    chips: [
+      { tag: 'Fill & log', say: `"${prefix}${exW} for ${rx.sampleRep}"`, primary: true },
+      { tag: 'With RPE', say: `"${prefix}${exW} for ${rx.sampleRep} RPE 8"` },
+    ],
+  };
+}
+
+function buildLiftStage(
+  s: LiftSession,
+  labs: string[],
+  groups: ReturnType<typeof supersetGroups>,
+  curPtr: SetPointer | null,
+  inp: WallboardBuildInput,
+  planWeek: number,
+  u: 'lb' | 'kg',
+): WallboardLiftStage | null {
+  if (!curPtr) return null;
+  const curGroupIdx = groups.findIndex((g) => curPtr.exIdx >= g.start && curPtr.exIdx <= g.end);
+  if (curGroupIdx < 0) return null;
+  const curGroup = groups[curGroupIdx];
+  const isSupersetStage = curGroup.ssIdx !== null && curGroup.end > curGroup.start;
+
+  const stations: WallboardStationCard[] = [];
+  for (let k = curGroup.start; k <= curGroup.end; k++) {
+    const se = s.exs[k];
+    const ex = inp.exOf(se.exId);
+    const isActive = k === curPtr.exIdx;
+    const rx = prescriptionFor(ex, planWeek);
+    const prevSe = inp.prevOf(se);
+    const firstOpenIdx = se.sets.findIndex((x) => !x.done);
+    const refIdx = isActive ? curPtr.setIdx : Math.max(0, firstOpenIdx);
+    const lastBenchmark = formatPrevBenchmark(prevSe, se, ex, refIdx, u);
+
+    let wc = 0;
+    const sets: WallboardSetSlot[] = se.sets.map((x, idx) => {
+      const setLab = x.kind === 'w' ? 'W' : String(++wc);
+      const state: WallboardSetSlot['state'] = x.done
+        ? 'done'
+        : isActive && idx === curPtr.setIdx
+          ? 'active'
+          : 'queued';
+      const prev = prevSetFor(prevSe, se, idx);
+      return formatSetSlot(x, setLab, state, ex, rx, prev, u);
+    });
+
+    stations.push({
+      label: labs[k] ?? String(k + 1),
+      exName: ex.name,
+      muscles: ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · '),
+      exType: ex.type,
+      isActive,
+      repTarget: rx.repTarget,
+      rpeTarget: rx.rpeTarget,
+      cue: rx.cue,
+      note: inp.noteOf(se.exId),
+      lastBenchmark,
+      sets,
+      voiceHint: isActive ? buildVoiceHint(ex, se.sets[curPtr.setIdx], curPtr, rx, inp.settings, inp.voice, u) : null,
+    });
+  }
+
+  let onDeck: WallboardOnDeckBlock | null = null;
+  for (let off = 1; off < groups.length; off++) {
+    const cand = groups[(curGroupIdx + off) % groups.length];
+    let hasOpen = false;
+    for (let k = cand.start; k <= cand.end; k++) {
+      if (s.exs[k].sets.some((x) => !x.done)) {
+        hasOpen = true;
+        break;
+      }
+    }
+    if (!hasOpen) continue;
+    const items: WallboardOnDeckBlock['items'] = [];
+    for (let k = cand.start; k <= cand.end; k++) {
+      const se = s.exs[k];
+      const ex = inp.exOf(se.exId);
+      const rx = prescriptionFor(ex, planWeek);
+      const prevSe = inp.prevOf(se);
+      const lastText = formatPrevBenchmark(prevSe, se, ex, 0, u);
+      items.push({
+        label: labs[k] ?? String(k + 1),
+        exName: ex.name,
+        sets: se.sets.filter((x) => !x.done).length,
+        repTarget: rx.repTarget,
+        rpeTarget: rx.rpeTarget,
+        lastText,
+      });
+    }
+    onDeck = {
+      label: labs.slice(cand.start, cand.end + 1).join(' + '),
+      isSuperset: cand.ssIdx !== null && cand.end > cand.start,
+      items,
+    };
+    break;
+  }
+
+  const kicker = isSupersetStage
+    ? `SUPERSET · ROUND ${curPtr.setNumber} OF ${curPtr.totalWorkingSets} · ALTERNATE ${stations.map((x) => x.label).join(' ↔ ')}`
+    : `STRAIGHT SETS · EXERCISE ${curPtr.label} · SET ${curPtr.setNumber} OF ${curPtr.totalWorkingSets}`;
+
+  return { kind: isSupersetStage ? 'superset' : 'single', kicker, stations, onDeck };
 }
 
 /** Pure, Node-testable snapshot builder transforming local gym telemetry and workout state into TV wallboard JSON. */
@@ -198,6 +496,8 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     }
     const curPtr = resolveTargetSet(s.exs, inp.voice.cursor);
     const nxtPtr = peekNextTargetSet(s.exs, curPtr);
+    const planWeek = PHASE1_PLAN.steps[st.queue.stepIndex]?.week ?? 2;
+    const stage = buildLiftStage(s, labs, groups, curPtr, inp, planWeek, u);
     const stats = sessionStats(s, inp.exOf);
     const setsTotal = s.exs.reduce((n, se) => n + se.sets.length, 0);
     const setsDone = s.exs.reduce((n, se) => n + se.sets.filter((x) => x.done).length, 0);
@@ -292,6 +592,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
         hold: activeHold,
         current,
         next,
+        stage,
         exercises,
       },
     };

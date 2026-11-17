@@ -24,6 +24,10 @@ const ONES: Record<string, number> = {
 const TENS: Record<string, number> = {
   twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70, eighty: 80, ninety: 90,
 };
+const PLURAL_TENS: Record<string, number> = {
+  twenties: 20, thirties: 30, forties: 40, fifties: 50, sixties: 60, seventies: 70, eighties: 80, nineties: 90,
+};
+const DB_WEIGHT_CONNECTORS = new Set(['for', 'four', 'by', 'x', 'times', 'at', 'lb', 'lbs', 'pound', 'pounds', 'kg', 'kgs', 'kilo', 'kilos']);
 
 function parseSpokenNumberTokens(toks: string[], start: number): { value: number; end: number } | null {
   const t0 = toks[start];
@@ -67,16 +71,27 @@ function parseSpokenNumberTokens(toks: string[], start: number): { value: number
     }
   }
 
-  // "twenty five" -> 25
+  // "twenty five" -> 25, "thirty fives" -> 35
   if (TENS[t0] != null) {
     let val = TENS[t0];
     let idx = start + 1;
     const t1 = toks[idx];
-    if (t1 && ONES[t1] != null && ONES[t1] >= 1 && ONES[t1] <= 9) {
+    if (t1 === 'fives') {
+      val += 5;
+      idx++;
+    } else if (t1 && ONES[t1] != null && ONES[t1] >= 1 && ONES[t1] <= 9) {
       val += ONES[t1];
       idx++;
     }
     return { value: val, end: idx };
+  }
+
+  if (PLURAL_TENS[t0] != null) {
+    return { value: PLURAL_TENS[t0], end: start + 1 };
+  }
+
+  if ((t0 === 'fives' || t0 === 'tens' || t0 === 'fifteens') && toks[start + 1] && DB_WEIGHT_CONNECTORS.has(toks[start + 1])) {
+    return { value: t0 === 'fives' ? 5 : t0 === 'tens' ? 10 : 15, end: start + 1 };
   }
 
   if (ONES[t0] != null && t0 !== 'oh' && t0 !== 'o') {
@@ -102,6 +117,12 @@ export function normalizeVoiceText(raw: string): string {
     const t = toks[i];
     if (/^\d+(?:\.\d+)?$/.test(t)) {
       out.push(t);
+      i++;
+      continue;
+    }
+    const dbPluralM = t.match(/^(\d+(?:\.\d+)?)s$/);
+    if (dbPluralM && toks[i + 1] && DB_WEIGHT_CONNECTORS.has(toks[i + 1])) {
+      out.push(dbPluralM[1]);
       i++;
       continue;
     }
@@ -155,7 +176,7 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
   if (!tail) return { kind: 'arm_wake' };
 
   if (/^(?:undo|uncheck|undo\s+last|cancel(?:\s+last)?)$/.test(tail)) return { kind: 'undo' };
-  if (/^(?:check|log|done|log\s+set|check\s+set|mark\s+done|complete(?:\s+set)?|yep|got\s+it)$/.test(tail)) {
+  if (/^(?:check|log|done|same|same\s+reps|same\s+weight|repeat|log\s+set|check\s+set|mark\s+done|complete(?:\s+set)?|yep|got\s+it)$/.test(tail)) {
     return { kind: 'log_current' };
   }
 

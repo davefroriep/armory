@@ -9,6 +9,8 @@ import {
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
+import { prescriptionFor } from '../../lifts/prescriptions';
+import { PHASE1_PLAN } from '../../domain/plan';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { resyncSession } from '../../lifts/intervals';
@@ -158,10 +160,12 @@ function build(root: HTMLElement, id?: string): () => void {
     const autoOn = active.restAutoFor(s, idx);
     const ls = liftSettings();
     const showTimerGroup = !edit && (ls.showTimer || ls.showAutoTimer);
+    const curWeek = PHASE1_PLAN.steps[getSettings().queue.stepIndex]?.week ?? 2;
+    const rx = prescriptionFor(ex, curWeek);
     return `<section class="xcard" data-idx="${idx}" data-uid="${se.uid}">
       <div class="xhead">
         <span class="xlab">${labs[idx]}</span>
-        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · ')}</small></button>
+        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${esc(rx.repTarget)} · ${esc(rx.rpeTarget)} · ${ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · ')}</small></button>
         <button class="xmore" data-act="exmenu" aria-label="Exercise options">⋯</button>
       </div>
       ${note ? `<button class="xnote" data-act="exnote">${esc(note)}</button>` : ''}
