@@ -291,4 +291,16 @@ describe('rolling queue auto-stager', () => {
     const emptySun = buildWeekGlimpse({ today, proj: restProj, loggedByDate: new Map() });
     expect(emptySun[0].kind).toBe('rest');
   });
+
+  it('anchors buildWeekGlimpse to another week when swiping future or past days', () => {
+    const today = '2026-11-17'; // Tue
+    const proj = projectPlan(PHASE1_PLAN, { ...defaultQueueState(), stepIndex: 1, stagedDate: today }, today, 0);
+    const cells = buildWeekGlimpse({ today, anchorYmd: '2026-11-25', proj, loggedByDate: new Map() });
+    expect(cells.map((c) => c.ymd)).toEqual([
+      '2026-11-22', '2026-11-23', '2026-11-24', '2026-11-25', '2026-11-26', '2026-11-27', '2026-11-28',
+    ]);
+    expect(cells.every((c) => !c.isToday && !c.isPast)).toBe(true);
+    expect(cells[0].kind).toBe('rest'); // Sunday rest day
+    expect(cells.some((c) => c.kind === 'upcoming')).toBe(true);
+  });
 });

@@ -586,12 +586,13 @@ export interface WeekDayCell {
 /** Builds a Sunday–Saturday 7-day strip mixing actual logged sessions with rolling-plan projections. */
 export function buildWeekGlimpse(args: {
   today: string;
+  anchorYmd?: string;
   proj: ProjectedStep[];
   todayEquipment?: Equipment[];
   loggedByDate: Map<string, { equipment: Equipment; name: string }[]>;
 }): WeekDayCell[] {
-  const { today, proj, todayEquipment = [], loggedByDate } = args;
-  const sun = shiftYmd(today, -dayOfWeek(today));
+  const { today, anchorYmd = today, proj, todayEquipment = [], loggedByDate } = args;
+  const sun = shiftYmd(anchorYmd, -dayOfWeek(anchorYmd));
   const cells: WeekDayCell[] = [];
 
   for (let d = 0; d < 7; d++) {

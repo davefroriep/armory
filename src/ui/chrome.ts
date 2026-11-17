@@ -11,6 +11,7 @@ import { lifts } from '../lifts/store';
 import { REV, REV_STAMP } from '../rev';
 import { getSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
+import type { TodayCompletedItem } from './dayZoom';
 import { openHrSheet } from './hrSheet';
 import { actionSheet, toast } from './lifts/kit';
 
@@ -175,13 +176,17 @@ function calItemRow(it: TodayItem, actionMode: 'link' | 'strength' = 'link'): st
 }
 
 /** Top Sunday–Saturday week glimpse strip on Home. */
-export function weekStripCard(cells: WeekDayCell[]): string {
+export function weekStripCard(cells: WeekDayCell[], selectedYmd?: string | null): string {
   const cols = cells.map((c) => {
     const dayNum = Number(c.ymd.slice(8));
+    const sel = selectedYmd === c.ymd;
+    const icos = c.equipments.slice(0, 2);
+    const chk = c.kind === 'done' ? '<em class="wk-chk" aria-hidden="true">✓</em>' : '';
     const mid = c.kind === 'rest'
       ? '<span class="wk-rest">REST</span>'
-      : `<span class="wk-icos">${c.equipments.slice(0, 2).map((eq) => `<i class="wk-ico ${eq}">${ICON[eq]}</i>`).join('')}${c.kind === 'done' ? '<em class="wk-chk">✓</em>' : ''}</span>`;
-    return `<button class="wk-d ${c.kind}${c.isToday ? ' today' : ''}" type="button" data-wk-ymd="${c.ymd}" aria-label="${DOW[c.dow]} ${dayNum}">
+      : `<span class="wk-icos${icos.length > 1 ? ' two' : ''}">${icos.map((eq) => `<i class="wk-ico ${eq}">${ICON[eq]}</i>`).join('')}</span>`;
+    return `<button class="wk-d ${c.kind}${c.isToday ? ' today' : ''}${sel ? ' sel' : ''}" type="button" data-wk-ymd="${c.ymd}" aria-pressed="${sel}" aria-label="${DOW[c.dow]} ${dayNum}">
+      ${chk}
       <span class="wk-dow">${DOW[c.dow]}</span>
       <span class="wk-num">${dayNum}</span>
       ${mid}
@@ -191,23 +196,32 @@ export function weekStripCard(cells: WeekDayCell[]): string {
 }
 
 /** Double-wide Program Hero card sitting directly above the 4 equipment bays on Home. */
-export function programHeroCard(items: TodayItem[]): string {
+export function programHeroCard(items: TodayItem[], completedToday: TodayCompletedItem[] = []): string {
   const s = getSettings();
   const st = calendar.status;
   const cur = calendar.currentStep();
   const up = calendar.upcomingStep();
   const wk = cur?.week ?? PHASE1_PLAN.steps[Math.min(s.queue.stepIndex, PHASE1_PLAN.steps.length - 1)]?.week ?? 1;
   const stepNum = Math.min(s.queue.stepIndex + 1, PHASE1_PLAN.steps.length);
-  const pill = `<span class="cal-pill">WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</span>`;
+  const completedRows = completedToday.map((c) => `<button class="cal-item cal-done-btn" type="button" data-today-zoom>
+    <span class="cal-link">
+      <span class="cal-ico done ${c.equipment}">${ICON[c.equipment]}</span>
+      <span class="cal-txt"><b>${esc(c.name)}</b><small>${esc(c.sub)}</small></span>
+    </span>
+    <span class="p-badge ok">✓ Details ›</span>
+  </button>`).join('');
 
   let body = '';
   let foot = '';
-  if (!hasKey() && items.length === 0) {
+  if (!hasKey() && items.length === 0 && completedToday.length === 0) {
     body = `<a class="cal-empty" href="#/settings">Add your Intervals.icu API key to sync your plan →</a>`;
-  } else if (items.length > 0) {
-    body = items.map((it) => calItemRow(it, 'link')).join('');
+  } else if (items.length > 0 || completedToday.length > 0) {
+    body = completedRows + items.map((it) => calItemRow(it, 'link')).join('');
+    if (items.length === 0 && up) {
+      foot = `<div class="cal-foot"><span class="cal-sub">Next: ${esc(up.title)} (${esc(fmtPlanDate(up.date))})</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
+    }
   } else if (up) {
-    body = `<div class="cal-empty"><b>✓ Today complete</b> · Next: ${esc(up.title)}</div>`;
+    body = `<button class="cal-empty cal-done-empty" type="button" data-today-zoom><b>✓ Today complete</b> · Next: ${esc(up.title)}<small>Tap to view today’s details ›</small></button>`;
     foot = `<div class="cal-foot"><span class="cal-sub">Scheduled ${esc(fmtPlanDate(up.date))}</span><button class="link" data-cal-pull>Pull to Today</button></div>`;
   } else if (st === 'loading') {
     body = `<div class="cal-empty">Loading today’s plan…</div>`;
@@ -216,7 +230,7 @@ export function programHeroCard(items: TodayItem[]): string {
   }
   const err = st === 'error' ? `<div class="cal-note">${esc(calendar.error)}</div>` : '';
   return `<section class="card cal prog-hero">
-    <div class="card-h"><span>ARMORY HYBRID · PHASE 1 ${pill}</span><a class="prog-link" href="#/program">Program ›</a></div>
+    <div class="card-h"><span><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</span><a class="prog-link" href="#/program?w=${wk}">Program ›</a></div>
     ${body}${foot}${err}
   </section>`;
 }

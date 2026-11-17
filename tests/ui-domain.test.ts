@@ -5,7 +5,12 @@ import { buildTcx } from '../src/domain/tcx';
 import { intensityColor, profileBar } from '../src/domain/profile';
 import { PROGRAMS, resolveProgram, BASE_FTP } from '../src/domain/programs';
 import { clearHrLog, currentStrapBeats, pushHr, recentHrPoints } from '../src/ble/telemetry';
-import { liftSettings } from '../src/lifts/settings';
+import { PHASE1_PLAN, defaultQueueState, projectPlan } from '../src/domain/plan';
+import { msUntilNextLocalMidnight } from '../src/intervals/calendar';
+import { PHASE1_ROUTINES } from '../src/lifts/seed';
+import { KG_PER_LB, liftSettings } from '../src/lifts/settings';
+import type { LiftSession } from '../src/lifts/types';
+import { groupDayLogs, renderDayZoomCard, todayCompletedItems, type ZoomLookup } from '../src/ui/dayZoom';
 import { hrDropStats } from '../src/ui/hr';
 
 describe('3 s smoothing', () => {
@@ -140,5 +145,97 @@ describe('live HR sheet telemetry helpers', () => {
     expect(s.restAuto).toBe(false);
     expect(s.showTimer).toBe(false);
     expect(s.showAutoTimer).toBe(false);
+  });
+
+  it('computes midnight rollover delay accurately before and after midnight', () => {
+    expect(msUntilNextLocalMidnight(new Date(2026, 10, 17, 23, 59, 50, 0))).toBe(12_000);
+    expect(msUntilNextLocalMidnight(new Date(2026, 10, 17, 0, 0, 5, 0))).toBe(86_397_000);
+  });
+
+  it('renders completed lift sets, upcoming day-zoom actions, and Today omit-shift rules cleanly', () => {
+    const today = '2026-11-17';
+    const w225Kg = 225 * KG_PER_LB;
+    const benchName = 'Barbell Bench Press';
+    const lookup: ZoomLookup = {
+      exOf: (id) => ({
+        id,
+        name: id === 'barbell-bench-press' ? benchName : id,
+        type: 'weight',
+        equip: 'bb',
+        primary: ['ch'],
+        secondary: [],
+      }),
+      rowOf: () => undefined,
+      prevOf: () => null,
+      routines: PHASE1_ROUTINES,
+      prs: new Map(),
+      unit: 'lb',
+    };
+
+    const doneSession: LiftSession = {
+      id: 'sess-1',
+      name: 'Upper 1',
+      routineId: 'day-upper-1',
+      eventId: null,
+      startMs: new Date(2026, 10, 17, 7, 15, 0).getTime(),
+      endMs: new Date(2026, 10, 17, 8, 5, 0).getTime(),
+      status: 'done',
+      exs: [{
+        uid: 'u1',
+        exId: 'barbell-bench-press',
+        sets: [
+          { id: 's1', w: w225Kg, r: 5, done: true, kind: 'n' },
+          { id: 's2', w: w225Kg, r: 5, done: true, kind: 'n' },
+          { id: 's3', w: w225Kg, r: 5, done: true, kind: 'n' },
+        ],
+      }],
+      rpe: 7,
+      bwKg: 82,
+    };
+
+    const grouped = groupDayLogs([doneSession], []);
+    const todayLog = grouped.byDate.get(today);
+    const items = todayCompletedItems(todayLog, lookup);
+    expect(items).toHaveLength(1);
+    expect(items[0].name).toBe('Upper 1');
+    expect(items[0].sub).toContain('3 sets');
+
+    const projDoneToday = projectPlan(PHASE1_PLAN, { ...defaultQueueState(), stepIndex: 2, stagedDate: '2026-11-18' }, today, 0);
+    const doneHtml = renderDayZoomCard({
+      ymd: today,
+      today,
+      proj: projDoneToday,
+      dayLog: todayLog,
+      restDay: 0,
+      lookup,
+    });
+    expect(doneHtml).toContain(benchName);
+    expect(doneHtml).toContain('3×5 @ 225 lb');
+    expect(doneHtml).toContain('✓ Done');
+    expect(doneHtml).toContain('Full workout &amp; edit ›');
+
+    const projActiveToday = projectPlan(PHASE1_PLAN, { ...defaultQueueState(), stepIndex: 1, stagedDate: today }, today, 0);
+    const tomorrowHtml = renderDayZoomCard({
+      ymd: '2026-11-18',
+      today,
+      proj: projActiveToday,
+      restDay: 0,
+      lookup,
+    });
+    expect(tomorrowHtml).toContain('Do this workout now');
+    expect(tomorrowHtml).toContain('Shift schedule to here');
+    expect(tomorrowHtml).toContain('View Program');
+    expect(tomorrowHtml).not.toContain('Move Queue Pointer Here');
+
+    const todayPendingHtml = renderDayZoomCard({
+      ymd: today,
+      today,
+      proj: projActiveToday,
+      restDay: 0,
+      lookup,
+    });
+    expect(todayPendingHtml).toContain('Do this workout now');
+    expect(todayPendingHtml).toContain('View Program');
+    expect(todayPendingHtml).not.toContain('Shift schedule to here');
   });
 });

@@ -1,17 +1,19 @@
 import {
-  PHASE1_PLAN, WEEK_THEMES, dayOfWeek, parseYmd, projectPlan, slotKey,
+  PHASE1_PLAN, WEEK_THEMES, parseYmd, projectPlan, slotKey,
   type ProjectedStep,
 } from '../domain/plan';
 import { addDays, calendar, localDate } from '../intervals/calendar';
-import { labels } from '../lifts/logic';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { liftSettings } from '../lifts/settings';
 import { lifts } from '../lifts/store';
-import { setText } from '../lifts/summary';
 import { allMeta } from '../store/db';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import { revFooter, topbar, wireChips } from './chrome';
+import {
+  localYmdFromMs, renderCompletedCardioSlot, renderCompletedLiftSlot,
+  renderPlannedSlot, resolveDayZoom, type ZoomLookup,
+} from './dayZoom';
 import { ICON, esc } from './dom';
 import { actionSheet, confirmSheet, mount, openSheet, toast } from './lifts/kit';
 import { startWorkout } from './lifts/train';
@@ -57,57 +59,60 @@ function statusPillHtml(p: ProjectedStep, today: string): string {
   return `<span class="p-badge">~${esc(p.date ? fmtShortDate(p.date, today) : 'TBD')}</span>`;
 }
 
+export function currentZoomLookup(): ZoomLookup {
+  return {
+    exOf: lifts.exOrStub,
+    rowOf: (id) => lifts.row(id),
+    prevOf: (id) => lifts.previous(id),
+    routines: lifts.sortedRoutines(),
+    prs: lifts.prs(),
+    unit: liftSettings().unit,
+  };
+}
+
+/** Shifts the rolling queue to `stepIndex` after user confirmation. */
+export async function shiftScheduleToStep(stepIndex: number): Promise<boolean> {
+  const step = PHASE1_PLAN.steps[stepIndex];
+  if (!step) return false;
+  const ok = await confirmSheet(
+    `Shift schedule to Wk ${step.week} · Day ${step.day}?`,
+    'Stages this day on Today in Intervals.icu and projects future weeks forward from here.',
+    'Shift schedule to here',
+  );
+  if (!ok) return false;
+  await calendar.setStep(stepIndex);
+  toast(`Schedule shifted to Wk ${step.week} · Day ${step.day}`);
+  return true;
+}
+
 /** Safe read-only inspection sheet for any step in the 4-week block, with out-of-order controls. */
 export async function openStepSheet(stepIndex: number): Promise<void> {
-  await lifts.ready;
+  const [metas] = await Promise.all([allMeta(), lifts.ready]);
   const s = getSettings();
   const today = localDate();
   const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
   const p = proj[stepIndex];
   if (!p) return;
 
-  const routines = lifts.sortedRoutines();
-  const unit = liftSettings().unit;
+  const lookup = currentZoomLookup();
+  const routines = lookup.routines;
+  const finishedLifts = lifts.finished();
+  const savedCardio = metas.filter((m) => m.status === 'saved' && m.equipment !== 'strength');
+
   const slotsHtml = p.step.slots.map((slot, si) => {
     const done = p.slotDone[si];
-    const mins = Math.round(slot.seconds / 60);
-    if (slot.equipment === 'strength') {
-      const r = matchRoutineByTitle(slot.name, routines);
-      let detail = `<p class="sh-text">${esc(slot.description)}</p>`;
-      if (r) {
-        const labs = labels(r.items);
-        const rows = r.items.map((it, idx) => {
-          const ex = lifts.exOrStub(it.exId);
-          const note = lifts.row(it.exId)?.note;
-          const prev = lifts.previous(it.exId);
-          const best = prev?.sets.filter((x) => x.done && x.kind !== 'w').slice(-1)[0];
-          const prevTxt = best ? setText(best, ex, unit) : '';
-          return `<div class="sh-ex">
-            <span class="xlab">${labs[idx]}</span>
-            <span class="sh-ex-m"><b>${esc(ex.name)}</b><small>${it.sets} sets${note ? ` · ${esc(note)}` : ''}</small></span>
-            ${prevTxt ? `<em>Last: ${esc(prevTxt)}</em>` : ''}
-          </div>`;
-        }).join('');
-        detail = `<div class="sh-exlist">${rows}</div>
-          <div class="sh-subrow"><a class="link" href="#/strength/routine/${r.id}">Edit template ›</a></div>`;
+    const slotDate = p.slotDates[si] ?? p.date;
+    const key = slotKey(stepIndex, si);
+    if (done) {
+      if (slot.equipment === 'strength') {
+        const ls = finishedLifts.find((x) => x.planSlot === key || (!!slotDate && localYmdFromMs(x.startMs) === slotDate));
+        if (ls) return renderCompletedLiftSlot(ls, lookup);
+      } else {
+        const cm = savedCardio.find((x) => x.equipment === slot.equipment && (x.planSlot === key || (!!slotDate && localYmdFromMs(x.startEpochMs) === slotDate)));
+        if (cm) return renderCompletedCardioSlot(cm);
       }
-      return `<div class="sh-slot">
-        <div class="sh-slot-h">
-          <span class="cal-ico strength">${ICON.strength}</span>
-          <span><b>${esc(r?.name ?? slot.name)}</b><small>Strength · ${mins} min</small></span>
-          ${done ? '<span class="p-badge ok">✓ Done</span>' : ''}
-        </div>
-        ${detail}
-      </div>`;
     }
-    return `<div class="sh-slot">
-      <div class="sh-slot-h">
-        <span class="cal-ico ${slot.equipment}">${ICON[slot.equipment]}</span>
-        <span><b>${esc(slot.name)}</b><small>${EQUIPMENT_LABEL[slot.equipment]} · ${mins} min</small></span>
-        ${done ? '<span class="p-badge ok">✓ Done</span>' : ''}
-      </div>
-      <p class="sh-text">${esc(slot.description)}</p>
-    </div>`;
+    return renderPlannedSlot(slot, done, lookup);
   }).join('');
 
   const acts: string[] = [];
@@ -130,11 +135,11 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
         acts.push(`<button class="btn primary big" type="button" data-sact="ext:${si}">Mark ${esc(slot.name)} Done Today</button>`);
       }
     });
-    acts.push(`<button class="btn big" type="button" data-sact="move">Move Queue Pointer Here</button>`);
+    acts.push('<button class="btn big" type="button" data-sact="move">Shift schedule to here</button>');
   } else {
-    acts.push(`<button class="btn big" type="button" data-sact="move">Move Queue Back Here</button>`);
+    acts.push('<button class="btn big" type="button" data-sact="move">Shift schedule to here</button>');
   }
-  acts.push(`<button class="btn big" type="button" data-sact="close">Close</button>`);
+  acts.push('<button class="btn big" type="button" data-sact="close">Close</button>');
 
   const sh = openSheet(
     `<div class="sh-meta">${statusPillHtml(p, today)}<span class="sh-week">Wk ${p.step.week} · ${esc(WEEK_THEMES[p.step.week] ?? '')}</span></div>
@@ -200,75 +205,69 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
 
     if (act === 'move') {
       sh.close();
-      const ok = await confirmSheet(
-        `Move active day to Wk ${p.step.week} · Day ${p.step.day}?`,
-        'Stages this day on Today in Intervals.icu and projects future weeks forward from here.',
-        'Move Queue Here',
-      );
-      if (ok) {
-        await calendar.setStep(stepIndex);
-        toast(`Queue set to Wk ${p.step.week} · Day ${p.step.day}`);
-      }
+      await shiftScheduleToStep(stepIndex);
     }
   });
 }
 
-/** Quick sheet opened when tapping any Sunday–Saturday day in the top week glimpse strip. */
-export async function openWeekDayPeek(ymd: string): Promise<void> {
-  const loggedByDate = await collectLoggedByDate();
+/** Launches the uncompleted workout scheduled on `ymd` from the Home inline day-zoom card. */
+export async function launchDayZoomWorkout(ymd: string): Promise<void> {
+  await lifts.ready;
   const s = getSettings();
   const today = localDate();
   const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
-  const { y, m, d } = parseYmd(ymd);
-  const fullDate = new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
-  const isRestPref = s.restDay != null && dayOfWeek(ymd) === s.restDay;
+  const res = resolveDayZoom({ ymd, today, proj, restDay: s.restDay });
+  if (!res.pendingSlots.length) return;
 
-  const logged = loggedByDate.get(ymd) ?? [];
-  const scheduled = ymd >= today
-    ? proj.filter((p) => (p.status === 'current' || p.status === 'upcoming') && p.step.slots.some((_, si) => !p.slotDone[si] && p.slotDates[si] === ymd))
-    : [];
-
-  let body = '';
-  if (logged.length) {
-    body += `<div class="fl">COMPLETED</div>` + logged.map((l) =>
-      `<div class="sh-peek-row"><span class="cal-ico ${l.equipment}">${ICON[l.equipment]}</span><span><b>${esc(l.name)}</b><small>${EQUIPMENT_LABEL[l.equipment]}</small></span><span class="p-badge ok">✓</span></div>`,
-    ).join('');
-  }
-  if (scheduled.length) {
-    body += `<div class="fl">${ymd === today ? 'TODAY’S PLAN' : 'PROJECTED'}</div>` + scheduled.map((p) => {
-      const slots = p.step.slots.filter((_, si) => !p.slotDone[si] && p.slotDates[si] === ymd);
-      const eq = slots[0]?.equipment ?? 'strength';
-      return `<button class="aitem sh-peek-btn" type="button" data-zoom="${p.step.index}">
-        <b>${esc(p.step.title)}</b>
-        <small>${esc(slots.map((sl) => `${sl.name} · ${Math.round(sl.seconds / 60)}m`).join(' + '))} · Tap to zoom in ›</small>
-        <span class="peek-ico ${eq}">${ICON[eq]}</span>
-      </button>`;
-    }).join('');
-  }
-  if (!logged.length && !scheduled.length) {
-    body = `<div class="sh-rest">
-      <b>Rest · Nothing scheduled</b>
-      <small>${isRestPref ? 'Configured weekly rest day — excluded from future date projections.' : 'Open training day — tap a future day in Program Overview to pull ahead.'}</small>
-    </div>`;
+  const routines = lifts.sortedRoutines();
+  let chosen = res.pendingSlots[0];
+  if (res.pendingSlots.length > 1) {
+    const k = await actionSheet(
+      'Do which workout now?',
+      res.pendingSlots.map((x, idx) => ({
+        key: String(idx),
+        label: x.slot.equipment === 'strength'
+          ? (matchRoutineByTitle(x.slot.name, routines)?.name ?? x.slot.name)
+          : x.slot.name,
+        sub: `${EQUIPMENT_LABEL[x.slot.equipment]} · ${Math.round(x.slot.seconds / 60)} min`,
+      })),
+    );
+    if (!k) return;
+    chosen = res.pendingSlots[Number(k)];
+    if (!chosen) return;
   }
 
-  const sh = openSheet(
-    `<div class="sh-meta"><span class="p-badge${ymd === today ? ' cur' : ''}">${esc(fmtShortDate(ymd, today))}</span></div>
-     <h3 class="sh-title">${esc(fullDate)}</h3>
-     ${body}
-     <a class="btn primary big" href="#/program">Open Program Overview ›</a>
-     <button class="btn big" type="button" data-close>Close</button>`,
-  );
-  sh.body.addEventListener('click', (e) => {
-    const t = e.target as HTMLElement;
-    if (t.closest('a') || t.closest('[data-close]')) { sh.close(); return; }
-    const z = t.closest<HTMLElement>('[data-zoom]');
-    if (z) {
-      const idx = Number(z.dataset.zoom);
-      sh.close();
-      void openStepSheet(idx);
+  const { p, slot, slotIndex } = chosen;
+  if (p.status === 'current') {
+    const ev = calendar.items.find((x) => x.match.equipment === slot.equipment);
+    if (slot.equipment === 'strength') {
+      const r = matchRoutineByTitle(slot.name, routines);
+      await startWorkout({ name: r?.name ?? slot.name, routine: r, eventId: ev?.ev.id ?? null });
+    } else if (slot.equipment === 'airbike') {
+      location.hash = slot.programId ? `#/airbike/p/${slot.programId}${ev ? `?ev=${ev.ev.id}` : ''}` : '#/airbike';
+    } else {
+      location.hash = `#/${slot.equipment}`;
     }
-  });
+    return;
+  }
+
+  const pick = slotKey(p.step.index, slotIndex);
+  if (slot.equipment === 'strength') {
+    const r = matchRoutineByTitle(slot.name, routines);
+    await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
+  } else if (slot.equipment === 'airbike') {
+    location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : '#/airbike';
+  } else {
+    const ok = await confirmSheet(
+      `Mark “${slot.name}” done today?`,
+      'Logs it for today and automatically skips this slot when your rolling schedule catches up.',
+      'Mark Done Today',
+    );
+    if (ok) {
+      await calendar.completeFutureSlotExternally(p.step.index, slotIndex);
+      toast('Marked done early');
+    }
+  }
 }
 
 /** 4-week zoomable block overview screen (`#/program`). */

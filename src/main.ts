@@ -8,6 +8,7 @@ import { programScreen } from './ui/program';
 import { settingsScreen } from './ui/settings';
 import { liftsScreen } from './ui/lifts';
 import { initSetupLinks } from './setup';
+import { calendar } from './intervals/calendar';
 import { isNative } from './native/service';
 import { kickSensors, releaseBike } from './ble/sources';
 import { parentHash } from './nav';
@@ -118,11 +119,22 @@ initSetupLinks();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
 window.addEventListener('hashchange', route);
 if (isNative()) {
+  void App.addListener('appStateChange', ({ isActive }) => {
+    if (isActive) {
+      kickSensors();
+      calendar.checkDayRollover(true);
+    }
+  });
   void App.addListener('backButton', () => {
     const modals = document.querySelectorAll<HTMLElement>('.lmodal:not([hidden]), .modal:not([hidden])');
     const topModal = modals[modals.length - 1];
     if (topModal) {
       topModal.dispatchEvent(new CustomEvent('armory:dismiss'));
+      return;
+    }
+    const inlineDismiss = document.querySelector<HTMLElement>('[data-inline-dismiss]');
+    if (inlineDismiss) {
+      inlineDismiss.click();
       return;
     }
     const up = parentHash(routeKey);

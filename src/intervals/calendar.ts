@@ -37,18 +37,61 @@ export function addDays(ymd: string, days: number): string {
   return localDate(dt);
 }
 
+/** Milliseconds until 2 seconds past the next local midnight (minimum 1s). */
+export function msUntilNextLocalMidnight(now = new Date()): number {
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 2, 0);
+  return Math.max(1_000, next.getTime() - now.getTime());
+}
+
 class Calendar {
   items: TodayItem[] = [];
   status: CalendarStatus = hasKey() ? 'loading' : 'nokey';
   error = '';
   readonly changed = new Emitter();
   private inflight: Promise<void> | null = null;
+  private activeDay = localDate();
+  private lastRefreshMs = 0;
+  private midnightTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     try {
       const c = JSON.parse(localStorage.getItem(CACHE_KEY) ?? 'null');
       if (c?.date === localDate()) this.items = c.items;
     } catch { /* ignore */ }
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      this.scheduleMidnightRollover();
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) this.checkDayRollover(true);
+      });
+      window.addEventListener('focus', () => {
+        this.checkDayRollover(true);
+      });
+    }
+  }
+
+  private scheduleMidnightRollover(): void {
+    if (typeof window === 'undefined') return;
+    if (this.midnightTimer !== null) clearTimeout(this.midnightTimer);
+    this.midnightTimer = setTimeout(() => {
+      this.checkDayRollover(true);
+    }, msUntilNextLocalMidnight());
+  }
+
+  /** Rolls over Today if the local calendar date changed (e.g. left open overnight) and refreshes when stale. */
+  checkDayRollover(refreshIfStale = false): boolean {
+    this.scheduleMidnightRollover();
+    const today = localDate();
+    if (today !== this.activeDay) {
+      this.activeDay = today;
+      this.items = [];
+      this.changed.emit();
+      void this.refresh();
+      return true;
+    }
+    if (refreshIfStale && Date.now() - this.lastRefreshMs > 5 * 60_000) {
+      void this.refresh();
+    }
+    return false;
   }
 
   /** Today's planned workouts, for one equipment tab. */
@@ -90,6 +133,8 @@ class Calendar {
   }
 
   private async runRefresh(): Promise<void> {
+    const today = localDate();
+    this.activeDay = today;
     if (!hasKey()) {
       this.status = 'nokey';
       this.items = [];
@@ -97,8 +142,8 @@ class Calendar {
       return;
     }
     this.status = 'loading';
+    this.lastRefreshMs = Date.now();
     this.changed.emit();
-    const today = localDate();
     const tomorrow = addDays(today, 1);
 
     try {
