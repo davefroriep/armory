@@ -6,7 +6,7 @@ import { startWorkout } from './train';
 import { getMeta, getSamples } from '../../store/db';
 import { hrSummary } from '../../lifts/intervals';
 import { esc } from '../dom';
-import { openShareCard, sessionRow, skippedCard, stat } from './cards';
+import { openShareCard, sessionRow, skippedCard, stat, wireSkippedCard } from './cards';
 import { LI, actionSheet, confirmSheet, mount, resumeBar, tabBar, toast, wireClock } from './kit';
 import { playVideo } from './video';
 
@@ -133,6 +133,7 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
     };
     paint();
     const offStore = lifts.changed.on(paint);
+    const offSkip = wireSkippedCard(root, () => lifts.sessions.get(id), paint);
 
     root.addEventListener('click', async (e) => {
       const s = lifts.sessions.get(id);
@@ -158,6 +159,6 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
         }
       }
     });
-    return offStore;
+    return () => { offStore(); offSkip(); };
   });
 }

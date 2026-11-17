@@ -8,7 +8,11 @@ import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
-import { effectiveRestAuto, hasLogged, hasSessionActivity, isSessionStarted, midSuperset, pruneUnlogged, resetSessionClock, startSessionClock } from './logic';
+import {
+  effectiveRestAuto, elapsedSessionSec, hasLogged, hasSessionActivity, isSessionPaused,
+  isSessionStarted, midSuperset, pauseSessionClock, pruneUnlogged, resetSessionClock,
+  resumeSessionClock, startSessionClock,
+} from './logic';
 import { liftSettings } from './settings';
 import { lifts } from './store';
 import type { LiftSession, SessionEx } from './types';
@@ -55,7 +59,7 @@ class ActiveWorkout {
 
   elapsedSec(): number {
     const s = this.session;
-    return s && isSessionStarted(s) ? Math.max(0, (Date.now() - s.startMs) / 1000) : 0;
+    return s ? elapsedSessionSec(s) : 0;
   }
 
   /** Call once at app start / when entering the lift tracker: resumes a workout the OS killed (only if started). */
@@ -83,7 +87,7 @@ class ActiveWorkout {
     this.booting ??= (async () => {
       await lifts.ready;
       const s = lifts.active;
-      if (s && isSessionStarted(s) && !this.timer) {
+      if (s && isSessionStarted(s) && !isSessionPaused(s) && !this.timer) {
         if (!s.started) s.started = true;
         await this.attach(s, true);
       }
@@ -107,6 +111,7 @@ class ActiveWorkout {
 
   /** Start the workout clock, HR recorder, wake lock and foreground service (via Start button, set check, or camera). */
   ensureStarted(s: LiftSession, manual = false): boolean {
+    if (isSessionPaused(s)) return this.resume();
     const prevManual = !!s.manualStart;
     if (!startSessionClock(s, Date.now(), manual)) {
       if (manual && !prevManual) lifts.saveSession(s, true);
@@ -115,6 +120,27 @@ class ActiveWorkout {
     }
     lifts.saveSession(s, true);
     void this.attach(s, false);
+    this.tick.emit();
+    return true;
+  }
+
+  /** Pause the workout clock and HR/foreground recording (e.g. for a multi-hour break), keeping all logged sets. */
+  pause(): boolean {
+    const s = this.session;
+    const now = Date.now();
+    if (!s || !pauseSessionClock(s, now)) return false;
+    this.rec?.tick(elapsedSessionSec(s, now), 0, now);
+    lifts.saveSession(s, true);
+    this.teardown();
+    return true;
+  }
+
+  /** Resume a paused workout clock without counting the paused break time. */
+  resume(): boolean {
+    const s = this.session;
+    if (!s || !resumeSessionClock(s, Date.now())) return false;
+    lifts.saveSession(s, true);
+    void this.attach(s, true);
     this.tick.emit();
     return true;
   }
@@ -131,6 +157,7 @@ class ActiveWorkout {
   }
 
   private async attach(s: LiftSession, resume: boolean): Promise<void> {
+    if (isSessionPaused(s)) return;
     const tok = ++this.runToken;
     const hrMax = getSettings().hrMax;
     let rec: Recorder | null = null;
@@ -154,7 +181,8 @@ class ActiveWorkout {
     if (!isNative()) this.requestLock();
     const wav = isNative() && !this.wavCached ? audio.getWavBase64('chime') : undefined;
     if (wav) this.wavCached = true;
-    void workoutService.start(`Armory Fit · ${s.name}`, 'Lifting…', s.startMs, wav);
+    const effStart = s.startMs + (s.pausedMs ?? 0);
+    void workoutService.start(`Armory Fit · ${s.name}`, 'Lifting…', effStart, wav);
     document.addEventListener('visibilitychange', this.onVis);
     this.tick.emit();
   }
@@ -179,7 +207,8 @@ class ActiveWorkout {
     const txt = isNative()
       ? (hr ? `♥ ${hr} BPM · Recording` : 'Workout active')
       : (r && !r.fired ? `Rest ${mmss((r.endMs - now) / 1000)} · ${mmss(el)}` : `${mmss(el)} · ${hr || '--'} BPM`);
-    void workoutService.update(`Armory Fit · ${s.name}`, txt, s.startMs);
+    const effStart = s.startMs + (s.pausedMs ?? 0);
+    void workoutService.update(`Armory Fit · ${s.name}`, txt, effStart);
   }
 
   private onTick(): void {
@@ -278,13 +307,33 @@ class ActiveWorkout {
       await this.discard();
       return null;
     }
-    pruneUnlogged(s);
     s.endMs = Date.now();
+    resumeSessionClock(s, s.endMs);
+    if (!s.bwKg) s.bwKg = getSettings().weightKg;
+    pruneUnlogged(s);
     s.status = 'done';
     const rec = this.rec;
-    const el = (s.endMs - s.startMs) / 1000;
+    const el = elapsedSessionSec(s, s.endMs);
     rec?.tick(el, 0, s.endMs);
-    const meta = rec ? rec.finalize() : ((await getMeta(s.id)) as WorkoutMeta);
+    let meta: WorkoutMeta;
+    if (rec) {
+      meta = rec.finalize();
+    } else {
+      const prevMeta = await getMeta(s.id);
+      if (prevMeta) {
+        meta = new Recorder(
+          s.id, 'strength', 'strength', s.name, s.eventId, getSettings().hrMax,
+          { meta: prevMeta, samples: await getSamples(s.id) },
+        ).finalize();
+      } else {
+        meta = {
+          id: s.id, equipment: 'strength', programId: 'strength', name: s.name,
+          startEpochMs: s.startMs, status: 'saved', seconds: Math.round(el),
+          kj: 0, avgW: 0, maxW: 0, avgHr: 0, maxHr: 0, rpe: null,
+          eventId: s.eventId, upload: 'pending', patched: false, activityId: null, lastError: null,
+        };
+      }
+    }
     meta.name = s.name;
     meta.planSlot = s.planSlot ?? null;
     meta.status = 'saved';

@@ -65,7 +65,6 @@
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <queries>
-        <package android:name="com.bpmhealth.boostcamp" />
         <intent>
             <action android:name="android.media.action.VIDEO_CAMERA" />
         </intent>

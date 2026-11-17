@@ -16,7 +16,9 @@ describe('BLE parsers', () => {
   });
   it('AirBike frame', () => {
     const f = parseBikeLine('{"dev":"airbike","w":127.0,"cad":44.0,"fan":488.8,"spd":16.87,"dist":452.1,"kcal":15.42,"pls":1042}');
-    expect(f).toEqual({ w: 127, cad: 44, dist: 452.1, kcal: 15.42, spd: 16.87 });
+    expect(f).toEqual({ w: 127, cad: 44, fan: 488.8, dist: 452.1, kcal: 15.42, spd: 16.87, pls: 1042 });
+    const full = parseBikeLine('{"dev":"airbike","w":200,"cad":52,"rfan":580,"dt":19500,"ratio":11.11}');
+    expect(full).toEqual({ w: 200, cad: 52, rfan: 580, dist: 0, kcal: 0, spd: 0, dt: 19500, ratio: 11.11 });
     expect(parseBikeLine('garbage')).toBeNull();
     expect(parseBikeLine('{"dev":"treadmill","w":1,"cad":2}')).toBeNull();
     expect(parseBikeLine('{"foo":1}')).toBeNull();

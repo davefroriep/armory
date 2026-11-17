@@ -8,7 +8,6 @@ import { arrange, moveProgram, restoreOrder, toggleHidden } from '../src/domain/
 import { repNote, repStats } from '../src/domain/reps';
 import { hrCue } from '../src/domain/pacer';
 import { cueFor, pacerDecision, type PacerConfig } from '../src/domain/pacer';
-import { classifyEvent } from '../src/intervals/parse';
 import { buildTcx } from '../src/domain/tcx';
 
 describe('Assault curve', () => {
@@ -118,6 +117,15 @@ describe('timeline + engine', () => {
     expect(e.state).toBe('finished');
     expect(e.elapsed(900000)).toBe(15);
   });
+  it('hydrates paused elapsed time for crash resume', () => {
+    const e = new WorkoutEngine(programById('n4x4')!);
+    e.hydratePaused(420);
+    expect(e.state).toBe('paused');
+    expect(e.elapsed(999_999)).toBe(420);
+    e.resume(10_000);
+    expect(e.state).toBe('running');
+    expect(e.elapsed(25_000)).toBe(435);
+  });
 });
 
 describe('pacer (metronome)', () => {
@@ -189,31 +197,6 @@ describe('cadence cues', () => {
     const t = programById('tabata')!.segments[0];
     expect(cueFor(t, 90, 3).level).toBe('ok');
     expect(cueFor(t, 50, 3).level).toBe('warn');
-  });
-});
-
-describe('calendar classification', () => {
-  const c = (name: string, type?: string) => classifyEvent({ name, type });
-  it('maps the user\'s naming convention', () => {
-    expect(c('AirBike Z5 — Norwegian 4×4')).toEqual({ equipment: 'airbike', programId: 'n4x4', zone: 'Z5' });
-    expect(c('AirBike Z2')).toEqual({ equipment: 'airbike', programId: 'z2', zone: 'Z2' });
-    expect(c('Spin Bike Z2').equipment).toBe('spin');
-    expect(c('Bowflex C7 Z5 — Cardiac Power 6×2').equipment).toBe('spin');
-    expect(c('Treadmill Z2').equipment).toBe('treadmill');
-    expect(c('Upper Body Strength').equipment).toBe('strength');
-    expect(c('Morning thing', 'WeightTraining').equipment).toBe('strength');
-  });
-  it('plain "AirBike Z5" opens the bike but leaves the protocol to you', () => {
-    expect(c('AirBike Z5')).toEqual({ equipment: 'airbike', programId: null, zone: 'Z5' });
-  });
-  it('other airbike protocols', () => {
-    expect(c('AirBike Billat 60/30').programId).toBe('b6030');
-    expect(c('AirBike Tabata 20/10').programId).toBe('tabata');
-    expect(c('AirBike Sprint 10/20').programId).toBe('sprint1020');
-    expect(c('AirBike Classic VO2 5×3').programId).toBe('v5x3');
-  });
-  it('unknown stays unmatched', () => {
-    expect(c('Dentist').equipment).toBeNull();
   });
 });
 

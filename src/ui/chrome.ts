@@ -1,16 +1,17 @@
 import { $, ICON, esc, mmss } from './dom';
-import { chipTap, chipView, linkStatus, type ChipKind } from '../ble/sources';
+import { chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
 import { PHASE1_PLAN, fmtWeekSpan, nextEquipmentSlot, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
 import { addDays, calendar, localDate, type TodayItem } from '../intervals/calendar';
 import { active } from '../lifts/active';
-import { isSessionStarted } from '../lifts/logic';
+import { isSessionPaused, isSessionStarted } from '../lifts/logic';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { lifts } from '../lifts/store';
 import { REV, REV_STAMP } from '../rev';
 import { getSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import type { TodayCompletedItem } from './dayZoom';
+import { openBikeSheet } from './bikeSheet';
 import { openHrSheet } from './hrSheet';
 import { actionSheet, toast } from './lifts/kit';
 
@@ -59,8 +60,11 @@ export function mountTopResume(root: HTMLElement): () => void {
     }
     const nameEl = strip.children[1] as HTMLElement;
     const clockEl = strip.children[2] as HTMLElement;
+    const dotEl = strip.children[0] as HTMLElement;
+    const paused = isSessionPaused(running);
+    dotEl.classList.toggle('paused', paused);
     if (nameEl.textContent !== running.name) nameEl.textContent = running.name;
-    const elapsed = mmss(active.elapsedSec());
+    const elapsed = paused ? `${mmss(active.elapsedSec())} · paused` : mmss(active.elapsedSec());
     if (clockEl.textContent !== elapsed) clockEl.textContent = elapsed;
 
     const bar = root.querySelector<HTMLElement>('header.bar');
@@ -103,7 +107,7 @@ export function wireChips(root: HTMLElement, opts?: { resume?: boolean }): () =>
     if (!el) return;
     const kind = el.dataset.chip as ChipKind;
     if (kind === 'hr') openHrSheet();
-    else chipTap(kind);
+    else openBikeSheet();
   };
   root.addEventListener('click', click);
   const off = linkStatus.on(paint);

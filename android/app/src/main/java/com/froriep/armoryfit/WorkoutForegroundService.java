@@ -265,6 +265,7 @@ public class WorkoutForegroundService extends Service {
     public void onDestroy() {
         running = false;
         restActive = false;
+        WorkoutMetronome.stop();
         handler.removeCallbacks(fireRestRunnable);
         handler.removeCallbacks(overlayTickRunnable);
         if (overlay != null) overlay.hide();

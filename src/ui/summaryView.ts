@@ -5,6 +5,7 @@ import type { WorkoutMeta } from '../types';
 import { discard, syncWorkout } from '../workout/sync';
 import { revFooter } from './chrome';
 import { esc, hms } from './dom';
+import { confirmSheet } from './lifts/kit';
 
 export interface SummaryOpts {
   title: string;
@@ -46,7 +47,7 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
     q<HTMLButtonElement>('save').disabled = false;
   });
   q('discard').addEventListener('click', async () => {
-    if (!confirm('Discard this workout? It will not be saved or uploaded.')) return;
+    if (!(await confirmSheet('Discard this workout?', 'It will not be saved or uploaded.', 'Discard', true))) return;
     await discard(meta.id);
     location.hash = o.backHref;
   });

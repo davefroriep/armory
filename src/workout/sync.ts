@@ -39,7 +39,7 @@ export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
         m.name,
       );
       const desc = m.equipment === 'strength'
-        ? `Armory Fit • ${fmt(m.seconds)} • avg HR ${Math.round(m.avgHr)} • max HR ${Math.round(m.maxHr)}` + (kcal ? ` • ~${kcal} kcal` : '') + (m.rpe ? ` • RPE ${m.rpe}/10` : '')
+        ? `Armory Fit • ${m.name} • ${fmt(m.seconds)} • avg HR ${Math.round(m.avgHr)} • max HR ${Math.round(m.maxHr)}` + (kcal ? ` • ~${kcal} kcal` : '') + (m.rpe ? ` • RPE ${m.rpe}/10` : '') + (m.notes ? ` • ${m.notes}` : '')
         : `Armory Fit • ${fmt(m.seconds)} • avg ${Math.round(m.avgW)} W • ${Math.round(m.kj)} kJ` + (m.rpe ? ` • RPE ${m.rpe}/10` : '') + (m.notes ? ` • ${m.notes}` : '');
       m.activityId = await uploadActivity({
         tcx, name: m.name, description: desc, externalId: `armory-${m.id}`, pairedEventId: m.eventId,
@@ -47,7 +47,8 @@ export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
       await putMeta(m);
     }
     if (!m.patched) {
-      await patchActivity(m.activityId, { type: m.equipment === 'strength' ? 'WeightTraining' : 'VirtualRide', ...(m.rpe ? { icu_rpe: m.rpe } : {}) });
+      const iType = m.programId === 'ruck' ? 'Walk' : m.equipment === 'strength' ? 'WeightTraining' : 'VirtualRide';
+      await patchActivity(m.activityId, { type: iType, ...(m.rpe ? { icu_rpe: m.rpe } : {}) });
       m.patched = true;
     }
     m.upload = 'done';

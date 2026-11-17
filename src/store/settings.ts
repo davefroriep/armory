@@ -20,6 +20,8 @@ export interface Settings {
   /** Body profile for HR-based strength calories (Keytel). Synced from the Intervals.icu profile; never committed. */
   sex: 'M' | 'F';
   weightKg: number | null;
+  /** Date (`YYYY-MM-DD`) of the latest smart-scale wellness weight synced from Intervals.icu. */
+  weightDate: string | null;
   /** ISO date (YYYY-MM-DD). */
   birthDate: string | null;
   /** "gated": recoveries last until HR is back at the target (floor + ceiling apply); "timed": plain timers. */
@@ -61,6 +63,7 @@ export const DEFAULTS: Settings = {
   hrMax: 180,
   sex: 'M',
   weightKg: null,
+  weightDate: null,
   birthDate: null,
   recoveryMode: 'gated',
   recoveryHrPct: 72,

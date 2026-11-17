@@ -11,7 +11,7 @@ import { retryPending } from '../../workout/sync';
 import { revFooter } from '../chrome';
 import { esc, hms } from '../dom';
 import { ZONE_COLOR, hrZone } from '../hr';
-import { openShareCard, skippedCard, stat } from './cards';
+import { openShareCard, skippedCard, stat, wireSkippedCard } from './cards';
 import { mount, promptSheet, toast } from './kit';
 
 /** Post-workout: numbers, PRs, effort rating, share card. The Intervals.icu upload has already started by itself. */
@@ -106,6 +106,10 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
         toast(`“${name}” saved. Find it under My Days`);
       }
     });
-    return () => { alive = false; clearInterval(poll); };
+    const offSkip = wireSkippedCard(root, () => lifts.sessions.get(s.id), () => {
+      const box = root.querySelector('[data-sk-card]');
+      if (box) box.outerHTML = skippedCard(s);
+    });
+    return () => { alive = false; offSkip(); clearInterval(poll); };
   });
 }

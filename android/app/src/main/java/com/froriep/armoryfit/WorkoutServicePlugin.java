@@ -18,6 +18,7 @@ import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.util.Base64;
+import android.view.WindowManager;
 
 import androidx.activity.result.ActivityResult;
 import androidx.core.content.ContextCompat;
@@ -44,6 +45,7 @@ public class WorkoutServicePlugin extends Plugin {
     @Override
     public void load() {
         instance = this;
+        WorkoutMetronome.warm(getContext());
     }
 
     static void setAppVisible(Context c, boolean visible) {
@@ -171,20 +173,25 @@ public class WorkoutServicePlugin extends Plugin {
     }
 
     @PluginMethod
-    public void openApp(PluginCall call) {
-        String pkg = call.getString("pkg", "");
-        boolean opened = false;
-        if (pkg != null && !pkg.isEmpty()) {
-            Intent launch = getContext().getPackageManager().getLaunchIntentForPackage(pkg);
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                getContext().startActivity(launch);
-                opened = true;
-            }
+    public void setKeepScreenOn(PluginCall call) {
+        boolean on = call.getBoolean("on", false);
+        Activity act = getActivity();
+        if (act != null) {
+            act.runOnUiThread(() -> {
+                if (on) act.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                else act.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            });
         }
-        JSObject ret = new JSObject();
-        ret.put("opened", opened);
-        call.resolve(ret);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void setMetronome(PluginCall call) {
+        boolean play = call.getBoolean("play", false);
+        double bpm = call.getDouble("bpm", 0.0);
+        float vol = call.getDouble("volume", 0.8).floatValue();
+        WorkoutMetronome.set(getContext(), play, bpm, vol);
+        call.resolve();
     }
 
     @PluginMethod
@@ -467,9 +474,10 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    /** Stops foreground workout service, removes the app task from Recents, and force-closes the process. */
+    /** Stops foreground workout service & metronome, removes the app task from Recents, and force-closes the process. */
     @PluginMethod
     public void forceClose(PluginCall call) {
+        WorkoutMetronome.stop();
         Activity act = getActivity();
         call.resolve();
         if (act == null) return;

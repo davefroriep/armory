@@ -8,7 +8,7 @@ export function parentHash(path: string): string | null {
   const parts = clean.split('/').filter(Boolean);
   const [section, sub] = parts;
   if (section === 'program') return '#/';
-  if (section === 'airbike') return sub === 'p' ? '#/airbike' : '#/';
+  if (section === 'airbike') return sub === 'p' || sub === 'w' ? '#/airbike' : '#/';
   if (section === 'strength') {
     if (!sub || sub === 'history' || sub === 'progress' || sub === 'exercises') return '#/';
     if (sub === 'summary' || sub === 'workout') return '#/strength/history';

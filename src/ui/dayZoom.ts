@@ -174,6 +174,7 @@ export function renderCompletedCardioSlot(m: WorkoutMeta): string {
     </div>
     ${pills.length ? `<div class="dz-stats">${pills.map((x) => `<i>${esc(x)}</i>`).join('')}</div>` : ''}
     ${m.notes ? `<p class="sh-text">${esc(m.notes)}</p>` : ''}
+    <div class="sh-subrow"><a class="link" href="#/airbike/w/${m.id}">Details &amp; delete ›</a></div>
   </div>`;
 }
 

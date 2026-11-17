@@ -8,9 +8,11 @@ import { audio } from '../audio/audio';
 import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
+import { fmtNum, fromDisplay, liftSettings, toDisplay } from '../lifts/settings';
 import { backupCardHtml, wireBackupCard } from './backupUi';
 import { revFooter, topbar, wireChips } from './chrome';
 import { $, esc } from './dom';
+import { toast } from './lifts/kit';
 
 export function settingsScreen(root: HTMLElement): () => void {
   const s = getSettings();
@@ -21,14 +23,19 @@ export function settingsScreen(root: HTMLElement): () => void {
     `<input class="num" type="number" inputmode="numeric" data-num="${name}" min="${min}" max="${max}" value="${v}">`;
   const ftpStatus = () => {
     const cur = getSettings();
-    return `Intervals modeled eFTP: <b>${cur.intervalsEftp != null ? `${cur.intervalsEftp} W` : '—'}</b> · Manual FTP: <b>${cur.intervalsSetFtp != null ? `${cur.intervalsSetFtp} W` : '—'}</b>`;
+    const u = liftSettings().unit;
+    const wtTxt = cur.weightKg ? `${fmtNum(toDisplay(cur.weightKg, u))} ${u}${cur.weightDate ? ` (${cur.weightDate})` : ''}` : '—';
+    return `Modeled eFTP: <b>${cur.intervalsEftp != null ? `${cur.intervalsEftp} W` : '—'}</b> · Manual: <b>${cur.intervalsSetFtp != null ? `${cur.intervalsSetFtp} W` : '—'}</b> · Scale: <b>${esc(wtTxt)}</b>`;
   };
+  const unit = liftSettings().unit;
+  const bwVal = s.weightKg ? fmtNum(toDisplay(s.weightKg, unit)) : '';
 
   root.innerHTML = `${topbar({ back: '#/', title: 'Settings' })}
   <main class="page settings">
     <h2 class="sec">TRAINING &amp; FTP</h2>
     <section class="card">
       <div class="line"><span>AirBike FTP<small>Scales Z2 &amp; Z5 % FTP targets (182 W baseline)</small></span>${num('ftp', s.ftp, 80, 450)}<em>W</em></div>
+      <div class="line"><span>Bodyweight<small>Auto-pulls latest smart-scale weigh-in from Intervals.icu</small></span><input class="num" type="number" inputmode="decimal" step="0.1" id="bwIn" placeholder="195" value="${bwVal}"><em>${unit}</em></div>
       <div class="line"><span>Auto-sync eFTP from Intervals<small>Updates FTP automatically when Intervals models a new eFTP</small></span>${tog('ftpAutoSync', s.ftpAutoSync)}</div>
       <div class="hint" id="ftpInfo">${ftpStatus()}</div>
       <div class="row">
@@ -104,6 +111,10 @@ export function settingsScreen(root: HTMLElement): () => void {
     $('#ftpInfo', root).innerHTML = ftpStatus();
     $<HTMLButtonElement>('#useEftp', root).disabled = !cur.intervalsEftp;
     $<HTMLInputElement>('[data-num="ftp"]', root).value = String(cur.ftp);
+    const bwEl = root.querySelector<HTMLInputElement>('#bwIn');
+    if (bwEl && document.activeElement !== bwEl) {
+      bwEl.value = cur.weightKg ? fmtNum(toDisplay(cur.weightKg, liftSettings().unit)) : '';
+    }
     $<HTMLSelectElement>('#restDay', root).value = cur.restDay == null ? 'none' : String(cur.restDay);
     const step = PHASE1_PLAN.steps[cur.queue.stepIndex];
     $('#planStepInfo', root).innerHTML = step
@@ -163,6 +174,11 @@ export function settingsScreen(root: HTMLElement): () => void {
     } else if (t.id === 'vol') {
       updateSettings({ metroVolume: Number(t.value) });
       audio.setVolume(Number(t.value));
+    } else if (t.id === 'bwIn') {
+      const v = Number(t.value);
+      if (Number.isFinite(v) && v >= 35 && v <= 450) {
+        updateSettings({ weightKg: fromDisplay(v, liftSettings().unit), weightDate: null });
+      }
     } else if (t.dataset.num) {
       const v = Number(t.value);
       if (Number.isFinite(v) && v >= Number(t.min) && v <= Number(t.max)) updateSettings({ [t.dataset.num]: v });
@@ -195,7 +211,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     hrLink.forget();
     bikeLink.forget();
     await transport.forgetAll();
-    alert('Sensors forgotten. Tap the heart-rate chip on the home screen to pair again.');
+    toast('Sensors forgotten — tap the HR chip to pair again');
   }
 
   const offBackup = wireBackupCard(root, paintFtpBox);

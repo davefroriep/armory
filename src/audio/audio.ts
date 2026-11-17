@@ -1,4 +1,4 @@
-import { isNative, playNativeChime } from '../native/service';
+import { isNative, playNativeChime, setNativeMetronome } from '../native/service';
 
 export const ALERT_SAMPLE_RATE = 24_000;
 
@@ -128,6 +128,9 @@ class Audio {
   private silentUrl: string | null = null;
   private wavUrls = new Map<keyof typeof ALERT_SPECS, string>();
   private wavB64Cache = new Map<keyof typeof ALERT_SPECS, string>();
+  private nativeMetroOn = false;
+  private nativeMetroBpm = 0;
+  private nativeMetroVol = 0.8;
   volume = 0.8;
 
   private ensureEl(): HTMLAudioElement | null {
@@ -239,9 +242,25 @@ class Audio {
     return this.playing;
   }
 
-  /** Start / retune / stop the AirBike cadence click track. */
+  /** Start / retune / stop the AirBike cadence click track (native SoundPool on APK; WebAudio in browsers). */
   setMetronome(play: boolean, bpm: number | null): void {
-    if (!play || !bpm) {
+    const nextPlay = !!play && !!bpm && bpm > 0;
+    const nextBpm = nextPlay ? Math.round((bpm ?? 0) * 10) / 10 : 0;
+    if (isNative()) {
+      if (
+        nextPlay !== this.nativeMetroOn
+        || (nextPlay && (nextBpm !== this.nativeMetroBpm || this.volume !== this.nativeMetroVol))
+      ) {
+        this.nativeMetroOn = nextPlay;
+        this.nativeMetroBpm = nextBpm;
+        this.nativeMetroVol = this.volume;
+        this.playing = nextPlay;
+        this.bpm = nextBpm;
+        void setNativeMetronome(nextPlay, nextBpm, this.volume);
+      }
+      return;
+    }
+    if (!nextPlay || !bpm) {
       this.stopMetronome();
       return;
     }
@@ -322,6 +341,10 @@ class Audio {
 
   setVolume(v: number): void {
     this.volume = v;
+    if (isNative() && this.nativeMetroOn && v !== this.nativeMetroVol) {
+      this.nativeMetroVol = v;
+      void setNativeMetronome(true, this.nativeMetroBpm, v);
+    }
     if (this.master) this.master.gain.value = v;
     if (this.alertEl) this.alertEl.volume = Math.max(0, Math.min(1, v));
   }

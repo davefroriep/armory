@@ -99,7 +99,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
             <div class="tpl-head"><span class="hint">Reusable lifting templates</span><a class="link" href="#/strength/routine/new">+ New day</a></div>
             <div class="tpl-list">${days}</div>
           </details>
-          <a class="hr-only" href="#/strength/hr">Heart-rate only session <small>(lift in another app)</small> ›</a>
+          <a class="hr-only" href="#/strength/hr">Ruck / outdoor HR session <small>(Polar H10 + pack weight)</small> ›</a>
           ${revFooter()}
         </main>${tabBar('train')}`;
       if (pickParam != null) {

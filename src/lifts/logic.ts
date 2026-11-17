@@ -145,12 +145,35 @@ export const hasSessionActivity = (s: LiftSession): boolean => s.exs.some((e) =>
 
 export const isSessionStarted = (s: LiftSession): boolean => !!s.started || hasSessionActivity(s);
 
+export const isSessionPaused = (s: LiftSession): boolean => !!s.started && s.status === 'active' && s.pausedAt != null;
+
+export function elapsedSessionSec(s: LiftSession, now = Date.now()): number {
+  if (!isSessionStarted(s)) return 0;
+  const end = s.endMs ?? s.pausedAt ?? now;
+  return Math.max(0, (end - s.startMs - (s.pausedMs ?? 0)) / 1000);
+}
+
 /** Starts an unstarted workout clock from zero (`startMs = now`). */
 export function startSessionClock(s: LiftSession, now = Date.now(), manual = false): boolean {
   if (manual) s.manualStart = true;
   if (s.started) return false;
   s.startMs = now;
   s.started = true;
+  delete s.pausedAt;
+  delete s.pausedMs;
+  return true;
+}
+
+export function pauseSessionClock(s: LiftSession, now = Date.now()): boolean {
+  if (!isSessionStarted(s) || s.status !== 'active' || s.pausedAt != null) return false;
+  s.pausedAt = now;
+  return true;
+}
+
+export function resumeSessionClock(s: LiftSession, now = Date.now()): boolean {
+  if (s.pausedAt == null) return false;
+  s.pausedMs = (s.pausedMs ?? 0) + Math.max(0, now - s.pausedAt);
+  s.pausedAt = null;
   return true;
 }
 
@@ -159,6 +182,8 @@ export function resetSessionClock(s: LiftSession, now = Date.now()): boolean {
   if (hasSessionActivity(s) || s.manualStart) return false;
   s.started = false;
   s.startMs = now;
+  delete s.pausedAt;
+  delete s.pausedMs;
   return true;
 }
 

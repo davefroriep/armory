@@ -2,9 +2,10 @@ import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import {
-  addSet, buildExercise, canLog, deleteSet, editReps, editWeight, hasLogged, isSessionStarted, labels, midSuperset,
+  addSet, buildExercise, canLog, deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
   prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
 } from '../../lifts/logic';
+import { setKeepScreenOn } from '../../native/service';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
@@ -43,6 +44,7 @@ function build(root: HTMLElement, id?: string): () => void {
   let dirty = false;
   let finishing = false;
   let dead = false;
+  let hold: { setId: string; endMs: number; timer: ReturnType<typeof setInterval> } | null = null;
   let hits = new Map<string, { n: number; kg: number }>();
   const prevCache = new Map<string, SessionEx | null>();
   const prevOf = (se: SessionEx): SessionEx | null => {
@@ -58,6 +60,60 @@ function build(root: HTMLElement, id?: string): () => void {
   const find = (uid: string): SessionEx => s.exs.find((e) => e.uid === uid)!;
 
   // ---------- render ----------
+  const paintHoldBtn = (setId?: string): void => {
+    const id = setId ?? hold?.setId;
+    if (!id) return;
+    const btn = root.querySelector<HTMLElement>(`.srow[data-sid="${id}"] .shold`);
+    if (!btn) return;
+    const activeHere = hold?.setId === id;
+    btn.classList.toggle('on', activeHere);
+    btn.textContent = activeHere ? `${Math.max(1, Math.ceil((hold!.endMs - Date.now()) / 1000))}s` : '▶';
+  };
+  const stopHold = (): void => {
+    if (!hold) return;
+    const prevId = hold.setId;
+    clearInterval(hold.timer);
+    hold = null;
+    void setKeepScreenOn(false);
+    paintHoldBtn(prevId);
+  };
+  const startHold = (se: SessionEx, i: number, card: HTMLElement, row: HTMLElement): void => {
+    const set = se.sets[i];
+    if (hold?.setId === set.id) { stopHold(); return; }
+    stopHold();
+    const sec = Math.max(1, Math.round(set.r ?? 45));
+    set.r = sec;
+    set.rAuto = false;
+    const rInp = row.querySelector<HTMLInputElement>('.sr');
+    if (rInp) { rInp.value = String(sec); rInp.classList.remove('auto'); }
+    if (!edit) {
+      active.ensureStarted(s);
+      paintClock();
+    }
+    if (liftSettings().restSound) audio.unlock();
+    void setKeepScreenOn(true);
+    const endMs = Date.now() + sec * 1000;
+    const setId = set.id;
+    const timer = setInterval(() => {
+      if (dead || !hold || hold.setId !== setId) return;
+      if (Date.now() < hold.endMs) {
+        paintHoldBtn(setId);
+        return;
+      }
+      stopHold();
+      if (liftSettings().restSound) audio.chime();
+      buzz([220, 90, 220]);
+      if (!set.done) {
+        const curCard = root.querySelector<HTMLElement>(`.xcard[data-uid="${se.uid}"]`) ?? card;
+        const curRow = curCard.querySelector<HTMLElement>(`.srow[data-sid="${setId}"]`) ?? row;
+        logSet(curCard, curRow, false);
+      }
+    }, 250);
+    hold = { setId, endMs, timer };
+    paintHoldBtn(setId);
+    save();
+  };
+
   const rowHtml = (se: SessionEx, ex: Exercise, i: number, labelMap: number[]): string => {
     const set = se.sets[i];
     const prev = prevSetFor(prevOf(se), se, i);
@@ -67,11 +123,17 @@ function build(root: HTMLElement, id?: string): () => void {
     const hasVid = !!set.vids?.length;
     const rpeTag = set.rpe != null ? `<u class="srpe">@${set.rpe}</u>` : '';
     const dot = set.note ? '<i class="ndot"></i>' : '';
-    return `<div class="srow${set.done ? ' done' : ''}${set.kind !== 'n' ? ' k-' + set.kind : ''}" data-i="${i}" data-sid="${set.id}">
+    const isTime = ex.type === 'time';
+    const holdActive = hold?.setId === set.id;
+    const holdBtn = isTime
+      ? `<button class="shold${holdActive ? ' on' : ''}" type="button" data-act="hold" aria-label="Hold timer">${holdActive ? `${Math.max(1, Math.ceil((hold!.endMs - Date.now()) / 1000))}s` : '▶'}</button>`
+      : '';
+    return `<div class="srow${isTime ? ' t-row' : ''}${set.done ? ' done' : ''}${set.kind !== 'n' ? ' k-' + set.kind : ''}" data-i="${i}" data-sid="${set.id}">
       <button class="snum${set.rpe != null ? ' has-rpe' : ''}" data-act="setmenu" aria-label="Set options">${kind}${pr ? '<i class="prstar">★</i>' : ''}${rpeTag}${dot}</button>
       <button class="sprev" data-act="usePrev" ${prev ? '' : 'disabled'}>${prev ? esc(setText(prev, ex, unit())) : '–'}</button>
       <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '–' : 'BW'}" aria-label="Weight">
-      <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${ex.type === 'time' ? 'sec' : '–'}" aria-label="${ex.type === 'time' ? 'Seconds' : 'Reps'}">
+      <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${isTime ? 'sec' : '–'}" aria-label="${isTime ? 'Seconds' : 'Reps'}">
+      ${holdBtn}
       <button class="svid${hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${hasVid ? 'Manage linked video' : 'Link or record lift video'}">${LI.video}</button>
       <button class="schk${set.done ? ' on' : ''}" data-act="done" aria-label="Log set">✓</button>
     </div>`;
@@ -95,7 +157,7 @@ function build(root: HTMLElement, id?: string): () => void {
         <button class="xmore" data-act="exmenu" aria-label="Exercise options">⋯</button>
       </div>
       ${note ? `<button class="xnote" data-act="exnote">${esc(note)}</button>` : ''}
-      <div class="xth"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span><span></span><span></span></div>
+      <div class="xth${ex.type === 'time' ? ' t-row' : ''}"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span>${ex.type === 'time' ? '<span>HOLD</span>' : ''}<span></span><span></span></div>
       <div class="xrows">${se.sets.map((_, i) => rowHtml(se, ex, i, labelMap)).join('')}</div>
       <div class="xfoot">
         <button class="stp" data-act="rmset" aria-label="Remove set">−</button><span>SET</span><button class="stp" data-act="addset" aria-label="Add set">+</button>
@@ -114,13 +176,20 @@ function build(root: HTMLElement, id?: string): () => void {
       return `<div class="ss-group ss-c${g.ssIdx % 2}" data-ss="${g.ssIdx}"><div class="ss-tag">SUPERSET</div>${inner}</div>`;
     }).join('');
 
+  const clockCtlHtml = (): string => {
+    if (edit) return '';
+    if (!isSessionStarted(s)) return '<button class="sstart" type="button" data-act="start">▶ Start</button>';
+    return isSessionPaused(s)
+      ? '<button class="sstart" type="button" data-act="resume">▶ Resume</button>'
+      : '<button class="spause" type="button" data-act="pause">⏸ Pause</button>';
+  };
+
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
-    const startBtn = edit ? '' : `<button class="sstart" type="button" data-act="start"${isSessionStarted(s) ? ' hidden' : ''}>▶ Start</button>`;
     return `<header class="bar sbar">
       <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
       <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
-      <div class="chips">${startBtn}<button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
+      <div class="chips"><span id="sclkctl">${clockCtlHtml()}</span><button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
   };
 
@@ -175,10 +244,12 @@ function build(root: HTMLElement, id?: string): () => void {
   const paintClock = (): void => {
     if (edit) return;
     const started = isSessionStarted(s);
-    const txt = started ? clock(active.elapsedSec()) : '0:00';
+    const paused = isSessionPaused(s);
+    const txt = started ? `${clock(active.elapsedSec())}${paused ? ' · paused' : ''}` : '0:00';
     root.querySelectorAll<HTMLElement>('[data-clock]').forEach((e) => { e.textContent = txt; });
-    const startBtn = root.querySelector<HTMLElement>('[data-act="start"]');
-    if (startBtn) startBtn.hidden = started;
+    const ctl = root.querySelector<HTMLElement>('#sclkctl');
+    const want = clockCtlHtml();
+    if (ctl && ctl.innerHTML !== want) ctl.innerHTML = want;
   };
   const paintRest = (): void => {
     const bar = root.querySelector<HTMLElement>('#restbar');
@@ -680,11 +751,19 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'finish') return void (await finish());
     if (act === 'rename') return void (await rename());
     if (act === 'wkmenu') return void (await wkMenu());
-    if (act === 'start') {
+    if (act === 'start' || act === 'resume') {
       if (!edit) {
         if (liftSettings().restSound) audio.unlock();
-        active.ensureStarted(s, true);
+        if (act === 'start') active.ensureStarted(s, true);
+        else active.resume();
         buzz(25);
+        paintClock();
+      }
+      return;
+    }
+    if (act === 'pause') {
+      if (!edit && active.pause()) {
+        buzz(20);
         paintClock();
       }
       return;
@@ -695,9 +774,11 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'exmenu') return void (await exMenu(se));
     if (act === 'exnote') return void (await editNote(se));
     if (act === 'reststart') {
+      if (!edit) active.ensureStarted(s, true);
       if (liftSettings().restSound) audio.unlock();
       active.startRest(active.restSecFor(se), exOf(se.exId).name);
       buzz(20);
+      paintClock();
       return;
     }
     if (act === 'restauto') {
@@ -727,6 +808,7 @@ function build(root: HTMLElement, id?: string): () => void {
     }
     const row = a.closest<HTMLElement>('.srow')!;
     const i = Number(row.dataset.i);
+    if (act === 'hold') { startHold(se, i, card, row); return; }
     if (act === 'done') return logSet(card, row, false);
     if (act === 'vid') {
       if (!edit) {
@@ -752,6 +834,7 @@ function build(root: HTMLElement, id?: string): () => void {
 
   return () => {
     dead = true;
+    stopHold();
     window.visualViewport?.removeEventListener('resize', onVvResize);
     offTick(); offRest(); offChips(); offCfg(); offStore();
     hideDock();

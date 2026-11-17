@@ -51,7 +51,7 @@ final class WorkoutNotif {
 
     static Notification build(Context c, String title, String text, long startEpochMs) {
         NotificationCompat.Builder b = new NotificationCompat.Builder(c, CHANNEL)
-                .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                .setSmallIcon(R.drawable.ic_stat_armory)
                 .setContentTitle(title)
                 .setContentText(text)
                 .setOngoing(true)
@@ -82,7 +82,7 @@ final class WorkoutNotif {
         String text = bpm != null ? (bpm + " · " + (fired ? "Next set ready" : "Resting")) : baseText;
 
         NotificationCompat.Builder b = new NotificationCompat.Builder(c, REST_CHANNEL)
-                .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                .setSmallIcon(R.drawable.ic_stat_armory)
                 .setContentTitle(title)
                 .setContentText(text)
                 .setOngoing(true)

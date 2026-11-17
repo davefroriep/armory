@@ -27,6 +27,11 @@ export interface BikeFrame {
   dist: number;
   kcal: number;
   spd: number;
+  fan?: number;
+  rfan?: number;
+  pls?: number;
+  dt?: number;
+  ratio?: number;
 }
 
 /** AirBike 5 Hz NUS frame: {"dev":"airbike","w":127.0,"cad":44.0,"dist":452.1,"kcal":15.42,"spd":16.87,...} */
@@ -35,7 +40,18 @@ export function parseBikeLine(line: string): BikeFrame | null {
     const o = JSON.parse(line);
     if (typeof o !== 'object' || o === null || typeof o.w !== 'number' || typeof o.cad !== 'number') return null;
     if (o.dev && o.dev !== 'airbike') return null;
-    return { w: o.w, cad: o.cad, dist: Number(o.dist) || 0, kcal: Number(o.kcal) || 0, spd: Number(o.spd) || 0 };
+    return {
+      w: o.w,
+      cad: o.cad,
+      dist: Number(o.dist) || 0,
+      kcal: Number(o.kcal) || 0,
+      spd: Number(o.spd) || 0,
+      ...(typeof o.fan === 'number' ? { fan: o.fan } : {}),
+      ...(typeof o.rfan === 'number' ? { rfan: o.rfan } : {}),
+      ...(typeof o.pls === 'number' ? { pls: o.pls } : {}),
+      ...(typeof o.dt === 'number' ? { dt: o.dt } : {}),
+      ...(typeof o.ratio === 'number' ? { ratio: o.ratio } : {}),
+    };
   } catch {
     return null;
   }

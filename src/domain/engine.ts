@@ -52,6 +52,14 @@ export class WorkoutEngine {
     this.state = 'running';
   }
 
+  /** Hydrates the engine in paused state from previously recorded elapsed seconds (crash resume). */
+  hydratePaused(elapsedSec: number): void {
+    this.accMs = Math.max(0, elapsedSec * 1000);
+    this.resumedAt = 0;
+    this.released.clear();
+    this.state = 'paused';
+  }
+
   finish(now: number): void {
     this.pause(now);
     this.state = 'finished';

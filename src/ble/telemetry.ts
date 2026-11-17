@@ -10,10 +10,18 @@ export interface Live {
   dist: number;
   kcal: number;
   spd: number;
+  fan: number;
+  rfan: number;
+  pls: number;
+  dt: number;
+  ratio: number;
   bikeAt: number;
 }
 
-export const live: Live = { hr: 0, hrAt: 0, w: 0, cad: 0, dist: 0, kcal: 0, spd: 0, bikeAt: 0 };
+export const live: Live = {
+  hr: 0, hrAt: 0, w: 0, cad: 0, dist: 0, kcal: 0, spd: 0,
+  fan: 0, rfan: 0, pls: 0, dt: 0, ratio: 11.11, bikeAt: 0,
+};
 
 export const HR_STALE_MS = 5000;
 export const BIKE_STALE_MS = 2000;
@@ -108,12 +116,20 @@ export function clearHrLog(): void {
   hrLog.length = 0;
 }
 
-export function pushBike(f: { w: number; cad: number; dist: number; kcal: number; spd: number }): void {
+export function pushBike(f: {
+  w: number; cad: number; dist: number; kcal: number; spd: number;
+  fan?: number; rfan?: number; pls?: number; dt?: number; ratio?: number;
+}): void {
   live.w = f.w;
   live.cad = f.cad;
   live.dist = f.dist;
   live.kcal = f.kcal;
   live.spd = f.spd;
+  if (f.fan !== undefined) live.fan = f.fan;
+  if (f.rfan !== undefined) live.rfan = f.rfan;
+  if (f.pls !== undefined) live.pls = f.pls;
+  if (f.dt !== undefined) live.dt = f.dt;
+  if (f.ratio !== undefined) live.ratio = f.ratio;
   live.bikeAt = Date.now();
   bikeFrame.emit(live);
 }

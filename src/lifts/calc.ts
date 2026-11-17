@@ -54,7 +54,8 @@ export function sessionStats(s: LiftSession, exOf: ExOf): SessionStats {
     if (any) exercises++;
   }
   const end = s.endMs ?? Date.now();
-  return { exercises, sets, reps, volumeKg, durationSec: Math.max(0, Math.round((end - s.startMs) / 1000)) };
+  const extraPaused = s.pausedAt != null ? Math.max(0, end - s.pausedAt) : 0;
+  return { exercises, sets, reps, volumeKg, durationSec: Math.max(0, Math.round((end - s.startMs - (s.pausedMs ?? 0) - extraPaused) / 1000)) };
 }
 
 export const doneSessions = (all: Iterable<LiftSession>): LiftSession[] =>

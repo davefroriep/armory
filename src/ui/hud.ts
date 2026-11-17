@@ -11,9 +11,9 @@ import { wattsForRpm } from '../domain/airbikeCurve';
 import { FTP_LINE_H, profileBar } from '../domain/profile';
 import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
-import { workoutService } from '../native/service';
+import { isNative, setKeepScreenOn, workoutService } from '../native/service';
 import { getSettings, updateSettings } from '../store/settings';
-import { putMeta } from '../store/db';
+import { getMeta, getSamples, putMeta } from '../store/db';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
 import { ICON, esc, hms, mmss } from './dom';
@@ -32,7 +32,7 @@ export function hudScreen(root: HTMLElement, args: string[], query: URLSearchPar
     location.hash = '#/airbike';
     return () => {};
   }
-  return new Hud(root, program, query.get('pick')).mount();
+  return new Hud(root, program, query.get('pick'), query.get('resume')).mount();
 }
 
 class Hud {
@@ -63,7 +63,12 @@ class Hud {
   private gateState: { waiting: boolean; timerOnly: boolean; into: number; minSec: number; nominal: number; hrLimit: number } | null = null;
   private el!: Record<string, HTMLElement>;
 
-  constructor(private root: HTMLElement, baseProgram: Program, private planSlot: string | null = null) {
+  constructor(
+    private root: HTMLElement,
+    baseProgram: Program,
+    private planSlot: string | null = null,
+    private resumeId: string | null = null,
+  ) {
     this.baseProgram = baseProgram;
     this.p = resolveProgram(baseProgram, getSettings().ftp, 0);
     this.engine = new WorkoutEngine(this.p);
@@ -75,6 +80,7 @@ class Hud {
   mount(): () => void {
     ensureSensors({ bike: true });
     this.paintHud();
+    if (this.resumeId) void this.hydrateResume(this.resumeId);
     this.loop();
     this.offSmooth = bikeFrame.on((f) => {
       const t = Date.now();
@@ -96,6 +102,7 @@ class Hud {
       audio.setMetronome(false, null);
       sim.setTarget(0);
       this.releaseLock();
+      void setKeepScreenOn(false);
       void workoutService.stop();
       document.removeEventListener('visibilitychange', vis);
       window.removeEventListener('beforeunload', unload);
@@ -107,9 +114,11 @@ class Hud {
   }
 
   private async acquireLock(): Promise<void> {
-    try { this.lock = (await navigator.wakeLock?.request('screen')) ?? null; } catch { /* denied */ }
+    if (isNative()) void setKeepScreenOn(true);
+    else { try { this.lock = (await navigator.wakeLock?.request('screen')) ?? null; } catch { /* denied */ } }
   }
   private releaseLock(): void {
+    void setKeepScreenOn(false);
     void this.lock?.release().catch(() => {});
     this.lock = null;
   }
@@ -245,6 +254,34 @@ class Hud {
 
   // ------------------------------------------------------------------ actions
 
+  private async hydrateResume(id: string): Promise<void> {
+    const [meta, samples] = await Promise.all([getMeta(id), getSamples(id)]);
+    if (!meta || meta.status !== 'active' || this.engine.state !== 'ready') return;
+    const s = getSettings();
+    this.rec = new Recorder(meta.id, meta.equipment, meta.programId, meta.name, meta.eventId, s.hrMax, { meta, samples }, meta.planSlot ?? null);
+    this.attachRecorderSensors();
+    this.engine.hydratePaused(samples.length);
+    this.guard.arm();
+    this.el.go.textContent = 'PAUSED';
+    this.el.go.classList.add('pause');
+    this.root.querySelector('#goalCtl')?.setAttribute('hidden', '');
+    this.el.pauseSub.textContent = `${hms(samples.length)} recovered · ready to resume`;
+    this.el.pauseModal.hidden = false;
+    this.loop();
+  }
+
+  private attachRecorderSensors(): void {
+    this.offFrame?.();
+    this.offRec?.();
+    this.offFrame = bikeFrame.on(() => { if (this.engine.state === 'running') this.rec?.onFrame(); });
+    this.offRec = this.rec!.attach(() => {
+      if (this.engine.state !== 'running') return null;
+      const now = Date.now();
+      const seg = this.engine.locate(now).seg;
+      return { elapsed: this.engine.elapsed(now), targetRpm: seg?.rpm ?? (this.p.segments.length === 0 ? this.p.paceRpm ?? 0 : 0) };
+    });
+  }
+
   private start(): void {
     audio.unlock();
     audio.setVolume(getSettings().metroVolume);
@@ -252,15 +289,7 @@ class Hud {
     const slot = this.planSlot ?? calendar.forEquipment('airbike').find((i) => i.programId === this.p.id)?.planSlot ?? null;
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     this.rec = new Recorder(id, 'airbike', this.p.id, this.p.intervalsName, null, s.hrMax, undefined, slot);
-    this.offFrame = bikeFrame.on(() => { if (this.engine.state === 'running') this.rec?.onFrame(); });
-    // Sensor-driven recording (registered after onFrame so each frame is accumulated before the tick):
-    // keeps the log complete while Android throttles this page's timers in the background.
-    this.offRec = this.rec.attach(() => {
-      if (this.engine.state !== 'running') return null;
-      const now = Date.now();
-      const seg = this.engine.locate(now).seg;
-      return { elapsed: this.engine.elapsed(now), targetRpm: seg?.rpm ?? (this.p.segments.length === 0 ? this.p.paceRpm ?? 0 : 0) };
-    });
+    this.attachRecorderSensors();
     this.engine.start(Date.now());
     this.guard.arm();
     this.lastIndex = -2;
@@ -275,6 +304,7 @@ class Hud {
     if (this.engine.state !== 'running') return;
     this.engine.pause(Date.now());
     audio.setMetronome(false, null);
+    this.releaseLock();
     this.el.pauseSub.textContent = `${hms(this.engine.elapsed(Date.now()))} elapsed`;
     this.el.pauseModal.hidden = false;
     void workoutService.update(`Armory Fit · ${this.p.name}`, `PAUSED · ${hms(this.engine.elapsed(Date.now()))}`);
@@ -283,6 +313,8 @@ class Hud {
   private resume(): void {
     this.el.pauseModal.hidden = true;
     this.engine.resume(Date.now());
+    void this.acquireLock();
+    void workoutService.start(`Armory Fit · ${this.p.name}`, 'Resumed…');
   }
 
   private finish(): void {

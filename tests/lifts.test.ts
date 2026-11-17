@@ -7,9 +7,10 @@ import {
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import {
-  addSet, buildExercise, canLog, driveUrlFor, editReps, editWeight, effectiveRestAuto, hasSessionActivity,
-  isSessionStarted, labels, midSuperset, newSet, prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock,
-  routineFromSession, startSessionClock, supersetGroups, swapExercise, toggleDone,
+  addSet, buildExercise, canLog, driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec,
+  hasSessionActivity, isSessionPaused, isSessionStarted, labels, midSuperset, newSet, pauseSessionClock,
+  prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
+  startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import { extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs } from '../src/lifts/mp4';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
@@ -560,5 +561,38 @@ describe('Phase 1 routine seed', () => {
     expect(parentHash('#/strength/workout/s1')).toBe('#/strength/history');
     expect(parentHash('#/strength/exercise/bench')).toBe('#/strength/exercises');
     expect(parentHash('#/airbike/p/1')).toBe('#/airbike');
+    expect(parentHash('#/airbike/w/w1')).toBe('#/airbike');
+  });
+
+  it('pauses and resumes active lift sessions without counting multi-hour break time', () => {
+    const s = sess('pause', 1_000_000, [sx('bench', [set(lb(135), 8, { done: false })])], {
+      status: 'active',
+      started: true,
+      manualStart: false,
+      startMs: 1_000_000,
+      endMs: null,
+    });
+    expect(isSessionPaused(s)).toBe(false);
+    expect(pauseSessionClock(s, 1_600_000)).toBe(true);
+    expect(isSessionPaused(s)).toBe(true);
+    // Double-pause is a no-op
+    expect(pauseSessionClock(s, 2_000_000)).toBe(false);
+    // 2 hours later: active elapsed and stats remain frozen at 600s (10 min)
+    expect(elapsedSessionSec(s, 8_800_000)).toBe(600);
+    expect(sessionStats({ ...s, endMs: 8_800_000 }, exOf).durationSec).toBe(600);
+
+    // Resume 2 hours later, train 5 more minutes -> 900s total (15 min)
+    expect(resumeSessionClock(s, 8_800_000)).toBe(true);
+    expect(isSessionPaused(s)).toBe(false);
+    expect(s.pausedMs).toBe(7_200_000);
+    expect(elapsedSessionSec(s, 9_100_000)).toBe(900);
+    expect(sessionStats({ ...s, endMs: 9_100_000 }, exOf).durationSec).toBe(900);
+
+    // Resetting an auto-started paused session clears pause tracking
+    expect(pauseSessionClock(s, 9_100_000)).toBe(true);
+    expect(resetSessionClock(s, 9_200_000)).toBe(true);
+    expect(s.pausedAt ?? null).toBeNull();
+    expect(s.pausedMs ?? 0).toBe(0);
+    expect(isSessionPaused(s)).toBe(false);
   });
 });

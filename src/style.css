@@ -452,6 +452,7 @@ a.metro { text-decoration: none; }
 
 /* ---------- unified top resume bar + live HR sheet ---------- */
 .rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); flex: none; }
+.rec-dot.paused { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 .top-resume {
   position: sticky;
   top: calc(58px + var(--sat));
@@ -469,7 +470,7 @@ a.metro { text-decoration: none; }
 .top-resume span { font-size: .82rem; font-weight: 800; font-variant-numeric: tabular-nums; color: #93c5fd; }
 .top-resume em { font-style: normal; font-size: .78rem; font-weight: 800; color: var(--blue); }
 
-[data-chip="hr"] { cursor: pointer; }
+[data-chip="hr"], [data-chip="bike"] { cursor: pointer; }
 .hr-sheet { text-align: left; max-height: 92dvh; overflow-y: auto; align-items: stretch; padding: 20px 18px calc(20px + var(--sab)); }
 #hrBody { display: flex; flex-direction: column; gap: 10px; }
 .hr-hero { background: var(--card2); border-radius: 18px; padding: 14px 16px; text-align: center; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05); }

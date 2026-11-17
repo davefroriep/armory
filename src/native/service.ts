@@ -40,7 +40,8 @@ interface WorkoutServicePlugin {
   requestOverlayPermission(): Promise<void>;
   openAppSettings(): Promise<void>;
   addListener(event: 'restSync', cb: (ev: NativeRestEvent) => void): Promise<PluginListenerHandle>;
-  openApp(o: { pkg: string }): Promise<{ opened: boolean }>;
+  setKeepScreenOn(o: { on: boolean }): Promise<void>;
+  setMetronome(o: { play: boolean; bpm: number; volume: number }): Promise<void>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
@@ -53,9 +54,6 @@ interface WorkoutServicePlugin {
 export const isNative = (): boolean => Capacitor.isNativePlatform();
 
 const plugin = isNative() ? registerPlugin<WorkoutServicePlugin>('WorkoutService') : null;
-
-const BOOSTCAMP_PKG = 'com.bpmhealth.boostcamp';
-const BOOSTCAMP_WEB = 'https://www.boostcamp.app/';
 
 /**
  * Android foreground service (custom plugin, android/.../WorkoutService*.java): keeps the process,
@@ -102,21 +100,14 @@ export function onNativeRestSync(cb: (ev: NativeRestEvent) => void): () => void 
   };
 }
 
-/** Launches the installed Boostcamp Android app directly (never the web install prompt when installed). */
-export async function openBoostcamp(): Promise<void> {
-  if (plugin) {
-    try {
-      const r = await plugin.openApp({ pkg: BOOSTCAMP_PKG });
-      if (r?.opened) return;
-    } catch { /* fall through */ }
-    window.open(`market://details?id=${BOOSTCAMP_PKG}`, '_system');
-    return;
-  }
-  if (/Android/i.test(navigator.userAgent)) {
-    location.href = `intent://#Intent;action=android.intent.action.MAIN;category=android.intent.category.LAUNCHER;package=${BOOSTCAMP_PKG};S.browser_fallback_url=${encodeURIComponent(BOOSTCAMP_WEB)};end`;
-    return;
-  }
-  window.open(BOOSTCAMP_WEB, '_blank', 'noopener');
+export async function setKeepScreenOn(on: boolean): Promise<void> {
+  if (!plugin) return;
+  try { await plugin.setKeepScreenOn({ on }); } catch { /* ignore */ }
+}
+
+export async function setNativeMetronome(play: boolean, bpm: number, volume: number): Promise<void> {
+  if (!plugin) return;
+  try { await plugin.setMetronome({ play, bpm, volume }); } catch { /* ignore */ }
 }
 
 export async function launchNativeVideoCamera(): Promise<boolean> {

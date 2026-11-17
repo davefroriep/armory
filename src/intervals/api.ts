@@ -1,6 +1,16 @@
 import { getSettings, updateSettings } from '../store/settings';
 import type { IntervalsActivityLite } from '../domain/plan';
-import type { IntervalsEvent } from './parse';
+
+export interface IntervalsEvent {
+  id: number;
+  external_id?: string | null;
+  paired_activity_id?: string | null;
+}
+
+interface WellnessRowRaw {
+  id?: string;
+  weight?: number | null;
+}
 
 const BASE = 'https://intervals.icu/api/v1';
 
@@ -69,20 +79,42 @@ export async function fetchAthleteProfile(): Promise<AthleteFtpInfo> {
   };
 }
 
+const ymdDaysAgo = (days: number): string => {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
+
+export async function fetchLatestWellnessWeight(days = 90): Promise<{ weightKg: number; date: string } | null> {
+  const oldest = ymdDaysAgo(days);
+  const newest = ymdDaysAgo(0);
+  const rows = (await (await call(`/athlete/${aid()}/wellness?oldest=${encodeURIComponent(oldest)}&newest=${encodeURIComponent(newest)}`)).json()) as WellnessRowRaw[];
+  if (!Array.isArray(rows)) return null;
+  const hit = [...rows]
+    .filter((r) => typeof r?.weight === 'number' && (r.weight ?? 0) > 0 && typeof r.id === 'string')
+    .sort((a, b) => String(b.id).localeCompare(String(a.id)))[0];
+  return hit ? { weightKg: Number(hit.weight), date: String(hit.id) } : null;
+}
+
 export async function syncAthleteFtp(forceUseEftp = false): Promise<AthleteFtpInfo> {
-  const info = await fetchAthleteProfile();
+  const [info, latestWt] = await Promise.all([
+    fetchAthleteProfile(),
+    fetchLatestWellnessWeight().catch(() => null),
+  ]);
+  const weightKg = latestWt?.weightKg ?? info.weightKg;
   const patch: Partial<ReturnType<typeof getSettings>> = {
     intervalsEftp: info.eftp,
     intervalsSetFtp: info.setFtp,
     ...(info.sex ? { sex: info.sex } : {}),
-    ...(info.weightKg ? { weightKg: info.weightKg } : {}),
+    ...(weightKg ? { weightKg } : {}),
+    ...(latestWt?.date ? { weightDate: latestWt.date } : {}),
     ...(info.birthDate ? { birthDate: info.birthDate } : {}),
   };
   if ((forceUseEftp || getSettings().ftpAutoSync) && info.eftp) {
     patch.ftp = info.eftp;
   }
   updateSettings(patch);
-  return info;
+  return { ...info, weightKg };
 }
 
 export async function testConnection(): Promise<string> {

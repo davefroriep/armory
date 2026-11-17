@@ -8,6 +8,7 @@ import { summarize } from '../workout/summary';
 import type { Equipment, WorkoutMeta } from '../types';
 import { lifts } from '../lifts/store';
 import { esc, mmss } from './dom';
+import { confirmSheet, toast } from './lifts/kit';
 import { machineDock, programHeroCard, revFooter, topbar, weekStripCard, wireCalendar, wireChips } from './chrome';
 import { groupDayLogs, renderDayZoomCard, todayCompletedItems, type DayLogs } from './dayZoom';
 import { currentZoomLookup, launchDayZoomWorkout, openStepSheet, shiftScheduleToStep } from './program';
@@ -89,9 +90,10 @@ export function homeScreen(root: HTMLElement): () => void {
     const pend = await pendingCount();
     let h = '';
     for (const m of activeIncomplete) {
+      const canResume = m.equipment === 'airbike' && m.programId;
       h += `<section class="card warn"><b>Unfinished workout</b>
         <p>${esc(m.name)} — started ${new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. The app closed before you finished.</p>
-        <div class="row"><button class="btn primary sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
+        <div class="row">${canResume ? `<a class="btn primary sm" href="#/airbike/p/${esc(m.programId)}?resume=${esc(m.id)}">Resume</a>` : ''}<button class="btn ${canResume ? '' : 'primary '}sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
     }
     if (pend) {
       const why = metas.find((m) => m.status === 'saved' && m.upload === 'pending')?.lastError;
@@ -156,7 +158,7 @@ export function homeScreen(root: HTMLElement): () => void {
       await loadDynamic();
     }
     const drop = t.closest<HTMLElement>('[data-drop]');
-    if (drop && confirm('Discard this unfinished workout?')) {
+    if (drop && await confirmSheet('Discard unfinished workout?', 'Drops any saved samples from this crashed session.', 'Discard', true)) {
       await discard(drop.dataset.drop!);
       await loadDynamic();
     }
@@ -258,7 +260,7 @@ async function recover(m: WorkoutMeta): Promise<void> {
   const samples = await getSamples(m.id);
   if (samples.length < 10) {
     await discard(m.id);
-    alert(`Only ${mmss(samples.length)} was recorded, so it was discarded.`);
+    toast(`Only ${mmss(samples.length)} recorded — discarded`);
     return;
   }
   const rec: WorkoutMeta = { ...m, ...summarize(samples), status: 'saved', upload: 'pending' };

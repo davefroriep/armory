@@ -1,7 +1,7 @@
 import { Emitter } from '../emitter';
 import {
   PHASE1_PLAN, UPPER1_FINISH_ITEMS, isPlanExternalId, parseExtraKey, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
-  type LocalTodayItem, type PlanStep, type QueueState,
+  type ExtraWorkout, type ExtraWorkoutItem, type LocalTodayItem, type PlanStep, type QueueState,
 } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import type { WorkoutMeta } from '../types';
@@ -461,6 +461,40 @@ class Calendar {
   /** Marks a cherry-picked future cardio slot done locally and logs to Intervals.icu when available. */
   async completeFutureSlotExternally(stepIndex: number, slotIndex: number): Promise<void> {
     await this.markSlotDone(slotKey(stepIndex, slotIndex));
+  }
+
+  /** Returns any existing make-up ExtraWorkout linked to a finished session's skipped exercises. */
+  makeupForSession(sessionId: string): ExtraWorkout | undefined {
+    return (getSettings().queue.extras ?? []).find((x) => x.id === `makeup-${sessionId}`);
+  }
+
+  /** Schedules skipped exercises from a strength session as an ExtraWorkout for today or tomorrow. */
+  scheduleSkippedMakeup(args: {
+    sessionId: string;
+    name: string;
+    items: ExtraWorkoutItem[];
+    when: 'today' | 'tomorrow';
+    description: string;
+  }): ExtraWorkout {
+    const today = localDate();
+    const date = args.when === 'today' ? today : addDays(today, 1);
+    const id = `makeup-${args.sessionId}`;
+    const seconds = Math.max(900, args.items.reduce((n, it) => n + it.sets * 180, 0));
+    const entry: ExtraWorkout = {
+      id,
+      name: `${args.name} (Finish)`,
+      date,
+      equipment: 'strength',
+      seconds,
+      description: args.description,
+      items: args.items.map((it) => ({ ...it })),
+    };
+    const s = getSettings();
+    const extras = (s.queue.extras ?? []).filter((x) => x.id !== id);
+    extras.push(entry);
+    this.syncLocalState({ ...s.queue, extras });
+    this.changed.emit();
+    return entry;
   }
 }
 

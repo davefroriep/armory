@@ -83,6 +83,8 @@ export interface LiftSession {
   planSlot?: string | null;
   startMs: number;
   endMs: number | null;
+  pausedAt?: number | null;
+  pausedMs?: number;
   status: 'active' | 'done';
   /** True once the workout has started (via Start button, set check, or camera). */
   started?: boolean;

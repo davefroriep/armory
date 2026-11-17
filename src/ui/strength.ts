@@ -1,26 +1,33 @@
 import { LeaveGuard } from './leaveGuard';
 import { hrFresh, live } from '../ble/telemetry';
 import { ensureSensors } from '../ble/sources';
-import { calendar } from '../intervals/calendar';
-import { isNative, openBoostcamp, workoutService } from '../native/service';
+import { isNative, workoutService } from '../native/service';
 import { bodyProfile, kcalFromSamples } from '../domain/energy';
 import { getSettings } from '../store/settings';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
-import { calendarCard, revFooter, topbar, wireCalendar, wireChips } from './chrome';
-import { $, hms, mmss } from './dom';
+import { revFooter, topbar, wireChips } from './chrome';
+import { $, esc, hms, mmss } from './dom';
 import { ZONE_COLOR, hrZone } from './hr';
 import { renderSummary } from './summaryView';
 
-/**
- * Strength = heart-rate logging only. You lift in Boostcamp; this records the H10 for the session
- * (like Wahoo's "Strength Train"), asks how hard it was, and uploads it to Intervals.icu.
- */
-export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLSearchParams): () => void {
-  ensureSensors({ bike: false });
-  void calendar.refresh();
-  const planSlot = query.get('pick') ?? calendar.forEquipment('strength')[0]?.planSlot ?? null;
+const PACK_KEY = 'armory.ruck.packLb';
+const PACK_OPTIONS = [0, 20, 30, 35, 45];
 
+function loadPackLb(): number {
+  if (typeof localStorage === 'undefined') return 35;
+  const v = Number(localStorage.getItem(PACK_KEY));
+  return Number.isFinite(v) && PACK_OPTIONS.includes(v) ? v : 35;
+}
+
+/**
+ * Outdoor Ruck / HR-only logger (`#/strength/hr`) powered by the Polar H10 chest strap.
+ * Records 1 Hz HR + Keytel kcal and uploads to Intervals.icu as a Walk/Hike activity.
+ */
+export function strengthHrScreen(root: HTMLElement): () => void {
+  ensureSensors({ bike: false });
+
+  let packLb = loadPackLb();
   let rec: Recorder | null = null;
   let state: 'ready' | 'running' | 'paused' | 'summary' = 'ready';
   let t0 = 0;
@@ -29,16 +36,22 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
   let lock: WakeLockSentinel | null = null;
   let lastSvc = 0;
   let offChips: (() => void) | null = null;
-  let offCal: (() => void) | null = null;
   let offRec: (() => void) | null = null;
   const guard = new LeaveGuard(() => state === 'running' || state === 'paused');
 
+  const sessionTitle = (): string => (packLb > 0 ? `Ruck · ${packLb} lb` : 'Outdoor HR');
   const elapsed = () => (accMs + (state === 'running' ? Date.now() - t0 : 0)) / 1000;
 
   const paintReady = () => {
-    root.innerHTML = `${topbar({ back: '#/strength', title: 'Heart-rate session', cog: true })}
+    const chips = PACK_OPTIONS.map((w) =>
+      `<button class="fchip${packLb === w ? ' on' : ''}" type="button" data-pack="${w}">${w === 0 ? 'No pack' : `${w} lb`}</button>`,
+    ).join('');
+    root.innerHTML = `${topbar({ back: '#/strength', title: 'Ruck / Outdoor HR', cog: true })}
       <main class="page">
-        ${calendarCard(calendar.forEquipment('strength'), false)}
+        <section class="card">
+          <div class="card-h"><span>PACK WEIGHT</span></div>
+          <div class="chips-row wrap">${chips}</div>
+        </section>
         <section class="card strength">
           <small class="lbl">HEART RATE</small>
           <div class="hr-big" id="hrBig">--</div>
@@ -50,10 +63,9 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
           </div>
         </section>
         <div class="ctrl nopad">
-          <button class="metro" id="openBoostcamp" type="button">OPEN BOOSTCAMP</button>
-          <button class="go" id="go">START</button>
+          <button class="go" id="go">START ${esc(sessionTitle().toUpperCase())}</button>
         </div>
-        <p class="hint c">Start logging, then lift in Boostcamp. Come back and finish to save your heart-rate session.</p>
+        <p class="hint c">Logs 1 Hz Polar H10 heart rate + calories to Intervals.icu (Walk activity for ruck/outdoor walks).</p>
         ${revFooter()}
       </main>
       <div class="modal" id="pauseModal" hidden>
@@ -62,9 +74,15 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
           <button class="btn big" id="finish">Finish session</button></div></div>`;
     offChips?.();
     offChips = wireChips(root);
-    offCal?.();
-    offCal = wireCalendar(root, () => { if (state === 'ready') paintReady(); });
-    $('#openBoostcamp', root).addEventListener('click', () => { void openBoostcamp(); });
+    root.querySelectorAll<HTMLElement>('[data-pack]').forEach((b) =>
+      b.addEventListener('click', () => {
+        if (state !== 'ready') return;
+        packLb = Number(b.dataset.pack);
+        if (typeof localStorage !== 'undefined') localStorage.setItem(PACK_KEY, String(packLb));
+        root.querySelectorAll<HTMLElement>('[data-pack]').forEach((x) => x.classList.toggle('on', x === b));
+        $('#go', root).textContent = `START ${sessionTitle().toUpperCase()}`;
+      }),
+    );
     $('#go', root).addEventListener('click', () => (state === 'ready' ? start() : pause()));
     $('#resume', root).addEventListener('click', resume);
     $('#finish', root).addEventListener('click', finish);
@@ -86,26 +104,27 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
       $('#sMax', root).textContent = rec.meta.maxHr ? String(Math.round(rec.meta.maxHr)) : '--';
       if (state === 'running' && Date.now() - lastSvc > 5000) {
         lastSvc = Date.now();
-        void workoutService.update('Armory Fit · Strength', `${mmss(el)} · ${hr || '--'} BPM`);
+        void workoutService.update(`Armory Fit · ${sessionTitle()}`, `${mmss(el)} · ${hr || '--'} BPM`);
       }
     }
     const go = $('#go', root);
-    go.textContent = state === 'ready' ? 'START' : state === 'paused' ? 'PAUSED' : 'PAUSE';
+    go.textContent = state === 'ready' ? `START ${sessionTitle().toUpperCase()}` : state === 'paused' ? 'PAUSED' : 'PAUSE';
     go.classList.toggle('pause', state !== 'ready');
   };
 
   const start = () => {
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    rec = new Recorder(id, 'strength', 'strength', 'Strength Train', null, getSettings().hrMax, undefined, planSlot);
+    const title = sessionTitle();
+    rec = new Recorder(id, 'strength', 'ruck', title, null, getSettings().hrMax);
+    if (packLb > 0) rec.meta.notes = `Pack weight: ${packLb} lb`;
     state = 'running';
-    // Beat-driven recording: keeps logging while Android throttles this page's timers in the background.
     offRec?.();
     offRec = rec.attach(() => (state === 'running' ? { elapsed: elapsed(), targetRpm: 0 } : null));
     guard.arm();
     t0 = Date.now();
     accMs = 0;
     if (!isNative()) void navigator.wakeLock?.request('screen').then((l) => { lock = l; }).catch(() => {});
-    void workoutService.start('Armory Fit · Strength', 'Logging heart rate…');
+    void workoutService.start(`Armory Fit · ${title}`, 'Logging heart rate…');
   };
   const pause = () => {
     if (state !== 'running') return;
@@ -146,7 +165,7 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
     const bars = [1, 2, 3, 4, 5].map((z) =>
       `<div class="zrow"><span>Z${z}</span><i><u style="width:${(secs[z] / total) * 100}%;background:${ZONE_COLOR[z]}"></u></i><b>${mmss(secs[z])}</b></div>`).join('');
     renderSummary(root, {
-      title: 'Strength Train',
+      title: meta.name,
       meta,
       stats: [['AVG HR', meta.avgHr ? String(Math.round(meta.avgHr)) : '--'], ['MAX HR', meta.maxHr ? String(Math.round(meta.maxHr)) : '--'], ['TIME', hms(meta.seconds)], ['KCAL', kcal != null ? `~${kcal}` : '--']],
       extra: `<section class="card zones"><div class="card-h"><span>TIME IN HR ZONE</span></div>${bars}</section>`,
@@ -164,7 +183,6 @@ export function strengthHrScreen(root: HTMLElement, _args: string[], query: URLS
     offRec?.();
     guard.dispose();
     offChips?.();
-    offCal?.();
     void workoutService.stop();
     void lock?.release().catch(() => {});
     window.removeEventListener('beforeunload', unload);
