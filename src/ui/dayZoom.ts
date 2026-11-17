@@ -1,5 +1,5 @@
 import {
-  PHASE1_PLAN, dayOfWeek, extraKey, parseYmd, shiftYmd,
+  PHASE1_PLAN, dayOfWeek, extraKey, parseYmd, shiftYmd, slotKey,
   type ExtraWorkout, type PlanSlot, type ProjectedStep, type SlotState,
 } from '../domain/plan';
 import { sessionStats, type ExOf, type PRHit } from '../lifts/calc';
@@ -207,9 +207,12 @@ function slotBadgeAndClass(state: SlotState): { badge: string; cls: string } {
 }
 
 /** Planned, externally completed, or skipped slot view with matched local routine exercises/sets/notes. */
-export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: ZoomLookup): string {
+export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: ZoomLookup, planSlot?: string): string {
   const mins = Math.round(slot.seconds / 60);
   const { badge, cls } = slotBadgeAndClass(state);
+  const doBtn = state === 'pending' && planSlot
+    ? `<button class="btn primary sh-do-btn" type="button" data-zact="do-slot" data-slot="${esc(planSlot)}">Do this workout now</button>`
+    : '';
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, lookup.routines);
     const detail = r ? renderItemList(r.items, lookup, r.id) : `<p class="sh-text">${esc(slot.description)}</p>`;
@@ -220,6 +223,7 @@ export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: Zoom
         ${badge}
       </div>
       ${detail}
+      ${doBtn}
     </div>`;
   }
   return `<div class="sh-slot${cls}">
@@ -229,15 +233,19 @@ export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: Zoom
       ${badge}
     </div>
     <p class="sh-text">${esc(slot.description)}</p>
+    ${doBtn}
   </div>`;
 }
 
-function renderExtraSlot(x: ExtraWorkout, state: SlotState, lookup: ZoomLookup): string {
+function renderExtraSlot(x: ExtraWorkout, state: SlotState, lookup: ZoomLookup, planSlot?: string): string {
   const mins = Math.round(x.seconds / 60);
   const { badge, cls } = slotBadgeAndClass(state);
   const detail = x.items?.length
     ? renderItemList(x.items, lookup)
     : `<p class="sh-text">${esc(x.description)}</p>`;
+  const doBtn = state === 'pending' && planSlot
+    ? `<button class="btn primary sh-do-btn" type="button" data-zact="do-slot" data-slot="${esc(planSlot)}">Do this workout now</button>`
+    : '';
   return `<div class="sh-slot${cls}">
     <div class="sh-slot-h">
       <span class="cal-ico ${x.equipment}">${ICON[x.equipment]}</span>
@@ -245,6 +253,7 @@ function renderExtraSlot(x: ExtraWorkout, state: SlotState, lookup: ZoomLookup):
       ${badge || '<span class="p-badge cur">Carry-over</span>'}
     </div>
     ${detail}
+    ${doBtn}
   </div>`;
 }
 
@@ -381,8 +390,8 @@ export function renderDayZoomCard(args: {
     ...res.externalDoneSlots.map(({ slot }) => renderPlannedSlot(slot, 'done', lookup)),
     ...res.skippedExtras.map((x) => renderExtraSlot(x, 'skipped', lookup)),
     ...res.skippedSlots.map(({ slot }) => renderPlannedSlot(slot, 'skipped', lookup)),
-    ...res.pendingExtras.map((x) => renderExtraSlot(x, 'pending', lookup)),
-    ...res.pendingSlots.map(({ slot }) => renderPlannedSlot(slot, 'pending', lookup)),
+    ...res.pendingExtras.map((x) => renderExtraSlot(x, 'pending', lookup, extraKey(x.id))),
+    ...res.pendingSlots.map(({ p, slot, slotIndex }) => renderPlannedSlot(slot, 'pending', lookup, slotKey(p.step.index, slotIndex))),
   ];
 
   const body = slotCards.length
@@ -398,9 +407,6 @@ export function renderDayZoomCard(args: {
         </div>`;
 
   const acts: string[] = [];
-  if (res.pendingSlots.length > 0 || res.pendingExtras.length > 0) {
-    acts.push('<button class="btn primary dz-btn" type="button" data-zact="do-now">Do this workout now</button>');
-  }
   if (res.canShift && res.associatedStep) {
     acts.push(`<button class="btn dz-btn" type="button" data-zact="shift" data-step-idx="${res.associatedStep.step.index}">Shift schedule to here</button>`);
   }

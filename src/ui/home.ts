@@ -11,7 +11,7 @@ import { esc, mmss } from './dom';
 import { confirmSheet, toast } from './lifts/kit';
 import { machineDock, programHeroCard, revFooter, topbar, weekStripCard, wireCalendar, wireChips } from './chrome';
 import { groupDayLogs, renderDayZoomCard, todayCompletedItems, type DayLogs } from './dayZoom';
-import { currentZoomLookup, launchDayZoomWorkout, openStepSheet, shiftScheduleToStep } from './program';
+import { currentZoomLookup, launchDayZoomSlot, launchDayZoomWorkout, openStepSheet, shiftScheduleToStep } from './program';
 
 export function homeScreen(root: HTMLElement): () => void {
   root.classList.add('home-app');
@@ -134,7 +134,9 @@ export function homeScreen(root: HTMLElement): () => void {
     const zact = t.closest<HTMLElement>('[data-zact]');
     if (zact) {
       const act = zact.dataset.zact!;
-      if (act === 'do-now') {
+      if (act === 'do-slot' && zact.dataset.slot) {
+        await launchDayZoomSlot(zact.dataset.slot);
+      } else if (act === 'do-now') {
         await launchDayZoomWorkout(selectedYmd);
       } else if (act === 'shift') {
         const idx = Number(zact.dataset.stepIdx);

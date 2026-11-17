@@ -240,6 +240,9 @@ describe('live HR sheet telemetry helpers', () => {
       lookup,
     });
     expect(todayPendingHtml).toContain('Do this workout now');
+    expect(todayPendingHtml).toContain('data-zact="do-slot" data-slot="1:0"');
+    expect(todayPendingHtml).toContain('data-zact="do-slot" data-slot="1:1"');
+    expect(todayPendingHtml).not.toContain('data-zact="do-now"');
     expect(todayPendingHtml).toContain('View Full Program');
     expect(todayPendingHtml).not.toContain('Shift schedule to here');
     expect(todayPendingHtml).not.toContain('data-back-today');
@@ -297,6 +300,7 @@ describe('live HR sheet telemetry helpers', () => {
       lookup,
     });
     expect(extraHtml).toContain('Upper 1 (Finish)');
+    expect(extraHtml).toContain('data-slot="extra:u1-finish-2026-11-16"');
     expect(extraHtml).toContain('seated-dumbbell-shoulder-press');
     expect(extraHtml).toContain('pull-up');
     expect(extraHtml).toContain('dumbbell-lateral-raise');

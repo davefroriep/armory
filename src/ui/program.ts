@@ -1,5 +1,5 @@
 import {
-  PHASE1_PLAN, WEEK_THEMES, extraKey, parseYmd, projectPlan, slotKey,
+  PHASE1_PLAN, WEEK_THEMES, extraKey, parseExtraKey, parseSlotKey, parseYmd, projectPlan, slotKey,
   type ProjectedStep,
 } from '../domain/plan';
 import { addDays, calendar, localDate } from '../intervals/calendar';
@@ -210,6 +210,54 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
       await shiftScheduleToStep(stepIndex);
     }
   });
+}
+
+/** Launches a specific pending workout slot (`step:slot` or `extra:<id>`) directly from Day Zoom. */
+export async function launchDayZoomSlot(planSlot: string): Promise<void> {
+  await lifts.ready;
+  const s = getSettings();
+  const today = localDate();
+  const routines = lifts.sortedRoutines();
+
+  const exId = parseExtraKey(planSlot);
+  if (exId) {
+    const x = (s.queue.extras ?? []).find((e) => e.id === exId);
+    if (!x) return;
+    if (x.equipment === 'strength') {
+      await startWorkout({ name: x.name, items: x.items, planSlot });
+    } else {
+      location.hash = `#/${x.equipment}?pick=${encodeURIComponent(planSlot)}`;
+    }
+    return;
+  }
+
+  const parsed = parseSlotKey(planSlot);
+  if (!parsed) return;
+  const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+  const p = proj[parsed.stepIndex];
+  const slot = p?.step.slots[parsed.slotIndex];
+  if (!p || !slot) return;
+
+  if (slot.equipment === 'strength') {
+    const r = matchRoutineByTitle(slot.name, routines);
+    await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot });
+  } else if (slot.equipment === 'airbike') {
+    location.hash = slot.programId
+      ? `#/airbike/p/${slot.programId}?pick=${encodeURIComponent(planSlot)}`
+      : `#/airbike?pick=${encodeURIComponent(planSlot)}`;
+  } else if (p.status === 'current') {
+    location.hash = `#/${slot.equipment}?pick=${encodeURIComponent(planSlot)}`;
+  } else {
+    const ok = await confirmSheet(
+      `Mark “${slot.name}” done today?`,
+      'Logs it for today and automatically skips this slot when your rolling schedule catches up.',
+      'Mark Done Today',
+    );
+    if (ok) {
+      await calendar.completeFutureSlotExternally(parsed.stepIndex, parsed.slotIndex);
+      toast('Marked done early');
+    }
+  }
 }
 
 /** Launches any pending workout (regular or carry-over extra) scheduled on `ymd`. */
