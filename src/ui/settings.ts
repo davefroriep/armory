@@ -8,6 +8,7 @@ import { audio } from '../audio/audio';
 import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
+import { backupCardHtml, wireBackupCard } from './backupUi';
 import { revFooter, topbar, wireChips } from './chrome';
 import { $, esc } from './dom';
 
@@ -91,6 +92,9 @@ export function settingsScreen(root: HTMLElement): () => void {
       <p class="hint">Remembers paired sensors so the app can reconnect silently. Use this if one stops reconnecting, then tap the chip to pair again.</p>
       <div class="line"><span>Simulator<small>Fake H10 + AirBike to try the app without hardware</small></span>${tog('simulator', s.simulator)}</div>
     </section>
+
+    <h2 class="sec">BACKUP &amp; RESTORE</h2>
+    ${backupCardHtml('Full phone backup: Strength, Cardio telemetry, Templates & Schedule.')}
     ${revFooter()}
   </main>`;
 
@@ -194,7 +198,10 @@ export function settingsScreen(root: HTMLElement): () => void {
     alert('Sensors forgotten. Tap the heart-rate chip on the home screen to pair again.');
   }
 
+  const offBackup = wireBackupCard(root, paintFtpBox);
+
   return () => {
+    offBackup();
     cleanupChips();
     offSet();
     root.removeEventListener('click', onClick);

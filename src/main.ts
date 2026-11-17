@@ -10,6 +10,7 @@ import { liftsScreen } from './ui/lifts';
 import { initSetupLinks } from './setup';
 import { calendar } from './intervals/calendar';
 import { forceCloseApp, isNative } from './native/service';
+import { ensureDailyBackup, initAutoBackup } from './store/backup';
 import { kickSensors, releaseBike } from './ble/sources';
 import { parentHash } from './nav';
 import { syncModalInert, wireModalBackdrop } from './ui/dom';
@@ -115,6 +116,7 @@ function promptExit(): void {
 }
 
 initSetupLinks();
+initAutoBackup();
 // Coming back to the app (or the phone waking up) retries a stalled sensor link immediately.
 document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
 window.addEventListener('hashchange', route);
@@ -123,6 +125,7 @@ if (isNative()) {
     if (isActive) {
       kickSensors();
       calendar.checkDayRollover(true);
+      ensureDailyBackup();
     }
   });
   void App.addListener('backButton', () => {

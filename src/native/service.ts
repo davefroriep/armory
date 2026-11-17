@@ -17,6 +17,19 @@ export interface NativeRestEvent {
   totalSec: number;
 }
 
+export interface NativeBackupWriteResult {
+  saved: boolean;
+  path?: string;
+  error?: string;
+}
+
+export interface NativeBackupPickResult {
+  picked: boolean;
+  fileName?: string;
+  content?: string;
+  error?: string;
+}
+
 interface WorkoutServicePlugin {
   start(o: { title: string; text: string; startMs?: number; wavBase64?: string }): Promise<void>;
   update(o: { title: string; text: string; startMs?: number }): Promise<void>;
@@ -32,6 +45,8 @@ interface WorkoutServicePlugin {
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
   playChime(o: { wavBase64?: string; volume: number }): Promise<void>;
+  writeBackupFile(o: { fileName: string; content: string }): Promise<NativeBackupWriteResult>;
+  pickBackupFile(): Promise<NativeBackupPickResult>;
   forceClose(): Promise<void>;
 }
 
@@ -127,4 +142,14 @@ export async function forceCloseApp(): Promise<void> {
 export async function playNativeChime(wavBase64: string, volume: number): Promise<boolean> {
   if (!plugin || !wavBase64) return false;
   try { await plugin.playChime({ wavBase64, volume }); return true; } catch { return false; }
+}
+
+export async function writeNativeBackupFile(fileName: string, content: string): Promise<NativeBackupWriteResult> {
+  if (!plugin) return { saved: false, error: 'not native' };
+  try { return await plugin.writeBackupFile({ fileName, content }); } catch (e) { return { saved: false, error: (e as Error).message }; }
+}
+
+export async function pickNativeBackupFile(): Promise<NativeBackupPickResult> {
+  if (!plugin) return { picked: false };
+  try { return await plugin.pickBackupFile(); } catch (e) { return { picked: false, error: (e as Error).message }; }
 }

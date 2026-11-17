@@ -1,5 +1,8 @@
 // IndexedDB: workouts_meta + workout_samples (1 Hz), with crash recovery and an upload retry queue.
+import { Emitter } from '../emitter';
 import type { Sample, WorkoutMeta } from '../types';
+
+export const metaSaved = new Emitter<WorkoutMeta>();
 
 const DB_NAME = 'armory-fit';
 let dbp: Promise<IDBDatabase> | null = null;
@@ -38,14 +41,23 @@ async function tx(stores: string[], mode: IDBTransactionMode): Promise<IDBTransa
   return (await open()).transaction(stores, mode);
 }
 
-export async function putMeta(m: WorkoutMeta): Promise<void> {
+export async function putMeta(m: WorkoutMeta, emit = true): Promise<void> {
   const t = await tx(['workouts_meta'], 'readwrite');
   await wrap(t.objectStore('workouts_meta').put(m));
+  if (emit && m.status === 'saved') metaSaved.emit(m);
 }
 
 export async function putSample(id: string, s: Sample): Promise<void> {
   const t = await tx(['workout_samples'], 'readwrite');
   await wrap(t.objectStore('workout_samples').put({ id, ...s }));
+}
+
+export async function putSamples(id: string, samples: Sample[]): Promise<void> {
+  if (!samples.length) return;
+  const t = await tx(['workout_samples'], 'readwrite');
+  const os = t.objectStore('workout_samples');
+  for (const s of samples) os.put({ id, ...s });
+  await done(t);
 }
 
 export async function getMeta(id: string): Promise<WorkoutMeta | undefined> {

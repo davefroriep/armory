@@ -2,13 +2,12 @@ import { audio } from '../../audio/audio';
 import { hasKey } from '../../intervals/api';
 import { canShowRestOverlay, isNative, openAppInfoSettings, requestRestOverlayPermission } from '../../native/service';
 import { liftSettings, updateLiftSettings, type Unit } from '../../lifts/settings';
-import { lifts, type LiftBackup } from '../../lifts/store';
-import { shareImage } from '../../lifts/share';
+import { lifts } from '../../lifts/store';
 import { allMeta } from '../../store/db';
 import { retryPending } from '../../workout/sync';
+import { backupCardHtml, wireBackupCard } from '../backupUi';
 import { revFooter } from '../chrome';
-import { esc } from '../dom';
-import { confirmSheet, mount, openSheet, toast } from './kit';
+import { mount, openSheet, toast } from './kit';
 
 /** Lift tracker settings: units, rest timer, camera, Intervals.icu status, backup. */
 export function liftSettingsScreen(root: HTMLElement): () => void {
@@ -42,12 +41,8 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
             <div class="hint">${hasKey() ? '✓ Finished workouts upload automatically: the lift log as the description, heart-rate trace if the H10 was connected, effort rating, type Weight Training.' : 'No API key set. Add it in the main Settings to auto-log workouts.'}</div>
             ${pending ? `<div class="row"><b>${pending} waiting to upload</b><button class="btn sm primary" data-retry>Retry now</button></div>` : ''}
           </section>
-          <h2 class="sec">YOUR DATA</h2>
-          <section class="card">
-            <div class="hint">${lifts.sessions.size} workouts · ${lifts.routines.size} days · stored on this phone.</div>
-            <div class="row"><button class="btn sm" data-export>Export backup</button><button class="btn sm" data-import>Import backup</button></div>
-            <input type="file" id="imp" accept="application/json,.json" hidden>
-          </section>
+          <h2 class="sec">BACKUP &amp; RESTORE</h2>
+          ${backupCardHtml(`${lifts.sessions.size} workouts · ${lifts.routines.size} days · stored on this phone.`)}
           ${revFooter()}
         </main>`;
     };
@@ -94,29 +89,17 @@ export function liftSettingsScreen(root: HTMLElement): () => void {
         return;
       }
       if (t.closest('[data-retry]')) { const n = await retryPending(); toast(n ? `${n} uploaded` : 'Still offline or key not accepted'); return void paint(); }
-      if (t.closest('[data-export]')) {
-        const blob = new Blob([JSON.stringify(lifts.exportAll(), null, 1)], { type: 'application/json' });
-        try { await shareImage(blob, `armory-lifts-${new Date().toISOString().slice(0, 10)}.json`, 'Armory lift backup'); } catch { /* cancelled */ }
-        return;
-      }
-      if (t.closest('[data-import]')) root.querySelector<HTMLInputElement>('#imp')!.click();
     });
-    root.addEventListener('change', async (e) => {
+    root.addEventListener('change', (e) => {
       const t = e.target as HTMLInputElement;
-      if (t.id === 'rest') { updateLiftSettings({ restSec: Number(t.value) }); return; }
-      if (t.id !== 'imp' || !t.files?.[0]) return;
-      try {
-        const b = JSON.parse(await t.files[0].text()) as LiftBackup;
-        if (!(await confirmSheet('Import backup?', `${b.sessions?.length ?? 0} workouts, ${b.routines?.length ?? 0} days. Matching ids are overwritten; nothing else changes.`, 'Import'))) return;
-        const r = await lifts.importAll(b);
-        toast(`Imported ${r.sessions} workouts, ${r.routines} days`);
-        void paint();
-      } catch (err) {
-        toast(`Import failed: ${esc((err as Error).message)}`);
-      }
+      if (t.id === 'rest') updateLiftSettings({ restSec: Number(t.value) });
     });
+    const offBackup = wireBackupCard(root, () => { void paint(); });
     const refreshVis = () => { if (!document.hidden) void paint(); };
     document.addEventListener('visibilitychange', refreshVis);
-    return () => document.removeEventListener('visibilitychange', refreshVis);
+    return () => {
+      offBackup();
+      document.removeEventListener('visibilitychange', refreshVis);
+    };
   });
 }

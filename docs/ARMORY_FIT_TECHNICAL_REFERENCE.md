@@ -83,7 +83,8 @@ Authoritative engineering specification for **Armory Fit** (`N:\Documents\Antigr
 ### Persistence (`src/store/`)
 | File | Key Exports & Responsibilities |
 | :--- | :--- |
-| [src/store/db.ts](../src/store/db.ts) | Opens IndexedDB `armory-fit` (version `2`). Object stores: `workouts_meta` (`id`), `workout_samples` (`[id, t]`), `lift_sessions` (`id`), `lift_routines` (`id`), `lift_ex` (`id`), `lift_videos` (`id`). CRUD helpers: `putMeta`, `putSample`, `getMeta`, `allMeta`, `getSamples`, `deleteWorkout`, `idbPut`, `idbPutMany`, `idbGet`, `idbAll`, `idbDelete`. |
+| [src/store/db.ts](../src/store/db.ts) | Opens IndexedDB `armory-fit` (version `2`). Object stores: `workouts_meta` (`id`), `workout_samples` (`[id, t]`), `lift_sessions` (`id`), `lift_routines` (`id`), `lift_ex` (`id`), `lift_videos` (`id`). Emits `metaSaved` on saved records. CRUD helpers incl. `putSamples()`. |
+| [src/store/backup.ts](../src/store/backup.ts) & [src/ui/backupUi.ts](../src/ui/backupUi.ts) | Complete `armory-fit-backup` v2 engine (Strength + `skipped`, Cardio metas + 1 Hz samples, routines, `QueueState`, non-secret settings; omits `apiKey`). Auto-writes `armory-fit-latest.json` + daily `armory-fit-YYYY-MM-DD.json` to `Documents/ArmoryFit Backup/` for DriveSync -> Drive `Backups/ArmoryFit Backup` (`1Zdl0m9eAaZsPJRLI205Db4NT-Puui0iq`), plus 1-tap restore (`v2` & legacy `v1`). |
 | [src/store/settings.ts](../src/store/settings.ts) | `Settings` interface & `DEFAULTS`, persisted in `localStorage` key `armory.settings.v1` (Node-safe `typeof localStorage !== 'undefined'` guard on `updateSettings`). Emits `settingsChanged`. |
 
 ### BLE, Sensors & Audio (`src/ble/`, `src/audio/`, `src/native/`)

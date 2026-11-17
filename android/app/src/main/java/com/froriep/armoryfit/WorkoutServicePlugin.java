@@ -2,6 +2,9 @@ package com.froriep.armoryfit;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ContentResolver;
+import android.content.ContentUris;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
@@ -9,6 +12,7 @@ import android.graphics.Bitmap;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.OpenableColumns;
@@ -26,6 +30,11 @@ import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 
 /** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, chimes + camera/DCIM video linking. */
 @CapacitorPlugin(name = "WorkoutService")
@@ -312,6 +321,150 @@ public class WorkoutServicePlugin extends Plugin {
             WorkoutChime.playBase64(getContext(), wavB64, vol);
         }
         call.resolve();
+    }
+
+    /** Writes a JSON backup file into shared Documents/ArmoryFit Backup/ for DriveSync. */
+    @PluginMethod
+    public void writeBackupFile(PluginCall call) {
+        String rawName = call.getString("fileName", "armory-fit-latest.json");
+        String fileName = (rawName == null || rawName.trim().isEmpty()) ? "armory-fit-latest.json" : rawName.trim().replace('/', '_');
+        String content = call.getString("content", "");
+        byte[] bytes = (content != null ? content : "").getBytes(StandardCharsets.UTF_8);
+        Context c = getContext().getApplicationContext();
+
+        new Thread(() -> {
+            JSObject ret = new JSObject();
+            String relPath = Environment.DIRECTORY_DOCUMENTS + "/ArmoryFit Backup";
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentResolver cr = c.getContentResolver();
+                Uri collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                Uri existing = null;
+                String sel = MediaStore.MediaColumns.DISPLAY_NAME + "=? AND ("
+                        + MediaStore.MediaColumns.RELATIVE_PATH + "=? OR "
+                        + MediaStore.MediaColumns.RELATIVE_PATH + "=?)";
+                String[] args = new String[] {fileName, relPath, relPath + "/"};
+                try (Cursor cur = cr.query(collection, new String[] {MediaStore.MediaColumns._ID}, sel, args, null)) {
+                    if (cur != null && cur.moveToFirst()) {
+                        long id = cur.getLong(0);
+                        existing = ContentUris.withAppendedId(collection, id);
+                    }
+                } catch (Exception ignored) {
+                }
+
+                Uri target = existing;
+                boolean wrote = false;
+                if (target != null) {
+                    try (OutputStream os = cr.openOutputStream(target, "wt")) {
+                        if (os != null) {
+                            os.write(bytes);
+                            os.flush();
+                            wrote = true;
+                        }
+                    } catch (Exception ignored) {
+                        try {
+                            cr.delete(target, null, null);
+                        } catch (Exception ignored2) {
+                        }
+                        target = null;
+                    }
+                }
+                if (!wrote) {
+                    ContentValues cv = new ContentValues();
+                    cv.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+                    cv.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+                    cv.put(MediaStore.MediaColumns.RELATIVE_PATH, relPath + "/");
+                    try {
+                        target = cr.insert(collection, cv);
+                        if (target != null) {
+                            try (OutputStream os = cr.openOutputStream(target, "w")) {
+                                if (os != null) {
+                                    os.write(bytes);
+                                    os.flush();
+                                    wrote = true;
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        ret.put("error", e.getMessage());
+                    }
+                }
+                ret.put("saved", wrote);
+                ret.put("path", relPath + "/" + fileName);
+            } else {
+                boolean wrote = false;
+                File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "ArmoryFit Backup");
+                try {
+                    if (!dir.exists()) dir.mkdirs();
+                    File out = new File(dir, fileName);
+                    try (FileOutputStream fos = new FileOutputStream(out, false)) {
+                        fos.write(bytes);
+                        fos.flush();
+                        wrote = true;
+                    }
+                    ret.put("path", out.getAbsolutePath());
+                } catch (Exception e) {
+                    ret.put("error", e.getMessage());
+                }
+                ret.put("saved", wrote);
+            }
+            call.resolve(ret);
+        }).start();
+    }
+
+    /** Opens Android file picker pointed at Documents/ArmoryFit Backup/ so DriveSync backups restore in 1 tap. */
+    @PluginMethod
+    public void pickBackupFile(PluginCall call) {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        i.addCategory(Intent.CATEGORY_OPENABLE);
+        i.setType("*/*");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/json", "text/plain"});
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            i.putExtra(
+                    DocumentsContract.EXTRA_INITIAL_URI,
+                    Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADocuments%2FArmoryFit%20Backup"));
+        }
+        startActivityForResult(call, i, "onBackupPicked");
+    }
+
+    @ActivityCallback
+    private void onBackupPicked(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        JSObject ret = new JSObject();
+        if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+            ret.put("picked", false);
+            call.resolve(ret);
+            return;
+        }
+        Uri uri = result.getData().getData();
+        Context c = getContext();
+        String fileName = uri.getLastPathSegment();
+        try (Cursor cur = c.getContentResolver().query(uri, null, null, null, null)) {
+            if (cur != null && cur.moveToFirst()) {
+                int ni = cur.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (ni >= 0 && cur.getString(ni) != null) fileName = cur.getString(ni);
+            }
+        } catch (Exception ignored) {
+        }
+        try (InputStream is = c.getContentResolver().openInputStream(uri)) {
+            if (is == null) {
+                ret.put("picked", false);
+                call.resolve(ret);
+                return;
+            }
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n;
+            while ((n = is.read(buf)) >= 0) {
+                baos.write(buf, 0, n);
+            }
+            ret.put("picked", true);
+            ret.put("fileName", fileName != null ? fileName : "backup.json");
+            ret.put("content", new String(baos.toByteArray(), StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            ret.put("picked", false);
+            ret.put("error", e.getMessage());
+        }
+        call.resolve(ret);
     }
 
     /** Stops foreground workout service, removes the app task from Recents, and force-closes the process. */
