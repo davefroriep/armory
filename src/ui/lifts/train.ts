@@ -1,12 +1,12 @@
 import { ensureSensors } from '../../ble/sources';
-import { PHASE1_PLAN, parseSlotKey } from '../../domain/plan';
+import { PHASE1_PLAN, parseExtraKey, parseSlotKey } from '../../domain/plan';
 import { calendar } from '../../intervals/calendar';
 import { active } from '../../lifts/active';
 import { buildExercise, isSessionStarted } from '../../lifts/logic';
 import { matchRoutineByTitle } from '../../lifts/seed';
 import { lifts } from '../../lifts/store';
 import type { Routine, RoutineItem } from '../../lifts/types';
-import { settingsChanged } from '../../store/settings';
+import { getSettings, settingsChanged } from '../../store/settings';
 import { esc } from '../dom';
 import { equipmentProgramCard, revFooter, wireCalendar, wireChips } from '../chrome';
 import { openStepSheet } from '../program';
@@ -116,6 +116,12 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         autoStarted = true;
         if (lifts.active) { location.replace('#/strength/session'); return; }
         if (dead) return;
+        const exId = parseExtraKey(pickParam);
+        if (exId) {
+          const ex = getSettings().queue.extras?.find((x) => x.id === exId);
+          if (ex) await startWorkout({ name: ex.name, items: ex.items, planSlot: pickParam, replace: true });
+          return;
+        }
         const parsed = parseSlotKey(pickParam);
         const slot = parsed ? PHASE1_PLAN.steps[parsed.stepIndex]?.slots[parsed.slotIndex] : undefined;
         if (!slot) return;
@@ -166,6 +172,9 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         const pick = plan.dataset.plan ?? plan.dataset.planCard ?? '';
         const it = calendar.items.find((i) => i.planSlot === pick);
         if (!it) return;
+        if (it.items?.length) {
+          return void (await startWorkout({ name: it.slot.name, items: it.items, planSlot: it.planSlot }));
+        }
         const r = matchRoutineByTitle(it.slot.name, lifts.sortedRoutines());
         return void (await startWorkout({ name: r?.name ?? it.slot.name, routine: r, planSlot: it.planSlot }));
       }
@@ -195,7 +204,7 @@ export function trainScreen(root: HTMLElement, query: URLSearchParams): () => vo
         }
         return;
       }
-      const match = calendar.forEquipment('strength').find((it) => matchRoutineByTitle(it.slot.name, [r]));
+      const match = calendar.forEquipment('strength').find((it) => !it.items?.length && matchRoutineByTitle(it.slot.name, [r]));
       await startWorkout({ name: r.name, routine: r, ...(match ? { planSlot: match.planSlot } : {}) });
     });
 

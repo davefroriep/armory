@@ -1,6 +1,6 @@
 import { Emitter } from '../emitter';
 import {
-  PHASE1_PLAN, isPlanExternalId, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
+  PHASE1_PLAN, UPPER1_FINISH_ITEMS, isPlanExternalId, parseExtraKey, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
   type LocalTodayItem, type PlanStep, type QueueState,
 } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
@@ -12,6 +12,7 @@ export type CalendarStatus = 'nokey' | 'loading' | 'ok' | 'error';
 
 const LEGACY_CLEANUP_KEY = 'armory.cleanup_staged_events.v1';
 const LEGACY_SKIP_Z5_KEY = 'armory.backfill_skipped_z5.v1';
+const LEGACY_U1_FINISH_KEY = 'armory.extra_u1_finish_2026_11_16.v1';
 let lastFtpSync = 0;
 
 export const localDate = (d = new Date()): string =>
@@ -45,6 +46,7 @@ class Calendar {
   private midnightTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
+    this.seedYesterdayUpper1Makeup();
     this.syncLocalState();
     settingsChanged.on(() => {
       this.items = todayItemsFromQueue(PHASE1_PLAN, getSettings().queue, localDate());
@@ -85,6 +87,27 @@ class Calendar {
       updateSettings({ queue: ops.nextState });
     }
     this.items = todayItemsFromQueue(PHASE1_PLAN, ops.nextState, today);
+  }
+
+  /** One-time local seed adding the 4 skipped Upper 1 exercises from Nov 16 onto Today's Strength work. */
+  private seedYesterdayUpper1Makeup(): void {
+    if (typeof localStorage === 'undefined' || localStorage.getItem(LEGACY_U1_FINISH_KEY)) return;
+    localStorage.setItem(LEGACY_U1_FINISH_KEY, '1');
+    const today = localDate();
+    if (today > '2026-11-18') return;
+    const s = getSettings();
+    const extras = [...(s.queue.extras ?? [])];
+    if (extras.some((x) => x.id === 'u1-finish-2026-11-16')) return;
+    extras.push({
+      id: 'u1-finish-2026-11-16',
+      name: 'Upper 1 (Finish)',
+      date: today,
+      equipment: 'strength',
+      seconds: 1800,
+      description: 'Skipped from yesterday Upper 1: Seated DB Shoulder Press / Pull-Up · DB Lateral Raise / Cable Triceps Pushdown',
+      items: UPPER1_FINISH_ITEMS.map((it) => ({ ...it })),
+    });
+    updateSettings({ queue: { ...s.queue, extras } });
   }
 
   /** One-time local migration so yesterday's skipped AirBike Z5 shows as `(skipped)` rather than `✓`. */
@@ -224,12 +247,36 @@ class Calendar {
     this.changed.emit();
   }
 
-  /** Marks one planned slot complete locally and logs a manual completed activity to Intervals.icu if configured. */
+  /** Marks one planned slot (or extra carry-over workout) complete locally and logs to Intervals.icu if configured. */
   async markSlotDone(planSlot: string): Promise<void> {
+    const today = localDate();
+    const exId = parseExtraKey(planSlot);
+    if (exId) {
+      const ex = getSettings().queue.extras?.find((x) => x.id === exId);
+      if (!ex) return;
+      this.markSlotDoneEarly(planSlot, null, today);
+      if (hasKey()) {
+        try {
+          const actId = await createManualActivity({
+            startLocalIso: localIsoNow(),
+            name: ex.name,
+            description: 'Marked done in Armory Fit',
+            seconds: ex.seconds || 1800,
+            type: 'WeightTraining',
+            externalId: `armory-done-extra-${exId}-${Date.now().toString(36)}`,
+            pairedEventId: null,
+          });
+          const cur = getSettings();
+          const consumedIds = Array.from(new Set([...cur.queue.consumedIds, String(actId)])).slice(-40);
+          updateSettings({ queue: { ...cur.queue, consumedIds } });
+        } catch { /* offline fallback already recorded locally */ }
+      }
+      return;
+    }
+
     const parsed = parseSlotKey(planSlot);
     const slot = parsed ? PHASE1_PLAN.steps[parsed.stepIndex]?.slots[parsed.slotIndex] : undefined;
     if (!parsed || !slot) return;
-    const today = localDate();
     this.markSlotDoneEarly(planSlot, null, today);
     if (hasKey()) {
       try {
@@ -249,9 +296,16 @@ class Calendar {
     }
   }
 
-  /** Marks a planned slot `(skipped)` locally and advances the rolling queue if no slots remain today. */
+  /** Marks a planned slot or extra carry-over workout `(skipped)` locally. */
   skipSlot(planSlot: string): void {
     const s = getSettings();
+    const exId = parseExtraKey(planSlot);
+    if (exId) {
+      const extras = (s.queue.extras ?? []).map((x) => (x.id === exId ? { ...x, skippedDate: localDate() } : x));
+      this.syncLocalState({ ...s.queue, extras });
+      this.changed.emit();
+      return;
+    }
     const skippedSlots = { ...(s.queue.skippedSlots ?? {}), [planSlot]: localDate() };
     const doneEarly = { ...(s.queue.doneEarly ?? {}) };
     delete doneEarly[planSlot];
@@ -262,10 +316,17 @@ class Calendar {
 
   /** Moves just this workout to tomorrow and holds the rolling schedule back until it finishes. */
   pushSlotToTomorrow(planSlot: string): void {
-    const parsed = parseSlotKey(planSlot);
-    if (!parsed) return;
     const tomorrow = addDays(localDate(), 1);
     const s = getSettings();
+    const exId = parseExtraKey(planSlot);
+    if (exId) {
+      const extras = (s.queue.extras ?? []).map((x) => (x.id === exId ? { ...x, date: tomorrow } : x));
+      this.syncLocalState({ ...s.queue, extras });
+      this.changed.emit();
+      return;
+    }
+    const parsed = parseSlotKey(planSlot);
+    if (!parsed) return;
     const carryIdx = (s.queue.carryOver ?? []).findIndex((c) => c.planSlot === planSlot);
     if (carryIdx >= 0) {
       const carryOver = (s.queue.carryOver ?? []).map((c, idx) => (idx === carryIdx ? { ...c, date: tomorrow } : c));
@@ -281,10 +342,15 @@ class Calendar {
 
   /** Carries this workout to tomorrow independently while letting tomorrow's regular schedule advance normally. */
   addSlotToTomorrow(planSlot: string): void {
-    const parsed = parseSlotKey(planSlot);
-    if (!parsed) return;
     const tomorrow = addDays(localDate(), 1);
     const s = getSettings();
+    const exId = parseExtraKey(planSlot);
+    if (exId) {
+      this.pushSlotToTomorrow(planSlot);
+      return;
+    }
+    const parsed = parseSlotKey(planSlot);
+    if (!parsed) return;
     const carryOver = (s.queue.carryOver ?? []).filter((c) => c.planSlot !== planSlot);
     carryOver.push({ planSlot, date: tomorrow });
     const slotDates = { ...(s.queue.slotDates ?? {}) };
@@ -298,11 +364,13 @@ class Calendar {
     const today = localDate();
     const s = getSettings();
     const carryOver = (s.queue.carryOver ?? []).map((c) => (c.date > today ? { ...c, date: today } : c));
+    const extras = (s.queue.extras ?? []).map((x) => (!x.doneDate && !x.skippedDate && x.date > today ? { ...x, date: today } : x));
     this.syncLocalState({
       ...s.queue,
       stagedDate: today,
       slotDates: {},
       carryOver,
+      extras,
     });
     this.changed.emit();
   }
@@ -354,14 +422,26 @@ class Calendar {
     this.changed.emit();
   }
 
-  /** Marks a specific plan slot (`stepIndex:slotIndex`) done locally and advances/reconciles immediately. */
+  /** Marks a specific plan slot (`stepIndex:slotIndex` or `extra:<id>`) done locally and reconciles. */
   markSlotDoneEarly(planSlot: string, activityId?: string | null, date = localDate()): void {
-    const parsed = parseSlotKey(planSlot);
-    if (!parsed) return;
     const s = getSettings();
     const consumedIds = activityId
       ? Array.from(new Set([...s.queue.consumedIds, String(activityId)])).slice(-40)
       : s.queue.consumedIds;
+    const exId = parseExtraKey(planSlot);
+    if (exId) {
+      const extras = (s.queue.extras ?? []).map((x) => {
+        if (x.id !== exId) return x;
+        const { skippedDate: _ignored, ...rest } = x;
+        return { ...rest, doneDate: date };
+      });
+      this.syncLocalState({ ...s.queue, extras, consumedIds });
+      this.changed.emit();
+      return;
+    }
+
+    const parsed = parseSlotKey(planSlot);
+    if (!parsed) return;
     const skippedSlots = { ...(s.queue.skippedSlots ?? {}) };
     delete skippedSlots[planSlot];
     const carryOver = (s.queue.carryOver ?? []).filter((c) => c.planSlot !== planSlot);

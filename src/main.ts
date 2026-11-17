@@ -9,7 +9,7 @@ import { settingsScreen } from './ui/settings';
 import { liftsScreen } from './ui/lifts';
 import { initSetupLinks } from './setup';
 import { calendar } from './intervals/calendar';
-import { isNative } from './native/service';
+import { forceCloseApp, isNative } from './native/service';
 import { kickSensors, releaseBike } from './ble/sources';
 import { parentHash } from './nav';
 import { syncModalInert, wireModalBackdrop } from './ui/dom';
@@ -108,7 +108,7 @@ function promptExit(): void {
     const b = (e.target as HTMLElement).closest<HTMLElement>('[data-exit]');
     if (!b) return;
     close();
-    if (b.dataset.exit === '1') void App.exitApp();
+    if (b.dataset.exit === '1') void forceCloseApp().catch(() => App.exitApp());
   });
   document.body.appendChild(el);
   syncModalInert();

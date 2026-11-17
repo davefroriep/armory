@@ -1,6 +1,6 @@
 import {
-  PHASE1_PLAN, dayOfWeek, parseYmd, shiftYmd,
-  type PlanSlot, type ProjectedStep, type SlotState,
+  PHASE1_PLAN, dayOfWeek, extraKey, parseYmd, shiftYmd,
+  type ExtraWorkout, type PlanSlot, type ProjectedStep, type SlotState,
 } from '../domain/plan';
 import { sessionStats, type ExOf, type PRHit } from '../lifts/calc';
 import { labels } from '../lifts/logic';
@@ -37,6 +37,9 @@ export interface ResolvedDayZoom {
   externalDoneSlots: { p: ProjectedStep; slot: PlanSlot; slotIndex: number }[];
   skippedSlots: { p: ProjectedStep; slot: PlanSlot; slotIndex: number }[];
   pendingSlots: { p: ProjectedStep; slot: PlanSlot; slotIndex: number }[];
+  pendingExtras: ExtraWorkout[];
+  doneExtras: ExtraWorkout[];
+  skippedExtras: ExtraWorkout[];
   associatedStep: ProjectedStep | undefined;
   canShift: boolean;
   afterPlanEnd: boolean;
@@ -172,35 +175,41 @@ export function renderCompletedCardioSlot(m: WorkoutMeta): string {
   </div>`;
 }
 
+function renderItemList(items: { exId: string; sets: number; ss?: boolean }[], lookup: ZoomLookup, templateId?: string): string {
+  const labs = labels(items);
+  const rows = items.map((it, idx) => {
+    const ex = lookup.exOf(it.exId);
+    const note = lookup.rowOf(it.exId)?.note;
+    const prev = lookup.prevOf(it.exId);
+    const best = prev?.sets.filter((x) => x.done && x.kind !== 'w').slice(-1)[0];
+    const prevTxt = best ? setText(best, ex, lookup.unit) : '';
+    return `<div class="sh-ex">
+      <span class="xlab">${labs[idx]}</span>
+      <span class="sh-ex-m"><b>${esc(ex?.name ?? it.exId)}</b><small>${it.sets} sets${note ? ` · ${esc(note)}` : ''}</small></span>
+      ${prevTxt ? `<em>Last: ${esc(prevTxt)}</em>` : ''}
+    </div>`;
+  }).join('');
+  return `<div class="sh-exlist">${rows}</div>${templateId ? `<div class="sh-subrow"><a class="link" href="#/strength/routine/${templateId}">Edit template ›</a></div>` : ''}`;
+}
+
+function slotBadgeAndClass(state: SlotState): { badge: string; cls: string } {
+  return {
+    badge: state === 'done'
+      ? '<span class="p-badge ok">✓ Done</span>'
+      : state === 'skipped'
+        ? '<span class="p-badge sk">(skipped)</span>'
+        : '',
+    cls: state === 'done' ? ' done' : state === 'skipped' ? ' skipped' : '',
+  };
+}
+
 /** Planned, externally completed, or skipped slot view with matched local routine exercises/sets/notes. */
 export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: ZoomLookup): string {
   const mins = Math.round(slot.seconds / 60);
-  const badge = state === 'done'
-    ? '<span class="p-badge ok">✓ Done</span>'
-    : state === 'skipped'
-      ? '<span class="p-badge sk">(skipped)</span>'
-      : '';
-  const cls = state === 'done' ? ' done' : state === 'skipped' ? ' skipped' : '';
+  const { badge, cls } = slotBadgeAndClass(state);
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, lookup.routines);
-    let detail = `<p class="sh-text">${esc(slot.description)}</p>`;
-    if (r) {
-      const labs = labels(r.items);
-      const rows = r.items.map((it, idx) => {
-        const ex = lookup.exOf(it.exId);
-        const note = lookup.rowOf(it.exId)?.note;
-        const prev = lookup.prevOf(it.exId);
-        const best = prev?.sets.filter((x) => x.done && x.kind !== 'w').slice(-1)[0];
-        const prevTxt = best ? setText(best, ex, lookup.unit) : '';
-        return `<div class="sh-ex">
-          <span class="xlab">${labs[idx]}</span>
-          <span class="sh-ex-m"><b>${esc(ex?.name ?? it.exId)}</b><small>${it.sets} sets${note ? ` · ${esc(note)}` : ''}</small></span>
-          ${prevTxt ? `<em>Last: ${esc(prevTxt)}</em>` : ''}
-        </div>`;
-      }).join('');
-      detail = `<div class="sh-exlist">${rows}</div>
-        <div class="sh-subrow"><a class="link" href="#/strength/routine/${r.id}">Edit template ›</a></div>`;
-    }
+    const detail = r ? renderItemList(r.items, lookup, r.id) : `<p class="sh-text">${esc(slot.description)}</p>`;
     return `<div class="sh-slot${cls}">
       <div class="sh-slot-h">
         <span class="cal-ico strength">${ICON.strength}</span>
@@ -220,15 +229,32 @@ export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: Zoom
   </div>`;
 }
 
-/** Resolves completed workouts, externally completed slots, skipped slots, and pending slots for a specific date. */
+function renderExtraSlot(x: ExtraWorkout, state: SlotState, lookup: ZoomLookup): string {
+  const mins = Math.round(x.seconds / 60);
+  const { badge, cls } = slotBadgeAndClass(state);
+  const detail = x.items?.length
+    ? renderItemList(x.items, lookup)
+    : `<p class="sh-text">${esc(x.description)}</p>`;
+  return `<div class="sh-slot${cls}">
+    <div class="sh-slot-h">
+      <span class="cal-ico ${x.equipment}">${ICON[x.equipment]}</span>
+      <span><b>${esc(x.name)}</b><small>${EQUIPMENT_LABEL[x.equipment]} · Carry-over · ${mins} min</small></span>
+      ${badge || '<span class="p-badge cur">Carry-over</span>'}
+    </div>
+    ${detail}
+  </div>`;
+}
+
+/** Resolves completed workouts, externally completed slots, skipped slots, extras, and pending slots for a date. */
 export function resolveDayZoom(args: {
   ymd: string;
   today: string;
   proj: ProjectedStep[];
   dayLog?: DayLogs;
+  extras?: ExtraWorkout[];
   restDay: number | null;
 }): ResolvedDayZoom {
-  const { ymd, today, proj, dayLog } = args;
+  const { ymd, today, proj, dayLog, extras = [] } = args;
   const liftsDone = dayLog?.lifts ?? [];
   const cardioDone = dayLog?.cardio ?? [];
   const doneEqs = new Set<Equipment>();
@@ -253,6 +279,22 @@ export function resolveDayZoom(args: {
     });
   }
 
+  const pendingExtras: ExtraWorkout[] = [];
+  const doneExtras: ExtraWorkout[] = [];
+  const skippedExtras: ExtraWorkout[] = [];
+  for (const x of extras) {
+    if (x.doneDate === ymd) {
+      const k = extraKey(x.id);
+      const hasLocal = liftsDone.some((ls) => ls.planSlot === k || ls.name === x.name)
+        || cardioDone.some((cm) => cm.planSlot === k || cm.name === x.name);
+      if (!hasLocal) doneExtras.push(x);
+    } else if (x.skippedDate === ymd) {
+      skippedExtras.push(x);
+    } else if (!x.doneDate && !x.skippedDate && ymd >= today && (x.date === ymd || (ymd === today && x.date <= today))) {
+      pendingExtras.push(x);
+    }
+  }
+
   const associatedStep = pendingSlots[0]?.p
     ?? externalDoneSlots[0]?.p
     ?? skippedSlots[0]?.p
@@ -268,8 +310,11 @@ export function resolveDayZoom(args: {
   const maxFutureDate = futureDates.length ? futureDates.sort()[futureDates.length - 1] : null;
   const afterPlanEnd = ymd > today
     && !pendingSlots.length
+    && !pendingExtras.length
     && !externalDoneSlots.length
+    && !doneExtras.length
     && !skippedSlots.length
+    && !skippedExtras.length
     && maxFutureDate != null
     && ymd > maxFutureDate;
 
@@ -279,19 +324,32 @@ export function resolveDayZoom(args: {
     ?? PHASE1_PLAN.steps[PHASE1_PLAN.steps.length - 1]?.week
     ?? 1;
 
-  return { liftsDone, cardioDone, externalDoneSlots, skippedSlots, pendingSlots, associatedStep, canShift, afterPlanEnd, week };
+  return {
+    liftsDone,
+    cardioDone,
+    externalDoneSlots,
+    skippedSlots,
+    pendingSlots,
+    pendingExtras,
+    doneExtras,
+    skippedExtras,
+    associatedStep,
+    canShift,
+    afterPlanEnd,
+    week,
+  };
 }
 
 function dayStatusPill(ymd: string, today: string, res: ResolvedDayZoom): string {
-  const hasDone = res.liftsDone.length > 0 || res.cardioDone.length > 0 || res.externalDoneSlots.length > 0;
+  const hasDone = res.liftsDone.length > 0 || res.cardioDone.length > 0 || res.externalDoneSlots.length > 0 || res.doneExtras.length > 0;
   if (ymd === today) {
-    return res.pendingSlots.length === 0 && hasDone
+    return res.pendingSlots.length === 0 && res.pendingExtras.length === 0 && hasDone
       ? '<span class="p-badge ok">✓ Today · Done</span>'
       : '<span class="p-badge cur">● Today</span>';
   }
   if (ymd === shiftYmd(today, 1)) return '<span class="p-badge">Tomorrow</span>';
   if (hasDone) return '<span class="p-badge ok">✓ Done</span>';
-  if (res.skippedSlots.length > 0) return '<span class="p-badge sk">Skipped</span>';
+  if (res.skippedSlots.length > 0 || res.skippedExtras.length > 0) return '<span class="p-badge sk">Skipped</span>';
   if (ymd < today) return '<span class="p-badge">Past</span>';
   return '<span class="p-badge">Projected</span>';
 }
@@ -302,12 +360,13 @@ export function renderDayZoomCard(args: {
   today: string;
   proj: ProjectedStep[];
   dayLog?: DayLogs;
+  extras?: ExtraWorkout[];
   restDay: number | null;
   anim?: '' | 'from-right' | 'from-left' | 'fade-in';
   lookup: ZoomLookup;
 }): string {
-  const { ymd, today, proj, dayLog, restDay, anim = '', lookup } = args;
-  const res = resolveDayZoom({ ymd, today, proj, dayLog, restDay });
+  const { ymd, today, proj, dayLog, extras = [], restDay, anim = '', lookup } = args;
+  const res = resolveDayZoom({ ymd, today, proj, dayLog, extras, restDay });
   const { y, m, d } = parseYmd(ymd);
   const fullDate = new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
   const isRestPref = restDay != null && dayOfWeek(ymd) === restDay;
@@ -315,8 +374,11 @@ export function renderDayZoomCard(args: {
   const slotCards = [
     ...res.liftsDone.map((s) => renderCompletedLiftSlot(s, lookup)),
     ...res.cardioDone.map((cm) => renderCompletedCardioSlot(cm)),
+    ...res.doneExtras.map((x) => renderExtraSlot(x, 'done', lookup)),
     ...res.externalDoneSlots.map(({ slot }) => renderPlannedSlot(slot, 'done', lookup)),
+    ...res.skippedExtras.map((x) => renderExtraSlot(x, 'skipped', lookup)),
     ...res.skippedSlots.map(({ slot }) => renderPlannedSlot(slot, 'skipped', lookup)),
+    ...res.pendingExtras.map((x) => renderExtraSlot(x, 'pending', lookup)),
     ...res.pendingSlots.map(({ slot }) => renderPlannedSlot(slot, 'pending', lookup)),
   ];
 
@@ -333,7 +395,7 @@ export function renderDayZoomCard(args: {
         </div>`;
 
   const acts: string[] = [];
-  if (res.pendingSlots.length > 0) {
+  if (res.pendingSlots.length > 0 || res.pendingExtras.length > 0) {
     acts.push('<button class="btn primary dz-btn" type="button" data-zact="do-now">Do this workout now</button>');
   }
   if (res.canShift && res.associatedStep) {

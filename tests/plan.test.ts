@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
-  PHASE1_PLAN, buildWeekGlimpse, defaultQueueState, fmtWeekSpan, projectPlan, reconcileQueue, slotKey, todayItemsFromQueue,
+  PHASE1_PLAN, UPPER1_FINISH_ITEMS, buildWeekGlimpse, defaultQueueState, fmtWeekSpan,
+  projectPlan, reconcileQueue, slotKey, todayItemsFromQueue,
 } from '../src/domain/plan';
 import type { Equipment } from '../src/types';
 
@@ -236,5 +237,34 @@ describe('local rolling schedule & queue reconciliation', () => {
     ]);
     expect(futureCells.every((c) => !c.isToday && !c.isPast)).toBe(true);
     expect(futureCells[0].kind).toBe('rest'); // Sunday rest day
+  });
+
+  it('surfaces carry-over ExtraWorkout (Upper 1 skipped exercises) on Today and slides until completed', () => {
+    const state = {
+      ...defaultQueueState(),
+      stepIndex: 2,
+      stagedDate: '2026-11-17',
+      extras: [{
+        id: 'u1-finish-2026-11-16',
+        name: 'Upper 1 (Finish)',
+        date: '2026-11-17',
+        equipment: 'strength' as const,
+        seconds: 1800,
+        description: 'Skipped yesterday',
+        items: UPPER1_FINISH_ITEMS,
+      }],
+    };
+    const items = todayItemsFromQueue(PHASE1_PLAN, state, '2026-11-17');
+    expect(items.map((i) => i.planSlot)).toEqual(['extra:u1-finish-2026-11-16', '2:0']);
+    expect(items[0].items?.map((x) => x.exId)).toEqual([
+      'seated-dumbbell-shoulder-press',
+      'pull-up',
+      'dumbbell-lateral-raise',
+      'cable-triceps-pushdown',
+    ]);
+
+    // If not done on Nov 17, reconcileQueue slides date forward to Nov 18
+    const rolled = reconcileQueue({ plan: PHASE1_PLAN, state, activities: [], today: '2026-11-18', tomorrow: '2026-11-19' });
+    expect(rolled.nextState.extras?.[0].date).toBe('2026-11-18');
   });
 });

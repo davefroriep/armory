@@ -156,10 +156,10 @@ function fmtPlanDate(ymd: string): string {
 function calItemRow(it: TodayItem, actionMode: 'link' | 'strength' = 'link'): string {
   const eq = it.equipment;
   const mins = it.slot.seconds ? Math.round(it.slot.seconds / 60) : 0;
-  const r = eq === 'strength' ? matchRoutineByTitle(it.slot.name, lifts.sortedRoutines()) : undefined;
+  const r = eq === 'strength' && !it.items ? matchRoutineByTitle(it.slot.name, lifts.sortedRoutines()) : undefined;
   const subParts = [
     eq === 'strength'
-      ? `Strength${r ? ` · ${r.name}` : ''}`
+      ? `Strength${it.items ? ` · ${it.items.length} exercises` : r ? ` · ${r.name}` : ''}`
       : EQUIPMENT_LABEL[eq] + (eq === 'airbike' && !it.programId ? ' · pick a program' : ''),
     mins ? `${mins} min` : '',
     it.carried ? 'carry-over' : '',

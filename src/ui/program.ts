@@ -1,5 +1,5 @@
 import {
-  PHASE1_PLAN, WEEK_THEMES, parseYmd, projectPlan, slotKey,
+  PHASE1_PLAN, WEEK_THEMES, extraKey, parseYmd, projectPlan, slotKey,
   type ProjectedStep,
 } from '../domain/plan';
 import { addDays, calendar, localDate } from '../intervals/calendar';
@@ -211,53 +211,68 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
   });
 }
 
-/** Launches the uncompleted workout scheduled on `ymd` from the Home inline day-zoom card. */
+/** Launches any pending workout (regular or carry-over extra) scheduled on `ymd`. */
 export async function launchDayZoomWorkout(ymd: string): Promise<void> {
   await lifts.ready;
   const s = getSettings();
   const today = localDate();
   const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
-  const res = resolveDayZoom({ ymd, today, proj, restDay: s.restDay });
-  if (!res.pendingSlots.length) return;
-
+  const res = resolveDayZoom({ ymd, today, proj, extras: s.queue.extras, restDay: s.restDay });
   const routines = lifts.sortedRoutines();
-  let chosen = res.pendingSlots[0];
-  if (res.pendingSlots.length > 1) {
+
+  const options: { label: string; sub: string; run: () => Promise<void> }[] = [
+    ...res.pendingExtras.map((x) => ({
+      label: x.name,
+      sub: `${EQUIPMENT_LABEL[x.equipment]} · Carry-over · ${Math.round(x.seconds / 60)} min`,
+      run: async () => {
+        const pick = extraKey(x.id);
+        if (x.equipment === 'strength') {
+          await startWorkout({ name: x.name, items: x.items, planSlot: pick });
+        } else {
+          location.hash = `#/${x.equipment}?pick=${encodeURIComponent(pick)}`;
+        }
+      },
+    })),
+    ...res.pendingSlots.map(({ p, slot, slotIndex }) => ({
+      label: slot.equipment === 'strength'
+        ? (matchRoutineByTitle(slot.name, routines)?.name ?? slot.name)
+        : slot.name,
+      sub: `${EQUIPMENT_LABEL[slot.equipment]} · ${Math.round(slot.seconds / 60)} min`,
+      run: async () => {
+        const pick = slotKey(p.step.index, slotIndex);
+        if (slot.equipment === 'strength') {
+          const r = matchRoutineByTitle(slot.name, routines);
+          await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
+        } else if (slot.equipment === 'airbike') {
+          location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
+        } else if (p.status === 'current') {
+          location.hash = `#/${slot.equipment}?pick=${pick}`;
+        } else {
+          const ok = await confirmSheet(
+            `Mark “${slot.name}” done today?`,
+            'Logs it for today and automatically skips this slot when your rolling schedule catches up.',
+            'Mark Done Today',
+          );
+          if (ok) {
+            await calendar.completeFutureSlotExternally(p.step.index, slotIndex);
+            toast('Marked done early');
+          }
+        }
+      },
+    })),
+  ];
+
+  if (!options.length) return;
+  let chosen = options[0];
+  if (options.length > 1) {
     const k = await actionSheet(
       'Do which workout now?',
-      res.pendingSlots.map((x, idx) => ({
-        key: String(idx),
-        label: x.slot.equipment === 'strength'
-          ? (matchRoutineByTitle(x.slot.name, routines)?.name ?? x.slot.name)
-          : x.slot.name,
-        sub: `${EQUIPMENT_LABEL[x.slot.equipment]} · ${Math.round(x.slot.seconds / 60)} min`,
-      })),
+      options.map((opt, idx) => ({ key: String(idx), label: opt.label, sub: opt.sub })),
     );
     if (!k) return;
-    chosen = res.pendingSlots[Number(k)];
-    if (!chosen) return;
+    chosen = options[Number(k)] ?? chosen;
   }
-
-  const { p, slot, slotIndex } = chosen;
-  const pick = slotKey(p.step.index, slotIndex);
-  if (slot.equipment === 'strength') {
-    const r = matchRoutineByTitle(slot.name, routines);
-    await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
-  } else if (slot.equipment === 'airbike') {
-    location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
-  } else if (p.status === 'current') {
-    location.hash = `#/${slot.equipment}?pick=${pick}`;
-  } else {
-    const ok = await confirmSheet(
-      `Mark “${slot.name}” done today?`,
-      'Logs it for today and automatically skips this slot when your rolling schedule catches up.',
-      'Mark Done Today',
-    );
-    if (ok) {
-      await calendar.completeFutureSlotExternally(p.step.index, slotIndex);
-      toast('Marked done early');
-    }
-  }
+  await chosen.run();
 }
 
 /** 4-week zoomable block overview screen (`#/program`). */

@@ -42,9 +42,36 @@ export interface QueueState {
   skippedSlots?: Record<string, string>;
   /** Individual slots carried forward ("Add to tomorrow") independently of queue advancement. */
   carryOver?: { planSlot: string; date: string }[];
+  /** One-off carry-over / make-up workouts attached to specific dates (e.g. skipped exercises). */
+  extras?: ExtraWorkout[];
   /** Intervals.icu activity IDs already consumed so we never double-advance. */
   consumedIds: string[];
 }
+
+export interface ExtraWorkoutItem {
+  exId: string;
+  sets: number;
+  ss?: boolean;
+}
+
+export interface ExtraWorkout {
+  id: string;
+  name: string;
+  date: string;
+  equipment: Equipment;
+  seconds: number;
+  description: string;
+  items?: ExtraWorkoutItem[];
+  doneDate?: string;
+  skippedDate?: string;
+}
+
+export const UPPER1_FINISH_ITEMS: ExtraWorkoutItem[] = [
+  { exId: 'seated-dumbbell-shoulder-press', sets: 3, ss: true },
+  { exId: 'pull-up', sets: 3 },
+  { exId: 'dumbbell-lateral-raise', sets: 3, ss: true },
+  { exId: 'cable-triceps-pushdown', sets: 3 },
+];
 
 export interface IntervalsActivityLite {
   id: string;
@@ -66,11 +93,21 @@ export interface LocalTodayItem {
   equipment: Equipment;
   programId: string | null;
   carried?: boolean;
+  items?: ExtraWorkoutItem[];
 }
 
 export interface QueueOps {
   nextState: QueueState;
 }
+
+export const extraKey = (id: string): string => `extra:${id}`;
+
+export function parseExtraKey(key: string | null | undefined): string | null {
+  return key && key.startsWith('extra:') ? key.slice(6) : null;
+}
+
+const intervalsTypeFor = (eq: Equipment): PlanSlot['intervalsType'] =>
+  eq === 'strength' ? 'WeightTraining' : eq === 'treadmill' ? 'VirtualRun' : 'VirtualRide';
 
 const PREFIX = 'armory-q-';
 
@@ -337,6 +374,9 @@ export function reconcileQueue(args: {
   const stepDates: Record<number, string> = { ...(state.stepDates ?? {}) };
   const skippedSlots: Record<string, string> = { ...(state.skippedSlots ?? {}) };
   const carryOver: { planSlot: string; date: string }[] = (state.carryOver ?? []).map((c) => ({ ...c }));
+  const extras: ExtraWorkout[] = (state.extras ?? []).map((x) =>
+    !x.doneDate && !x.skippedDate && x.date < today ? { ...x, date: today } : { ...x },
+  );
   let stagedDate = state.stagedDate;
   let justAdvanced = false;
 
@@ -474,15 +514,38 @@ export function reconcileQueue(args: {
       stepDates,
       skippedSlots,
       carryOver: cleanCarry,
+      extras,
       consumedIds: consumedList,
     },
   };
 }
 
-/** Synchronously extracts today's active workouts (carry-overs + unresolved current-step slots). */
+/** Synchronously extracts today's active workouts (extras + carry-overs + unresolved current-step slots). */
 export function todayItemsFromQueue(plan: RollingPlan, state: QueueState, today: string): LocalTodayItem[] {
   const out: LocalTodayItem[] = [];
   const seen = new Set<string>();
+
+  for (const x of state.extras ?? []) {
+    if (x.doneDate || x.skippedDate || x.date > today) continue;
+    const k = extraKey(x.id);
+    seen.add(k);
+    out.push({
+      planSlot: k,
+      stepIndex: -1,
+      slotIndex: -1,
+      slot: {
+        equipment: x.equipment,
+        intervalsType: intervalsTypeFor(x.equipment),
+        name: x.name,
+        description: x.description,
+        seconds: x.seconds,
+      },
+      equipment: x.equipment,
+      programId: null,
+      carried: true,
+      items: x.items,
+    });
+  }
 
   for (const c of state.carryOver ?? []) {
     if (c.date > today || state.skippedSlots?.[c.planSlot] || state.doneEarly?.[c.planSlot]) continue;
@@ -656,9 +719,10 @@ export function buildWeekGlimpse(args: {
   anchorYmd?: string;
   proj: ProjectedStep[];
   todayEquipment?: Equipment[];
+  extras?: ExtraWorkout[];
   loggedByDate: Map<string, { equipment: Equipment; name: string }[]>;
 }): WeekDayCell[] {
-  const { today, anchorYmd = today, proj, todayEquipment = [], loggedByDate } = args;
+  const { today, anchorYmd = today, proj, todayEquipment = [], extras = [], loggedByDate } = args;
   const sun = shiftYmd(anchorYmd, -dayOfWeek(anchorYmd));
   const cells: WeekDayCell[] = [];
 
@@ -694,6 +758,12 @@ export function buildWeekGlimpse(args: {
           }
         });
       }
+      for (const x of extras) {
+        if (!x.doneDate && !x.skippedDate && x.date <= today) {
+          eqSet.add(x.equipment);
+          remaining++;
+        }
+      }
       for (const eq of todayEquipment) {
         eqSet.add(eq);
         remaining++;
@@ -710,6 +780,9 @@ export function buildWeekGlimpse(args: {
           stepSet.add(p.step.index);
         }
       });
+    }
+    for (const x of extras) {
+      if (!x.doneDate && !x.skippedDate && x.date === ymd) eqSet.add(x.equipment);
     }
     cells.push({
       ymd,

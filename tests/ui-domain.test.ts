@@ -5,7 +5,7 @@ import { buildTcx } from '../src/domain/tcx';
 import { intensityColor, profileBar } from '../src/domain/profile';
 import { PROGRAMS, resolveProgram, BASE_FTP } from '../src/domain/programs';
 import { clearHrLog, currentStrapBeats, pushHr, recentHrPoints } from '../src/ble/telemetry';
-import { PHASE1_PLAN, defaultQueueState, projectPlan } from '../src/domain/plan';
+import { PHASE1_PLAN, UPPER1_FINISH_ITEMS, defaultQueueState, projectPlan, type ExtraWorkout } from '../src/domain/plan';
 import { msUntilNextLocalMidnight } from '../src/intervals/calendar';
 import { PHASE1_ROUTINES } from '../src/lifts/seed';
 import { KG_PER_LB, liftSettings } from '../src/lifts/settings';
@@ -275,5 +275,28 @@ describe('live HR sheet telemetry helpers', () => {
     });
     expect(allSkippedHtml).toContain('(skipped)');
     expect(allSkippedHtml).not.toContain('✓ Done');
+
+    const extra: ExtraWorkout = {
+      id: 'u1-finish-2026-11-16',
+      name: 'Upper 1 (Finish)',
+      date: today,
+      equipment: 'strength',
+      seconds: 1800,
+      description: 'Skipped yesterday',
+      items: UPPER1_FINISH_ITEMS,
+    };
+    const extraHtml = renderDayZoomCard({
+      ymd: today,
+      today,
+      proj: projActiveToday,
+      extras: [extra],
+      restDay: 0,
+      lookup,
+    });
+    expect(extraHtml).toContain('Upper 1 (Finish)');
+    expect(extraHtml).toContain('seated-dumbbell-shoulder-press');
+    expect(extraHtml).toContain('pull-up');
+    expect(extraHtml).toContain('dumbbell-lateral-raise');
+    expect(extraHtml).toContain('cable-triceps-pushdown');
   });
 });

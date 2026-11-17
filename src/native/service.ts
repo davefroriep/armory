@@ -32,6 +32,7 @@ interface WorkoutServicePlugin {
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
   playChime(o: { wavBase64?: string; volume: number }): Promise<void>;
+  forceClose(): Promise<void>;
 }
 
 export const isNative = (): boolean => Capacitor.isNativePlatform();
@@ -116,6 +117,11 @@ export async function pickNativeDcimVideo(): Promise<PickedNativeVideo | null> {
 export async function openNativeVideoUri(uri: string): Promise<boolean> {
   if (!plugin || !uri) return false;
   try { return (await plugin.openVideoUri({ uri })).opened; } catch { return false; }
+}
+
+/** Terminates any foreground workout service, removes the Android Recents task, and exits the process. */
+export async function forceCloseApp(): Promise<void> {
+  if (plugin) await plugin.forceClose();
 }
 
 export async function playNativeChime(wavBase64: string, volume: number): Promise<boolean> {

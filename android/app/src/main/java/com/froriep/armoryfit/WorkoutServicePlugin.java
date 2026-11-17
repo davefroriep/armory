@@ -313,4 +313,24 @@ public class WorkoutServicePlugin extends Plugin {
         }
         call.resolve();
     }
+
+    /** Stops foreground workout service, removes the app task from Recents, and force-closes the process. */
+    @PluginMethod
+    public void forceClose(PluginCall call) {
+        Activity act = getActivity();
+        call.resolve();
+        if (act == null) return;
+        act.runOnUiThread(() -> {
+            try {
+                if (WorkoutForegroundService.running) {
+                    act.stopService(new Intent(act, WorkoutForegroundService.class));
+                }
+            } catch (Exception ignored) {
+            }
+            act.finishAffinity();
+            act.finishAndRemoveTask();
+            act.getWindow().getDecorView().postDelayed(() ->
+                    android.os.Process.killProcess(android.os.Process.myPid()), 120);
+        });
+    }
 }
