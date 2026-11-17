@@ -12,5 +12,6 @@ Tracked upcoming hardware, telemetry, and programming milestones for **Armory Fi
 3. **Spin Bike (`Bowflex C7 + SS2K`) Calibration**
    - Calibrate resistance steps against Dave's power pedals (`128–130 W @ 82–88 RPM` Zone 2) and wire the interactive `#/spin` ERG / Zone 2 HUD alongside MyWhoosh reconciliation.
 
-4. **Armory Live Wall Display / Wallboard Stream *(Holding Pattern — See [ARMORY_AV_TECH_SETUP.md](./ARMORY_AV_TECH_SETUP.md))***
-   - Once monitor/TV inputs & Denon HDMI Out 2 routing are confirmed, add a lightweight live state stream from the phone APK (1 Hz Polar H10 readiness/HR, rest timer, current/next exercise & sets left) for a secondary gym display without interrupting Fire TV Cube audio.
+4. **Armory Live Wall Display / Wallboard Stream & Voice Commands *(Framework Shipped `v0.38` — Hardware Placement Pending See [ARMORY_AV_TECH_SETUP.md](./ARMORY_AV_TECH_SETUP.md))***
+   - `v0.38` ships the Pixel APK's built-in **Smart TV Wallboard Server** (`http://<pixel-ip>:8765`, HTTP + SSE + `/api/voice`), **superset-interleaved execution cursor**, and **foreground-scoped Voice Command framework** (`"Armory — 225 for 8"`, `"Armory — check"`, `"Armory — next exercise"`).
+   - Pending physical check: 19" monitor video inputs / spare 32" TV availability / Denon HDMI Out 2 routing, plus optional LAN external mic relay (`POST /api/voice`) via OptiPlex if room speakers overpower the Pixel mic.

@@ -1,5 +1,6 @@
 package com.froriep.armoryfit;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.content.ContentResolver;
@@ -23,12 +24,16 @@ import android.view.WindowManager;
 import androidx.activity.result.ActivityResult;
 import androidx.core.content.ContextCompat;
 
+import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -36,9 +41,15 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 
-/** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, chimes + camera/DCIM video linking. */
-@CapacitorPlugin(name = "WorkoutService")
+/** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, wallboard HTTP/SSE, voice recognition + video linking. */
+@CapacitorPlugin(
+        name = "WorkoutService",
+        permissions = {
+                @Permission(strings = { Manifest.permission.RECORD_AUDIO }, alias = "microphone")
+        }
+)
 public class WorkoutServicePlugin extends Plugin {
     private static volatile WorkoutServicePlugin instance;
 
@@ -50,6 +61,7 @@ public class WorkoutServicePlugin extends Plugin {
 
     static void setAppVisible(Context c, boolean visible) {
         WorkoutForegroundService.appVisible = visible;
+        VoiceRecognitionManager.onAppVisibilityChanged(c, visible);
         if (WorkoutForegroundService.running) {
             Intent i = new Intent(c, WorkoutForegroundService.class)
                     .setAction(WorkoutForegroundService.ACTION_APP_VISIBILITY);
@@ -58,6 +70,23 @@ public class WorkoutServicePlugin extends Plugin {
             } catch (Exception ignored) {
             }
         }
+    }
+
+    static void deliverVoiceEvent(String transcript, boolean isFinal, String source, String state, String error) {
+        WorkoutServicePlugin p = instance;
+        if (p == null) return;
+        JSObject ret = new JSObject();
+        ret.put("transcript", transcript != null ? transcript : "");
+        ret.put("isFinal", isFinal);
+        ret.put("source", source != null ? source : "mic");
+        ret.put("state", state != null ? state : "listening");
+        if (error != null) ret.put("error", error);
+        p.notifyListeners("voiceResult", ret);
+    }
+
+    static void deliverExternalVoice(String transcript, String source) {
+        if (transcript == null || transcript.trim().isEmpty()) return;
+        deliverVoiceEvent(transcript.trim(), true, source != null ? source : "lan", "lan", null);
     }
 
     static void emitRestSync(String action, long remainingMs, int totalSec) {
@@ -192,6 +221,76 @@ public class WorkoutServicePlugin extends Plugin {
         float vol = call.getDouble("volume", 0.8).floatValue();
         WorkoutMetronome.set(getContext(), play, bpm, vol);
         call.resolve();
+    }
+
+    @PluginMethod
+    public void startWallboard(PluginCall call) {
+        int port = call.getInt("port", 8765);
+        String html = call.getString("html", "");
+        call.resolve(WallboardServer.start(getContext(), port, html));
+    }
+
+    @PluginMethod
+    public void stopWallboard(PluginCall call) {
+        WallboardServer.stop();
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void getWallboardStatus(PluginCall call) {
+        call.resolve(WallboardServer.status());
+    }
+
+    @PluginMethod
+    public void pushWallboardState(PluginCall call) {
+        String stateJson = call.getString("stateJson", "{\"mode\":\"standby\"}");
+        int clients = WallboardServer.pushState(stateJson);
+        JSObject ret = new JSObject();
+        ret.put("clients", clients);
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void setVoiceListening(PluginCall call) {
+        boolean enabled = call.getBoolean("enabled", false);
+        if (enabled && getPermissionState("microphone") != PermissionState.GRANTED) {
+            requestPermissionForAlias("microphone", call, "onMicPermResult");
+            return;
+        }
+        VoiceRecognitionManager.setEnabled(getContext(), enabled, readBiasPhrases(call));
+        call.resolve(VoiceRecognitionManager.status(getContext(), getPermissionState("microphone") == PermissionState.GRANTED));
+    }
+
+    @PermissionCallback
+    private void onMicPermResult(PluginCall call) {
+        boolean granted = getPermissionState("microphone") == PermissionState.GRANTED;
+        if (granted) {
+            VoiceRecognitionManager.setEnabled(getContext(), true, readBiasPhrases(call));
+            call.resolve(VoiceRecognitionManager.status(getContext(), true));
+        } else {
+            VoiceRecognitionManager.stop();
+            JSObject ret = VoiceRecognitionManager.status(getContext(), false);
+            ret.put("listening", false);
+            ret.put("error", "Microphone permission denied");
+            call.resolve(ret);
+        }
+    }
+
+    @PluginMethod
+    public void getVoiceStatus(PluginCall call) {
+        call.resolve(VoiceRecognitionManager.status(getContext(), getPermissionState("microphone") == PermissionState.GRANTED));
+    }
+
+    private static ArrayList<String> readBiasPhrases(PluginCall call) {
+        ArrayList<String> out = new ArrayList<>();
+        JSArray arr = call.getArray("biasPhrases");
+        if (arr != null) {
+            for (int i = 0; i < arr.length(); i++) {
+                String s = arr.optString(i, "").trim();
+                if (!s.isEmpty()) out.add(s);
+            }
+        }
+        return out;
     }
 
     @PluginMethod
@@ -474,10 +573,12 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    /** Stops foreground workout service & metronome, removes the app task from Recents, and force-closes the process. */
+    /** Stops foreground workout service, voice recognizer, wallboard server & metronome, and force-closes the process. */
     @PluginMethod
     public void forceClose(PluginCall call) {
         WorkoutMetronome.stop();
+        VoiceRecognitionManager.stop();
+        WallboardServer.stop();
         Activity act = getActivity();
         call.resolve();
         if (act == null) return;

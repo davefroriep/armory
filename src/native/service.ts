@@ -30,6 +30,31 @@ export interface NativeBackupPickResult {
   error?: string;
 }
 
+export interface WallboardStatus {
+  running: boolean;
+  port: number;
+  ip: string;
+  url: string;
+  clients: number;
+  error?: string;
+}
+
+export interface NativeVoiceStatus {
+  listening: boolean;
+  granted: boolean;
+  available: boolean;
+  onDevice?: boolean;
+  error?: string;
+}
+
+export interface NativeVoiceEvent {
+  transcript: string;
+  isFinal: boolean;
+  source: 'mic' | 'lan';
+  state: string;
+  error?: string;
+}
+
 interface WorkoutServicePlugin {
   start(o: { title: string; text: string; startMs?: number; wavBase64?: string }): Promise<void>;
   update(o: { title: string; text: string; startMs?: number }): Promise<void>;
@@ -40,8 +65,15 @@ interface WorkoutServicePlugin {
   requestOverlayPermission(): Promise<void>;
   openAppSettings(): Promise<void>;
   addListener(event: 'restSync', cb: (ev: NativeRestEvent) => void): Promise<PluginListenerHandle>;
+  addListener(event: 'voiceResult', cb: (ev: NativeVoiceEvent) => void): Promise<PluginListenerHandle>;
   setKeepScreenOn(o: { on: boolean }): Promise<void>;
   setMetronome(o: { play: boolean; bpm: number; volume: number }): Promise<void>;
+  startWallboard(o: { port: number; html: string }): Promise<WallboardStatus>;
+  stopWallboard(): Promise<void>;
+  getWallboardStatus(): Promise<WallboardStatus>;
+  pushWallboardState(o: { stateJson: string }): Promise<{ clients: number }>;
+  setVoiceListening(o: { enabled: boolean; biasPhrases: string[] }): Promise<NativeVoiceStatus>;
+  getVoiceStatus(): Promise<NativeVoiceStatus>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
@@ -143,4 +175,52 @@ export async function writeNativeBackupFile(fileName: string, content: string): 
 export async function pickNativeBackupFile(): Promise<NativeBackupPickResult> {
   if (!plugin) return { picked: false };
   try { return await plugin.pickBackupFile(); } catch (e) { return { picked: false, error: (e as Error).message }; }
+}
+
+export async function startNativeWallboard(port: number, html: string): Promise<WallboardStatus> {
+  if (!plugin) return { running: false, port, ip: '127.0.0.1', url: `http://127.0.0.1:${port}`, clients: 0, error: 'Android APK required for LAN server' };
+  try { return await plugin.startWallboard({ port, html }); }
+  catch (e) { return { running: false, port, ip: '127.0.0.1', url: `http://127.0.0.1:${port}`, clients: 0, error: (e as Error).message }; }
+}
+
+export async function stopNativeWallboard(): Promise<void> {
+  if (!plugin) return;
+  try { await plugin.stopWallboard(); } catch { /* ignore */ }
+}
+
+export async function getNativeWallboardStatus(): Promise<WallboardStatus> {
+  if (!plugin) return { running: false, port: 8765, ip: '127.0.0.1', url: 'http://127.0.0.1:8765', clients: 0 };
+  try { return await plugin.getWallboardStatus(); }
+  catch { return { running: false, port: 8765, ip: '127.0.0.1', url: 'http://127.0.0.1:8765', clients: 0 }; }
+}
+
+export async function pushNativeWallboardState(stateJson: string): Promise<number> {
+  if (!plugin) return 0;
+  try { return (await plugin.pushWallboardState({ stateJson })).clients; } catch { return 0; }
+}
+
+export async function setNativeVoiceListening(enabled: boolean, biasPhrases: string[]): Promise<NativeVoiceStatus> {
+  if (!plugin) return { listening: false, granted: false, available: false, error: 'Android APK required' };
+  try { return await plugin.setVoiceListening({ enabled, biasPhrases }); }
+  catch (e) { return { listening: false, granted: false, available: false, error: (e as Error).message }; }
+}
+
+export async function getNativeVoiceStatus(): Promise<NativeVoiceStatus> {
+  if (!plugin) return { listening: false, granted: false, available: false };
+  try { return await plugin.getVoiceStatus(); }
+  catch { return { listening: false, granted: false, available: false }; }
+}
+
+export function onNativeVoiceResult(cb: (ev: NativeVoiceEvent) => void): () => void {
+  if (!plugin) return () => {};
+  let handle: PluginListenerHandle | null = null;
+  let dead = false;
+  void plugin.addListener('voiceResult', cb).then((h) => {
+    if (dead) void h.remove();
+    else handle = h;
+  }).catch(() => {});
+  return () => {
+    dead = true;
+    if (handle) void handle.remove();
+  };
 }

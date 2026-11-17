@@ -10,6 +10,7 @@ import { revFooter, topbar, wireChips } from './chrome';
 import { $, esc, hms, mmss } from './dom';
 import { ZONE_COLOR, hrZone } from './hr';
 import { renderSummary } from './summaryView';
+import { setWallboardCardioState } from '../wallboard/state';
 
 const PACK_KEY = 'armory.ruck.packLb';
 const PACK_OPTIONS = [0, 20, 30, 35, 45];
@@ -110,6 +111,24 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     const go = $('#go', root);
     go.textContent = state === 'ready' ? `START ${sessionTitle().toUpperCase()}` : state === 'paused' ? 'PAUSED' : 'PAUSE';
     go.classList.toggle('pause', state !== 'ready');
+    if (state === 'running' || state === 'paused') {
+      setWallboardCardioState({
+        title: sessionTitle(),
+        phase: state === 'paused' ? 'PAUSED' : 'OUTDOOR / RUCK',
+        phaseTone: state === 'paused' ? 'done' : 'work',
+        repText: packLb > 0 ? `${packLb} lb pack` : 'Bodyweight HR',
+        countdownText: hms(el),
+        targetText: z ? `Zone ${z.z} · ${Math.round(z.pct * 100)}% HRmax` : 'Polar H10 Live HR',
+        watts: 0,
+        targetWatts: null,
+        rpm: 0,
+        targetRpm: null,
+        elapsedSec: el,
+        kcal: 0,
+        z5Sec: 0,
+        paused: state === 'paused',
+      });
+    }
   };
 
   const start = () => {
@@ -145,6 +164,7 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     offRec = null;
     state = 'summary';
     guard.disarm();
+    setWallboardCardioState(null);
     void workoutService.stop();
     void lock?.release().catch(() => {});
     lock = null;
@@ -182,6 +202,7 @@ export function strengthHrScreen(root: HTMLElement): () => void {
     if (timer) clearInterval(timer);
     offRec?.();
     guard.dispose();
+    setWallboardCardioState(null);
     offChips?.();
     void workoutService.stop();
     void lock?.release().catch(() => {});

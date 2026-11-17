@@ -7,7 +7,11 @@ import { hudScreen } from './ui/hud';
 import { cardioWorkoutScreen } from './ui/cardioWorkout';
 import { programScreen } from './ui/program';
 import { settingsScreen } from './ui/settings';
+import { wallboardPreviewScreen } from './ui/wallboardPreview';
 import { liftsScreen } from './ui/lifts';
+import { toast } from './ui/lifts/kit';
+import { voice } from './lifts/voice';
+import { initWallboardSync, wallboard } from './wallboard/sync';
 import { initSetupLinks } from './setup';
 import { calendar } from './intervals/calendar';
 import { forceCloseApp, isNative } from './native/service';
@@ -26,6 +30,7 @@ const routes: Record<string, Screen> = {
   treadmill: stubScreen('treadmill'),
   strength: liftsScreen,
   settings: settingsScreen,
+  wallboard: wallboardPreviewScreen,
 };
 
 const root = document.getElementById('app')!;
@@ -118,6 +123,9 @@ function promptExit(): void {
 
 initSetupLinks();
 initAutoBackup();
+voice.init();
+voice.toasted.on(({ msg, kind }) => toast(msg, kind ? { kind } : {}));
+initWallboardSync();
 // Coming back to the app (or the phone waking up) retries a stalled sensor link immediately.
 document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
 window.addEventListener('hashchange', route);
@@ -127,6 +135,7 @@ if (isNative()) {
       kickSensors();
       calendar.checkDayRollover(true);
       ensureDailyBackup();
+      void wallboard.refreshStatus();
     }
   });
   void App.addListener('backButton', () => {

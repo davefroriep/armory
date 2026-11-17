@@ -46,6 +46,12 @@ export interface Settings {
   simulator: boolean;
   /** Preferred weekly off-day (`0` = Sun .. `6` = Sat, `null` = None). Skipped when projecting future plan dates. */
   restDay: number | null;
+  /** Local Wi-Fi HTTP/SSE server hosting the Smart TV wallboard. */
+  wallboardEnabled: boolean;
+  wallboardPort: number;
+  /** Foreground-only hands-free voice command listener ("armory ..."). */
+  voiceEnabled: boolean;
+  voiceWakeWord: string;
   /** Current position in the rolling training queue. */
   queue: QueueState;
 }
@@ -80,6 +86,10 @@ export const DEFAULTS: Settings = {
   needleSmooth: '2',
   simulator: false,
   restDay: 0,
+  wallboardEnabled: false,
+  wallboardPort: 8765,
+  voiceEnabled: false,
+  voiceWakeWord: 'armory',
   queue: defaultQueueState(),
 };
 

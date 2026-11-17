@@ -21,6 +21,7 @@ import { topbar, wireChips } from './chrome';
 import { ZONE_COLOR, hrZone } from './hr';
 import { renderSummary } from './summaryView';
 import { LeaveGuard } from './leaveGuard';
+import { setWallboardCardioState } from '../wallboard/state';
 
 /** Display smoothing for cadence and power. The gauge needle + cue use their own window (Settings). */
 const SMOOTH_MS = 3000;
@@ -101,6 +102,7 @@ class Hud {
       this.offChips?.();
       audio.setMetronome(false, null);
       sim.setTarget(0);
+      setWallboardCardioState(null);
       this.releaseLock();
       void setKeepScreenOn(false);
       void workoutService.stop();
@@ -329,6 +331,7 @@ class Hud {
     this.el.pauseModal.hidden = true;
     this.el.doneModal.hidden = true;
     this.releaseLock();
+    setWallboardCardioState(null);
     void workoutService.stop();
     this.showSummary();
   }
@@ -533,6 +536,32 @@ class Hud {
     e.skip.textContent = seg?.kind === 'warmup' ? 'SKIP WARM-UP' : 'READY ▶';
     if (this.engine.state === 'paused') e.go.textContent = 'PAUSED';
     else if (running) e.go.textContent = 'PAUSE';
+
+    if (running || this.engine.state === 'paused') {
+      const k = shown?.kind;
+      const tone = this.engine.state === 'paused' ? 'done'
+        : k === 'work' || k === 'steady' ? 'work'
+        : k === 'rest' ? 'rest'
+        : k === 'float' ? 'float'
+        : k === 'cooldown' ? 'cool'
+        : 'warm';
+      setWallboardCardioState({
+        title: p.name,
+        phase: e.ph.textContent || 'CARDIO',
+        phaseTone: tone,
+        repText: e.tag.textContent || '',
+        countdownText: e.cd.textContent || '0:00',
+        targetText: e.tgt.textContent || '',
+        watts: wS,
+        targetWatts: shown?.rpm != null ? Math.round(wattsForRpm(shown.rpm)) : null,
+        rpm: cadS,
+        targetRpm: shown?.rpm ?? null,
+        elapsedSec: elapsed,
+        kcal: this.rec?.lastKcal ?? 0,
+        z5Sec: this.rec?.z5Seconds ?? 0,
+        paused: this.engine.state === 'paused',
+      });
+    }
   }
 
   /** Timeline head position (0..1) on the nominal timeline; gated blocks fill up to their nominal length. */

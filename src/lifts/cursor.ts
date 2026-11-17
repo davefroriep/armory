@@ -1,0 +1,213 @@
+import { labels, supersetGroups } from './logic';
+import type { Exercise, SessionEx } from './types';
+
+export interface CursorRef {
+  exUid: string;
+  setId?: string;
+}
+
+export interface SetPointer {
+  exIdx: number;
+  setIdx: number;
+  exUid: string;
+  setId: string;
+  label: string;
+  setNumber: number;
+  totalWorkingSets: number;
+  isWarmup: boolean;
+}
+
+/**
+ * Planned execution sequence across all exercises, interleaving superset rounds (`1A[0], 1B[0], 1A[1], 1B[1]...`)
+ * with warm-up rounds first and working rounds after within each superset group.
+ */
+export function plannedSetSequence(exs: SessionEx[]): { exIdx: number; setIdx: number }[] {
+  const out: { exIdx: number; setIdx: number }[] = [];
+  for (const g of supersetGroups(exs)) {
+    const warms: number[][] = [];
+    const works: number[][] = [];
+    let maxWarm = 0;
+    let maxWork = 0;
+    for (let k = g.start; k <= g.end; k++) {
+      const se = exs[k];
+      const wIdx: number[] = [];
+      const nIdx: number[] = [];
+      se.sets.forEach((s, si) => {
+        if (s.kind === 'w') wIdx.push(si);
+        else nIdx.push(si);
+      });
+      warms.push(wIdx);
+      works.push(nIdx);
+      maxWarm = Math.max(maxWarm, wIdx.length);
+      maxWork = Math.max(maxWork, nIdx.length);
+    }
+    for (let r = 0; r < maxWarm; r++) {
+      for (let off = 0; off < warms.length; off++) {
+        const si = warms[off][r];
+        if (si != null) out.push({ exIdx: g.start + off, setIdx: si });
+      }
+    }
+    for (let r = 0; r < maxWork; r++) {
+      for (let off = 0; off < works.length; off++) {
+        const si = works[off][r];
+        if (si != null) out.push({ exIdx: g.start + off, setIdx: si });
+      }
+    }
+  }
+  return out;
+}
+
+function makePointer(exs: SessionEx[], labs: string[], exIdx: number, setIdx: number): SetPointer | null {
+  const se = exs[exIdx];
+  const set = se?.sets[setIdx];
+  if (!se || !set) return null;
+  const totalWorkingSets = se.sets.filter((s) => s.kind !== 'w').length;
+  const workingOrdinal = se.sets.slice(0, setIdx + 1).filter((s) => s.kind !== 'w').length;
+  return {
+    exIdx,
+    setIdx,
+    exUid: se.uid,
+    setId: set.id,
+    label: labs[exIdx] ?? String(exIdx + 1),
+    setNumber: set.kind === 'w' ? setIdx + 1 : Math.max(1, workingOrdinal),
+    totalWorkingSets,
+    isWarmup: set.kind === 'w',
+  };
+}
+
+/**
+ * Resolves the exact target set row to highlight and log next.
+ * Respects `cursor` if it points to an unlogged exercise/set, otherwise falls back to the first unlogged
+ * slot in `plannedSetSequence(exs)`.
+ */
+export function resolveTargetSet(exs: SessionEx[], cursor?: CursorRef | null): SetPointer | null {
+  if (!exs.length) return null;
+  const labs = labels(exs);
+  if (cursor) {
+    const exIdx = exs.findIndex((e) => e.uid === cursor.exUid);
+    if (exIdx >= 0) {
+      const se = exs[exIdx];
+      if (cursor.setId) {
+        const si = se.sets.findIndex((s) => s.id === cursor.setId);
+        if (si >= 0 && !se.sets[si].done) return makePointer(exs, labs, exIdx, si);
+      }
+      const firstOpen = se.sets.findIndex((s) => !s.done);
+      if (firstOpen >= 0) return makePointer(exs, labs, exIdx, firstOpen);
+    }
+  }
+  const seq = plannedSetSequence(exs);
+  for (const step of seq) {
+    if (!exs[step.exIdx]?.sets[step.setIdx]?.done) {
+      return makePointer(exs, labs, step.exIdx, step.setIdx);
+    }
+  }
+  return null;
+}
+
+/** Advances the cursor cleanly through superset alternation after a set is logged. */
+export function advanceCursorAfterLog(exs: SessionEx[], justLogged: { exIdx: number; setIdx: number }): CursorRef | null {
+  const seq = plannedSetSequence(exs);
+  if (!seq.length) return null;
+  const pos = seq.findIndex((p) => p.exIdx === justLogged.exIdx && p.setIdx === justLogged.setIdx);
+  const start = pos >= 0 ? pos : -1;
+  for (let offset = 1; offset <= seq.length; offset++) {
+    const step = seq[(start + offset) % seq.length];
+    const se = exs[step.exIdx];
+    const set = se?.sets[step.setIdx];
+    if (se && set && !set.done && !(step.exIdx === justLogged.exIdx && step.setIdx === justLogged.setIdx)) {
+      return { exUid: se.uid, setId: set.id };
+    }
+  }
+  return null;
+}
+
+/** Previews what the target set would be right after `current` is completed (for Wallboard `UP NEXT`). */
+export function peekNextTargetSet(exs: SessionEx[], current: SetPointer | null): SetPointer | null {
+  if (!current) return null;
+  const nextRef = advanceCursorAfterLog(exs, { exIdx: current.exIdx, setIdx: current.setIdx });
+  if (!nextRef) return null;
+  const labs = labels(exs);
+  const exIdx = exs.findIndex((e) => e.uid === nextRef.exUid);
+  if (exIdx < 0) return null;
+  const setIdx = nextRef.setId ? exs[exIdx].sets.findIndex((s) => s.id === nextRef.setId) : exs[exIdx].sets.findIndex((s) => !s.done);
+  return setIdx >= 0 ? makePointer(exs, labs, exIdx, setIdx) : null;
+}
+
+/** Moves focus forward (`+1`) or backward (`-1`) across exercises with unlogged sets. */
+export function stepExerciseCursor(exs: SessionEx[], current: SetPointer | null, dir: 1 | -1): CursorRef | null {
+  if (!exs.length) return null;
+  const curIdx = current ? current.exIdx : (dir > 0 ? -1 : 0);
+  for (let step = 1; step <= exs.length; step++) {
+    const idx = ((curIdx + dir * step) % exs.length + exs.length) % exs.length;
+    const se = exs[idx];
+    const open = se.sets.find((s) => !s.done);
+    if (open) return { exUid: se.uid, setId: open.id };
+  }
+  return null;
+}
+
+const SPOKEN_PREFIX: Record<string, string> = {
+  one: '1', two: '2', to: '2', too: '2', three: '3', four: '4', for: '4', five: '5', six: '6', seven: '7', eight: '8', nine: '9',
+};
+const SPOKEN_SUFFIX: Record<string, string> = {
+  a: 'a', ay: 'a', eh: 'a', b: 'b', be: 'b', bee: 'b', c: 'c', see: 'c', sea: 'c', d: 'd', dee: 'd',
+};
+
+function normalizeLabelQuery(raw: string): string {
+  const cleaned = raw.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').trim();
+  const toks = cleaned.split(/\s+/).filter((t) => t && !['exercise', 'group', 'set', 'the', 'to'].includes(t));
+  if (toks.length === 1 && /^[1-9][a-d]?$/.test(toks[0])) return toks[0];
+  if (toks.length === 2) {
+    const num = SPOKEN_PREFIX[toks[0]] ?? (/^[1-9]$/.test(toks[0]) ? toks[0] : '');
+    const letCh = SPOKEN_SUFFIX[toks[1]] ?? (/^[a-d]$/.test(toks[1]) ? toks[1] : '');
+    if (num && letCh) return `${num}${letCh}`;
+  }
+  if (toks.length === 1 && SPOKEN_PREFIX[toks[0]]) return SPOKEN_PREFIX[toks[0]];
+  return '';
+}
+
+/** Jumps the cursor to a superset/exercise label (`2B`, `"two b"`) or best-matching exercise name (`"pull ups"`). */
+export function jumpToExerciseCursor(exs: SessionEx[], rawTarget: string, exOf: (id: string) => Exercise): CursorRef | null {
+  if (!exs.length) return null;
+  const labs = labels(exs);
+  const labQ = normalizeLabelQuery(rawTarget);
+  if (labQ) {
+    const idx = labs.findIndex((l) => l.toLowerCase() === labQ);
+    if (idx >= 0) {
+      const se = exs[idx];
+      const open = se.sets.find((s) => !s.done) ?? se.sets[se.sets.length - 1];
+      return open ? { exUid: se.uid, setId: open.id } : { exUid: se.uid };
+    }
+  }
+
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const q = norm(rawTarget);
+  if (!q) return null;
+  const qTokens = q.split(' ').filter((w) => w.length >= 2);
+  let bestIdx = -1;
+  let bestScore = 0;
+
+  exs.forEach((se, idx) => {
+    const name = norm(exOf(se.exId).name);
+    const hasOpen = se.sets.some((s) => !s.done);
+    let score = 0;
+    if (name === q) score += 100;
+    else if (name.includes(q) || q.includes(name)) score += 60;
+    const nameTokens = name.split(' ');
+    for (const qt of qTokens) {
+      if (nameTokens.some((nt) => nt === qt || nt.startsWith(qt) || qt.startsWith(nt))) {
+        score += 20;
+      }
+    }
+    if (score > 0 && hasOpen) score += 10;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx = idx;
+    }
+  });
+
+  if (bestIdx < 0) return null;
+  const se = exs[bestIdx];
+  const open = se.sets.find((s) => !s.done) ?? se.sets[se.sets.length - 1];
+  return open ? { exUid: se.uid, setId: open.id } : { exUid: se.uid };
+}

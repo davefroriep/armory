@@ -1,6 +1,7 @@
 import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
+import { advanceCursorAfterLog, resolveTargetSet } from '../../lifts/cursor';
 import {
   addSet, buildExercise, canLog, deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
   prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
@@ -12,7 +13,11 @@ import { lifts } from '../../lifts/store';
 import { resyncSession } from '../../lifts/intervals';
 import { setText } from '../../lifts/summary';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
+import { voice } from '../../lifts/voice';
 import { allowNextRoute } from '../../main';
+import { getSettings } from '../../store/settings';
+import { setWallboardHoldState } from '../../wallboard/state';
+import { wallboard } from '../../wallboard/sync';
 import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
@@ -74,6 +79,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const prevId = hold.setId;
     clearInterval(hold.timer);
     hold = null;
+    setWallboardHoldState(null);
     void setKeepScreenOn(false);
     paintHoldBtn(prevId);
   };
@@ -110,6 +116,7 @@ function build(root: HTMLElement, id?: string): () => void {
       }
     }, 250);
     hold = { setId, endMs, timer };
+    setWallboardHoldState({ exUid: se.uid, setId, label: exOf(se.exId).name, endMs, totalSec: sec });
     paintHoldBtn(setId);
     save();
   };
@@ -186,11 +193,30 @@ function build(root: HTMLElement, id?: string): () => void {
 
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
+    const micBtn = edit ? '' : '<button class="s-mic" id="smic" type="button" data-act="voice" aria-label="Voice commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>';
     return `<header class="bar sbar">
       <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
       <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
-      <div class="chips"><span id="sclkctl">${clockCtlHtml()}</span><button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
+      <div class="chips"><span id="sclkctl">${clockCtlHtml()}</span>${micBtn}<button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
+  };
+
+  const paintTarget = (): void => {
+    const ptr = edit ? null : resolveTargetSet(s.exs, voice.cursor);
+    root.querySelectorAll<HTMLElement>('.srow').forEach((row) => {
+      row.classList.toggle('cur-target', !!ptr && row.dataset.sid === ptr.setId && !row.classList.contains('done'));
+    });
+  };
+
+  const paintMic = (): void => {
+    const btn = root.querySelector<HTMLElement>('#smic');
+    if (!btn) return;
+    const on = getSettings().voiceEnabled;
+    const armed = voice.isArmed();
+    btn.classList.toggle('on', on && voice.listening);
+    btn.classList.toggle('armed', on && armed);
+    btn.setAttribute('aria-pressed', String(on));
+    btn.title = armed ? 'Listening for command…' : on ? `Say "${getSettings().voiceWakeWord || 'armory'} …"` : 'Enable hands-free voice logging';
   };
 
   const paint = (): void => {
@@ -213,6 +239,8 @@ function build(root: HTMLElement, id?: string): () => void {
       <div class="dock" id="dock" hidden></div>`;
     paintRest();
     paintClock();
+    paintTarget();
+    paintMic();
   };
 
   // ---------- targeted refresh (never touches the focused input) ----------
@@ -267,7 +295,29 @@ function build(root: HTMLElement, id?: string): () => void {
   const offRest = active.restChanged.on(paintRest);
   const offChips = wireChips(root, { resume: false });
   const offCfg = liftSettingsChanged.on(() => { if (!dead) paint(); });
-  // another screen/tab finished or deleted this workout
+  const syncVisibleCards = (): void => {
+    if (dead) return;
+    recomputePRs();
+    root.querySelectorAll<HTMLElement>('.xcard').forEach((card) => syncCard(card));
+    paintTarget();
+    paintMic();
+    paintClock();
+  };
+  const offVoice = edit ? () => {} : voice.changed.on(syncVisibleCards);
+  if (!edit) {
+    voice.holdStarter = (exUid, setId, seconds) => {
+      const se = s.exs.find((e) => e.uid === exUid);
+      const si = se?.sets.findIndex((x) => x.id === setId) ?? -1;
+      if (!se || si < 0) return false;
+      if (seconds != null) { se.sets[si].r = seconds; se.sets[si].rAuto = false; }
+      const card = root.querySelector<HTMLElement>(`.xcard[data-uid="${exUid}"]`);
+      const row = card?.querySelector<HTMLElement>(`.srow[data-sid="${setId}"]`);
+      if (!card || !row) return false;
+      startHold(se, si, card, row);
+      return true;
+    };
+  }
+  // another screen/tab finished, deleted, or voice-updated this workout
   const offStore = lifts.changed.on(() => {
     if (finishing) return;
     if (!lifts.sessions.has(s.id)) { allowNextRoute(); location.replace('#/strength'); }
@@ -275,7 +325,7 @@ function build(root: HTMLElement, id?: string): () => void {
       allowNextRoute();
       location.replace(`#/strength/summary/${s.id}`);
     }
-    else if (!dead) paintClock();
+    else if (!dead) syncVisibleCards();
   });
 
   // ---------- dock (steppers & rep presets above the keyboard) ----------
@@ -342,6 +392,11 @@ function build(root: HTMLElement, id?: string): () => void {
   root.addEventListener('focusin', (e) => {
     const t = e.target as HTMLElement;
     if (!(t instanceof HTMLInputElement) || !t.closest('.srow')) return;
+    if (!edit) {
+      const { se, i } = rowOf(t);
+      const stSet = se.sets[i];
+      if (stSet && !stSet.done) voice.setCursor({ exUid: se.uid, setId: stSet.id });
+    }
     showDock(t);
     if (scrollT1) clearTimeout(scrollT1);
     if (scrollT2) clearTimeout(scrollT2);
@@ -409,7 +464,10 @@ function build(root: HTMLElement, id?: string): () => void {
     const r = toggleDone(se, i, ex);
     if (r === null) return shakeIncomplete();
     if (r && !was) {
-      if (!edit) active.ensureStarted(s);
+      if (!edit) {
+        active.ensureStarted(s);
+        voice.setCursor(advanceCursorAfterLog(s.exs, { exIdx: idx, setIdx: i }));
+      }
       recomputePRs();
       if (!edit) {
         active.afterSetLogged(s, idx);
@@ -419,14 +477,21 @@ function build(root: HTMLElement, id?: string): () => void {
     } else {
       recomputePRs();
       if (!r && was && !edit) {
+        voice.setCursor({ exUid: se.uid, setId: set.id });
         void active.resetIfNoneLogged(s).then((reset) => { if (reset && !dead) paintClock(); });
       }
     }
     syncCard(card);
+    paintTarget();
     save();
     if (r && fromDock) {
-      const next = card.querySelectorAll<HTMLElement>('.srow')[i + 1];
-      const nxtW = next && !se.sets[i + 1].done ? next.querySelector<HTMLInputElement>('.sw') : null;
+      const nextPtr = !edit ? resolveTargetSet(s.exs, voice.cursor) : null;
+      const nxtW = nextPtr
+        ? root.querySelector<HTMLInputElement>(`.xcard[data-uid="${nextPtr.exUid}"] .srow[data-sid="${nextPtr.setId}"] .sw`)
+        : (() => {
+            const next = card.querySelectorAll<HTMLElement>('.srow')[i + 1];
+            return next && !se.sets[i + 1].done ? next.querySelector<HTMLInputElement>('.sw') : null;
+          })();
       if (nxtW) nxtW.focus(); else (document.activeElement as HTMLElement | null)?.blur();
     }
   };
@@ -690,15 +755,37 @@ function build(root: HTMLElement, id?: string): () => void {
   };
 
   const wkMenu = async (): Promise<void> => {
+    const wbSt = wallboard.status;
     const k = await actionSheet(s.name, [
       { key: 'rename', label: 'Rename workout' },
       { key: 'note', label: s.note ? 'Edit workout note' : 'Add workout note' },
+      ...(!edit ? [{ key: 'wallboard', label: wbSt.running ? `TV Wallboard · ${wbSt.url}` : 'TV Wallboard (Gym Display)', sub: wbSt.running ? `${wbSt.clients} TV${wbSt.clients === 1 ? '' : 's'} connected` : 'Stream live HR, rest timer & next set over Wi-Fi' }] : []),
       { key: 'del', label: edit ? 'Delete workout' : 'Discard workout', danger: true },
     ]);
     if (k === 'rename') await rename();
     else if (k === 'note') {
       const v = await promptSheet('Workout note', s.note ?? '', 'How it felt…', true);
       if (v != null) { if (v) s.note = v; else delete s.note; save(); }
+    } else if (k === 'wallboard') {
+      const sh = openSheet(`
+        <h3 class="sh-title">Smart TV Wallboard</h3>
+        <p class="sh-text" id="wbSheetInfo">${wallboard.status.running ? `Live on your gym Wi-Fi at <b>${esc(wallboard.status.url)}</b> (${wallboard.status.clients} connected).` : 'Broadcast live HR readiness, rest timer, and superset progression to your gym TV browser.'}</p>
+        <button class="btn primary big" type="button" data-wbs="tog">${getSettings().wallboardEnabled ? 'Turn off TV Wallboard' : 'Turn on TV Wallboard'}</button>
+        <button class="btn big" type="button" data-wbs="copy">Copy TV URL</button>
+        <a class="btn big" href="#/wallboard" data-wbs="open">Open TV Setup &amp; Preview ›</a>`);
+      sh.body.addEventListener('click', (ev) => {
+        const wbs = (ev.target as HTMLElement).closest<HTMLElement>('[data-wbs]')?.dataset.wbs;
+        if (wbs === 'tog') {
+          void wallboard.setEnabled(!getSettings().wallboardEnabled).then((st) => {
+            sh.body.querySelector('#wbSheetInfo')!.innerHTML = st.running ? `Live at <b>${esc(st.url)}</b>` : 'TV Wallboard turned off';
+            sh.body.querySelector('[data-wbs="tog"]')!.textContent = st.running ? 'Turn off TV Wallboard' : 'Turn on TV Wallboard';
+          });
+        } else if (wbs === 'copy') {
+          void navigator.clipboard?.writeText(wallboard.status.url).then(() => toast(`Copied ${wallboard.status.url}`));
+        } else if (wbs === 'open') {
+          sh.close();
+        }
+      });
     } else if (k === 'del') {
       if (!(await confirmSheet(edit ? 'Delete workout?' : 'Discard workout?', edit ? 'Removes it from history (not from Intervals.icu).' : 'Everything logged so far is lost.', edit ? 'Delete' : 'Discard', true))) return;
       finishing = true;
@@ -765,6 +852,12 @@ function build(root: HTMLElement, id?: string): () => void {
       if (!edit && active.pause()) {
         buzz(20);
         paintClock();
+      }
+      return;
+    }
+    if (act === 'voice') {
+      if (!edit) {
+        void voice.setEnabled(!getSettings().voiceEnabled).then(() => paintMic());
       }
       return;
     }
@@ -836,7 +929,8 @@ function build(root: HTMLElement, id?: string): () => void {
     dead = true;
     stopHold();
     window.visualViewport?.removeEventListener('resize', onVvResize);
-    offTick(); offRest(); offChips(); offCfg(); offStore();
+    offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice();
+    if (!edit) voice.holdStarter = null;
     hideDock();
     void lifts.flush();
     if (edit && dirty) void resyncSession(s.id);

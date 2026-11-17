@@ -9,6 +9,8 @@ import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { fmtNum, fromDisplay, liftSettings, toDisplay } from '../lifts/settings';
+import { voice } from '../lifts/voice';
+import { wallboard } from '../wallboard/sync';
 import { backupCardHtml, wireBackupCard } from './backupUi';
 import { revFooter, topbar, wireChips } from './chrome';
 import { $, esc } from './dom';
@@ -41,6 +43,24 @@ export function settingsScreen(root: HTMLElement): () => void {
       <div class="row">
         <button class="btn sm" id="useEftp" ${s.intervalsEftp ? '' : 'disabled'}>Use modeled eFTP</button>
         <button class="btn sm" id="syncFtp">Sync from Intervals</button>
+      </div>
+    </section>
+
+    <h2 class="sec">GYM DISPLAY &amp; VOICE</h2>
+    <section class="card">
+      <div class="line"><span>Smart TV Wallboard<small>Streams live 1 Hz HR, rest timer &amp; superset progression over Wi-Fi</small></span><button class="switch ${s.wallboardEnabled ? 'on' : ''}" id="wbTog" role="switch" aria-checked="${s.wallboardEnabled}"><i></i></button></div>
+      <div class="hint" id="wbInfo"></div>
+      <div class="row">
+        <button class="btn sm" id="wbCopy">Copy TV URL</button>
+        <a class="btn sm primary" href="#/wallboard">Open Preview &amp; Setup ›</a>
+      </div>
+      <div class="line" style="margin-top:8px"><span>Hands-Free Voice Commands<small>Active ONLY while Armory Fit is open on screen</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
+      <label class="field">Wake word<input id="vxWake" value="${esc(s.voiceWakeWord || 'armory')}" placeholder="armory" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
+      <p class="hint">Say: “Armory 225 for 8” · “Armory check” · “Armory next exercise” · “Armory 2B” · “Armory skip rest” · “Armory undo”.</p>
+      <div class="hint" id="vxStatus"></div>
+      <div class="row" style="margin-top:6px">
+        <input class="lf-input" id="vxTest" style="flex:1;padding:8px 10px;font-size:.88rem" placeholder="Test phrase (e.g. armory 225 for 8)" autocomplete="off">
+        <button class="btn sm" id="vxRun">Run</button>
       </div>
     </section>
 
@@ -120,9 +140,28 @@ export function settingsScreen(root: HTMLElement): () => void {
     $('#planStepInfo', root).innerHTML = step
       ? `Current: <b>Step ${step.index + 1}/${PHASE1_PLAN.steps.length}</b> · ${esc(step.title)} (local schedule)`
       : '<b>Phase 1 complete!</b>';
+
+    const wbTog = $<HTMLElement>('#wbTog', root);
+    wbTog.classList.toggle('on', cur.wallboardEnabled);
+    wbTog.setAttribute('aria-checked', String(cur.wallboardEnabled));
+    const wbSt = wallboard.status;
+    $('#wbInfo', root).innerHTML = wbSt.running
+      ? `<b>● LIVE:</b> <code>${esc(wbSt.url)}</code> · ${wbSt.clients} display${wbSt.clients === 1 ? '' : 's'} connected`
+      : wbSt.error ? `✗ ${esc(wbSt.error)}` : `Off · will serve on port ${cur.wallboardPort}`;
+
+    const vxTog = $<HTMLElement>('#vxTog', root);
+    vxTog.classList.toggle('on', cur.voiceEnabled);
+    vxTog.setAttribute('aria-checked', String(cur.voiceEnabled));
+    const vxEl = $('#vxStatus', root);
+    if (voice.lastError) vxEl.innerHTML = `<span style="color:#fca5a5">${esc(voice.lastError)}</span>`;
+    else if (voice.lastAction) vxEl.innerHTML = `Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
+    else vxEl.textContent = cur.voiceEnabled ? (voice.listening ? `● Listening for “${cur.voiceWakeWord || 'armory'}”` : 'Ready while Armory Fit is open') : 'Off';
   };
   paintFtpBox();
   const offSet = settingsChanged.on(paintFtpBox);
+  const offWb = wallboard.changed.on(paintFtpBox);
+  const offVx = voice.changed.on(paintFtpBox);
+  void wallboard.refreshStatus();
   if (hasKey()) void syncAthleteFtp(false).catch(() => {});
 
   const onClick = (e: Event) => {
@@ -161,10 +200,25 @@ export function settingsScreen(root: HTMLElement): () => void {
       $('#resetOut', root).textContent = '✓ Back to the default list';
     }
     if (t.closest('#test')) void test();
+    if (t.closest('#wbTog')) void wallboard.setEnabled(!getSettings().wallboardEnabled).then(paintFtpBox);
+    if (t.closest('#wbCopy')) {
+      const u = wallboard.status.url;
+      void navigator.clipboard?.writeText(u).then(() => toast(`Copied ${u}`)).catch(() => toast(u));
+    }
+    if (t.closest('#vxTog')) void voice.setEnabled(!getSettings().voiceEnabled).then(paintFtpBox);
+    if (t.closest('#vxRun')) {
+      const phrase = $<HTMLInputElement>('#vxTest', root).value.trim();
+      if (phrase) {
+        const res = voice.runTextCommand(phrase, false);
+        toast(res ? res.text : 'Did not match a lift voice command');
+        paintFtpBox();
+      }
+    }
   };
   const onInput = (e: Event) => {
     const t = e.target as HTMLInputElement;
     if (t.id === 'aid') updateSettings({ athleteId: t.value.trim() });
+    else if (t.id === 'vxWake') updateSettings({ voiceWakeWord: t.value.trim().toLowerCase() || 'armory' });
     else if (t.id === 'restDay') {
       updateSettings({ restDay: t.value === 'none' ? null : Number(t.value) });
       void calendar.refresh();
@@ -220,6 +274,8 @@ export function settingsScreen(root: HTMLElement): () => void {
     offBackup();
     cleanupChips();
     offSet();
+    offWb();
+    offVx();
     root.removeEventListener('click', onClick);
     root.removeEventListener('input', onInput);
     if (hasKey()) void calendar.refresh();
