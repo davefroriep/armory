@@ -9,6 +9,7 @@ import {
   jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
 import { parseVoiceTranscript } from '../src/lifts/voiceParser';
+import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
 import { buildWallboardSnapshot } from '../src/wallboard/snapshot';
 import type { Exercise, LiftSession, LiftSet, SessionEx } from '../src/lifts/types';
 
@@ -304,5 +305,30 @@ describe('wallboard snapshot & routing', () => {
     });
     expect(standby.mode).toBe('standby');
     expect(standby.standby!.weekLabel).toContain('Wk 1');
+  });
+
+  it('hardens WALLBOARD_HTML overflow & compact TV heights and computes 16:9 preview scaling', () => {
+    expect(WALLBOARD_HTML).toMatch(/\.card\s*\{[^}]*overflow:\s*hidden/);
+    expect(WALLBOARD_HTML).toMatch(/\.cur-body\s*\{[^}]*overflow:\s*hidden/);
+    expect(WALLBOARD_HTML).toContain('@media (max-height:700px)');
+
+    expect(TV_W).toBe(1600);
+    expect(TV_H).toBe(900);
+
+    const inlineFit = computeTvPreviewFit(360, 0, false);
+    expect(inlineFit.rotated).toBe(false);
+    expect(inlineFit.scale).toBeCloseTo(360 / 1600, 5);
+    expect(inlineFit.boxW).toBe(360);
+    expect(inlineFit.boxH).toBe(203);
+
+    const portraitFs = computeTvPreviewFit(412, 915, true);
+    expect(portraitFs.rotated).toBe(true);
+    expect(portraitFs.scale).toBeCloseTo((412 - 20) / 900, 5);
+    expect(portraitFs.boxW).toBe(392);
+    expect(portraitFs.boxH).toBe(697);
+
+    const landscapeFs = computeTvPreviewFit(915, 412, true);
+    expect(landscapeFs.rotated).toBe(false);
+    expect(landscapeFs.scale).toBeCloseTo((412 - 48) / 900, 5);
   });
 });

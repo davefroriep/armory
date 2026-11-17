@@ -1,3 +1,26 @@
+export const TV_W = 1600;
+export const TV_H = 900;
+
+export interface TvPreviewFit {
+  scale: number;
+  boxW: number;
+  boxH: number;
+  rotated: boolean;
+}
+
+/** Computes scaled 16:9 stage dimensions (rotating 90deg in portrait so a landscape TV fills tall phones). */
+export function computeTvPreviewFit(vw: number, vh: number, rotateInPortrait = false): TvPreviewFit {
+  const rotated = rotateInPortrait && vh > vw;
+  const scale = rotated
+    ? Math.max(0.05, Math.min((vh - 56) / TV_W, (vw - 20) / TV_H))
+    : rotateInPortrait
+      ? Math.max(0.05, Math.min((vw - 32) / TV_W, (vh - 48) / TV_H))
+      : Math.max(0.05, vw / TV_W);
+  const boxW = Math.round((rotated ? TV_H : TV_W) * scale);
+  const boxH = Math.round((rotated ? TV_W : TV_H) * scale);
+  return { scale, boxW, boxH, rotated };
+}
+
 /**
  * Self-contained zero-dependency HTML5 Smart TV / gym monitor wallboard served directly from the Pixel APK.
  * Uses SSE (`/events`) with automatic 1s `/state` polling fallback and accepts `armory:wallboard-state` postMessages
@@ -35,8 +58,9 @@ export const WALLBOARD_HTML = `<!doctype html>
   .vtoast.warn { background:rgba(245,158,11,.18); border-color:var(--amber); color:#fef3c7; }
   .grid { flex:1; min-height:0; display:grid; grid-template-columns:1.35fr 0.95fr; gap:clamp(12px,1.8vw,24px); }
   .col { display:flex; flex-direction:column; gap:clamp(10px,1.4vh,18px); min-height:0; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:clamp(14px,2vh,24px); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:clamp(14px,2vh,24px); overflow:hidden; }
   .hero { flex:1; display:flex; flex-direction:column; justify-content:space-between; min-height:0; position:relative; }
+  .cur-body { min-height:0; overflow:hidden; }
   .kicker { font-size:clamp(12px,1.3vw,16px); font-weight:800; letter-spacing:.12em; color:var(--blue); text-transform:uppercase; }
   .rest { border-radius:16px; padding:14px 18px; background:rgba(56,189,248,.14); border:2px solid var(--blue); display:flex; align-items:center; justify-content:space-between; gap:16px; position:relative; overflow:hidden; }
   .rest.over { background:rgba(34,197,94,.2); border-color:var(--green); }
@@ -80,6 +104,19 @@ export const WALLBOARD_HTML = `<!doctype html>
   .ptt { position:fixed; right:16px; bottom:16px; border:1px solid var(--line); background:var(--card2); color:var(--txt); padding:10px 16px; border-radius:999px; font-weight:700; cursor:pointer; opacity:.85; }
   .ptt.on { background:rgba(34,211,238,.25); border-color:var(--cyan); color:#fff; }
   @media (max-width:860px) { .grid { grid-template-columns:1fr; } }
+  @media (max-height:700px) {
+    .wrap { gap:8px; padding:10px 16px; }
+    .card { padding:10px 14px; border-radius:14px; }
+    .rest { padding:8px 14px; }
+    .rest b { font-size:clamp(22px,4.5vh,34px); }
+    .cur-lab { font-size:clamp(16px,3.2vh,24px); padding:2px 10px; }
+    .cur-name { font-size:clamp(20px,4.2vh,32px); }
+    .target-num { font-size:clamp(30px,7vh,52px); margin:6px 0; }
+    .sp { padding:5px 10px; font-size:clamp(12px,2.2vh,15px); }
+    .hr-bpm { font-size:clamp(34px,7.5vh,56px); }
+    .ex-list { gap:5px; }
+    .ex-row { padding:6px 10px; font-size:clamp(12px,2.2vh,15px); }
+  }
 </style>
 </head>
 <body>
@@ -138,7 +175,7 @@ function render(st) {
     }
 
     const c = l.current;
-    const curHtml = c ? '<div><div class="kicker">UP NOW · ' + (c.isSuperset ? 'SUPERSET ' : '') + 'SET ' + c.setNumber + ' OF ' + c.totalSets + '</div>'
+    const curHtml = c ? '<div class="cur-body"><div class="kicker">UP NOW · ' + (c.isSuperset ? 'SUPERSET ' : '') + 'SET ' + c.setNumber + ' OF ' + c.totalSets + '</div>'
       + '<div class="cur-head"><span class="cur-lab">' + esc(c.label) + '</span><span class="cur-name">' + esc(c.exName) + '</span></div>'
       + '<div class="cur-meta">' + esc(c.muscles) + (c.prevText ? ' &nbsp;·&nbsp; Last: ' + esc(c.prevText) : '') + '</div>'
       + (c.note ? '<div class="note">' + esc(c.note) + '</div>' : '')
