@@ -770,39 +770,24 @@ function build(root: HTMLElement, id?: string): () => void {
     return true;
   };
 
-  const openChoiceSheet = <T extends string>(html: string, attr: string, fallback: T): Promise<T> =>
+  const promptUnfinishedAction = (title: string, msg: string): Promise<'today' | 'tomorrow' | 'delete' | 'cancel'> =>
     new Promise((resolve) => {
-      let out: T = fallback;
-      const sh = openSheet(html, { onClose: () => resolve(out) });
+      let out: 'today' | 'tomorrow' | 'delete' | 'cancel' = 'cancel';
+      const sh = openSheet(
+        `<h3 class="sh-title">${esc(title)}</h3><p class="sh-text">${esc(msg)}</p>
+         <button class="btn primary big" type="button" data-uf="today">Do later today</button>
+         <button class="btn big" type="button" data-uf="tomorrow">Do tomorrow</button>
+         <button class="btn danger big" type="button" data-uf="delete">Delete unfinished sets &amp; finish</button>
+         <button class="btn big" type="button" data-uf="cancel">Keep lifting</button>`,
+        { onClose: () => resolve(out) },
+      );
       sh.body.addEventListener('click', (ev) => {
-        const hit = (ev.target as HTMLElement).closest<HTMLElement>(`[data-${attr}]`)?.dataset[attr] as T | undefined;
-        if (!hit) return;
-        out = hit;
+        const uf = (ev.target as HTMLElement).closest<HTMLElement>('[data-uf]')?.dataset.uf as typeof out | undefined;
+        if (!uf) return;
+        out = uf;
         sh.close();
       });
     });
-
-  const promptUnfinishedAction = (title: string, msg: string): Promise<'today' | 'tomorrow' | 'delete' | 'discard' | 'cancel'> =>
-    openChoiceSheet(
-      `<h3 class="sh-title">${esc(title)}</h3><p class="sh-text">${esc(msg)}</p>
-       <button class="btn primary big" type="button" data-uf="today">Do later today</button>
-       <button class="btn big" type="button" data-uf="tomorrow">Do tomorrow</button>
-       <button class="btn big" type="button" data-uf="delete">Delete unfinished sets &amp; finish</button>
-       <button class="btn danger big" type="button" data-uf="discard">Discard entire workout</button>
-       <button class="btn big" type="button" data-uf="cancel">Keep lifting</button>`,
-      'uf',
-      'cancel',
-    );
-
-  const promptFinishComplete = (): Promise<'save' | 'discard' | 'cancel'> =>
-    openChoiceSheet(
-      `<h3 class="sh-title">Finish workout?</h3><p class="sh-text">It uploads to Intervals.icu automatically.</p>
-       <button class="btn primary big" type="button" data-fc="save">Finish &amp; save</button>
-       <button class="btn danger big" type="button" data-fc="discard">Discard entire workout</button>
-       <button class="btn big" type="button" data-fc="cancel">Keep lifting</button>`,
-      'fc',
-      'cancel',
-    );
 
   const finish = async (skipConfirm = false): Promise<boolean> => {
     if (edit) { allowNextRoute(); location.hash = `#/strength/workout/${s.id}`; return true; }
@@ -817,7 +802,6 @@ function build(root: HTMLElement, id?: string): () => void {
           `${leftSets} unfinished set${leftSets === 1 ? '' : 's'}: ${summary}. Delete them or do them later?`,
         );
         if (choice === 'cancel') return false;
-        if (choice === 'discard') return discardCurrentWorkout();
         if (choice === 'today' || choice === 'tomorrow') {
           calendar.scheduleSkippedMakeup({
             sessionId: s.id,
@@ -829,9 +813,8 @@ function build(root: HTMLElement, id?: string): () => void {
           toast(choice === 'today' ? 'Scheduled remaining sets for later today' : 'Scheduled remaining sets for tomorrow');
         }
       } else {
-        const fc = await promptFinishComplete();
-        if (fc === 'cancel') return false;
-        if (fc === 'discard') return discardCurrentWorkout();
+        const ok = await confirmSheet('Finish workout?', 'It uploads to Intervals.icu automatically.', 'Finish & save', false, 'Keep lifting');
+        if (!ok) return false;
       }
     }
     finishing = true;
