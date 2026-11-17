@@ -606,7 +606,7 @@ function build(root: HTMLElement, id?: string): () => void {
       const left = unloggedCount(s);
       const ok = await confirmSheet(
         'Finish workout?',
-        left ? `${left} set${left === 1 ? ' isn’t' : 's aren’t'} logged and will be dropped. It uploads to Intervals.icu automatically.` : 'It uploads to Intervals.icu automatically.',
+        left ? `${left} set${left === 1 ? ' isn’t' : 's aren’t'} logged and will be marked skipped. It uploads to Intervals.icu automatically.` : 'It uploads to Intervals.icu automatically.',
         'Finish & save', false, 'Keep lifting',
       );
       if (!ok) return false;

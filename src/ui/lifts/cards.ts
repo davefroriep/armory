@@ -4,12 +4,26 @@ import { hrSummary } from '../../lifts/intervals';
 import { renderShareCard, shareImage } from '../../lifts/share';
 import { liftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
-import { fmtDuration, fmtVolume, sessionPRs } from '../../lifts/summary';
+import { effectiveSkipped, fmtDuration, fmtVolume, sessionPRs } from '../../lifts/summary';
 import type { LiftSession } from '../../lifts/types';
 import { esc } from '../dom';
 import { openSheet, toast } from './kit';
 
 export const stat = (label: string, value: string): string => `<div><small>${label}</small><b>${value}</b></div>`;
+
+/** Skipped / partially logged exercises card for Summary and Workout History. */
+export function skippedCard(s: LiftSession): string {
+  const skipped = effectiveSkipped(s);
+  if (!skipped.length) return '';
+  const rows = skipped.map((sk) => {
+    const name = lifts.exOrStub(sk.exId).name;
+    const status = sk.doneSets === 0
+      ? `0/${sk.plannedSets} sets`
+      : `${sk.doneSets}/${sk.plannedSets} sets · ${sk.plannedSets - sk.doneSets} skipped`;
+    return `<div class="wsk-row"><b>${esc(name)}</b><span>${esc(status)}</span></div>`;
+  }).join('');
+  return `<section class="card wskipped"><div class="card-h"><span>SKIPPED</span></div>${rows}</section>`;
+}
 
 /** Compact history row for a finished session. */
 export function sessionRow(s: LiftSession): string {

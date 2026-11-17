@@ -1,22 +1,21 @@
 # THE ARMORY — Strength & Conditioning Hub + Armory Fit Telemetry Primer
 
-**Created:** 2026-11-14 (Updated for `Strength and Conditioning` Workspace + 5 Hz Direct BLE Architecture)  
+**Created:** 2026-11-14 *(Updated for `v0.35` APK-only Capacitor Architecture — see [ARMORY_FIT_TECHNICAL_REFERENCE.md](./ARMORY_FIT_TECHNICAL_REFERENCE.md) for the complete screen/module/API spec)*  
 **Umbrella Workspace:** `N:\Documents\Antigravity\Strength and Conditioning` *(Strength & Conditioning Ecosystem)*  
 **Target Athlete:** Dave Froriep (`Intervals.icu` ID `i758105` — Cycling FTP `182 W`, Zone 2 `128–130 W`, Norwegian 4×4 `218–225 W`)  
-**Scope:** Unified **Strength & Conditioning Hub** housing **Armory Fit** (Capacitor `.apk` + GitHub Pages mirror), **Boostcamp** (`boostcamp_client.py` strength programming), and **Intervals.icu** telemetry/analytics — connecting over **5 Hz Direct BLE (`NUS`)** to **Spin (Bowflex C7 / SS2K)**, **AirBike (Assault Elite)**, and **Treadmill (Horizon T101)** + **Polar H10**, while leaving **BLE FTMS (`0x1826`)** passive in the background for **MyWhoosh**.
+**Scope:** Unified **Strength & Conditioning Hub** housing **Armory Fit** (native Android `.apk` only — integrated Strength Lift Tracker, local 4-week rolling mesocycle queue, and Cardio Cockpit) plus automatic post-workout **Intervals.icu** sync — connecting over **5 Hz Direct BLE (`NUS`)** to **AirBike (Assault Elite)**, and targeting **Spin (Bowflex C7 / SS2K)** & **Treadmill (Horizon T101)** + **Polar H10**, while leaving **BLE FTMS (`0x1826`)** passive in the background for **MyWhoosh**.
 
 ---
 
 ## 1. Ecosystem Branding & Thread Topology
 
-Because **"The Armory"** represents your entire home Strength & Conditioning gym (Belt Squat, 4-Post Rack, Cables, plus the cardio bay), keep the umbrella workspace focused on S&C and name the cardio cockpit app distinctly:
+Because **"The Armory"** represents your entire home Strength & Conditioning gym (Belt Squat, 4-Post Rack, Cables, plus the cardio bay), **Armory Fit** serves as the single on-phone app while Intervals.icu acts purely as post-workout cloud analytics & cross-app activity sync:
 
 | Thread / Sub-Domain | Workspace / Target | Responsibility |
 | :--- | :--- | :--- |
-| **Thread 1: Strength Programming** | `Boostcamp` (moved/linked under S&C Hub) | 100% programmatic workout programming via `boostcamp_client.py` + `backups/` |
-| **Thread 2: Telemetry & Wellness** | `Intervals.icu` (`i758105` + `health_records.sqlite`) | Daily wellness trends, TSB/CTL load, power zone tracking, `.fit`/`.tcx` sync |
-| **Thread 3: `Armory Fit` App** | `N:\Documents\Antigravity\Strength and Conditioning` (`davefroriep/armory`) | Unified Capacitor `.apk` + GitHub Pages mirror replacing `SS2K/cockpit_pwa` & `Treadmill/pwa` |
-| **Hardware Repo 1: AirBike** | `N:\Documents\Antigravity\Smart Airbike` | XIAO ESP32-C6 (`AssaultBike`) CAD + firmware + `/dev` bench calibration |
+| **`Armory Fit` Android App (Cardio + Strength)** | `N:\Documents\Antigravity\Strength and Conditioning` (`davefroriep/armory`) | Native Capacitor `.apk` **only** (GitHub Pages PWA disabled): Strength Lift Tracker, local rolling queue (`PHASE1_PLAN`), 5 Hz Cardio HUD, `WorkoutForegroundService`, offline queue |
+| **Post-Workout Telemetry & CLI Analytics** | `Intervals.icu` (`i758105` + `armory_cli.py`) | Receives finished `.tcx` & `WeightTraining` logs (incl. `Skipped:` sets/exercises in `v0.35+`); read-only `fetchActivities` reconciles external MyWhoosh rides |
+| **Hardware Repo 1: AirBike** | `N:\Documents\Antigravity\Smart Airbike` | XIAO ESP32-C6 (`AssaultBike` `Rev v1.5`) CAD + firmware + `/dev` bench calibration |
 | **Hardware Repo 2: Spin** | `N:\Documents\Antigravity\SS2K Head` | ESP32-WROOM (`SS2K_Tuner`) NEMA17 + TMC2209 actuator + Power Pedal calibration |
 | **Hardware Repo 3: Treadmill** | `N:\Documents\Antigravity\Smart Treadmill` | XIAO ESP32-C6 (`Horizon T101 Pod`) roller/MPU-6050 firmware + enclosure |
 
@@ -51,13 +50,10 @@ Standard **BLE FTMS (`0x1826`)** is designed for third-party virtual worlds like
 2. **Audio-Focus Collision:** `silent.wav` + `MediaSession` hacks collided with Spotify/podcasts/YouTube; silencing audio re-triggered Android Doze disconnects.
 
 ### Permanent Root-Cause Architecture
-Build **one** responsive web UI (`Vite + TypeScript`), shipped in two ways:
-1. **Primary Gym Daily Driver — Capacitor Android `.apk`:**
-   - **Native OS Bluetooth (`@capacitor-community/bluetooth-le`):** Talks directly to Android's native `BluetoothGatt` stack, persists `deviceId` (MAC) per machine + Polar H10, and reconnects without browser chooser prompts.
-   - **Custom Lightweight `WorkoutForegroundService.kt` (~60 lines):** Acquires `PARTIAL_WAKE_LOCK` + displays a live status-bar/lockscreen notification (`WORKOUT ACTIVE • 18:42 • 129 W • 134 BPM`) using `foregroundServiceType="connectedDevice"`. You can lock your phone, text, or stream Spotify/YouTube with **zero BLE disconnects**.
-   - **Phone-Side 1 Hz `IndexedDB` Recording:** Every `1,000 ms`, writes `{ t, watts, cad, speedMph, inclinePct, elevGainM, distM, kcal, hr, targetW }` directly to IndexedDB (`workouts_meta` + `workout_samples`) with crash/reboot recovery (`Resume` | `Finish & Sync` | `Discard`). ESP32 SPIFFS `/wo.bin` logging is retired.
-2. **Desktop/Backup Mirror — GitHub Pages (`https://davefroriep.github.io/armory/`):**
-   - Swaps transport at runtime via `Capacitor.isNativePlatform()` (`CapacitorBleTransport` on Android vs. `WebBluetoothTransport` on Desktop Chrome).
+Build **one** Vite + TypeScript codebase packaged natively as a **Capacitor Android `.apk`** *(primary and only distribution channel — GitHub Pages deploy disabled; download latest via `https://github.com/davefroriep/armory/releases/latest/download/armory-fit.apk`)*:
+1. **Native OS Bluetooth (`@capacitor-community/bluetooth-le`):** Talks directly to Android's native `BluetoothGatt` stack, persists `deviceId` (MAC) per machine + Polar H10, and reconnects without browser chooser prompts (`WebBluetoothTransport` remains inside `src/ble/transport.ts` solely for local Vite dev tests).
+2. **`WorkoutForegroundService` (`android/.../WorkoutForegroundService.java` + `RestOverlay.java` + `WorkoutChime.java`):** Acquires `PARTIAL_WAKE_LOCK` + displays a live status-bar/lockscreen notification + minimized floating rest overlay using `foregroundServiceType="connectedDevice"`. You can lock your phone, text, or stream Spotify/YouTube with **zero BLE disconnects**.
+3. **Phone-Side 1 Hz `IndexedDB` Recording (`armory-fit` v2):** Writes workouts (`workouts_meta` + `workout_samples`) and Strength logs (`lift_sessions`, `lift_routines`, `lift_ex`, `lift_videos`) locally with crash recovery. ESP32 SPIFFS `/wo.bin` logging is retired.
 
 ### Required Android 12+ (`API 31+`) Manifest Permissions (`AndroidManifest.xml`)
 - `BLUETOOTH_SCAN` (`android:usesPermissionFlags="neverForLocation"`), `BLUETOOTH_CONNECT`
@@ -195,7 +191,5 @@ Source verified: `N:\Documents\Antigravity\Smart Treadmill\PlatformIO\src\main.c
 
 ---
 
-## 8. Copy-Paste Kickoff Prompts (Thread Structure)
-
-### For the `Armory Fit` App Thread
-> *"We are building the **Armory Fit** cardio cockpit app in `N:\Documents\Antigravity\Strength and Conditioning`. Read `GEMINI.md` and `docs/ARMORY_MASTER_PRIMER.md` first. Every machine (`Spin`, `AirBike`, `Treadmill`) uses **5 Hz Direct BLE (`NUS` `6e400001-...`)** as its primary telemetry and calibration transport, with FTMS kept strictly passive for MyWhoosh. Let's scaffold the `Vite + TypeScript + Capacitor` app with our custom `WorkoutForegroundService.kt`, `BleTransport` abstraction, 1 Hz `IndexedDB` session recorder with crash recovery, machine adapters (`SpinAdapter`, `AirBikeAdapter`, `TreadmillAdapter`, `PolarH10`), the 4-protocol `[ZONE 5 VO2]` drawer (`Norwegian 4×4`, `Classic VO2 5×3`, `Cardiac Power 6×2`, `Billat/Rønnestad 60/30`), Tactical Cockpit HUD with WebAudio Lock-In Transition Metronome & Overshoot Chirp, Intervals.icu `.tcx` uploader, and GitHub Actions `.apk` CI build."*
+## 8. Implementation Status
+See [ARMORY_FIT_TECHNICAL_REFERENCE.md](./ARMORY_FIT_TECHNICAL_REFERENCE.md) for the live module map, screen-by-screen UI/button/gesture inventory, storage schemas, and APK release workflow (`v0.35+`).

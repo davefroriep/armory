@@ -66,6 +66,13 @@ export interface SessionEx {
   slot?: number;
 }
 
+export interface SkippedEx {
+  exId: string;
+  plannedSets: number;
+  doneSets: number;
+  ss?: boolean;
+}
+
 export interface LiftSession {
   id: string;
   name: string;
@@ -82,6 +89,8 @@ export interface LiftSession {
   /** True when started explicitly via Start button or camera (prevents unchecking Set 1 from resetting clock). */
   manualStart?: boolean;
   exs: SessionEx[];
+  /** Exercises or working sets left unlogged when the session was finished. */
+  skipped?: SkippedEx[];
   note?: string;
   /** Session effort 3-10 (same scale as the rest of the app). */
   rpe: number | null;

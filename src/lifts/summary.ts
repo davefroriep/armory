@@ -1,6 +1,6 @@
 import { isWorking, sessionStats, type ExOf, type SessionStats } from './calc';
 import { fmtNum, toDisplay, type Unit } from './settings';
-import type { Exercise, LiftSession, LiftSet, SessionEx } from './types';
+import type { Exercise, LiftSession, LiftSet, SessionEx, SkippedEx } from './types';
 import type { PRHit } from './calc';
 
 const working = (e: SessionEx): LiftSet[] => e.sets.filter(isWorking);
@@ -85,6 +85,24 @@ export interface DescribeOpts {
   kcal?: number | null;
 }
 
+export function effectiveSkipped(s: LiftSession): SkippedEx[] {
+  if (!s.skipped?.length) return [];
+  return s.skipped.flatMap((sk) => {
+    const loggedNow = s.exs
+      .filter((e) => e.exId === sk.exId)
+      .reduce((n, e) => n + e.sets.filter((x) => x.done && x.kind !== 'w').length, 0);
+    const doneSets = Math.max(sk.doneSets, loggedNow);
+    return doneSets < sk.plannedSets ? [{ ...sk, doneSets }] : [];
+  });
+}
+
+export function formatSkippedItem(sk: SkippedEx, exOf: ExOf): string {
+  const name = exOf(sk.exId)?.name ?? sk.exId;
+  return sk.doneSets === 0
+    ? `${name} (0/${sk.plannedSets} sets)`
+    : `${name} (${sk.doneSets}/${sk.plannedSets} sets — ${sk.plannedSets - sk.doneSets} skipped)`;
+}
+
 /** The Intervals.icu activity description: a compact, human-readable lift log. */
 export function intervalsDescription(s: LiftSession, o: DescribeOpts): string {
   const st: SessionStats = sessionStats(s, o.exOf);
@@ -104,11 +122,20 @@ export function intervalsDescription(s: LiftSession, o: DescribeOpts): string {
       return `${ex?.name ?? 'Exercise'}: ${line}${h ? `  ★ ${h.n}RM PR` : ''}`;
     })
     .filter(Boolean);
+  const skippedLine = effectiveSkipped(s).map((sk) => formatSkippedItem(sk, o.exOf)).join(' · ');
   const tail = [
     o.avgHr ? `avg HR ${Math.round(o.avgHr)}` : '',
     o.maxHr ? `max HR ${Math.round(o.maxHr)}` : '',
     o.kcal ? `~${o.kcal} kcal` : '',
     s.rpe ? `RPE ${s.rpe}/10` : '',
   ].filter(Boolean).join(' · ');
-  return [`Armory Fit · ${s.name}`, head, '', ...lines, ...(tail ? ['', tail] : []), ...(s.note ? ['', s.note] : [])].join('\n');
+  return [
+    `Armory Fit · ${s.name}`,
+    head,
+    '',
+    ...lines,
+    ...(skippedLine ? ['', `Skipped: ${skippedLine}`] : []),
+    ...(tail ? ['', tail] : []),
+    ...(s.note ? ['', s.note] : []),
+  ].join('\n');
 }

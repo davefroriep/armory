@@ -189,6 +189,7 @@ describe('live HR sheet telemetry helpers', () => {
           { id: 's3', w: w225Kg, r: 5, done: true, kind: 'n' },
         ],
       }],
+      skipped: [{ exId: 'pull-up', plannedSets: 3, doneSets: 0 }],
       rpe: 7,
       bwKg: 82,
     };
@@ -212,6 +213,8 @@ describe('live HR sheet telemetry helpers', () => {
     expect(doneHtml).toContain(benchName);
     expect(doneHtml).toContain('3×5 @ 225 lb');
     expect(doneHtml).toContain('✓ Done');
+    expect(doneHtml).toContain('sh-skipped');
+    expect(doneHtml).toContain('pull-up (0/3 sets)');
     expect(doneHtml).toContain('Full workout &amp; edit ›');
 
     const projActiveToday = projectPlan(PHASE1_PLAN, { ...defaultQueueState(), stepIndex: 1, stagedDate: today }, today, 0);

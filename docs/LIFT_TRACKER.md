@@ -1,73 +1,32 @@
-# Lift Tracker (Strength tile)
+# Lift Tracker (Strength Bay)
 
-The Strength tile is a full lift tracker: log sets, auto-fill from last time, swap and add exercises, rest timer, history, records, muscle volume, share card, optional lift videos, and automatic Intervals.icu logging.
+The Strength tile is a full lift tracker: log sets, auto-fill from last time, swap and add exercises, configurable per-exercise/global rest timers, history, records, muscle volume, share card, optional DCIM lift videos, and automatic Intervals.icu logging.
+
+> Complete technical & programmer architecture: [ARMORY_FIT_TECHNICAL_REFERENCE.md](./ARMORY_FIT_TECHNICAL_REFERENCE.md)  
+> Global Antigravity Skill: `C:\Users\davef\.gemini\config\skills\armory-fit\SKILL.md`
+
 Route: `#/strength/...` (code: `src/lifts/` domain + storage, `src/ui/lifts/` screens).
 
 ## What is deliberately NOT in it
-Auto-progression, built-in programs, photos / social, how-to or demo content, plate calculator. The master exercise list is names + muscle mapping only. You build your own "days" (repeating workouts).
+Auto-progression, bloat/social feeds, how-to tutorials, plate calculator. Your 4 Armory Phase 1 lifting days (`Lower 1`, `Upper 1`, `Lower 2`, `Upper 2`) seed cleanly on first install (`src/lifts/seed.ts`) and remain fully editable repeating templates.
 
 ## Screens
 | Tab / route | What it does |
 |---|---|
-| Train `#/strength` | Resume strip, today's Intervals.icu plan (Start pairs the workout with the planned event), **Custom Workout** freestyle card, **My Days** (your repeating workouts) |
-| Session `#/strength/session` | The workout. Boostcamp-style cards, PREVIOUS column, forward-fill, steppers dock, rest timer, supersets |
-| Summary `#/strength/summary/<id>` | Totals, new records, effort rating, upload status, share card, save as a day |
-| History `#/strength/history` | Month calendar + list; detail page per workout (edit sets, repeat, delete, share) |
-| Progress `#/strength/progress` | Weekly hard sets per muscle, workouts/week, your lifts (est. 1RM), recent records, lift videos |
-| Exercises `#/strength/exercises` | Master list (+ custom). Detail page: **1RM-5RM** (more up to 12RM), est. 1RM chart, videos, history |
-| Settings `#/strength/settings` | Units, default rest, record delay, backup export / import |
-| `#/strength/hr` | The old heart-rate-only session (for lifting in another app) is kept here |
+| Train `#/strength` | `STRENGTH · PROGRAM` card (today's local queue / carry-over extras), **Custom Workout** freestyle card, collapsible **DAY TEMPLATES**, HR-only session link |
+| Session `#/strength/session` | The workout (`0:00` preview mode + `▶ Start` until Set 1 / video / manual start). Zero-nag Back (sticky top `Resume ›` bar), `PREVIOUS` column, forward-fill, steppers dock, `⋯` exercise Settings (rest duration, `Show timer`, `Show auto-timer`, `Auto`), spanning superset brackets (`1A/1B`), video camera/DCIM linker |
+| Summary `#/strength/summary/<id>` | Totals, new PRs, **SKIPPED** card (`v0.35+` skipped exercises & partial sets), HR Z1–Z5 bars, live Intervals.icu sync, 8-word RPE (`3–10`), `1080×1350` PNG share card, `Save as a day` |
+| History `#/strength/history` | Month calendar + feed; workout detail page (`#/strength/workout/<id>`) with completed sets, `SKIPPED` card, HR/Intervals link, edit sets, repeat, delete, share |
+| Progress `#/strength/progress` | Weekly hard sets per muscle (`1.0` primary / `0.5` secondary), workouts/week chart, best lifts (est. 1RM), recent records, lift videos reel |
+| Exercises `#/strength/exercises` | 120+ master list (+ custom). Detail page (`#/strength/exercise/<id>`): `1RM–5RM` (up to `12RM`), est. 1RM chart, videos, history, sticky note, per-exercise rest |
+| Settings `#/strength/settings` | Units (`lb`/`kg`), default rest, `Show timer`, `Show auto-timer`, master `Auto-timer`, rest chime + `Test`, Android floating overlay walkthrough, camera delay, Intervals status, JSON export/import |
+| `#/strength/hr` | Standalone heart-rate-only recorder + Keytel kcal |
 
-## Logging rules
-* **Auto-fill:** every unlogged set is pre-filled from the matching set of the last time you did that exercise (warm-ups pair with warm-ups, working sets with working sets; extra sets reuse the last set). Suggestions render dim; typing or logging makes them real.
-* **Forward-fill:** a weight / reps value typed or logged in set *n* flows into later sets that are still untouched suggestions. Never overwrites something you typed or a logged set. Warm-ups neither push nor receive.
-* **Tap PREVIOUS** to copy last time's numbers into the set. **−/+ Set** under every card (with Undo).
-* **Clock:** stays in `0:00` preview mode until your first set `✓` is checked off so you can browse days freely without starting a session.
-* **Dock** above the keyboard: weight `−10 −5 +5 +10` (kg: `5 / 2.5`), reps `8 10 12 15` presets + `−1 / +1` (time lifts: `−15 −5 +5 +15`), and **LOG ✓** (jumps to the next set).
-* Set types: Normal, Warm-up, Drop, To failure. Warm-ups never count anywhere. Optional per-set RPE (6-10 in halves) and note.
-* Exercise types: weight × reps, bodyweight (+ optional load), time (seconds, e.g. triceps iso hold).
-* **Swap:** "Just today" / "This day · *name*" (updates that repeating day) / "Everywhere" (every day that uses it). Swap suggestions list similar exercises first (shared primary muscles).
-* Supersets: link an exercise with the next one; spanning left bracket wraps the full pair (`A` + `B`) with alternating colors across consecutive supersets (`1A/1B`, `2A/2B`, …).
-* Rest timer: every card footer has an `Auto` toggle pill (OFF by default on `A` mid-superset, ON on `B` and standalone lifts), a 1-tap `▶` quick-start button, and a `⚙` Timer Settings cog (plus master toggle in Settings), with chime + haptic at zero and lock-screen notification updates.
-* Sticky exercise notes ("seat 4, neutral handles") appear every time the exercise comes up.
-
-## Records & PRs
-* **Rep records:** heaviest load for *at least* n reps, n = 1..12. Table shows 1RM-5RM by default; ties keep the earliest date.
-* **PR:** a set whose load beats every earlier set of ≥ that many reps. First time you ever log an exercise is not flagged. PRs are *derived* (recomputed from history), so edits and imports can never leave stale badges.
-* **Est. 1RM:** Epley `w·(1 + reps/30)`, shown only for ≤12 reps. Bodyweight lifts use body mass (from Intervals.icu) + added load.
-
-## Muscle tracking (recommended: yes, kept simple)
-Hard sets per muscle per week is the one volume metric worth watching. A set counts **1.0 to each primary mover and 0.5 to each secondary mover** (fractional counting, as used in the volume literature and by Hevy/Strong-style trackers), warm-ups excluded. The Progress bars show a 10-20 sets/week band; it is a visual reference only, nothing is prescribed or progressed automatically. 17 muscles (Chest, Lats, Upper Back, Traps, Front/Side/Rear Delts, Biceps, Triceps, Forearms, Quads, Hamstrings, Glutes, Adductors, Calves, Abs, Lower Back). Every library exercise has a primary / secondary mapping; you can edit the mapping on any exercise (Exercise page → ⋯) and set it for custom ones.
-
-## Intervals.icu (automatic)
-Finish → the workout is saved locally first, then uploaded with no further taps:
-1. Activity created. Heart-rate strap connected → TCX with the HR trace (+ Keytel kcal). No strap → manual activity (`POST /athlete/{id}/activities/manual`, fields verified against the Intervals.icu OpenAPI).
-2. Patched with type `WeightTraining`, the **lift log as the description**, effort rating (`icu_rpe`), and `kg_lifted`.
-3. Paired with today's planned event when you started from it (the rolling plan advances as before).
-
-Both steps are idempotent and retried automatically (offline at the gym is fine; the Home banner shows pending uploads). Tapping an effort rating after the upload re-sends the description/RPE. Intervals.icu has no native sets/reps view, so the description is the lift log:
-```
-Armory Fit · Upper 1
-52 min · 18 sets · 12,450 lb · 2 PRs
-
-Barbell Bench Press: 3×5 @ 175 lb  ★ 5RM PR
-Lat Pulldown: 3×10 @ 130 lb
-avg HR 118 · max HR 151 · ~310 kcal · RPE 8/10
-```
-
-## Share card
-1080×1350 PNG: name, date, sets / volume / time / PRs, one condensed line per exercise (`3×5 @ 175`, or `5 sets · top 195×1` when sets differ a lot), ★ on PRs, HR line if recorded. Native share sheet on Android (Capacitor Share + Filesystem), Web Share in the browser, download fallback.
-
-## Lift Videos (DCIM & Google Drive)
-Every set row has a compact video icon (`📹`). Tapping it offers **Record Video** (launches camera directly in video mode) or **Select Video** (visual video picker capturing lightweight filename/timestamp + poster thumbnail without duplicating large videos into browser storage). Linking or recording a video starts the workout timer (and unlinking the only video resets to unstarted if nothing is logged); linked videos stay attached across Workout History, `1RM–5RM` Rep Records, Progress, and JSON backups with 1-tap Google Drive search recall.
-
-## Data & backup
-IndexedDB `armory-fit` v2: `lift_sessions`, `lift_routines`, `lift_ex` (custom exercises + per-exercise note/rest/muscle overrides), `lift_videos` (meta + blobs). Settings → **Export backup** writes `{ app: "armory-lifts", v: 1, sessions, routines, exercises }` JSON; **Import** merges by id. Weights are stored in kg; the lb/kg switch is display only.
-
-A session looks like:
-```json
-{ "id": "…", "name": "Upper 1", "routineId": null, "eventId": null, "startMs": 1763296200000, "endMs": 1763299320000,
-  "status": "done", "rpe": 8, "bwKg": 88.5,
-  "exs": [ { "uid": "…", "exId": "barbell-bench-press", "sets": [ { "id": "…", "w": 79.4, "r": 5, "done": true, "kind": "n", "rpe": 8 } ] } ] }
-```
-Library exercise ids are the slug of the name (`barbell-bench-press`, `belt-squat`, …), so history can be imported from other apps by mapping names to ids.
+## Logging, Skipped Tracking & Intervals.icu (`v0.35+`)
+* **Auto-fill & Forward-fill:** Every unlogged set is pre-filled from the matching previous set (`warm-ups <-> warm-ups`, `working <-> working`). Typing or logging flows forward into untouched suggestions only.
+* **No-Trap Navigation & Explicit Start:** Tapping `< Back` saves live state and leaves the top `Resume ›` banner pinned across every screen. Unchecking Set 1 restarts the clock if `manualStart` is false; tapping `▶ Start` or linking a video commits `manualStart`.
+* **Rest Controls Behind `⋯` → Settings:** `showTimer` (`▶ m:ss`) and `showAutoTimer` (`Auto`) default `off` (`v0.30+`) for a clean card layout and can be toggled live per card/globally from any exercise's `⋯ -> Settings`.
+* **Skipped Exercises & Partial Sets (`v0.35+`):** Finishing a workout calls `pruneUnlogged(s)`, which records any unlogged working-set shortfalls into `LiftSession.skipped` (`exId`, `plannedSets`, `doneSets`) before removing empty rows. Skipped items display on Home Day Zoom, Summary, Workout History, and upload inside the Intervals.icu description (`Skipped: <Exercise> (0/3 sets)` or `(2/3 sets — 1 skipped)`).
+* **Intervals.icu Automatic Sync:** Local rolling scheduling runs offline with zero planned-event staging (`v0.33+`). On Finish:
+  1. Polar H10 connected (`>=30` beats) -> uploads `.tcx` HR trace (+ Keytel kcal); no strap -> `POST /athlete/{id}/activities/manual`.
+  2. Patches `WeightTraining`, condensed lift log + `Skipped:` summary, `icu_rpe`, and `kg_lifted`.

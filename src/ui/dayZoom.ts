@@ -6,7 +6,7 @@ import { sessionStats, type ExOf, type PRHit } from '../lifts/calc';
 import { labels } from '../lifts/logic';
 import { matchRoutineByTitle } from '../lifts/seed';
 import type { Unit } from '../lifts/settings';
-import { condenseSets, fmtDuration, fmtVolume, sessionPRs, setText } from '../lifts/summary';
+import { condenseSets, effectiveSkipped, fmtDuration, fmtVolume, formatSkippedItem, sessionPRs, setText } from '../lifts/summary';
 import type { ExRow, LiftSession, Routine, SessionEx } from '../lifts/types';
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
 import { ICON, esc, hms } from './dom';
@@ -142,6 +142,7 @@ export function renderCompletedLiftSlot(
       ${hit ? `<em>★ ${hit.n}RM</em>` : ''}
     </div>`;
   }).join('');
+  const sk = effectiveSkipped(s);
   return `<div class="sh-slot done">
     <div class="sh-slot-h">
       <span class="cal-ico strength">${ICON.strength}</span>
@@ -149,6 +150,7 @@ export function renderCompletedLiftSlot(
       <span class="p-badge ok">✓ Done</span>
     </div>
     ${rows ? `<div class="sh-exlist">${rows}</div>` : ''}
+    ${sk.length ? `<div class="sh-skipped">Skipped: ${esc(sk.map((x) => formatSkippedItem(x, lookup.exOf)).join(' · '))}</div>` : ''}
     ${s.note ? `<p class="sh-text">${esc(s.note)}</p>` : ''}
     <div class="sh-subrow"><a class="link" href="#/strength/workout/${s.id}">Full workout &amp; edit ›</a></div>
   </div>`;

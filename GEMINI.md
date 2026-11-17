@@ -1,28 +1,21 @@
 # Strength & Conditioning Hub ("The Armory" + Armory Fit App)
 
-## 1. Umbrella Ecosystem & Deployment
-- **Workspace Scope:** Umbrella S&C hub (`N:\Documents\Antigravity\Strength and Conditioning`) unifying **Boostcamp** (strength programming), **Intervals.icu** (`i758105` endurance/wellness telemetry), and **Armory Fit** (cardio telemetry + built-in Strength Lift Tracker).
-- **Primary Client (Armory Fit):** Native Android `.apk` ONLY wrapped with **Capacitor** (`@capacitor-community/bluetooth-le` + native `WorkoutForegroundService` / `WorkoutChime` / `RestOverlay`). **No PWA deployment or PWA dev-testing** — always deliver the direct GitHub Release APK link (`https://github.com/davefroriep/armory/releases/latest/download/armory-fit.apk`).
-- **Storage & Sync:** Phone-side 1 Hz `IndexedDB` (`workouts_meta`, `workout_samples`, plus v2 lift-tracker stores `lift_sessions`, `lift_routines`, `lift_ex`, `lift_videos`) with crash/resume recovery and automatic TCX/manual `WeightTraining` sync to Intervals.icu.
+## 1. Umbrella Ecosystem & Deployment (APK Only)
+- **Workspace Scope:** Umbrella S&C hub (`N:\Documents\Antigravity\Strength and Conditioning`) hosting **Armory Fit**, a native Android Capacitor app combining **Cardio Cockpit** (AirBike, Spin, Treadmill + Polar H10) with **Built-in Strength Lift Tracker** & **Local Rolling Queue**.
+- **Primary & Only Client:** Native Android `.apk` (`com.froriep.armoryfit`) with native `WorkoutForegroundService`, `WorkoutChime`, `RestOverlay`, and `forceClose`. **No PWA deployment or PWA dev-testing** — always deliver `https://github.com/davefroriep/armory/releases/latest/download/armory-fit.apk`.
+- **Full Documentation & Agent Skill:** See `docs/ARMORY_FIT_TECHNICAL_REFERENCE.md` for every screen/module/protocol, and global skill `C:\Users\davef\.gemini\config\skills\armory-fit\SKILL.md` (+ `armory_cli.py`) for workout lookups, skipped sets, and program migrations.
 
-## 2. Primary 5 Hz Direct BLE (`NUS`) Protocol & Athlete Constants
-- **Unified Direct BLE (`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`):** Primary 5 Hz (`200 ms`) unquantized JSON `TX ...0003` + `RX ...0002` control/calibration across **all 3 machines** (`Spin`, `AirBike`, `Treadmill`); standard **BLE FTMS (`0x1826`)** runs passively only for external apps (e.g. **MyWhoosh**).
-- **Spin (`Bowflex C7` / `SS2K_Tuner`):** 5 Hz NUS JSON + `SET_MODE` / `SET_WATTS` / `SET_LEVEL` / `SET_RATIO` (+ Stage 2 Power Pedal calibration & Stage 3 passive FTMS for MyWhoosh).
-- **AirBike (`AssaultBike` `Rev v1.5`):** Primary 5 Hz NUS JSON (`w`, `cad`, `fan`, `pls`, `dt`, `SET_RATIO` [`11.1100`], `RESET`) + passive FTMS (`0x1826`) / CSC (`0x1816`).
-- **Treadmill (`Horizon T101 Pod`):** Planned 5 Hz NUS stream (`spd_mph`, `inc_pct`, `cad_spm`, `TARE_INCLINE`) alongside existing passive FTMS (`0x2ACD`) / RSC (`0x2A53`).
-- **Heart Rate (`Polar H10`) & Profile:** BLE HR `0x180D` (`0x2A37`); `i758105` FTP `182 W`, Z2 `128–130 W`, 4×4 `218–225 W` (API key stored strictly in local device settings, NEVER committed to git).
-- **Z5 Suite & Tactical HUD:** `[ZONE 5 VO2]` 4-protocol drawer (`Norwegian 4×4`, `Classic VO2 5×3`, `Cardiac Power 6×2`, `Billat/Rønnestad 60/30`) + 5 Hz Sweet-Spot Horizon HUD, split/lookahead timers, and auto-muting WebAudio `2×RPM` Lock-In Transition Metronome + Overshoot Chirp.
+## 2. Data, Intervals.icu Sync & BLE Architecture
+- **Phone Local Source of Truth:** `IndexedDB` `armory-fit` v2 (`workouts_meta`, `workout_samples`, `lift_sessions` incl. `skipped`, `lift_routines`, `lift_ex`, `lift_videos`) + `localStorage` (`armory.settings.v1` rolling `QueueState`/`extras`/`skippedSlots`/`carryOver`, `armory.lifts.settings.v1`). **Never** edit `seed.ts` routines/notes for existing users without a `localStorage`-guarded migration in `LiftStore.load()` (`src/lifts/store.ts`).
+- **Intervals.icu (`i758105`) Post-Workout Bridge:** Zero planned-event staging (`createEvent`/`moveEvent` removed in `v0.33`). Finished workouts auto-upload `.tcx` or `WeightTraining` logs (including `Skipped:` items in `v0.35+` via `intervalsDescription()`) plus read-only `fetchActivities` for external MyWhoosh reconciliation.
+- **Primary 5 Hz Direct BLE (`NUS` `6E400001-...`):** Unquantized `200 ms` JSON across **AirBike (`AssaultBike` `Rev v1.5`, `ratio=11.1100`)**, **Spin (`SS2K_Tuner`)**, and **Treadmill (`Horizon T101 Pod`)** alongside Polar H10 (`0x180D`) & passive FTMS (`0x1826`) for MyWhoosh. Effort scale = 8 words (**RPE 3–10**); `i758105` FTP `182 W`, Z2 `128–130 W`, 4×4 `218–225 W`. (Keys stay in local storage/`intervals_creds.json`, never in git.)
 
-## 3. Canonical Directory Structure
-- `src/`: Modular TypeScript/JS UI (`src/ui/`, `src/ui/lifts/`), lift-tracker domain/store (`src/lifts/`), BLE transport (`capacitor` / `web`), `IndexedDB` recorder, cardio protocols, and Intervals uploader.
-- `public/`: PWA manifest, icons (`192`, `512`), and service worker (`sw.js`).
-- `android/`: Generated Capacitor Android project + custom Kotlin `WorkoutForegroundService`.
-- `docs/`: `ARMORY_MASTER_PRIMER.md` and S&C / BLE protocol specs.
-- `.github/workflows/`: CI checks/manual Pages workflow (disabled on push — APK releases only).
-*(Root policy: Keep build scripts in `package.json` or `scripts/`; zero hardcoded API keys or Wi-Fi credentials in repo.)*
+## 3. Canonical Directory Layout
+- `src/`: Core UI (`src/ui/`, `src/ui/lifts/`), domain logic (`src/domain/`, `src/lifts/`), BLE (`src/ble/`), IndexedDB/settings (`src/store/`), Intervals client/calendar (`src/intervals/`), native bridge (`src/native/`), audio/workout engine (`src/audio/`, `src/workout/`).
+- `android/`: Capacitor Android project + Kotlin/Java `WorkoutServicePlugin`, `WorkoutForegroundService`, `WorkoutNotif`, `WorkoutChime`, `RestOverlay`.
+- `docs/`: `ARMORY_FIT_TECHNICAL_REFERENCE.md`, `ARMORY_MASTER_PRIMER.md`, `LIFT_TRACKER.md`.
+- `scripts/` & `tests/`: `android.ps1`, `bump-rev.mjs`, `make_setup_qr.py`, 8 `vitest` test suites (`tests/*.test.ts`).
 
-## 4. Build & Android APK Workflow (No PWA)
-- Tests & checks: `npx tsc --noEmit && npm test` (plus local UI check if UI changed). Do NOT deploy, watch, verify, or link GitHub Pages PWA.
-- Build & publish APK: `.\scripts\android.ps1 -Publish` (bumps `rev.json`, builds Vite bundle, syncs Capacitor, builds `app-debug.apk` with portable JDK 21 in `C:\Users\davef\Tools\jdk-21` + SDK in `%LOCALAPPDATA%\Android\Sdk`, uploads `armory-fit.apk` to GitHub Release `vX.Y`). Add `-Install` for local USB adb.
-- One-time Intervals.icu hookup: `python scripts\make_setup_qr.py` -> scan QR (key never in repo; `local-secrets/` is git-ignored).
-- Names: `Assault AirBike Elite` (Assault Fitness). Effort scale = 8 words -> RPE 3-10.
+## 4. Verification, Build & APK Release Workflow
+- **Verify:** `npx tsc --noEmit && npm test` -> `npm run build && npm test` (bumps `rev.json`, `src/rev.ts`, `public/sw.js`).
+- **Commit & Publish APK:** `git add -A && git commit ... && git push origin main && .\scripts\android.ps1 -NoBump -Publish` (add `-Install` for USB adb). One-time QR setup: `python scripts\make_setup_qr.py`.

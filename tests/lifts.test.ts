@@ -15,7 +15,7 @@ import { extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs } from '
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
 import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
 import { KG_PER_LB, fmtNum, fromDisplay, stepsFor, toDisplay } from '../src/lifts/settings';
-import { condenseSets, intervalsDescription, shortLine } from '../src/lifts/summary';
+import { condenseSets, effectiveSkipped, intervalsDescription, shortLine } from '../src/lifts/summary';
 import { MUSCLES, type Exercise, type LiftSession, type LiftSet, type SessionEx } from '../src/lifts/types';
 
 const lb = (v: number): number => v * KG_PER_LB;
@@ -207,12 +207,27 @@ describe('supersets & finishing', () => {
     exs[2].restAuto = true;
     expect(effectiveRestAuto(exs, 2, false, false)).toBe(true); // explicit session override wins
   });
-  it('prunes unlogged sets and empty exercises, and clears a dangling superset flag', () => {
-    const s = sess('x', 0, [sx('bench', [set(lb(135), 5), set(null, null, { done: false })], { ss: true }), sx('curl', [set(null, null, { done: false })])], { status: 'active' });
-    expect(pruneUnlogged(s)).toBe(2);
+  it('prunes unlogged sets and empty exercises, clears dangling superset flag, and records partial/full skipped working sets', () => {
+    const s = sess('x', 0, [
+      sx('bench', [set(lb(95), 8, { kind: 'w', done: false }), set(lb(135), 5), set(null, null, { done: false })], { ss: true }),
+      sx('curl', [set(null, null, { done: false }), set(null, null, { done: false }), set(null, null, { done: false })]),
+    ], { status: 'active' });
+    expect(pruneUnlogged(s)).toBe(5);
     expect(s.exs).toHaveLength(1);
     expect(s.exs[0].sets).toHaveLength(1);
     expect(s.exs[0].ss).toBeUndefined();
+    expect(s.skipped).toEqual([
+      { exId: 'bench', plannedSets: 2, doneSets: 1, ss: true },
+      { exId: 'curl', plannedSets: 3, doneSets: 0 },
+    ]);
+    // Adding back the missing logged bench set in edit mode resolves bench out of effectiveSkipped
+    s.exs[0].sets.push(set(lb(135), 5));
+    expect(effectiveSkipped(s)).toEqual([{ exId: 'curl', plannedSets: 3, doneSets: 0 }]);
+
+    // Warm-up-only unlogged sets do not pollute skipped when all working sets are done
+    const clean = sess('y', 0, [sx('bench', [set(lb(95), 8, { kind: 'w', done: false }), set(lb(135), 5)])], { status: 'active' });
+    expect(pruneUnlogged(clean)).toBe(1);
+    expect(clean.skipped).toBeUndefined();
   });
   it('turns a session into a day with logged working-set counts', () => {
     const s = sess('x', 0, [sx('bench', [set(lb(95), 8, { kind: 'w' }), set(lb(135), 5), set(lb(135), 5)], { ss: true }), sx('curl', [set(lb(30), 10)])]);
@@ -357,6 +372,24 @@ describe('summary text', () => {
       'curl: 1×12 @ 30 lb',
       '',
       'avg HR 118 · max HR 151 · ~310 kcal · RPE 8/10',
+    ].join('\n'));
+
+    const partial = sess('d2', new Date(2026, 0, 6, 7).getTime(), [sx('bench', [set(lb(175), 5), set(lb(175), 5)])], {
+      name: 'Upper 1',
+      endMs: new Date(2026, 0, 6, 7, 30).getTime(),
+      skipped: [
+        { exId: 'bench', plannedSets: 3, doneSets: 2 },
+        { exId: 'curl', plannedSets: 3, doneSets: 0 },
+      ],
+    });
+    const descSkip = intervalsDescription(partial, { unit, exOf, prs: new Map() });
+    expect(descSkip).toBe([
+      'Armory Fit · Upper 1',
+      '30 min · 2 sets · 1,750 lb',
+      '',
+      'bench: 2×5 @ 175 lb',
+      '',
+      'Skipped: bench (2/3 sets — 1 skipped) · curl (0/3 sets)',
     ].join('\n'));
   });
 });

@@ -11,7 +11,7 @@ import { retryPending } from '../../workout/sync';
 import { revFooter } from '../chrome';
 import { esc, hms } from '../dom';
 import { ZONE_COLOR, hrZone } from '../hr';
-import { openShareCard, stat } from './cards';
+import { openShareCard, skippedCard, stat } from './cards';
 import { mount, promptSheet, toast } from './kit';
 
 /** Post-workout: numbers, PRs, effort rating, share card. The Intervals.icu upload has already started by itself. */
@@ -36,6 +36,7 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
         const wTxt = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit}`;
         return `<div class="prl"><i>★</i><b>${esc(ex.name)}</b><span>${h.n}RM · ${wTxt}${x.vids?.length ? ' 🎥' : ''}</span></div>`;
       }).join('')}</section>` : ''}
+      ${skippedCard(s)}
       <div id="hrzones"></div>
       <div id="sync" class="status busy"><span class="spinner"></span> Logging to Intervals.icu…</div>
       <h2 class="sec">HOW HARD WAS IT?</h2>

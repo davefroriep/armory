@@ -351,6 +351,12 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .prl b { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .prl span { color: #e5e7eb; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .prl small { color: var(--mut); font-size: .72rem; }
+.wskipped { border: 1px solid rgba(245, 158, 11, .28); }
+.wskipped .card-h span { color: #fbbf24; }
+.wsk-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px solid #1f2630; font-size: .88rem; }
+.wsk-row:first-of-type { border-top: 0; }
+.wsk-row b { flex: 1; min-width: 0; color: #e5e7eb; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wsk-row span { color: #fcd34d; font-size: .78rem; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .sc-wrap { display: grid; place-items: center; min-height: 120px; }
 .sc-img { width: 100%; max-height: 56dvh; object-fit: contain; border-radius: 14px; }
 .sc-load { padding: 40px; }
