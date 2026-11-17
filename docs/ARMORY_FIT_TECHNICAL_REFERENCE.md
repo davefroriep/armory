@@ -6,6 +6,8 @@ Authoritative engineering specification for **Armory Fit** (`N:\Documents\Antigr
 > - Global Agent Skill: `C:\Users\davef\.gemini\config\skills\armory-fit\SKILL.md`
 > - CLI Logbook Inspector: `C:\Users\davef\.gemini\config\skills\armory-fit\scripts\armory_cli.py`
 > - Roadmap & Pending Hardware Upgrades: [TODO.md](./TODO.md)
+> - A/V, Compute & Wall Display Setup: [ARMORY_AV_TECH_SETUP.md](./ARMORY_AV_TECH_SETUP.md)
+> - Gym Equipment & Exercise Inventory: [ARMORY_EQUIPMENT_SETUP.md](./ARMORY_EQUIPMENT_SETUP.md)
 > - Hardware & Ecosystem Primer: [ARMORY_MASTER_PRIMER.md](./ARMORY_MASTER_PRIMER.md)
 > - Lift Tracker Notes: [LIFT_TRACKER.md](./LIFT_TRACKER.md)
 
