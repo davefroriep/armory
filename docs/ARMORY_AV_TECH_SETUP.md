@@ -27,7 +27,8 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so f
                                     └─▶ HDMI Out 2: [ Optional 32" TV / Pending check ]
 ```
 
-- **Streaming & Audio Source:** **Amazon Fire TV Cube** feeds the Denon AVR — serves as both **treadmill video display** (through Hisense HDMI 2) and **whole-gym music / audio-video streaming head** (voice control + familiar UI for wife/kids; raw PC browser streaming is a non-starter for family usability).
+- **Display / TV:** **Hisense 43" 4K Fire TV** *(previously noted as `43U6GR`, though `U6GR` is a 55"+ Roku TV line — exact 43" Fire TV model label TBD; 43" Hisense 4K Fire TVs typically carry 3× HDMI incl. ARC + 1× Optical SPDIF)*.
+- **Streaming & Audio Source:** **Amazon Fire TV Cube** feeds the Denon AVR — serves as both **treadmill video display** (through Hisense HDMI 2) and **whole-gym music / audio-video streaming head** (voice control + familiar UI for wife/kids; raw PC browser streaming is a non-starter for family usability). *(Note: having both an external Fire TV Cube and a Fire TV-built-in Hisense can contribute to Alexa/CEC quirks.)*
 - **Receiver & Speaker Array:** **Denon AVR-3313CI** (HDMI 1.4a: max 4K@24/30Hz passthrough, no HDMI 2.0 4K/60 HDR or HDCP 2.2; supports **ARC** on HDMI Monitor Out 1, 2× Optical TOSLINK inputs, and 3 HDMI outputs: 2× main-zone + 1× Zone 2) driving **4 corner tower speakers** + **1 center-channel speaker** mounted over/in front of the treadmill (typically **5-channel / Multi-Ch Stereo** mode — *exact surround mode to confirm*).
 - **Known A/V Pain Points & Architecture Notes (No Extractor Wanted):**
   - **4K HDR + CEC power bottleneck:** Routing Fire TV Cube → Denon AVR-3313CI → Hisense drops 4K/60 HDR and causes flaky HDMI-CEC TV turn-on. (Fire TV Cube built-in **IR blaster** for Hisense + Denon can bypass CEC power/volume flakiness.)
@@ -59,7 +60,7 @@ Goal for a future secondary display (no code changes yet): glanceable real-time 
 ## 4. Open Questions / To Verify Next
 
 - [x] *Music playback TV state:* Confirmed **Hisense TV is always ON** when streaming music.
-- [ ] Confirm exact **Hisense TV model**, total **HDMI input count** (`ARC` label), and whether it has a **`DIGITAL AUDIO OUT (Optical / TOSLINK)`** port.
+- [ ] Confirm exact **Hisense 43" 4K Fire TV** model number off rear sticker and verify back-panel **`Optical Out` + HDMI count/`ARC` port** *(note: `43U6GR` noted in earlier inventory doesn't match a 43" Fire TV SKU)*.
 - [ ] Confirm exact Denon **5-channel stereo** mode and whether **HDMI Monitor Out 2** is free or wired.
 - [ ] Check video inputs on the **19" monitor** (HDMI vs. VGA/DVI/DisplayPort) and approximate rack/bench viewing distance.
 - [ ] Confirm whether the **spare 32" TV** is available and whether a **strength-area screen** feels worth hanging vs. a compact **ESP32 rack display / LED gym timer**.
