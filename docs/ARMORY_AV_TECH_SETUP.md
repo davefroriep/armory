@@ -48,13 +48,13 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so f
 
 ## 3. Secondary Wall Display / Live Wallboard Candidates *(Holding Pattern)*
 
-Goal for a future secondary display (no code changes yet): glanceable real-time **Polar H10 HR / readiness**, **active rest timer**, and **current/next exercise** positioned for visibility from the **strength equipment** (not cardio, which already faces the Hisense). Because Dave already touches his Pixel between sets, a second giant 32" TV purely mirroring phone sets may be overkill compared to an ambient rack/wall timer or lightweight dedicated screen. *(Constraint: zero spare PCs currently on hand.)*
+Goal for a future secondary display (no code changes yet): glanceable real-time **Polar H10 HR / readiness**, **active rest timer**, and **current/next exercise** positioned for visibility from the **strength equipment** (not cardio, which already faces the Hisense). Because Dave already touches his Pixel between sets, a second giant 32" TV purely mirroring phone sets only pays off if paired with **hands-free voice logging** (say *"check"*, *"225 for 8"*, *"10 reps"*, *"undo"*, and see instant big-screen `✓` confirmation + rest timer start without touching the phone over loud 5-ch gym music). *(Constraint: zero spare PCs currently on hand; OptiPlex never sleeps.)*
 
 - **Candidate 1 — Existing 19" Monitor:** Need to check physical video inputs before deciding whether a **Fire TV Stick** (or adapter) can plug in directly.
 - **Candidate 2 — Possible Spare 32" TV:** Availability/placement TBD (potentially tied to Denon **HDMI Out 2** or standalone with a Fire TV Stick).
 - **Candidate 3 — ESP32 Rack/Wall Display (e.g., LED Matrix Gym Clock / Tactical Display):** Boots in 1s, direct BLE/Wi-Fi, doubles as always-on digital gym clock + giant rest/HR readiness readout without hanging another full TV.
 - **Candidate 4 — OptiPlex Always-On Relay / Existing Hisense HDMI 1:** Because OptiPlex never sleeps and sits on strong gym Wi-Fi, it can optionally act as an always-on local relay or fullscreen browser host on Hisense HDMI 1 with zero extra hardware.
-- **Important Constraint:** Music/video on the **Fire TV Cube -> Denon** should stay uninterrupted and wife/kid-friendly while lifting or running.
+- **Important Constraint:** Music/video on the **Fire TV Cube -> Denon** should stay uninterrupted and wife/kid-friendly while lifting or running; voice capture must tolerate 4-tower + center speaker room audio (e.g., Pixel/rack mic wake word, OptiPlex conference mic + Whisper, or 1-tap BLE rack button PTT).
 
 ---
 
