@@ -5,7 +5,7 @@ import { lifts } from '../../lifts/store';
 import { condenseSets } from '../../lifts/summary';
 import { esc } from '../dom';
 import { lineChart } from './charts';
-import { LI, actionSheet, clock, confirmSheet, mount, promptSheet, relDay, resumeBar, tabBar, toast, wireClock } from './kit';
+import { LI, actionSheet, clock, confirmSheet, mount, relDay, resumeBar, tabBar, toast, wireClock } from './kit';
 import { exerciseForm } from './picker';
 import { playVideo } from './video';
 
@@ -68,7 +68,6 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
           <div class="chips"><button class="icon-btn" data-act="menu" aria-label="More">${LI.more}</button></div></header>
         <main class="page has-tabs">
           <div class="mtags">${ex.primary.map((m) => `<span class="mtag p">${MUSCLE_LABEL[m]}</span>`).join('')}${ex.secondary.map((m) => `<span class="mtag">${MUSCLE_LABEL[m]}</span>`).join('')}<span class="mtag eq">${EQUIP_LABEL[ex.equip]}</span></div>
-          ${row?.note ? `<button class="xnote" data-act="note">${esc(row.note)}</button>` : ''}
           <section class="stats four">
             <div><small>${isTime ? 'BEST HOLD' : 'EST 1RM'}</small><b>${isTime ? (bestHold ? `${bestHold}s` : '–') : bestE1 ? Math.round(toDisplay(bestE1)) : '–'}</b></div>
             <div><small>HEAVIEST</small><b>${heaviest ? `${fmtKg(heaviest)}<em>×${heaviestReps}</em>` : isTime ? '–' : hist.length ? 'BW' : '–'}</b></div>
@@ -102,7 +101,6 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
       const a = t.closest<HTMLElement>('[data-act]')?.dataset.act;
       if (a === 'back') { if (history.length > 1) history.back(); else location.hash = '#/strength/exercises'; return; }
       if (a === 'more') { more = !more; return paint(); }
-      if (a === 'note') return void (await editNote());
       if (a === 'rest') {
         const opts = [30, 45, 60, 90, 120, 150, 180, 240, 300];
         const k = await actionSheet('Rest timer', opts.map((o) => ({ key: String(o), label: clock(o), on: o === (lifts.row(exId)?.restSec ?? liftSettings().restSec) })));
@@ -112,11 +110,9 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
       if (a === 'menu') {
         const cur = lifts.exercise(exId)!;
         const k = await actionSheet(cur.name, [
-          { key: 'note', label: lifts.row(exId)?.note ? 'Edit note' : 'Add note' },
           ...(cur.custom ? [{ key: 'edit', label: 'Edit exercise' }, { key: 'del', label: 'Delete exercise', danger: true }] : [{ key: 'muscles', label: 'Edit muscle mapping', sub: 'Changes how its sets count toward each muscle' }]),
         ]);
-        if (k === 'note') await editNote();
-        else if (k === 'edit' || k === 'muscles') await exerciseForm(cur);
+        if (k === 'edit' || k === 'muscles') await exerciseForm(cur);
         else if (k === 'del' && (await confirmSheet(`Delete ${cur.name}?`, lifts.isUsed(exId) ? 'It has history, so it is hidden from pickers but past workouts keep it.' : '', 'Delete', true))) {
           await lifts.deleteCustom(exId);
           toast('Exercise deleted');
@@ -124,10 +120,6 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
         }
       }
     });
-    const editNote = async (): Promise<void> => {
-      const v = await promptSheet(`${lifts.exercise(exId)!.name} note`, lifts.row(exId)?.note ?? '', 'Seat 4, neutral handles, pin 7…', true);
-      if (v != null) await lifts.saveRow({ ...(lifts.row(exId) ?? { id: exId }), note: v || undefined });
-    };
     return () => { offClock(); offStore(); };
   });
 }

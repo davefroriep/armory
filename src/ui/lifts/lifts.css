@@ -191,7 +191,7 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .sprev { color: var(--mut); font-size: .8rem; font-weight: 600; font-variant-numeric: tabular-nums; text-align: center; padding: 8px 0; border-radius: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sprev:disabled { opacity: .5; }
 .srow input { width: 100%; height: 40px; border-radius: 10px; background: var(--card2); border: 1.5px solid transparent; color: #fff; text-align: center; font-size: 1.08rem; font-weight: 800; font-variant-numeric: tabular-nums; user-select: text; -webkit-user-select: text; font-family: inherit; padding: 0 2px; }
-.srow input.auto { color: #6b7686; }
+.srow input.auto { color: #4c5665; }
 .srow input::placeholder { color: #3e4857; }
 .srow input:focus { outline: none; border-color: var(--blue); background: #0f2233; color: #fff; }
 .srow.done .snum { background: rgba(26, 31, 38, .55); color: #94a3b8; }

@@ -63,7 +63,7 @@ export const PHASE1_ROUTINES: Routine[] = [
 ];
 
 export const SEED_EX_ROWS: ExRow[] = [
-  { id: 'triceps-isometric-hold', note: '90° elbow bend · 45s motionless @ RPE 5', restSec: 45 },
+  { id: 'triceps-isometric-hold', restSec: 45 },
 ];
 
 /** Planned-event title -> matching day (e.g. "Strength Train — Wk 1 · Day 2 Upper 1" -> "Upper 1"). */

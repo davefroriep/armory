@@ -88,13 +88,10 @@ export interface WallboardVoiceHint {
 export interface WallboardStationCard {
   label: string;
   exName: string;
-  muscles: string;
   exType: 'weight' | 'bodyweight' | 'time';
   isActive: boolean;
   repTarget: string;
   rpeTarget: string;
-  cue: string;
-  note: string;
   lastBenchmark: string;
   sets: WallboardSetSlot[];
   voiceHint: WallboardVoiceHint | null;
@@ -190,7 +187,7 @@ export interface WallboardBuildInput {
   todayItems: LocalTodayItem[];
   routines: Routine[];
   exOf: (exId: string) => Exercise;
-  noteOf: (exId: string) => string;
+  noteOf?: (exId: string) => string;
   prevOf: (se: SessionEx) => SessionEx | null;
 }
 
@@ -270,7 +267,6 @@ function buildVoiceHint(
   rx: CoachPrescription,
   st: Pick<Settings, 'voiceEnabled' | 'voiceWakeWord'>,
   voice: { listening: boolean; armed: boolean },
-  u: 'lb' | 'kg',
 ): WallboardVoiceHint {
   const wakeRaw = (st.voiceWakeWord || 'armory').trim() || 'armory';
   const wakeDisp = wakeRaw.charAt(0).toUpperCase() + wakeRaw.slice(1);
@@ -285,33 +281,31 @@ function buildVoiceHint(
 
   const readyToConfirm = canLog(activeSet, ex);
   const headline = micState === 'armed'
-    ? 'LISTENING NOW — SPEAK WITHOUT WAKE WORD'
-    : micState === 'ready'
-      ? (readyToConfirm ? `MIC LIVE · CONFIRM OR UPDATE SET ${curPtr.setNumber}` : `MIC LIVE · SPEAK WEIGHT & REPS FOR SET ${curPtr.setNumber}`)
-      : micState === 'standby'
-        ? `VOICE READY ON WORKOUT SCREEN · SET ${curPtr.setNumber}`
-        : `TAP MIC ON PIXEL (OR LOG ON PHONE) · SET ${curPtr.setNumber}`;
+    ? 'LISTENING…'
+    : micState === 'off'
+      ? 'MIC OFF'
+      : '';
 
   if (ex.type === 'time') {
     return {
       micState,
       headline,
       chips: [
-        { tag: 'Countdown', say: `"${prefix}start hold"`, primary: true },
-        { tag: 'Log hold', say: readyToConfirm ? `"${prefix}done"` : `"${prefix}${rx.sampleRep} seconds"` },
+        { tag: '', say: `"${prefix}start hold"`, primary: true },
+        { tag: '', say: readyToConfirm ? `"${prefix}done"` : `"${prefix}${rx.sampleRep} seconds"` },
       ],
     };
   }
   if (ex.type === 'bodyweight') {
     if (readyToConfirm) {
-      const lbl = activeSet.w && activeSet.w > 0 ? `+${fmtKg(activeSet.w)}×${activeSet.r}` : `BW×${activeSet.r}`;
+      const bumpR = (activeSet.r ?? rx.sampleRep) + 1;
       return {
         micState,
         headline,
         chips: [
-          { tag: `Same (${lbl})`, say: `"${prefix}done"`, primary: true },
-          { tag: 'Diff reps', say: `"${prefix}for ${rx.sampleRep}"` },
-          { tag: '+ Weight', say: `"${prefix}25 for 6"` },
+          { tag: '', say: `"${prefix}done"`, primary: true },
+          { tag: '', say: `"${prefix}for ${bumpR}"` },
+          { tag: '', say: `"${prefix}25 for 6"` },
         ],
       };
     }
@@ -319,8 +313,7 @@ function buildVoiceHint(
       micState,
       headline,
       chips: [
-        { tag: 'Bodyweight', say: `"${prefix}bodyweight for ${rx.sampleRep}"`, primary: true },
-        { tag: '+ Weight', say: `"${prefix}25 for 6"` },
+        { tag: '', say: `"${prefix}bodyweight for ${rx.sampleRep}"`, primary: true },
       ],
     };
   }
@@ -333,13 +326,17 @@ function buildVoiceHint(
         ? '135'
         : '70';
   if (readyToConfirm) {
+    const curWNum = Number(fmtKg(activeSet.w!));
+    const bumpW = Number.isFinite(curWNum) ? String(Math.round((curWNum + 5) * 10) / 10) : fmtKg(activeSet.w!);
+    const curR = activeSet.r ?? rx.sampleRep;
+    const bumpR = curR + 1;
     return {
       micState,
       headline,
       chips: [
-        { tag: `Same (${fmtKg(activeSet.w!)}×${activeSet.r})`, say: `"${prefix}done"`, primary: true },
-        { tag: `Keep ${fmtKg(activeSet.w!)} ${u}`, say: `"${prefix}for ${activeSet.r ?? rx.sampleRep}"` },
-        { tag: 'New load × reps', say: `"${prefix}${exW} for ${rx.sampleRep}"` },
+        { tag: '', say: `"${prefix}done"`, primary: true },
+        { tag: '', say: `"${prefix}for ${bumpR}"` },
+        { tag: '', say: `"${prefix}${bumpW} for ${curR}"` },
       ],
     };
   }
@@ -347,8 +344,7 @@ function buildVoiceHint(
     micState,
     headline,
     chips: [
-      { tag: 'Fill & log', say: `"${prefix}${exW} for ${rx.sampleRep}"`, primary: true },
-      { tag: 'With RPE', say: `"${prefix}${exW} for ${rx.sampleRep} RPE 8"` },
+      { tag: '', say: `"${prefix}${exW} for ${rx.sampleRep}"`, primary: true },
     ],
   };
 }
@@ -394,16 +390,13 @@ function buildLiftStage(
     stations.push({
       label: labs[k] ?? String(k + 1),
       exName: ex.name,
-      muscles: ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · '),
       exType: ex.type,
       isActive,
       repTarget: rx.repTarget,
       rpeTarget: rx.rpeTarget,
-      cue: rx.cue,
-      note: inp.noteOf(se.exId),
       lastBenchmark,
       sets,
-      voiceHint: isActive ? buildVoiceHint(ex, se.sets[curPtr.setIdx], curPtr, rx, inp.settings, inp.voice, u) : null,
+      voiceHint: isActive ? buildVoiceHint(ex, se.sets[curPtr.setIdx], curPtr, rx, inp.settings, inp.voice) : null,
     });
   }
 
@@ -519,7 +512,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
         isSuperset: ssMap.get(curPtr.exIdx) != null,
         exName: ex.name,
         muscles: ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · '),
-        note: inp.noteOf(se.exId),
+        note: '',
         exType: ex.type,
         setNumber: curPtr.setNumber,
         totalSets: curPtr.totalWorkingSets || se.sets.length,

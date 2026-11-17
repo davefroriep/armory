@@ -83,7 +83,6 @@ export const WALLBOARD_HTML = `<!doctype html>
   /* Live Set Cockpit */
   .ss-stage { flex:1; min-height:0; display:flex; flex-direction:column; gap:clamp(8px,1.1vh,12px); border-left:4px solid var(--cyan); }
   .ss-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-shrink:0; }
-  .ss-after { font-size:clamp(11px,1.15vw,15px); font-weight:700; color:var(--mut); background:var(--card2); padding:4px 10px; border-radius:999px; border:1px solid var(--line); white-space:nowrap; }
   .ss-pair { flex:1; min-height:0; display:flex; flex-direction:column; gap:clamp(8px,1vh,12px); overflow:hidden; }
   .st-card { background:var(--card2); border:1px solid var(--line); border-radius:14px; padding:clamp(10px,1.3vh,16px) clamp(12px,1.4vw,18px); display:flex; flex-direction:column; gap:clamp(6px,0.8vh,10px); min-height:0; overflow:hidden; }
   .st-card.single { flex:1; background:var(--card); border-radius:18px; border-left:4px solid var(--blue); padding:clamp(14px,1.8vh,22px); justify-content:space-between; }
@@ -100,10 +99,9 @@ export const WALLBOARD_HTML = `<!doctype html>
   .st-tag { font-size:clamp(10px,1vw,12px); font-weight:800; letter-spacing:.08em; padding:3px 8px; border-radius:999px; background:var(--card); border:1px solid var(--line); color:var(--mut); text-transform:uppercase; flex-shrink:0; }
   .rx-pills { display:flex; align-items:center; gap:6px; flex-shrink:0; }
   .rx-pill { font-size:clamp(11px,1.2vw,16px); font-weight:800; padding:4px 10px; border-radius:8px; white-space:nowrap; }
+  .rx-pill.last { background:var(--card); border:1px solid var(--line); color:var(--mut); }
   .rx-pill.reps { background:rgba(34,211,238,.14); border:1px solid rgba(34,211,238,.4); color:#67e8f9; }
   .rx-pill.rpe { background:rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.4); color:#fde68a; }
-  .st-sub { font-size:clamp(12px,1.3vw,17px); color:var(--mut); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex-shrink:0; }
-  .st-sub b { color:var(--txt); font-weight:700; }
 
   /* Fill-in-the-blank Set Slots */
   .set-rows { display:flex; flex-direction:column; gap:6px; min-height:0; overflow:hidden; flex:1; justify-content:center; }
@@ -111,18 +109,20 @@ export const WALLBOARD_HTML = `<!doctype html>
   .st-card.single .s-row { padding:9px 16px; gap:16px; }
   .s-row.active { background:rgba(56,189,248,.12); border:1.5px solid var(--blue); }
   .s-row.done { background:rgba(15,23,36,.75); border-color:rgba(34,197,94,.22); }
-  .s-row.queued { opacity:.62; }
+  .s-row.queued { opacity:.68; }
   .s-tag { font-size:clamp(11px,1.15vw,15px); font-weight:800; letter-spacing:.06em; color:var(--mut); min-width:58px; font-variant-numeric:tabular-nums; }
   .s-row.active .s-tag { color:var(--blue); }
   .s-slots { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-variant-numeric:tabular-nums; }
   .s-x { font-size:clamp(14px,1.6vw,22px); font-weight:800; color:var(--mut); }
   .s-logged { font-size:clamp(16px,1.95vw,26px); font-weight:800; color:#fff; }
   .st-card.single .s-logged { font-size:clamp(20px,2.5vw,34px); }
+  .s-queued { font-size:clamp(14px,1.65vw,22px); font-weight:700; color:rgba(148,163,184,.36); }
+  .st-card.single .s-queued { font-size:clamp(17px,2vw,26px); }
   .s-rpe { font-size:clamp(12px,1.25vw,16px); font-weight:800; color:#fde68a; background:rgba(245,158,11,.14); border:1px solid rgba(245,158,11,.35); padding:2px 8px; border-radius:999px; }
   .slot-box { padding:4px 12px; border-radius:9px; font-size:clamp(15px,1.8vw,24px); font-weight:800; letter-spacing:.01em; line-height:1.15; }
   .st-card.single .slot-box { padding:7px 16px; font-size:clamp(19px,2.4vw,32px); }
   .slot-box.empty { border:2px dashed rgba(56,189,248,.8); background:rgba(7,11,18,.88); color:#7dd3fc; }
-  .slot-box.ghost { border:2px dashed rgba(148,163,184,.58); background:rgba(7,11,18,.72); color:#bae6fd; }
+  .slot-box.ghost { border:1.5px dashed rgba(148,163,184,.26); background:rgba(7,11,18,.55); color:rgba(148,163,184,.44); font-weight:700; }
   .slot-box.filled { border:2px solid rgba(56,189,248,.85); background:rgba(56,189,248,.16); color:#fff; }
   .slot-box.bw { border:1px solid var(--line); background:var(--card); color:var(--mut); }
   .s-stat { font-size:clamp(11px,1.1vw,14px); font-weight:800; letter-spacing:.07em; color:var(--mut); text-transform:uppercase; white-space:nowrap; }
@@ -130,16 +130,15 @@ export const WALLBOARD_HTML = `<!doctype html>
   .s-row.active .s-stat { color:#7dd3fc; }
 
   /* Contextual Voice Strip */
-  .vbar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; padding:8px 12px; border-radius:11px; background:rgba(7,11,18,.82); border:1px solid rgba(56,189,248,.35); flex-shrink:0; }
+  .vbar { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 12px; border-radius:11px; background:rgba(7,11,18,.82); border:1px solid rgba(56,189,248,.32); flex-shrink:0; }
   .vbar.armed { border-color:var(--cyan); background:rgba(34,211,238,.15); box-shadow:0 0 18px rgba(34,211,238,.2); }
   .vbar.off { border-color:var(--line); opacity:.82; }
-  .vbar-head { display:flex; align-items:center; gap:8px; font-size:clamp(11px,1.1vw,14px); font-weight:800; letter-spacing:.07em; color:#86efac; text-transform:uppercase; }
-  .vbar.armed .vbar-head { color:#67e8f9; }
-  .vbar.standby .vbar-head, .vbar.off .vbar-head { color:var(--mut); }
-  .vchips { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .vchip { display:inline-flex; align-items:baseline; gap:6px; padding:4px 10px; border-radius:9px; background:var(--card); border:1px solid var(--line); font-size:clamp(11px,1.2vw,15px); }
+  .vbar-l { display:flex; align-items:center; gap:7px; font-size:clamp(11px,1.1vw,14px); font-weight:800; letter-spacing:.08em; color:#86efac; text-transform:uppercase; flex-shrink:0; }
+  .vbar.armed .vbar-l { color:#67e8f9; }
+  .vbar.standby .vbar-l, .vbar.off .vbar-l { color:var(--mut); }
+  .vchips { display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end; }
+  .vchip { display:inline-flex; align-items:center; padding:4px 10px; border-radius:9px; background:var(--card); border:1px solid var(--line); font-size:clamp(11px,1.2vw,15px); }
   .vchip.primary { background:rgba(56,189,248,.16); border-color:rgba(56,189,248,.55); }
-  .vchip em { font-style:normal; color:var(--mut); font-size:.88em; font-weight:700; }
   .vchip b { color:#fff; font-weight:800; }
 
   /* On Deck Card (Straight Sets) */
@@ -153,6 +152,8 @@ export const WALLBOARD_HTML = `<!doctype html>
   .od-row span { color:var(--mut); font-size:.88em; font-weight:600; white-space:nowrap; }
 
   .hr-card { display:flex; align-items:center; justify-content:space-between; gap:16px; }
+  .hr-slim { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; flex-shrink:0; }
+  .hr-slim-st { font-size:clamp(12px,1.3vw,16px); color:var(--mut); font-weight:700; }
   .hr-bpm { font-size:clamp(46px,6.4vw,88px); font-weight:900; line-height:1; font-variant-numeric:tabular-nums; }
   .hr-ready { padding:10px 16px; border-radius:14px; font-size:clamp(14px,1.65vw,21px); font-weight:800; letter-spacing:.04em; text-align:right; }
   .hr-ready.ready { background:rgba(34,197,94,.2); border:2px solid var(--green); color:#86efac; }
@@ -161,13 +162,18 @@ export const WALLBOARD_HTML = `<!doctype html>
   .hr-ready.idle { background:var(--card2); border:1px solid var(--line); color:var(--mut); }
   .ex-list { flex:1; min-height:0; overflow:hidden; display:flex; flex-direction:column; gap:7px; }
   .ex-row { display:flex; align-items:center; gap:12px; padding:9px 13px; border-radius:11px; background:var(--card2); border:1px solid transparent; font-size:clamp(13px,1.5vw,20px); }
-  .ex-row.ss { border-left:3px solid rgba(34,211,238,.55); }
   .ex-row.cur { border-color:var(--blue); background:rgba(56,189,248,.14); }
   .ex-row.done { opacity:.55; }
   .ex-row em { font-style:normal; font-weight:800; color:var(--blue); min-width:34px; }
   .ex-row b { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .ex-row span { font-variant-numeric:tabular-nums; font-weight:700; color:var(--mut); }
   .ex-row.done span { color:#86efac; }
+  .ex-ss { --ss:var(--amber); border-radius:12px; padding-left:4px; background:var(--card2); box-shadow:inset 4px 0 0 var(--ss), inset 0 0 0 1px rgba(245,158,11,.28); overflow:hidden; display:flex; flex-direction:column; flex-shrink:0; }
+  .ex-ss.c1 { --ss:var(--cyan); box-shadow:inset 4px 0 0 var(--ss), inset 0 0 0 1px rgba(34,211,238,.28); }
+  .ex-ss .ex-row { border-radius:0; background:transparent; border:0; }
+  .ex-ss .ex-row + .ex-row { border-top:1px dashed rgba(148,163,184,.22); }
+  .ex-ss .ex-row.cur { background:rgba(56,189,248,.16); }
+  .ex-ss .ex-row em { color:var(--ss); }
   .standby-big { font-size:clamp(54px,8vw,112px); font-weight:900; font-variant-numeric:tabular-nums; letter-spacing:-.03em; }
   .sb-item { padding:14px 16px; border-radius:14px; background:var(--card2); border:1px solid var(--line); }
   .sb-item b { font-size:clamp(18px,2.2vw,28px); display:block; margin-bottom:4px; }
@@ -192,15 +198,16 @@ export const WALLBOARD_HTML = `<!doctype html>
     .st-name { font-size:clamp(15px,2.9vh,22px); }
     .st-card.single .st-name { font-size:clamp(19px,3.8vh,28px); }
     .rx-pill { font-size:clamp(10px,1.9vh,13px); padding:2px 7px; }
-    .st-sub { font-size:clamp(11px,1.9vh,13px); }
     .set-rows { gap:3px; }
     .s-row { padding:4px 9px; gap:8px; }
     .st-card.single .s-row { padding:6px 12px; }
     .slot-box { padding:2px 9px; font-size:clamp(13px,2.4vh,18px); border-width:1.5px; }
     .st-card.single .slot-box { padding:4px 12px; font-size:clamp(15px,3vh,22px); }
     .s-logged { font-size:clamp(13px,2.5vh,19px); }
+    .s-queued { font-size:clamp(12px,2.1vh,16px); }
     .vbar { padding:5px 9px; gap:6px; }
     .vchip { padding:2px 8px; font-size:clamp(10px,1.9vh,13px); }
+    .hr-slim { padding:7px 12px; }
     .hr-bpm { font-size:clamp(32px,7vh,52px); }
     .ex-list { gap:4px; }
     .ex-row { padding:5px 9px; font-size:clamp(11px,2.1vh,14px); }
@@ -260,41 +267,47 @@ function render(st) {
         + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '')
         + '</div><span class="s-stat ok">✓</span></div>';
     }
+    if (slot.state === 'queued') {
+      const qTxt = exType === 'time'
+        ? (slot.repsVal || slot.repsPlaceholder)
+        : exType === 'bodyweight'
+          ? (slot.repsVal ? slot.weightVal + ' × ' + slot.repsVal : slot.weightVal)
+          : ((slot.weightVal && slot.repsVal) ? slot.weightVal + ' × ' + slot.repsVal : '—');
+      return '<div class="s-row queued"><span class="s-tag">' + esc(tagTxt) + '</span>'
+        + '<div class="s-slots"><span class="s-queued">' + esc(qTxt) + '</span>'
+        + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '')
+        + '</div><span class="s-stat">○</span></div>';
+    }
     const showWeightBox = exType !== 'time' || !!slot.weightVal;
     let wCls = 'slot-box ';
     if (exType === 'bodyweight' && !slot.isGhost && slot.weightVal === 'BW') wCls += 'bw';
     else if (!slot.weightVal) wCls += 'empty';
     else wCls += slot.isGhost ? 'ghost' : 'filled';
-    const wTxt = slot.weightVal ? slot.weightVal + (slot.isGhost ? ' ?' : '') : slot.weightPlaceholder;
+    const wTxt = slot.weightVal || slot.weightPlaceholder;
     const rCls = 'slot-box ' + (!slot.repsVal ? 'empty' : slot.isGhost ? 'ghost' : 'filled');
-    const rTxt = slot.repsVal ? slot.repsVal + (slot.isGhost ? ' ?' : '') : slot.repsPlaceholder;
+    const rTxt = slot.repsVal || slot.repsPlaceholder;
     const slotsHtml = (showWeightBox ? '<span class="' + wCls + '">' + esc(wTxt) + '</span><span class="s-x">×</span>' : '')
       + '<span class="' + rCls + '">' + esc(rTxt) + '</span>'
       + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '');
-    const statTxt = slot.state === 'active'
-      ? (slot.isGhost ? 'SUGGESTED' : exType === 'time' ? 'HOLD' : 'SPEAK SET')
-      : '○';
-    return '<div class="s-row ' + esc(slot.state) + '"><span class="s-tag">' + (slot.state === 'active' ? '▶ ' : '') + esc(tagTxt) + '</span>'
+    const statTxt = slot.isGhost ? 'SUGGESTED' : exType === 'time' ? 'HOLD' : 'SPEAK SET';
+    return '<div class="s-row active"><span class="s-tag">▶ ' + esc(tagTxt) + '</span>'
       + '<div class="s-slots">' + slotsHtml + '</div>'
       + '<span class="s-stat">' + esc(statTxt) + '</span></div>';
   };
 
   const renderVoiceBar = (vh) => '<div class="vbar ' + esc(vh.micState) + '">'
-    + '<div class="vbar-head"><i class="dot"></i><span>' + esc(vh.headline) + '</span></div>'
-    + '<div class="vchips">' + vh.chips.map((ch) => '<span class="vchip' + (ch.primary ? ' primary' : '') + '"><em>' + esc(ch.tag) + '</em><b>' + esc(ch.say) + '</b></span>').join('') + '</div></div>';
+    + '<div class="vbar-l"><i class="dot"></i><span>' + esc(vh.headline || 'SAY') + '</span></div>'
+    + '<div class="vchips">' + vh.chips.map((ch) => '<span class="vchip' + (ch.primary ? ' primary' : '') + '"><b>' + esc(ch.say) + '</b></span>').join('') + '</div></div>';
 
   const renderStation = (stCard, isSingle) => {
     const cls = 'st-card' + (isSingle ? ' card single' : '') + (stCard.isActive ? ' active' : ' partner');
-    const subParts = [esc(stCard.muscles)];
-    if (stCard.lastBenchmark) subParts.push('<b>Last: ' + esc(stCard.lastBenchmark) + '</b>');
-    if (stCard.cue) subParts.push(esc(stCard.cue));
     return '<section class="' + cls + '">'
       + '<div class="st-top"><div class="st-title"><span class="st-lab">' + esc(stCard.label) + '</span><span class="st-name">' + esc(stCard.exName) + '</span>'
       + (!isSingle && !stCard.isActive ? '<span class="st-tag">PARTNER</span>' : '') + '</div>'
-      + '<div class="rx-pills"><span class="rx-pill reps">' + esc(stCard.repTarget) + '</span><span class="rx-pill rpe">' + esc(stCard.rpeTarget) + '</span></div></div>'
-      + '<div class="st-sub cur-body">' + subParts.join(' · ') + '</div>'
-      + (stCard.note ? '<div class="note">' + esc(stCard.note) + '</div>' : '')
-      + '<div class="set-rows">' + stCard.sets.map((s) => renderSetRow(s, stCard.exType)).join('') + '</div>'
+      + '<div class="rx-pills">'
+      + (stCard.lastBenchmark ? '<span class="rx-pill last">Last ' + esc(stCard.lastBenchmark) + '</span>' : '')
+      + '<span class="rx-pill reps">' + esc(stCard.repTarget) + '</span><span class="rx-pill rpe">' + esc(stCard.rpeTarget) + '</span></div></div>'
+      + '<div class="set-rows cur-body">' + stCard.sets.map((s) => renderSetRow(s, stCard.exType)).join('') + '</div>'
       + (stCard.isActive && stCard.voiceHint ? renderVoiceBar(stCard.voiceHint) : '')
       + '</section>';
   };
@@ -302,8 +315,10 @@ function render(st) {
   const renderOnDeck = (od) => '<section class="card ondeck"><div class="od-head"><div class="kicker">ON DECK NEXT</div>'
     + '<span class="od-tag">' + (od.isSuperset ? 'SUPERSET PAIR · ' : '') + esc(od.label) + '</span></div>'
     + '<div class="od-items">' + od.items.map((it) => '<div class="od-row"><em>' + esc(it.label) + '</em><b>' + esc(it.exName) + '</b><span>'
-      + it.sets + '× ' + esc(it.repTarget) + ' · ' + esc(it.rpeTarget) + (it.lastText ? ' · Last: ' + esc(it.lastText) : '') + '</span></div>').join('')
+      + it.sets + '× ' + esc(it.repTarget) + ' · ' + esc(it.rpeTarget) + (it.lastText ? ' · Last ' + esc(it.lastText) : '') + '</span></div>').join('')
     + '</div></section>';
+
+  const renderExRow = (e) => '<div class="ex-row' + (e.isCurrent ? ' cur' : '') + (e.isDone ? ' done' : '') + '"><em>' + esc(e.label) + '</em><b>' + esc(e.name) + '</b><span>' + (e.isDone ? '✓ ' : '') + e.doneSets + '/' + e.totalSets + '</span></div>';
 
   let main = '';
   if (st.mode === 'lift' && st.lift) {
@@ -328,17 +343,35 @@ function render(st) {
     if (!sg) {
       leftStage = '<section class="card hero"><div class="cur-body" style="margin:auto 0"><div class="kicker">ALL ' + l.setsTotal + ' SETS COMPLETE</div><div class="cur-name" style="margin-top:8px">Finish workout on your Pixel to save &amp; sync</div><div class="cur-meta" style="margin-top:10px">Or say “' + esc((v.wakeWord || 'armory')) + ' finish workout”</div></div></section>';
     } else if (sg.kind === 'superset') {
-      leftStage = '<section class="card ss-stage"><div class="ss-head"><div class="kicker">' + esc(sg.kicker) + '</div>'
-        + (sg.onDeck ? '<span class="ss-after">After pair → ' + esc(sg.onDeck.label) + '</span>' : '')
-        + '</div><div class="ss-pair">' + sg.stations.map((sc) => renderStation(sc, false)).join('') + '</div></section>';
+      leftStage = '<section class="card ss-stage"><div class="ss-head"><div class="kicker">' + esc(sg.kicker) + '</div></div>'
+        + '<div class="ss-pair">' + sg.stations.map((sc) => renderStation(sc, false)).join('') + '</div></section>';
     } else {
       leftStage = renderStation(sg.stations[0], true) + (sg.onDeck ? renderOnDeck(sg.onDeck) : '');
     }
 
-    const exRows = (l.exercises || []).map((e) => '<div class="ex-row' + (e.ssGroup != null ? ' ss' : '') + (e.isCurrent ? ' cur' : '') + (e.isDone ? ' done' : '') + '"><em>' + esc(e.label) + '</em><b>' + esc(e.name) + '</b><span>' + (e.isDone ? '✓ ' : '') + e.doneSets + '/' + e.totalSets + '</span></div>').join('');
+    let exRows = '';
+    const exArr = l.exercises || [];
+    for (let i = 0; i < exArr.length; ) {
+      const g = exArr[i].ssGroup;
+      if (g == null) {
+        exRows += renderExRow(exArr[i]);
+        i++;
+      } else {
+        let j = i;
+        while (j + 1 < exArr.length && exArr[j + 1].ssGroup === g) j++;
+        let inner = '';
+        for (let k = i; k <= j; k++) inner += renderExRow(exArr[k]);
+        exRows += '<div class="ex-ss' + (g % 2 ? ' c1' : '') + '">' + inner + '</div>';
+        i = j + 1;
+      }
+    }
+
+    const liftHrHtml = (hr.fresh && hr.bpm)
+      ? hrHtml
+      : '<section class="card hr-slim"><div class="kicker">POLAR H10</div><span class="hr-slim-st">Not connected</span></section>';
 
     main = '<div class="grid"><div class="col">' + timerBanner + leftStage + '</div>'
-      + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px"><div class="kicker">' + esc(l.title) + ' · ' + l.setsDone + '/' + l.setsTotal + ' SETS' + (l.setsDone > 0 ? ' · ' + esc(l.volumeText) : '') + '</div><div class="ex-list">' + exRows + '</div></section></div></div>';
+      + '<div class="col">' + liftHrHtml + '<section class="card" style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px"><div class="kicker">' + esc(l.title) + ' · ' + l.setsDone + '/' + l.setsTotal + ' SETS' + (l.setsDone > 0 ? ' · ' + esc(l.volumeText) : '') + '</div><div class="ex-list">' + exRows + '</div></section></div></div>';
   } else if (st.mode === 'cardio' && st.cardio) {
     const k = st.cardio;
     main = '<div class="grid"><div class="col"><section class="card hero">'

@@ -234,7 +234,7 @@ describe('wallboard snapshot & routing', () => {
     expect(snapReady.hr.drop60).toBe(27);
     expect(snapReady.voice.banner?.text).toContain('100 lb');
     expect(snapReady.lift!.current!.label).toBe('2A');
-    expect(snapReady.lift!.current!.note).toBe('Pins on hole 5');
+    expect(snapReady.lift!.current!.note).toBe('');
     expect(snapReady.lift!.next!.label).toBe('2B');
 
     // Recovering state when HR > 130 and no active rest timer
@@ -318,6 +318,9 @@ describe('wallboard snapshot & routing', () => {
     expect(WALLBOARD_HTML).toMatch(/\.card\s*\{[^}]*overflow:\s*hidden/);
     expect(WALLBOARD_HTML).toMatch(/\.cur-body\s*\{[^}]*overflow:\s*hidden/);
     expect(WALLBOARD_HTML).toContain('@media (max-height:700px)');
+    expect(WALLBOARD_HTML).toContain('.ex-ss');
+    expect(WALLBOARD_HTML).toContain('.hr-slim');
+    expect(WALLBOARD_HTML).not.toContain("' ?'");
 
     expect(TV_W).toBe(1600);
     expect(TV_H).toBe(900);
@@ -339,22 +342,28 @@ describe('wallboard snapshot & routing', () => {
     expect(landscapeFs.scale).toBeCloseTo((412 - 48) / 900, 5);
   });
 
-  it('provides week-aware RPE/rep prescriptions and builds single vs superset cockpit stages', () => {
-    expect(prescriptionFor(exOf('seated-dumbbell-shoulder-press'), 1).rpeTarget).toBe('RPE 7 (3 RIR)');
-    expect(prescriptionFor(exOf('seated-dumbbell-shoulder-press'), 2)).toMatchObject({
+  it('provides week-aware RPE/rep prescriptions (zero RIR/cues) and builds single vs superset cockpit stages', () => {
+    expect(prescriptionFor(exOf('seated-dumbbell-shoulder-press'), 1).rpeTarget).toBe('RPE 7');
+    expect(prescriptionFor(exOf('seated-dumbbell-shoulder-press'), 2)).toEqual({
       repTarget: '8–10 reps',
-      rpeTarget: 'RPE 7.5 (2–3 RIR)',
-      cue: 'Smooth press · match right triceps',
+      rpeTarget: 'RPE 7.5',
+      sampleRep: 10,
     });
-    expect(prescriptionFor(exOf('triceps-isometric-hold'), 3).rpeTarget).toBe('RPE 5 (primer)');
-    expect(prescriptionFor(exOf('cable-triceps-pushdown'), 4).cue).toContain('1:1:1');
-    expect(prescriptionFor(exOf('low-bar-squat'), 4)).toMatchObject({
+    expect(prescriptionFor(exOf('triceps-isometric-hold'), 3).rpeTarget).toBe('RPE 5');
+    expect(prescriptionFor(exOf('cable-triceps-pushdown'), 4)).toEqual({
+      repTarget: '12–15 reps',
+      rpeTarget: 'RPE 7–7.5',
+      sampleRep: 12,
+    });
+    expect(prescriptionFor(exOf('low-bar-squat'), 4)).toEqual({
       repTarget: '6–8 reps',
-      rpeTarget: 'RPE 8 (2 RIR)',
+      rpeTarget: 'RPE 8',
+      sampleRep: 8,
     });
-    expect(prescriptionFor(exOf('dumbbell-curl'), 2)).toMatchObject({
+    expect(prescriptionFor(exOf('dumbbell-curl'), 2)).toEqual({
       repTarget: '10–12 reps',
-      rpeTarget: 'RPE 8 (1–2 RIR)',
+      rpeTarget: 'RPE 8',
+      sampleRep: 12,
     });
 
     const now = 3_000_000;
@@ -395,18 +404,21 @@ describe('wallboard snapshot & routing', () => {
       todayItems: [],
       routines: PHASE1_ROUTINES,
       exOf,
-      noteOf: () => '',
       prevOf: () => null,
     });
+    expect(JSON.stringify(singleSnap)).not.toContain('RIR');
     const stSingle = singleSnap.lift!.stage!;
     expect(stSingle.kind).toBe('single');
     expect(stSingle.stations).toHaveLength(1);
     expect(stSingle.stations[0].label).toBe('1');
-    expect(stSingle.stations[0].voiceHint!.chips[0].say).toBe('"Armory start hold"');
+    expect(stSingle.stations[0].voiceHint!.chips.map((c) => c.say)).toEqual([
+      '"Armory start hold"',
+      '"Armory done"',
+    ]);
     expect(stSingle.onDeck!.isSuperset).toBe(true);
     expect(stSingle.onDeck!.label).toBe('2A + 2B');
 
-    // 2. Superset shared workspace (2A + 2B) with auto pre-fill suggestions
+    // 2. Superset shared workspace (2A + 2B) with distinct delta voice chips & deeper ghost state
     const ssExs = mkUpper1();
     ssExs[0].sets.forEach((s) => { s.done = true; });
     ssExs[1].sets.forEach((s) => { s.wAuto = true; s.rAuto = true; });
@@ -426,14 +438,18 @@ describe('wallboard snapshot & routing', () => {
       todayItems: [],
       routines: PHASE1_ROUTINES,
       exOf,
-      noteOf: () => '',
       prevOf: () => null,
     });
+    expect(JSON.stringify(ssSnap)).not.toContain('RIR');
     const stSs = ssSnap.lift!.stage!;
     expect(stSs.kind).toBe('superset');
     expect(stSs.stations).toHaveLength(2);
     expect(stSs.stations[0].isActive).toBe(true);
-    expect(stSs.stations[0].voiceHint!.chips[0].say).toBe('"Armory done"');
+    expect(stSs.stations[0].voiceHint!.chips.map((c) => c.say)).toEqual([
+      '"Armory done"',
+      '"Armory for 9"',
+      '"Armory 230 for 8"',
+    ]);
     expect(stSs.stations[0].sets[0].state).toBe('active');
     expect(stSs.stations[0].sets[0].isGhost).toBe(true);
     expect(stSs.stations[1].isActive).toBe(false);
@@ -441,7 +457,7 @@ describe('wallboard snapshot & routing', () => {
     expect(stSs.stations[1].sets[0].state).toBe('queued');
     expect(stSs.stations[1].sets[0].isGhost).toBe(true);
 
-    // 3. Blank un-prefilled weighted exercise never suggests "done"
+    // 3. Blank un-prefilled weighted exercise shows single clean prompt & never suggests "done"
     const blankExs: SessionEx[] = [
       { uid: 'b_ohp', exId: 'seated-dumbbell-shoulder-press', sets: [mkSet(null, null), mkSet(null, null)] },
     ];
@@ -460,7 +476,6 @@ describe('wallboard snapshot & routing', () => {
       todayItems: [],
       routines: PHASE1_ROUTINES,
       exOf,
-      noteOf: () => '',
       prevOf: () => null,
     });
     const blankStation = blankSnap.lift!.stage!.stations[0];
@@ -469,7 +484,6 @@ describe('wallboard snapshot & routing', () => {
     expect(blankStation.sets[0].isGhost).toBe(false);
     expect(blankStation.voiceHint!.chips.map((c) => c.say)).toEqual([
       '"Armory 50 for 10"',
-      '"Armory 50 for 10 RPE 8"',
     ]);
     expect(blankStation.voiceHint!.chips.some((c) => /done/i.test(c.say))).toBe(false);
   });

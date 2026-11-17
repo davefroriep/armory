@@ -90,6 +90,22 @@ class LiftStore {
       localStorage.setItem(CLEAN_ROWS_KEY, '1');
     }
 
+    const STRIP_EX_NOTES_KEY = 'armory.lifts.strip_ex_notes.v1';
+    if (typeof localStorage !== 'undefined' && !localStorage.getItem(STRIP_EX_NOTES_KEY)) {
+      for (const row of this.rows.values()) {
+        if (row.note != null) {
+          delete row.note;
+          await idbPut('lift_ex', row);
+        }
+      }
+      const actNote = this.active;
+      if (actNote && actNote.exs.some((se) => se.note != null)) {
+        actNote.exs.forEach((se) => { delete se.note; });
+        await idbPut('lift_sessions', actNote);
+      }
+      localStorage.setItem(STRIP_EX_NOTES_KEY, '1');
+    }
+
     // Auto-heal an empty active workout launched from a planned day before routines were seeded.
     const act = this.active;
     if (act && act.exs.length === 0) {

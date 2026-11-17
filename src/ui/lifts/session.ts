@@ -8,7 +8,6 @@ import {
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
-import { MUSCLE_LABEL } from '../../lifts/muscles';
 import { prescriptionFor } from '../../lifts/prescriptions';
 import { PHASE1_PLAN } from '../../domain/plan';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
@@ -132,14 +131,13 @@ function build(root: HTMLElement, id?: string): () => void {
     const wShow = set.w != null ? fmtKg(set.w) : '';
     const hasVid = !!set.vids?.length;
     const rpeTag = set.rpe != null ? `<u class="srpe">@${set.rpe}</u>` : '';
-    const dot = set.note ? '<i class="ndot"></i>' : '';
     const isTime = ex.type === 'time';
     const holdActive = hold?.setId === set.id;
     const holdBtn = isTime
       ? `<button class="shold${holdActive ? ' on' : ''}" type="button" data-act="hold" aria-label="Hold timer">${holdActive ? `${Math.max(1, Math.ceil((hold!.endMs - Date.now()) / 1000))}s` : '▶'}</button>`
       : '';
     return `<div class="srow${isTime ? ' t-row' : ''}${set.done ? ' done' : ''}${set.kind !== 'n' ? ' k-' + set.kind : ''}" data-i="${i}" data-sid="${set.id}">
-      <button class="snum${set.rpe != null ? ' has-rpe' : ''}" data-act="setmenu" aria-label="Set options">${kind}${pr ? '<i class="prstar">★</i>' : ''}${rpeTag}${dot}</button>
+      <button class="snum${set.rpe != null ? ' has-rpe' : ''}" data-act="setmenu" aria-label="Set options">${kind}${pr ? '<i class="prstar">★</i>' : ''}${rpeTag}</button>
       <button class="sprev" data-act="usePrev" ${prev ? '' : 'disabled'}>${prev ? esc(setText(prev, ex, unit())) : '–'}</button>
       <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '–' : 'BW'}" aria-label="Weight">
       <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${isTime ? 'sec' : '–'}" aria-label="${isTime ? 'Seconds' : 'Reps'}">
@@ -153,7 +151,6 @@ function build(root: HTMLElement, id?: string): () => void {
     const ex = exOf(se.exId);
     let w = 0;
     const labelMap = se.sets.map((x) => (x.kind === 'w' ? 0 : ++w));
-    const note = lifts.row(se.exId)?.note;
     const wHead = ex.type === 'bodyweight' ? `+${unit().toUpperCase()}` : unit().toUpperCase();
     const rHead = ex.type === 'time' ? 'SEC' : 'REPS';
     const restSec = active.restSecFor(se);
@@ -165,10 +162,9 @@ function build(root: HTMLElement, id?: string): () => void {
     return `<section class="xcard" data-idx="${idx}" data-uid="${se.uid}">
       <div class="xhead">
         <span class="xlab">${labs[idx]}</span>
-        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${esc(rx.repTarget)} · ${esc(rx.rpeTarget)} · ${ex.primary.map((m) => MUSCLE_LABEL[m]).join(' · ')}</small></button>
+        <button class="xname" data-act="exmenu"><b>${esc(ex.name)}</b><small>${esc(rx.repTarget)} · ${esc(rx.rpeTarget)}</small></button>
         <button class="xmore" data-act="exmenu" aria-label="Exercise options">⋯</button>
       </div>
-      ${note ? `<button class="xnote" data-act="exnote">${esc(note)}</button>` : ''}
       <div class="xth${ex.type === 'time' ? ' t-row' : ''}"><span>SET</span><span>PREVIOUS</span><span>${wHead}</span><span>${rHead}</span>${ex.type === 'time' ? '<span>HOLD</span>' : ''}<span></span><span></span></div>
       <div class="xrows">${se.sets.map((_, i) => rowHtml(se, ex, i, labelMap)).join('')}</div>
       <div class="xfoot">
@@ -535,7 +531,6 @@ function build(root: HTMLElement, id?: string): () => void {
     const idx = s.exs.indexOf(se);
     const k = await actionSheet(ex.name, [
       { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
-      { key: 'note', label: lifts.row(se.exId)?.note ? 'Edit note' : 'Add note', sub: 'Sticks to the exercise (seat height, handle…)' },
       ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
       { key: 'rest', label: 'Settings', sub: `${clock(active.restSecFor(se))} · Auto ${active.restAutoFor(s, idx) ? 'on' : 'off'}` },
       ...(idx > 0 ? [{ key: 'up', label: 'Move up' }] : []),
@@ -545,7 +540,6 @@ function build(root: HTMLElement, id?: string): () => void {
     ]);
     if (!k) return;
     if (k === 'swap') await swap(se);
-    else if (k === 'note') await editNote(se);
     else if (k === 'ss') { se.ss = !se.ss; save(); paint(); }
     else if (k === 'rest') await openTimerSheet(se);
     else if (k === 'up' || k === 'down') {
@@ -563,14 +557,6 @@ function build(root: HTMLElement, id?: string): () => void {
       save(); paint();
       toast(`${ex.name} removed`, { undo: () => restore(snap) });
     }
-  };
-
-  const editNote = async (se: SessionEx): Promise<void> => {
-    const cur = lifts.row(se.exId)?.note ?? '';
-    const v = await promptSheet(`${exOf(se.exId).name} note`, cur, 'Seat 4, neutral handles, pin 7…', true);
-    if (v == null) return;
-    await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), note: v || undefined });
-    paint();
   };
 
   const openTimerSheet = async (se: SessionEx): Promise<void> => {
@@ -713,7 +699,6 @@ function build(root: HTMLElement, id?: string): () => void {
       <h3 class="sh-title">${esc(ex.name)} · ${set.kind === 'w' ? 'Warm-up' : `Set ${n}`}</h3>
       <div class="fl">SET TYPE</div><div class="seg" id="sk"></div>
       <div class="fl">EFFORT <small>RPE</small></div><div class="chips-row wrap" id="sr"></div>
-      <div class="fl">NOTE</div><input class="lf-input" id="sn" value="${esc(set.note ?? '')}" placeholder="Optional" autocomplete="off">
       <div class="fl">VIDEO</div>
       <div class="vrow"><div id="sv" class="vthumbs">${vids()}</div></div>
       <button class="btn big" type="button" data-vmanage>Link or Record Video…</button>
@@ -750,8 +735,6 @@ function build(root: HTMLElement, id?: string): () => void {
       } else if (t.closest('[data-ok]')) sh.close();
     });
     await closed;
-    const note = (sh.body.querySelector<HTMLInputElement>('#sn')?.value ?? set.note ?? '').trim();
-    if (note) set.note = note; else delete set.note;
     save(); paint();
   };
 
@@ -950,7 +933,6 @@ function build(root: HTMLElement, id?: string): () => void {
     if (!card) return;
     const se = find(card.dataset.uid!);
     if (act === 'exmenu') return void (await exMenu(se));
-    if (act === 'exnote') return void (await editNote(se));
     if (act === 'reststart') {
       if (!edit) active.ensureStarted(s, true);
       if (liftSettings().restSound) audio.unlock();
