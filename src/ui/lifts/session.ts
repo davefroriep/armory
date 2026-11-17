@@ -2,7 +2,7 @@ import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import {
-  addSet, buildExercise, deleteSet, editReps, editWeight, hasLogged, isSessionStarted, labels, midSuperset,
+  addSet, buildExercise, canLog, deleteSet, editReps, editWeight, hasLogged, isSessionStarted, labels, midSuperset,
   prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
 } from '../../lifts/logic';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
@@ -306,13 +306,22 @@ function build(root: HTMLElement, id?: string): () => void {
     const ex = exOf(se.exId);
     const set = se.sets[i];
     const was = set.done;
-    const r = toggleDone(se, i, ex);
-    if (r === null) {
+    const shakeIncomplete = (): void => {
       row.classList.remove('shake'); void row.offsetWidth; row.classList.add('shake');
       buzz(40);
       row.querySelector<HTMLInputElement>(!set.r || set.r < 1 ? '.sr' : '.sw')?.focus();
+    };
+    if (fromDock && was) {
+      if (!canLog(set, ex)) return shakeIncomplete();
+      recomputePRs();
+      syncCard(card);
+      save();
+      focused?.blur();
+      hideDock();
       return;
     }
+    const r = toggleDone(se, i, ex);
+    if (r === null) return shakeIncomplete();
     if (r && !was) {
       if (!edit) active.ensureStarted(s);
       recomputePRs();
