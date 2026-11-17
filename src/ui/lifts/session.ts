@@ -311,9 +311,21 @@ function build(root: HTMLElement, id?: string): () => void {
       buzz(40);
       row.querySelector<HTMLInputElement>(!set.r || set.r < 1 ? '.sr' : '.sw')?.focus();
     };
+    const commitBuzz = (hadPr: boolean): void => {
+      const h = !hadPr ? hits.get(set.id) : undefined;
+      if (h) {
+        const prW = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit()}`;
+        toast(`New ${h.n}RM PR · ${prW}`, { kind: 'pr', ms: 3200 });
+        buzz([60, 40, 60, 40, 120]);
+      } else {
+        buzz(25);
+      }
+    };
     if (fromDock && was) {
       if (!canLog(set, ex)) return shakeIncomplete();
+      const hadPr = hits.has(set.id);
       recomputePRs();
+      commitBuzz(hadPr);
       syncCard(card);
       save();
       focused?.blur();
@@ -325,16 +337,11 @@ function build(root: HTMLElement, id?: string): () => void {
     if (r && !was) {
       if (!edit) active.ensureStarted(s);
       recomputePRs();
-      const h = hits.get(set.id);
       if (!edit) {
         active.afterSetLogged(s, idx);
         paintClock();
       }
-      if (h) {
-        const prW = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit()}`;
-        toast(`New ${h.n}RM PR · ${prW}`, { kind: 'pr', ms: 3200 });
-        buzz([60, 40, 60, 40, 120]);
-      } else buzz(25);
+      commitBuzz(false);
     } else {
       recomputePRs();
       if (!r && was && !edit) {
