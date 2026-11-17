@@ -164,5 +164,6 @@ final class WorkoutChime {
             }
             activeFocusReq = null;
         }
+        VoiceRecognitionManager.onAudioFocusRestored(c);
     }
 }

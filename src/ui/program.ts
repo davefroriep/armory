@@ -55,6 +55,7 @@ export async function collectLoggedByDate(): Promise<Map<string, { equipment: Eq
 function statusPillHtml(p: ProjectedStep, today: string): string {
   if (p.status === 'done') return `<span class="p-badge ok">✓ Done${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
   if (p.status === 'skipped') return `<span class="p-badge sk">Skipped${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
+  if (p.status === 'removed') return `<span class="p-badge">Removed${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
   if (p.status === 'early') return `<span class="p-badge ok">✓ Done early${p.date ? ` · ${esc(fmtShortDate(p.date, today))}` : ''}</span>`;
   if (p.status === 'current') return `<span class="p-badge cur">● Current · ${esc(p.date ? fmtShortDate(p.date, today) : 'Today')}</span>`;
   return `<span class="p-badge">~${esc(p.date ? fmtShortDate(p.date, today) : 'TBD')}</span>`;
@@ -322,10 +323,12 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
           const mins = Math.round(sl.seconds / 60);
           const st = p.slotStates[si];
           const loggedToday = p.status === 'current' && st === 'done' && loggedByDate.has(today);
-          const cls = st === 'skipped' ? ' skipped' : (st === 'done' || loggedToday) ? ' done' : '';
+          const cls = (st === 'skipped' || st === 'removed') ? ' skipped' : (st === 'done' || loggedToday) ? ' done' : '';
           const tag = st === 'skipped'
             ? '<small class="sk-tag">(skipped)</small>'
-            : `<small>${st === 'done' || loggedToday ? '✓' : `${mins}m`}</small>`;
+            : st === 'removed'
+              ? '<small>(removed)</small>'
+              : `<small>${st === 'done' || loggedToday ? '✓' : `${mins}m`}</small>`;
           return `<div class="p-slot${cls}">
             <span class="p-sico ${sl.equipment}">${ICON[sl.equipment]}</span>
             <span class="p-sname">${esc(sl.name)}</span>

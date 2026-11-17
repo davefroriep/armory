@@ -11,6 +11,7 @@ export type VoiceIntent =
   | { kind: 'rest_add'; deltaSec: number }
   | { kind: 'pause_workout' }
   | { kind: 'resume_workout' }
+  | { kind: 'finish_workout' }
   | { kind: 'add_set' }
   | { kind: 'add_set_prev_ex' }
   | { kind: 'delete_empty_sets' };
@@ -172,6 +173,7 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
 
   if (/^pause(?:\s+workout)?$/.test(tail)) return { kind: 'pause_workout' };
   if (/^resume(?:\s+workout)?$/.test(tail)) return { kind: 'resume_workout' };
+  if (/^(?:finish|end|complete)\s+workout$/.test(tail)) return { kind: 'finish_workout' };
 
   if (/^(?:(?:add(?:\s+a|\s+1|\s+another)?\s+set)|(?:(?:1|one|another|extra)\s+(?:more\s+)?set))\s+(?:(?:to|on|of|for)\s+)?(?:the\s+)?(?:last|previous|prev|prior)\s+exercise$/.test(tail)) {
     return { kind: 'add_set_prev_ex' };

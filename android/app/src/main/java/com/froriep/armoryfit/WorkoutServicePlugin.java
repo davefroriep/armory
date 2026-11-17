@@ -52,6 +52,7 @@ import java.util.ArrayList;
 )
 public class WorkoutServicePlugin extends Plugin {
     private static volatile WorkoutServicePlugin instance;
+    private static volatile boolean keepScreenOnWanted = false;
 
     @Override
     public void load() {
@@ -62,6 +63,13 @@ public class WorkoutServicePlugin extends Plugin {
     static void setAppVisible(Context c, boolean visible) {
         WorkoutForegroundService.appVisible = visible;
         VoiceRecognitionManager.onAppVisibilityChanged(c, visible);
+        WorkoutServicePlugin p = instance;
+        if (visible && p != null && keepScreenOnWanted) {
+            Activity act = p.getActivity();
+            if (act != null) {
+                act.runOnUiThread(() -> act.getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON));
+            }
+        }
         if (WorkoutForegroundService.running) {
             Intent i = new Intent(c, WorkoutForegroundService.class)
                     .setAction(WorkoutForegroundService.ACTION_APP_VISIBILITY);
@@ -204,6 +212,7 @@ public class WorkoutServicePlugin extends Plugin {
     @PluginMethod
     public void setKeepScreenOn(PluginCall call) {
         boolean on = call.getBoolean("on", false);
+        keepScreenOnWanted = on;
         Activity act = getActivity();
         if (act != null) {
             act.runOnUiThread(() -> {
@@ -253,11 +262,12 @@ public class WorkoutServicePlugin extends Plugin {
     @PluginMethod
     public void setVoiceListening(PluginCall call) {
         boolean enabled = call.getBoolean("enabled", false);
+        boolean forceRestart = call.getBoolean("forceRestart", false);
         if (enabled && getPermissionState("microphone") != PermissionState.GRANTED) {
             requestPermissionForAlias("microphone", call, "onMicPermResult");
             return;
         }
-        VoiceRecognitionManager.setEnabled(getContext(), enabled, readBiasPhrases(call));
+        VoiceRecognitionManager.setEnabled(getContext(), enabled, readBiasPhrases(call), forceRestart);
         call.resolve(VoiceRecognitionManager.status(getContext(), getPermissionState("microphone") == PermissionState.GRANTED));
     }
 
@@ -265,7 +275,7 @@ public class WorkoutServicePlugin extends Plugin {
     private void onMicPermResult(PluginCall call) {
         boolean granted = getPermissionState("microphone") == PermissionState.GRANTED;
         if (granted) {
-            VoiceRecognitionManager.setEnabled(getContext(), true, readBiasPhrases(call));
+            VoiceRecognitionManager.setEnabled(getContext(), true, readBiasPhrases(call), true);
             call.resolve(VoiceRecognitionManager.status(getContext(), true));
         } else {
             VoiceRecognitionManager.stop();

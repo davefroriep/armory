@@ -267,4 +267,40 @@ describe('local rolling schedule & queue reconciliation', () => {
     const rolled = reconcileQueue({ plan: PHASE1_PLAN, state, activities: [], today: '2026-11-18', tomorrow: '2026-11-19' });
     expect(rolled.nextState.extras?.[0].date).toBe('2026-11-18');
   });
+
+  it('tracks removedSlots independently from skippedSlots and advances queue without marking skipped or done', () => {
+    const mid = reconcileQueue({
+      plan: PHASE1_PLAN,
+      state: { ...defaultQueueState(), stagedDate: '2026-11-16', removedSlots: { '1:1': '2026-11-16' } },
+      activities: [],
+      today: '2026-11-16',
+      tomorrow: '2026-11-17',
+    });
+    expect(todayItemsFromQueue(PHASE1_PLAN, mid.nextState, '2026-11-16').map((i) => i.planSlot)).toEqual(['1:0']);
+
+    const after = reconcileQueue({
+      plan: PHASE1_PLAN,
+      state: { ...mid.nextState, completedSlots: [0] },
+      activities: [],
+      today: '2026-11-16',
+      tomorrow: '2026-11-17',
+    });
+    expect(after.nextState.stepIndex).toBe(2);
+
+    const removedAll = reconcileQueue({
+      plan: PHASE1_PLAN,
+      state: { ...after.nextState, removedSlots: { ...after.nextState.removedSlots, '2:0': '2026-11-17' } },
+      activities: [],
+      today: '2026-11-17',
+      tomorrow: '2026-11-18',
+    });
+    expect(removedAll.nextState.stepIndex).toBe(3);
+
+    const proj = projectPlan(PHASE1_PLAN, removedAll.nextState, '2026-11-18', 0);
+    expect(proj[1].slotStates).toEqual(['done', 'removed']);
+    expect(proj[1].slotDone).toEqual([true, false]);
+    expect(proj[1].status).toBe('done');
+    expect(proj[2].slotStates).toEqual(['removed']);
+    expect(proj[2].status).toBe('removed');
+  });
 });

@@ -58,7 +58,7 @@ const ARM_WINDOW_MS = 6500;
 const BASE_BIAS = [
   'armory', 'check', 'done', 'log', 'undo', 'next exercise', 'previous exercise',
   'add set', 'add set to last exercise', 'delete empty sets',
-  'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'rpe',
+  'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
 ];
 
 class VoiceController {
@@ -70,6 +70,7 @@ class VoiceController {
   lastError: string | null = null;
   lastAction: VoiceActionNotice | null = null;
   holdStarter: ((exUid: string, setId: string, seconds?: number) => boolean) | null = null;
+  finishTrigger: (() => void) | null = null;
 
   readonly changed = new Emitter<void>();
   readonly toasted = new Emitter<{ msg: string; kind?: 'pr' }>();
@@ -145,6 +146,14 @@ class VoiceController {
     return this.applyListening(on && this.liftScreenMounted);
   }
 
+  async restart(): Promise<boolean> {
+    updateSettings({ voiceEnabled: true });
+    if (!this.liftScreenMounted) return false;
+    const ok = await this.applyListening(true, true);
+    this.toasted.emit({ msg: 'Voice mic restarted' });
+    return ok;
+  }
+
   async refreshStatus(): Promise<void> {
     if (!isNative()) return;
     const st = await getNativeVoiceStatus();
@@ -186,9 +195,9 @@ class VoiceController {
     }
   }
 
-  private async applyListening(on: boolean): Promise<boolean> {
+  private async applyListening(on: boolean, forceRestart = false): Promise<boolean> {
     if (isNative()) {
-      const res = await setNativeVoiceListening(on, on ? this.biasPhrases() : []);
+      const res = await setNativeVoiceListening(on, on ? this.biasPhrases() : [], forceRestart);
       this.listening = res.listening;
       this.granted = res.granted;
       this.lastError = res.error ?? null;
@@ -362,6 +371,14 @@ class VoiceController {
     if (intent.kind === 'resume_workout') {
       if (active.resume()) return this.notice('Workout resumed', 'info');
       return this.notice('Workout is not paused', 'warn');
+    }
+    if (intent.kind === 'finish_workout') {
+      if (this.finishTrigger) {
+        buzz(25);
+        this.finishTrigger();
+        return this.notice('Finishing workout…', 'info', false);
+      }
+      return this.notice('Open active Strength workout to finish', 'warn');
     }
 
     const cur = resolveTargetSet(s.exs, this.cursor);

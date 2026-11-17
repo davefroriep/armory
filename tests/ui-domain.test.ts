@@ -301,5 +301,22 @@ describe('live HR sheet telemetry helpers', () => {
     expect(extraHtml).toContain('pull-up');
     expect(extraHtml).toContain('dumbbell-lateral-raise');
     expect(extraHtml).toContain('cable-triceps-pushdown');
+
+    const projRemoved = projectPlan(
+      PHASE1_PLAN,
+      { ...defaultQueueState(), stepIndex: 3, stagedDate: today, removedSlots: { '2:0': '2026-11-16' }, stepDates: { 2: '2026-11-16' } },
+      today,
+      0,
+    );
+    const removedHtml = renderDayZoomCard({
+      ymd: '2026-11-16',
+      today,
+      proj: projRemoved,
+      restDay: 0,
+      lookup,
+    });
+    expect(removedHtml).not.toContain('(skipped)');
+    expect(removedHtml).not.toContain('✓ Done');
+    expect(removedHtml).not.toContain('Spin Bike Z2');
   });
 });

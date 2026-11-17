@@ -122,10 +122,13 @@ body.dock-open .ltoast { bottom: calc(134px + var(--sab)); }
 .sstart { height: 34px; padding: 0 13px; border-radius: 999px; background: var(--green); color: #03140a; font-size: .78rem; font-weight: 900; letter-spacing: .04em; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex: none; }
 .sstart:active, .spause:active, .s-mic:active { transform: scale(.96); }
 .spause { height: 34px; padding: 0 12px; border-radius: 999px; background: rgba(245, 158, 11, .18); color: #fcd34d; box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .45); font-size: .76rem; font-weight: 800; letter-spacing: .03em; display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; flex: none; }
-.s-mic { width: 34px; height: 34px; border-radius: 999px; background: var(--card2); color: var(--mut); border: 1px solid var(--line); display: inline-grid; place-items: center; flex: none; }
-.s-mic svg { width: 15px; height: 15px; }
+.s-mic { min-width: 34px; height: 34px; padding: 0 9px; border-radius: 999px; background: var(--card2); color: var(--mut); border: 1px solid var(--line); display: inline-flex; align-items: center; justify-content: center; gap: 4px; flex: none; font-size: .68rem; font-weight: 900; letter-spacing: .04em; }
+.s-mic:not(.on):not(.armed):not(.warn) { padding: 0; width: 34px; }
+.s-mic svg { width: 15px; height: 15px; flex: none; }
+.s-mic-lbl:empty { display: none; }
 .s-mic.on { color: #86efac; background: rgba(34, 197, 94, .16); border-color: rgba(34, 197, 94, .5); }
 .s-mic.armed { color: #67e8f9; background: rgba(34, 211, 238, .22); border-color: #22d3ee; box-shadow: 0 0 12px rgba(34, 211, 238, .45); }
+.s-mic.warn { color: #fcd34d; background: rgba(245, 158, 11, .16); border-color: rgba(245, 158, 11, .5); }
 .stitle { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; text-align: left; line-height: 1.15; }
 .stitle b { font-size: 1.02rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .stitle small { color: var(--mut); font-size: .78rem; font-weight: 700; font-variant-numeric: tabular-nums; }

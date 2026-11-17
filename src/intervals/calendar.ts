@@ -175,6 +175,7 @@ class Calendar {
         !s.queue.completedSlots.includes(x.si)
         && !s.queue.doneEarly?.[x.k]
         && !s.queue.skippedSlots?.[x.k]
+        && !s.queue.removedSlots?.[x.k]
         && !(s.queue.carryOver ?? []).some((c) => c.planSlot === x.k),
       );
     const dates = pending.map((x) => s.queue.slotDates?.[x.si] ?? '');
@@ -307,10 +308,35 @@ class Calendar {
       return;
     }
     const skippedSlots = { ...(s.queue.skippedSlots ?? {}), [planSlot]: localDate() };
+    const removedSlots = { ...(s.queue.removedSlots ?? {}) };
+    delete removedSlots[planSlot];
     const doneEarly = { ...(s.queue.doneEarly ?? {}) };
     delete doneEarly[planSlot];
     const carryOver = (s.queue.carryOver ?? []).filter((c) => c.planSlot !== planSlot);
-    this.syncLocalState({ ...s.queue, skippedSlots, doneEarly, carryOver });
+    this.syncLocalState({ ...s.queue, skippedSlots, removedSlots, doneEarly, carryOver });
+    this.changed.emit();
+  }
+
+  /** Drops a planned slot or carry-over extra cleanly without marking `(skipped)` or logging externally. */
+  removeSlot(planSlot: string): void {
+    const s = getSettings();
+    const exId = parseExtraKey(planSlot);
+    if (exId) {
+      const extras = (s.queue.extras ?? []).filter((x) => x.id !== exId);
+      this.syncLocalState({ ...s.queue, extras });
+      this.changed.emit();
+      return;
+    }
+    const removedSlots = { ...(s.queue.removedSlots ?? {}), [planSlot]: localDate() };
+    const skippedSlots = { ...(s.queue.skippedSlots ?? {}) };
+    delete skippedSlots[planSlot];
+    const doneEarly = { ...(s.queue.doneEarly ?? {}) };
+    delete doneEarly[planSlot];
+    const carryOver = (s.queue.carryOver ?? []).filter((c) => c.planSlot !== planSlot);
+    const parsed = parseSlotKey(planSlot);
+    const slotDates = { ...(s.queue.slotDates ?? {}) };
+    if (parsed?.stepIndex === s.queue.stepIndex) delete slotDates[parsed.slotIndex];
+    this.syncLocalState({ ...s.queue, removedSlots, skippedSlots, doneEarly, carryOver, slotDates });
     this.changed.emit();
   }
 
@@ -382,6 +408,7 @@ class Calendar {
     const today = localDate();
     const doneEarly = { ...(s.queue.doneEarly ?? {}) };
     const skippedSlots = { ...(s.queue.skippedSlots ?? {}) };
+    const removedSlots = { ...(s.queue.removedSlots ?? {}) };
     let carryOver = [...(s.queue.carryOver ?? [])];
 
     if (clamped > s.queue.stepIndex) {
@@ -392,7 +419,7 @@ class Calendar {
           const k = slotKey(i, si);
           const wasDone = (i === s.queue.stepIndex && s.queue.completedSlots.includes(si)) || !!doneEarly[k];
           const carried = carryOver.some((c) => c.planSlot === k);
-          if (!wasDone && !carried && !skippedSlots[k]) {
+          if (!wasDone && !carried && !skippedSlots[k] && !removedSlots[k]) {
             skippedSlots[k] = today;
           }
         }
@@ -405,6 +432,7 @@ class Calendar {
         const k = slotKey(clamped, si);
         delete doneEarly[k];
         delete skippedSlots[k];
+        delete removedSlots[k];
         carryOver = carryOver.filter((c) => c.planSlot !== k);
       }
     }
@@ -417,6 +445,7 @@ class Calendar {
       slotDates: {},
       doneEarly,
       skippedSlots,
+      removedSlots,
       carryOver,
     });
     this.changed.emit();
@@ -444,16 +473,18 @@ class Calendar {
     if (!parsed) return;
     const skippedSlots = { ...(s.queue.skippedSlots ?? {}) };
     delete skippedSlots[planSlot];
+    const removedSlots = { ...(s.queue.removedSlots ?? {}) };
+    delete removedSlots[planSlot];
     const carryOver = (s.queue.carryOver ?? []).filter((c) => c.planSlot !== planSlot);
 
     if (parsed.stepIndex === s.queue.stepIndex) {
       const completedSlots = Array.from(new Set([...s.queue.completedSlots, parsed.slotIndex])).sort((a, b) => a - b);
       const slotDates = { ...(s.queue.slotDates ?? {}) };
       delete slotDates[parsed.slotIndex];
-      this.syncLocalState({ ...s.queue, completedSlots, slotDates, skippedSlots, carryOver, consumedIds });
+      this.syncLocalState({ ...s.queue, completedSlots, slotDates, skippedSlots, removedSlots, carryOver, consumedIds });
     } else {
       const doneEarly = { ...(s.queue.doneEarly ?? {}), [planSlot]: date };
-      this.syncLocalState({ ...s.queue, doneEarly, skippedSlots, carryOver, consumedIds });
+      this.syncLocalState({ ...s.queue, doneEarly, skippedSlots, removedSlots, carryOver, consumedIds });
     }
     this.changed.emit();
   }

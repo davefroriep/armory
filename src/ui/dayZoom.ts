@@ -199,8 +199,10 @@ function slotBadgeAndClass(state: SlotState): { badge: string; cls: string } {
       ? '<span class="p-badge ok">✓ Done</span>'
       : state === 'skipped'
         ? '<span class="p-badge sk">(skipped)</span>'
-        : '',
-    cls: state === 'done' ? ' done' : state === 'skipped' ? ' skipped' : '',
+        : state === 'removed'
+          ? '<span class="p-badge">(removed)</span>'
+          : '',
+    cls: state === 'done' ? ' done' : (state === 'skipped' || state === 'removed') ? ' skipped' : '',
   };
 }
 
@@ -303,7 +305,7 @@ export function resolveDayZoom(args: {
   const canShift = !!associatedStep && (
     associatedStep.status === 'upcoming'
     || (associatedStep.status === 'current' && associatedStep.date != null && associatedStep.date > today)
-    || ((associatedStep.status === 'done' || associatedStep.status === 'early' || associatedStep.status === 'skipped') && ymd < today)
+    || ((associatedStep.status === 'done' || associatedStep.status === 'early' || associatedStep.status === 'skipped' || associatedStep.status === 'removed') && ymd < today)
   );
   const futureDates = proj
     .flatMap((p) => p.slotDates)

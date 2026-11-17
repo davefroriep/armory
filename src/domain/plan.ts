@@ -40,6 +40,8 @@ export interface QueueState {
   stepDates?: Record<number, string>;
   /** Skipped slots: key `"${stepIndex}:${slotIndex}"` -> `"YYYY-MM-DD"`. */
   skippedSlots?: Record<string, string>;
+  /** Removed slots (dropped cleanly without `(skipped)` badge): key `"${stepIndex}:${slotIndex}"` -> `"YYYY-MM-DD"`. */
+  removedSlots?: Record<string, string>;
   /** Individual slots carried forward ("Add to tomorrow") independently of queue advancement. */
   carryOver?: { planSlot: string; date: string }[];
   /** One-off carry-over / make-up workouts attached to specific dates (e.g. skipped exercises). */
@@ -82,8 +84,8 @@ export interface IntervalsActivityLite {
   paired_event_id?: number | null;
 }
 
-export type SlotState = 'pending' | 'done' | 'skipped';
-export type StepStatus = 'done' | 'skipped' | 'early' | 'current' | 'upcoming';
+export type SlotState = 'pending' | 'done' | 'skipped' | 'removed';
+export type StepStatus = 'done' | 'skipped' | 'removed' | 'early' | 'current' | 'upcoming';
 
 export interface LocalTodayItem {
   planSlot: string;
@@ -373,6 +375,7 @@ export function reconcileQueue(args: {
   const doneEarly: Record<string, string> = { ...(state.doneEarly ?? {}) };
   const stepDates: Record<number, string> = { ...(state.stepDates ?? {}) };
   const skippedSlots: Record<string, string> = { ...(state.skippedSlots ?? {}) };
+  const removedSlots: Record<string, string> = { ...(state.removedSlots ?? {}) };
   const carryOver: { planSlot: string; date: string }[] = (state.carryOver ?? []).map((c) => ({ ...c }));
   const extras: ExtraWorkout[] = (state.extras ?? []).map((x) =>
     !x.doneDate && !x.skippedDate && x.date < today ? { ...x, date: today } : { ...x },
@@ -382,7 +385,7 @@ export function reconcileQueue(args: {
 
   const isSlotResolvedOnStep = (si: number): boolean => {
     const k = slotKey(stepIndex, si);
-    return completedSlots.has(si) || !!skippedSlots[k] || carryOver.some((c) => c.planSlot === k);
+    return completedSlots.has(si) || !!skippedSlots[k] || !!removedSlots[k] || carryOver.some((c) => c.planSlot === k);
   };
 
   const allSlotsResolved = (): boolean => {
@@ -401,6 +404,7 @@ export function reconcileQueue(args: {
         completedSlots.add(si);
         delete doneEarly[k];
         delete skippedSlots[k];
+        delete removedSlots[k];
         delete slotDates[si];
         const ci = carryOver.findIndex((c) => c.planSlot === k);
         if (ci >= 0) carryOver.splice(ci, 1);
@@ -436,6 +440,7 @@ export function reconcileQueue(args: {
         doneEarly[hit.planSlot] = actDate;
       }
       delete skippedSlots[hit.planSlot];
+      delete removedSlots[hit.planSlot];
       consumed.add(String(act.id));
       continue;
     }
@@ -457,7 +462,7 @@ export function reconcileQueue(args: {
           const fut = plan.steps[sIdx];
           for (let slIdx = 0; slIdx < fut.slots.length; slIdx++) {
             const k = slotKey(sIdx, slIdx);
-            if (!doneEarly[k] && !skippedSlots[k] && activityMatchesSlot(act, fut.slots[slIdx]) && matchesExplicitTag(act.name, fut.slots[slIdx].name)) {
+            if (!doneEarly[k] && !skippedSlots[k] && !removedSlots[k] && activityMatchesSlot(act, fut.slots[slIdx]) && matchesExplicitTag(act.name, fut.slots[slIdx].name)) {
               doneEarly[k] = actDate;
               consumed.add(String(act.id));
               matched = true;
@@ -501,7 +506,7 @@ export function reconcileQueue(args: {
     stagedDate = null;
   }
 
-  const cleanCarry = carryOver.filter((c) => !doneEarly[c.planSlot] && !skippedSlots[c.planSlot]);
+  const cleanCarry = carryOver.filter((c) => !doneEarly[c.planSlot] && !skippedSlots[c.planSlot] && !removedSlots[c.planSlot]);
   const consumedList = Array.from(consumed).slice(-40);
   return {
     nextState: {
@@ -513,6 +518,7 @@ export function reconcileQueue(args: {
       doneEarly,
       stepDates,
       skippedSlots,
+      removedSlots,
       carryOver: cleanCarry,
       extras,
       consumedIds: consumedList,
@@ -548,7 +554,7 @@ export function todayItemsFromQueue(plan: RollingPlan, state: QueueState, today:
   }
 
   for (const c of state.carryOver ?? []) {
-    if (c.date > today || state.skippedSlots?.[c.planSlot] || state.doneEarly?.[c.planSlot]) continue;
+    if (c.date > today || state.skippedSlots?.[c.planSlot] || state.removedSlots?.[c.planSlot] || state.doneEarly?.[c.planSlot]) continue;
     const p = parseSlotKey(c.planSlot);
     const slot = p ? plan.steps[p.stepIndex]?.slots[p.slotIndex] : undefined;
     if (!p || !slot) continue;
@@ -569,7 +575,7 @@ export function todayItemsFromQueue(plan: RollingPlan, state: QueueState, today:
     const baseDate = state.stagedDate && state.stagedDate > today ? state.stagedDate : today;
     step.slots.forEach((slot, si) => {
       const k = slotKey(state.stepIndex, si);
-      if (seen.has(k) || state.completedSlots.includes(si) || state.doneEarly?.[k] || state.skippedSlots?.[k]) return;
+      if (seen.has(k) || state.completedSlots.includes(si) || state.doneEarly?.[k] || state.skippedSlots?.[k] || state.removedSlots?.[k]) return;
       if ((state.carryOver ?? []).some((c) => c.planSlot === k)) return;
       const ov = state.slotDates?.[si];
       const d = ov && ov > baseDate ? ov : baseDate;
@@ -609,6 +615,7 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
     if (i < state.stepIndex) {
       const slotStates: SlotState[] = step.slots.map((_, si) => {
         const k = slotKey(i, si);
+        if (state.removedSlots?.[k]) return 'removed';
         if (state.skippedSlots?.[k]) return 'skipped';
         if (carryMap.has(k)) return 'pending';
         return 'done';
@@ -616,12 +623,17 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
       const slotDone = slotStates.map((st) => st === 'done');
       const slotDates = step.slots.map((_, si) => {
         const k = slotKey(i, si);
+        if (state.removedSlots?.[k]) return state.removedSlots[k];
         if (state.skippedSlots?.[k]) return state.skippedSlots[k];
         if (carryMap.has(k)) return carryMap.get(k)!;
         return state.doneEarly?.[k] ?? state.stepDates?.[i] ?? null;
       });
       const d = state.stepDates?.[i] ?? slotDates.find((x) => !!x) ?? null;
-      const status: StepStatus = slotStates.every((st) => st === 'skipped') ? 'skipped' : 'done';
+      const status: StepStatus = slotStates.every((st) => st === 'removed')
+        ? 'removed'
+        : slotStates.every((st) => st === 'skipped' || st === 'removed')
+          ? 'skipped'
+          : 'done';
       out.push({ step, status, date: d, slotDone, slotStates, slotDates });
       continue;
     }
@@ -629,6 +641,7 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
     if (i === state.stepIndex) {
       const slotStates: SlotState[] = step.slots.map((_, si) => {
         const k = slotKey(i, si);
+        if (state.removedSlots?.[k]) return 'removed';
         if (state.skippedSlots?.[k]) return 'skipped';
         if (state.completedSlots.includes(si) || state.doneEarly?.[k]) return 'done';
         return 'pending';
@@ -638,6 +651,7 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
       const slotDates = step.slots.map((_, si) => {
         const k = slotKey(i, si);
         if (carryMap.has(k)) return carryMap.get(k)!;
+        if (state.removedSlots?.[k]) return state.removedSlots[k];
         if (state.skippedSlots?.[k]) return state.skippedSlots[k];
         const early = state.doneEarly?.[k];
         if (early) return early;
@@ -654,6 +668,7 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
 
     const slotStates: SlotState[] = step.slots.map((_, si) => {
       const k = slotKey(i, si);
+      if (state.removedSlots?.[k]) return 'removed';
       if (state.skippedSlots?.[k]) return 'skipped';
       if (state.doneEarly?.[k]) return 'done';
       return 'pending';
@@ -661,11 +676,15 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
     const slotDone = slotStates.map((st) => st === 'done');
     const resolvedDates = step.slots.map((_, si) => {
       const k = slotKey(i, si);
-      return state.skippedSlots?.[k] ?? state.doneEarly?.[k] ?? null;
+      return state.removedSlots?.[k] ?? state.skippedSlots?.[k] ?? state.doneEarly?.[k] ?? null;
     });
     if (slotStates.every((st) => st !== 'pending')) {
       const latest = resolvedDates.filter((d): d is string => !!d).sort().pop() ?? null;
-      const status: StepStatus = slotStates.every((st) => st === 'skipped') ? 'skipped' : 'early';
+      const status: StepStatus = slotStates.every((st) => st === 'removed')
+        ? 'removed'
+        : slotStates.some((st) => st === 'done')
+          ? 'early'
+          : 'skipped';
       out.push({ step, status, date: latest, slotDone, slotStates, slotDates: resolvedDates });
       continue;
     }
@@ -681,7 +700,7 @@ export function projectPlan(plan: RollingPlan, state: QueueState, today: string,
 
 export function nextEquipmentSlot(proj: ProjectedStep[], eq: Equipment): { p: ProjectedStep; slot: PlanSlot; slotIndex: number } | null {
   for (const p of proj) {
-    if (p.status === 'early' || p.status === 'skipped') continue;
+    if (p.status === 'early' || p.status === 'skipped' || p.status === 'removed') continue;
     for (let si = 0; si < p.step.slots.length; si++) {
       if (p.slotStates[si] === 'pending' && p.step.slots[si].equipment === eq) {
         return { p, slot: p.step.slots[si], slotIndex: si };

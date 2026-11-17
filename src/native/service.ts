@@ -72,7 +72,7 @@ interface WorkoutServicePlugin {
   stopWallboard(): Promise<void>;
   getWallboardStatus(): Promise<WallboardStatus>;
   pushWallboardState(o: { stateJson: string }): Promise<{ clients: number }>;
-  setVoiceListening(o: { enabled: boolean; biasPhrases: string[] }): Promise<NativeVoiceStatus>;
+  setVoiceListening(o: { enabled: boolean; biasPhrases: string[]; forceRestart?: boolean }): Promise<NativeVoiceStatus>;
   getVoiceStatus(): Promise<NativeVoiceStatus>;
   ensureVoicePermission(): Promise<{ granted: boolean }>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
@@ -200,9 +200,9 @@ export async function pushNativeWallboardState(stateJson: string): Promise<numbe
   try { return (await plugin.pushWallboardState({ stateJson })).clients; } catch { return 0; }
 }
 
-export async function setNativeVoiceListening(enabled: boolean, biasPhrases: string[]): Promise<NativeVoiceStatus> {
+export async function setNativeVoiceListening(enabled: boolean, biasPhrases: string[], forceRestart = false): Promise<NativeVoiceStatus> {
   if (!plugin) return { listening: false, granted: false, available: false, error: 'Android APK required' };
-  try { return await plugin.setVoiceListening({ enabled, biasPhrases }); }
+  try { return await plugin.setVoiceListening({ enabled, biasPhrases, forceRestart }); }
   catch (e) { return { listening: false, granted: false, available: false, error: (e as Error).message }; }
 }
 

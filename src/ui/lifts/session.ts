@@ -81,7 +81,7 @@ function build(root: HTMLElement, id?: string): () => void {
     clearInterval(hold.timer);
     hold = null;
     setWallboardHoldState(null);
-    void setKeepScreenOn(false);
+    if (edit) void setKeepScreenOn(false);
     paintHoldBtn(prevId);
   };
   const startHold = (se: SessionEx, i: number, card: HTMLElement, row: HTMLElement): void => {
@@ -194,7 +194,7 @@ function build(root: HTMLElement, id?: string): () => void {
 
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/strength';
-    const micBtn = edit ? '' : '<button class="s-mic" id="smic" type="button" data-act="voice" aria-label="Voice commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg></button>';
+    const micBtn = edit ? '' : '<button class="s-mic" id="smic" type="button" data-act="voice" aria-label="Voice commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg><span class="s-mic-lbl" id="smicLbl"></span></button>';
     return `<header class="bar sbar">
       <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
       <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
@@ -212,12 +212,25 @@ function build(root: HTMLElement, id?: string): () => void {
   const paintMic = (): void => {
     const btn = root.querySelector<HTMLElement>('#smic');
     if (!btn) return;
+    const lbl = btn.querySelector<HTMLElement>('#smicLbl');
     const on = getSettings().voiceEnabled;
     const armed = voice.isArmed();
-    btn.classList.toggle('on', on && voice.listening);
+    const liveMic = on && voice.listening;
+    const waiting = on && !voice.listening;
+    btn.classList.toggle('on', liveMic && !armed);
     btn.classList.toggle('armed', on && armed);
+    btn.classList.toggle('warn', waiting);
+    if (lbl) {
+      lbl.textContent = !on ? '' : armed ? 'ARMED' : liveMic ? 'MIC' : 'MIC …';
+    }
     btn.setAttribute('aria-pressed', String(on));
-    btn.title = armed ? 'Listening for command…' : on ? `Say "${getSettings().voiceWakeWord || 'armory'} …"` : 'Enable hands-free voice logging';
+    btn.title = armed
+      ? 'Listening for command…'
+      : liveMic
+        ? `Mic live — say "${getSettings().voiceWakeWord || 'armory'} …"`
+        : waiting
+          ? 'Voice paused or recovering — tap to restart mic'
+          : 'Enable hands-free voice logging';
   };
 
   const paint = (): void => {
@@ -904,7 +917,16 @@ function build(root: HTMLElement, id?: string): () => void {
     }
     if (act === 'voice') {
       if (!edit) {
-        void voice.setEnabled(!getSettings().voiceEnabled).then(() => paintMic());
+        if (getSettings().voiceEnabled && !voice.listening) {
+          void voice.restart().then(() => paintMic());
+        } else {
+          const next = !getSettings().voiceEnabled;
+          void voice.setEnabled(next).then((ok) => {
+            paintMic();
+            if (next && ok) toast(`Voice on — say "${getSettings().voiceWakeWord || 'armory'} …"`);
+            else if (!next) toast('Voice commands off');
+          });
+        }
       }
       return;
     }
@@ -970,16 +992,28 @@ function build(root: HTMLElement, id?: string): () => void {
     }
   });
 
+  const onVisKeepAwake = (): void => {
+    if (!document.hidden && !dead && !edit) void setKeepScreenOn(true);
+  };
+  if (!edit) {
+    void setKeepScreenOn(true);
+    document.addEventListener('visibilitychange', onVisKeepAwake);
+    voice.finishTrigger = () => { void finish(); };
+  }
+
   paint();
 
   return () => {
     dead = true;
     stopHold();
+    document.removeEventListener('visibilitychange', onVisKeepAwake);
     window.visualViewport?.removeEventListener('resize', onVvResize);
     offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice();
     if (!edit) {
       voice.holdStarter = null;
+      voice.finishTrigger = null;
       voice.setLiftScreenMounted(false);
+      void setKeepScreenOn(false);
     }
     hideDock();
     void lifts.flush();
