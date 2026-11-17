@@ -11,7 +11,7 @@ import { retryPending } from '../../workout/sync';
 import { revFooter } from '../chrome';
 import { esc, hms } from '../dom';
 import { ZONE_COLOR, hrZone } from '../hr';
-import { openShareCard, skippedCard, stat, wireSkippedCard } from './cards';
+import { openShareCard, stat } from './cards';
 import { mount, promptSheet, toast } from './kit';
 
 /** Post-workout: numbers, PRs, effort rating, share card. The Intervals.icu upload has already started by itself. */
@@ -36,7 +36,6 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
         const wTxt = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit}`;
         return `<div class="prl"><i>★</i><b>${esc(ex.name)}</b><span>${h.n}RM · ${wTxt}${x.vids?.length ? ' 🎥' : ''}</span></div>`;
       }).join('')}</section>` : ''}
-      ${skippedCard(s)}
       <div id="hrzones"></div>
       <div id="sync" class="status busy"><span class="spinner"></span> Logging to Intervals.icu…</div>
       <h2 class="sec">HOW HARD WAS IT?</h2>
@@ -106,10 +105,6 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
         toast(`“${name}” saved. Find it under My Days`);
       }
     });
-    const offSkip = wireSkippedCard(root, () => lifts.sessions.get(s.id), () => {
-      const box = root.querySelector('[data-sk-card]');
-      if (box) box.outerHTML = skippedCard(s);
-    });
-    return () => { alive = false; offSkip(); clearInterval(poll); };
+    return () => { alive = false; clearInterval(poll); };
   });
 }

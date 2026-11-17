@@ -4,67 +4,12 @@ import { hrSummary } from '../../lifts/intervals';
 import { renderShareCard, shareImage } from '../../lifts/share';
 import { liftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
-import { calendar, localDate, addDays } from '../../intervals/calendar';
-import { effectiveSkipped, fmtDuration, fmtVolume, formatSkippedItem, sessionPRs } from '../../lifts/summary';
+import { fmtDuration, fmtVolume, sessionPRs } from '../../lifts/summary';
 import type { LiftSession } from '../../lifts/types';
 import { esc } from '../dom';
 import { openSheet, toast } from './kit';
 
 export const stat = (label: string, value: string): string => `<div><small>${label}</small><b>${value}</b></div>`;
-
-/** Skipped / partially logged exercises card for Summary and Workout History with 1-tap same-day / tomorrow scheduling. */
-export function skippedCard(s: LiftSession): string {
-  const skipped = effectiveSkipped(s);
-  if (!skipped.length) return '';
-  const rows = skipped.map((sk) => {
-    const name = lifts.exOrStub(sk.exId).name;
-    const status = sk.doneSets === 0
-      ? `0/${sk.plannedSets} sets`
-      : `${sk.doneSets}/${sk.plannedSets} sets · ${sk.plannedSets - sk.doneSets} skipped`;
-    return `<div class="wsk-row"><b>${esc(name)}</b><span>${esc(status)}</span></div>`;
-  }).join('');
-  const existing = calendar.makeupForSession(s.id);
-  const today = localDate();
-  const tomorrow = addDays(today, 1);
-  let note = '';
-  if (existing?.doneDate) note = `<p class="wsk-note">✓ Make-up completed</p>`;
-  else if (existing && !existing.skippedDate) {
-    const lbl = existing.date <= today ? 'Today' : existing.date === tomorrow ? 'Tomorrow' : existing.date;
-    note = `<p class="wsk-note">✓ Scheduled for ${esc(lbl)} (${existing.name})</p>`;
-  }
-  return `<section class="card wskipped" data-sk-card>
-    <div class="card-h"><span>SKIPPED</span></div>
-    ${rows}
-    ${note}
-    <div class="wsk-acts">
-      <button class="btn sm" type="button" data-sk-when="today">Do later today</button>
-      <button class="btn sm" type="button" data-sk-when="tomorrow">Carry to tomorrow</button>
-    </div>
-  </section>`;
-}
-
-export function wireSkippedCard(root: HTMLElement, getSession: () => LiftSession | undefined, onScheduled?: () => void): () => void {
-  const onClick = (e: Event): void => {
-    const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-sk-when]');
-    if (!btn) return;
-    const s = getSession();
-    if (!s) return;
-    const skipped = effectiveSkipped(s);
-    if (!skipped.length) return;
-    const when = btn.dataset.skWhen as 'today' | 'tomorrow';
-    const items = skipped.map((sk) => ({
-      exId: sk.exId,
-      sets: Math.max(1, sk.plannedSets - sk.doneSets),
-      ...(sk.ss ? { ss: true } : {}),
-    }));
-    const description = `Skipped from ${s.name}: ${skipped.map((sk) => formatSkippedItem(sk, lifts.exOrStub)).join(' · ')}`;
-    calendar.scheduleSkippedMakeup({ sessionId: s.id, name: s.name, items, when, description });
-    toast(when === 'today' ? 'Added to Today’s workouts' : 'Carried over to Tomorrow');
-    onScheduled?.();
-  };
-  root.addEventListener('click', onClick);
-  return () => root.removeEventListener('click', onClick);
-}
 
 /** Compact history row for a finished session. */
 export function sessionRow(s: LiftSession): string {

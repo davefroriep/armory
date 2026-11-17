@@ -3,10 +3,11 @@ import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import { advanceCursorAfterLog, resolveTargetSet } from '../../lifts/cursor';
 import {
-  addSet, buildExercise, canLog, deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
-  prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone, unloggedCount,
+  addSet, buildExercise, canLog, collectUnfinishedItems, deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
+  prevSetFor, removeLastSet, supersetGroups, swapExercise, toggleDone,
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
+import { calendar } from '../../intervals/calendar';
 import { MUSCLE_LABEL } from '../../lifts/muscles';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
@@ -297,6 +298,15 @@ function build(root: HTMLElement, id?: string): () => void {
   const offCfg = liftSettingsChanged.on(() => { if (!dead) paint(); });
   const syncVisibleCards = (): void => {
     if (dead) return;
+    const domSig = [...root.querySelectorAll<HTMLElement>('.xcard')]
+      .map((c) => `${c.dataset.uid}:${[...c.querySelectorAll<HTMLElement>('.srow')].map((r) => r.dataset.sid).join(',')}`)
+      .join('|');
+    const modelSig = s.exs.map((e) => `${e.uid}:${e.sets.map((x) => x.id).join(',')}`).join('|');
+    if (domSig !== modelSig) {
+      paint();
+      root.querySelector('.srow.cur-target')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      return;
+    }
     recomputePRs();
     root.querySelectorAll<HTMLElement>('.xcard').forEach((card) => syncCard(card));
     paintTarget();
@@ -305,6 +315,7 @@ function build(root: HTMLElement, id?: string): () => void {
   };
   const offVoice = edit ? () => {} : voice.changed.on(syncVisibleCards);
   if (!edit) {
+    voice.setLiftScreenMounted(true);
     voice.holdStarter = (exUid, setId, seconds) => {
       const se = s.exs.find((e) => e.uid === exUid);
       const si = se?.sets.findIndex((x) => x.id === setId) ?? -1;
@@ -466,6 +477,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (r && !was) {
       if (!edit) {
         active.ensureStarted(s);
+        voice.recordLoggedExercise(se.uid);
         voice.setCursor(advanceCursorAfterLog(s.exs, { exIdx: idx, setIdx: i }));
       }
       recomputePRs();
@@ -726,6 +738,25 @@ function build(root: HTMLElement, id?: string): () => void {
     save(); paint();
   };
 
+  const promptUnfinishedAction = (title: string, msg: string): Promise<'today' | 'tomorrow' | 'delete' | 'cancel'> =>
+    new Promise((resolve) => {
+      let out: 'today' | 'tomorrow' | 'delete' | 'cancel' = 'cancel';
+      const sh = openSheet(
+        `<h3 class="sh-title">${esc(title)}</h3><p class="sh-text">${esc(msg)}</p>
+         <button class="btn primary big" type="button" data-uf="today">Do later today</button>
+         <button class="btn big" type="button" data-uf="tomorrow">Do tomorrow</button>
+         <button class="btn danger big" type="button" data-uf="delete">Delete unfinished sets &amp; finish</button>
+         <button class="btn big" type="button" data-uf="cancel">Keep lifting</button>`,
+        { onClose: () => resolve(out) },
+      );
+      sh.body.addEventListener('click', (ev) => {
+        const uf = (ev.target as HTMLElement).closest<HTMLElement>('[data-uf]')?.dataset.uf as typeof out | undefined;
+        if (!uf) return;
+        out = uf;
+        sh.close();
+      });
+    });
+
   const finish = async (skipConfirm = false): Promise<boolean> => {
     if (edit) { allowNextRoute(); location.hash = `#/strength/workout/${s.id}`; return true; }
     if (!s.exs.some(hasLogged)) {
@@ -739,13 +770,29 @@ function build(root: HTMLElement, id?: string): () => void {
       return false;
     }
     if (!skipConfirm) {
-      const left = unloggedCount(s);
-      const ok = await confirmSheet(
-        'Finish workout?',
-        left ? `${left} set${left === 1 ? ' isn’t' : 's aren’t'} logged and will be marked skipped. It uploads to Intervals.icu automatically.` : 'It uploads to Intervals.icu automatically.',
-        'Finish & save', false, 'Keep lifting',
-      );
-      if (!ok) return false;
+      const unfinished = collectUnfinishedItems(s);
+      if (unfinished.length > 0) {
+        const leftSets = unfinished.reduce((n, x) => n + x.sets, 0);
+        const summary = unfinished.map((u) => `${exOf(u.exId).name} (${u.sets})`).join(' · ');
+        const choice = await promptUnfinishedAction(
+          'There are unfinished sets',
+          `${leftSets} unfinished set${leftSets === 1 ? '' : 's'}: ${summary}. Delete them or do them later?`,
+        );
+        if (choice === 'cancel') return false;
+        if (choice === 'today' || choice === 'tomorrow') {
+          calendar.scheduleSkippedMakeup({
+            sessionId: s.id,
+            name: s.name,
+            items: unfinished,
+            when: choice,
+            description: `Remaining from ${s.name}: ${summary}`,
+          });
+          toast(choice === 'today' ? 'Scheduled remaining sets for later today' : 'Scheduled remaining sets for tomorrow');
+        }
+      } else {
+        const ok = await confirmSheet('Finish workout?', 'It uploads to Intervals.icu automatically.', 'Finish & save', false, 'Keep lifting');
+        if (!ok) return false;
+      }
     }
     finishing = true;
     allowNextRoute();
@@ -930,7 +977,10 @@ function build(root: HTMLElement, id?: string): () => void {
     stopHold();
     window.visualViewport?.removeEventListener('resize', onVvResize);
     offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice();
-    if (!edit) voice.holdStarter = null;
+    if (!edit) {
+      voice.holdStarter = null;
+      voice.setLiftScreenMounted(false);
+    }
     hideDock();
     void lifts.flush();
     if (edit && dirty) void resyncSession(s.id);

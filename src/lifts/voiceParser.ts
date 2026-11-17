@@ -10,7 +10,10 @@ export type VoiceIntent =
   | { kind: 'rest_skip' }
   | { kind: 'rest_add'; deltaSec: number }
   | { kind: 'pause_workout' }
-  | { kind: 'resume_workout' };
+  | { kind: 'resume_workout' }
+  | { kind: 'add_set' }
+  | { kind: 'add_set_prev_ex' }
+  | { kind: 'delete_empty_sets' };
 
 const ONES: Record<string, number> = {
   zero: 0, oh: 0, o: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
@@ -169,6 +172,16 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
 
   if (/^pause(?:\s+workout)?$/.test(tail)) return { kind: 'pause_workout' };
   if (/^resume(?:\s+workout)?$/.test(tail)) return { kind: 'resume_workout' };
+
+  if (/^(?:(?:add(?:\s+a|\s+1|\s+another)?\s+set)|(?:(?:1|one|another|extra)\s+(?:more\s+)?set))\s+(?:(?:to|on|of|for)\s+)?(?:the\s+)?(?:last|previous|prev|prior)\s+exercise$/.test(tail)) {
+    return { kind: 'add_set_prev_ex' };
+  }
+  if (/^(?:add(?:\s+a|\s+1|\s+another)?\s+set|(?:1|one|another|extra)\s+(?:more\s+)?set)(?:\s+(?:here|to\s+(?:this|current)(?:\s+exercise)?))?$/.test(tail)) {
+    return { kind: 'add_set' };
+  }
+  if (/^(?:delete|remove|drop|clear)\s+(?:all\s+|the\s+)?(?:empty|unlogged|unfinished|remaining)\s+sets?$/.test(tail)) {
+    return { kind: 'delete_empty_sets' };
+  }
 
   if (/^(?:next|next\s+exercise|skip\s+exercise)$/.test(tail)) return { kind: 'next_ex' };
   if (/^(?:prev|previous|previous\s+exercise|back\s+exercise)$/.test(tail)) return { kind: 'prev_ex' };

@@ -110,7 +110,8 @@ function render(st) {
   const v = st.voice || {};
   const micCls = v.armed ? 'mic armed' : v.listening ? 'mic on' : 'mic';
   const micLbl = v.armed ? 'LISTENING…' : v.listening ? '“' + esc((v.wakeWord || 'armory').toUpperCase()) + ' …”' : 'MIC OFF';
-  const banner = v.banner ? '<div class="vtoast ' + esc(v.banner.kind) + '">' + esc(v.banner.text) + '</div>' : '';
+  const micBadge = st.mode === 'lift' ? '<div class="' + micCls + '"><i class="dot"></i><span>' + micLbl + '</span></div>' : '';
+  const banner = st.mode === 'lift' && v.banner ? '<div class="vtoast ' + esc(v.banner.kind) + '">' + esc(v.banner.text) + '</div>' : '';
 
   const hr = st.hr || {};
   const hrColor = ZCOL[hr.zone || 0] || '#fff';
@@ -172,7 +173,7 @@ function render(st) {
       + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker">TODAY ON THE SCHEDULE</div>' + items + '</section></div></div>';
   }
 
-  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + '</div><div class="top-r"><div class="' + micCls + '"><i class="dot"></i><span>' + micLbl + '</span></div><div class="clk">' + esc(nowStr) + '</div></div></div>' + banner + main;
+  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + '</div><div class="top-r">' + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + banner + main;
 }
 
 window.addEventListener('message', (ev) => {

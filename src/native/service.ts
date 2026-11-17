@@ -74,6 +74,7 @@ interface WorkoutServicePlugin {
   pushWallboardState(o: { stateJson: string }): Promise<{ clients: number }>;
   setVoiceListening(o: { enabled: boolean; biasPhrases: string[] }): Promise<NativeVoiceStatus>;
   getVoiceStatus(): Promise<NativeVoiceStatus>;
+  ensureVoicePermission(): Promise<{ granted: boolean }>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
@@ -209,6 +210,12 @@ export async function getNativeVoiceStatus(): Promise<NativeVoiceStatus> {
   if (!plugin) return { listening: false, granted: false, available: false };
   try { return await plugin.getVoiceStatus(); }
   catch { return { listening: false, granted: false, available: false }; }
+}
+
+export async function ensureNativeVoicePermission(): Promise<boolean> {
+  if (!plugin) return true;
+  try { return (await plugin.ensureVoicePermission()).granted; }
+  catch { return false; }
 }
 
 export function onNativeVoiceResult(cb: (ev: NativeVoiceEvent) => void): () => void {

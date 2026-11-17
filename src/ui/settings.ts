@@ -54,9 +54,9 @@ export function settingsScreen(root: HTMLElement): () => void {
         <button class="btn sm" id="wbCopy">Copy TV URL</button>
         <a class="btn sm primary" href="#/wallboard">Open Preview &amp; Setup ›</a>
       </div>
-      <div class="line" style="margin-top:8px"><span>Hands-Free Voice Commands<small>Active ONLY while Armory Fit is open on screen</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
+      <div class="line" style="margin-top:8px"><span>Hands-Free Voice Commands<small>Strength workouts only · listens while an active lift is open</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
       <label class="field">Wake word<input id="vxWake" value="${esc(s.voiceWakeWord || 'armory')}" placeholder="armory" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
-      <p class="hint">Say: “Armory 225 for 8” · “Armory check” · “Armory next exercise” · “Armory 2B” · “Armory skip rest” · “Armory undo”.</p>
+      <p class="hint">Say: “Armory 225 for 8” · “Armory check” · “Armory add set” · “Armory add set to last exercise” · “Armory delete empty sets” · “Armory next exercise” · “Armory undo”.</p>
       <div class="hint" id="vxStatus"></div>
       <div class="row" style="margin-top:6px">
         <input class="lf-input" id="vxTest" style="flex:1;padding:8px 10px;font-size:.88rem" placeholder="Test phrase (e.g. armory 225 for 8)" autocomplete="off">

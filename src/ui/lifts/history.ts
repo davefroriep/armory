@@ -6,7 +6,7 @@ import { startWorkout } from './train';
 import { getMeta, getSamples } from '../../store/db';
 import { hrSummary } from '../../lifts/intervals';
 import { esc } from '../dom';
-import { openShareCard, sessionRow, skippedCard, stat, wireSkippedCard } from './cards';
+import { openShareCard, sessionRow, stat } from './cards';
 import { LI, actionSheet, confirmSheet, mount, resumeBar, tabBar, toast, wireClock } from './kit';
 import { playVideo } from './video';
 
@@ -110,7 +110,6 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
           <div id="hrline"></div>
           ${s.note ? `<section class="card"><p class="note-p">${esc(s.note)}</p></section>` : ''}
           ${exHtml}
-          ${skippedCard(s)}
           <button class="btn big" data-act="repeat">Do this workout again</button>
           <a class="btn big" href="#/strength/session/${s.id}">Edit sets</a>
         </main>`;
@@ -133,7 +132,6 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
     };
     paint();
     const offStore = lifts.changed.on(paint);
-    const offSkip = wireSkippedCard(root, () => lifts.sessions.get(id), paint);
 
     root.addEventListener('click', async (e) => {
       const s = lifts.sessions.get(id);
@@ -159,6 +157,6 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
         }
       }
     });
-    return () => { offStore(); offSkip(); };
+    return () => { offStore(); };
   });
 }

@@ -1,4 +1,4 @@
-import { uid, type Exercise, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type SkippedEx, type VideoMeta } from './types';
+import { uid, type Exercise, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type VideoMeta } from './types';
 
 export const newSet = (kind: SetKind = 'n', w: number | null = null, r: number | null = null, auto = false): LiftSet => ({
   id: uid(), w, r, done: false, kind, wAuto: auto && w != null, rAuto: auto && r != null,
@@ -235,22 +235,26 @@ export function effectiveRestAuto(exs: SessionEx[], i: number, rowRestAuto: bool
 }
 
 // ---------- finishing ----------
-/** Records unlogged working sets/exercises into `s.skipped`, then drops unlogged sets and empty exercises. */
+/** Returns remaining unlogged working exercises & set counts for explicit finish-time make-up scheduling. */
+export function collectUnfinishedItems(s: LiftSession): { exId: string; sets: number; ss?: boolean }[] {
+  const out: { exId: string; sets: number; ss?: boolean }[] = [];
+  for (const e of s.exs) {
+    const left = e.sets.filter((x) => !x.done && x.kind !== 'w').length;
+    if (left > 0) out.push({ exId: e.exId, sets: left, ...(e.ss ? { ss: true } : {}) });
+  }
+  if (out.length) delete out[out.length - 1].ss;
+  return out;
+}
+
+/** Drops unlogged sets and empty exercises when finishing a lift session (never marks sets as skipped). */
 export function pruneUnlogged(s: LiftSession): number {
-  const skipped: SkippedEx[] = [];
   let dropped = 0;
   for (const e of s.exs) {
-    const plannedSets = e.sets.filter((x) => x.kind !== 'w').length;
-    const doneSets = e.sets.filter((x) => x.done && x.kind !== 'w').length;
-    if (plannedSets > doneSets) {
-      skipped.push({ exId: e.exId, plannedSets, doneSets, ...(e.ss ? { ss: true } : {}) });
-    }
     const keep = e.sets.filter((x) => x.done);
     dropped += e.sets.length - keep.length;
     e.sets = keep;
   }
-  if (skipped.length) s.skipped = skipped;
-  else delete s.skipped;
+  delete s.skipped;
   s.exs = s.exs.filter((e) => e.sets.length > 0);
   // a superset flag on the new last exercise would dangle
   if (s.exs.length) delete s.exs[s.exs.length - 1].ss;

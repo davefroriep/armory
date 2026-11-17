@@ -1,5 +1,5 @@
-import { labels, supersetGroups } from './logic';
-import type { Exercise, SessionEx } from './types';
+import { addSet, labels, supersetGroups } from './logic';
+import type { Exercise, LiftSet, SessionEx } from './types';
 
 export interface CursorRef {
   exUid: string;
@@ -210,4 +210,90 @@ export function jumpToExerciseCursor(exs: SessionEx[], rawTarget: string, exOf: 
   const se = exs[bestIdx];
   const open = se.sets.find((s) => !s.done) ?? se.sets[se.sets.length - 1];
   return open ? { exUid: se.uid, setId: open.id } : { exUid: se.uid };
+}
+
+export interface SetMutationResult {
+  changed: boolean;
+  cursor: CursorRef | null;
+  exIdx: number;
+  added?: LiftSet;
+  deletedCount?: number;
+}
+
+/** Appends a set to the current target exercise (keeps focus on the first open set or the newly added one). */
+export function applyAddSet(
+  exs: SessionEx[],
+  cursor: CursorRef | null,
+  lastLoggedExUid: string | null,
+  prevOf: (exId: string) => SessionEx | null,
+): SetMutationResult {
+  if (!exs.length) return { changed: false, cursor, exIdx: -1 };
+  const cur = resolveTargetSet(exs, cursor);
+  const targetSe = cur
+    ? exs[cur.exIdx]
+    : (lastLoggedExUid ? exs.find((e) => e.uid === lastLoggedExUid) : undefined) ?? exs[exs.length - 1];
+  const exIdx = exs.indexOf(targetSe);
+  const firstOpen = targetSe.sets.find((x) => !x.done);
+  const added = addSet(targetSe, prevOf(targetSe.exId));
+  return {
+    changed: true,
+    cursor: { exUid: targetSe.uid, setId: firstOpen ? firstOpen.id : added.id },
+    exIdx,
+    added,
+  };
+}
+
+/** Appends a set to the previously logged exercise and focuses that newly added set for the next command. */
+export function applyAddSetToLastEx(
+  exs: SessionEx[],
+  cursor: CursorRef | null,
+  lastLoggedExUid: string | null,
+  prevOf: (exId: string) => SessionEx | null,
+): SetMutationResult {
+  if (!exs.length) return { changed: false, cursor, exIdx: -1 };
+  const cur = resolveTargetSet(exs, cursor);
+  let prevSe = lastLoggedExUid ? exs.find((e) => e.uid === lastLoggedExUid) : undefined;
+  if (!prevSe && cur && cur.exIdx > 0) prevSe = exs[cur.exIdx - 1];
+  if (!prevSe) return { changed: false, cursor, exIdx: -1 };
+  const exIdx = exs.indexOf(prevSe);
+  const added = addSet(prevSe, prevOf(prevSe.exId));
+  return {
+    changed: true,
+    cursor: { exUid: prevSe.uid, setId: added.id },
+    exIdx,
+    added,
+  };
+}
+
+/** Deletes all unlogged sets from the current exercise only, removing the card if empty, and advances to the next open exercise. */
+export function applyDeleteEmptySets(exs: SessionEx[], cursor: CursorRef | null): SetMutationResult {
+  const cur = resolveTargetSet(exs, cursor);
+  if (!cur) return { changed: false, cursor, exIdx: -1, deletedCount: 0 };
+  const se = exs[cur.exIdx];
+  const emptyCount = se.sets.filter((x) => !x.done).length;
+  if (!emptyCount) return { changed: false, cursor, exIdx: cur.exIdx, deletedCount: 0 };
+
+  let nextRef: CursorRef | null = null;
+  for (let offset = 1; offset < exs.length; offset++) {
+    const cand = exs[(cur.exIdx + offset) % exs.length];
+    const open = cand.sets.find((x) => !x.done);
+    if (open) {
+      nextRef = { exUid: cand.uid, setId: open.id };
+      break;
+    }
+  }
+
+  const kept = se.sets.filter((x) => x.done);
+  if (kept.length > 0) {
+    se.sets = kept;
+  } else {
+    exs.splice(cur.exIdx, 1);
+    if (exs.length) delete exs[exs.length - 1].ss;
+  }
+  return {
+    changed: true,
+    cursor: nextRef,
+    exIdx: cur.exIdx,
+    deletedCount: emptyCount,
+  };
 }

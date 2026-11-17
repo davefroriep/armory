@@ -1,16 +1,16 @@
 import { buzz } from '../audio/audio';
 import { Emitter } from '../emitter';
 import {
-  getNativeVoiceStatus, isNative, onNativeVoiceResult, setNativeVoiceListening,
-  type NativeVoiceEvent,
+  ensureNativeVoicePermission, getNativeVoiceStatus, isNative, onNativeVoiceResult,
+  setNativeVoiceListening, type NativeVoiceEvent,
 } from '../native/service';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { active } from './active';
 import {
-  advanceCursorAfterLog, jumpToExerciseCursor, resolveTargetSet, stepExerciseCursor,
-  type CursorRef,
+  advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
+  jumpToExerciseCursor, resolveTargetSet, stepExerciseCursor, type CursorRef,
 } from './cursor';
-import { canLog, editReps, editWeight, toggleDone } from './logic';
+import { canLog, editReps, editWeight, labels, toggleDone } from './logic';
 import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
 import { parseVoiceTranscript, type VoiceIntent } from './voiceParser';
@@ -21,16 +21,27 @@ export interface VoiceActionNotice {
   atMs: number;
 }
 
-interface UndoEntry {
-  sessionId: string;
-  exUid: string;
-  setId: string;
-  w: number | null;
-  r: number | null;
-  wAuto?: boolean;
-  rAuto?: boolean;
-  rpe?: number;
-}
+type UndoEntry =
+  | {
+      type: 'set';
+      sessionId: string;
+      exUid: string;
+      setId: string;
+      w: number | null;
+      r: number | null;
+      wAuto?: boolean;
+      rAuto?: boolean;
+      rpe?: number;
+      prevLastLoggedExUid: string | null;
+    }
+  | {
+      type: 'exs';
+      sessionId: string;
+      exsJson: string;
+      prevCursor: CursorRef | null;
+      prevLastLoggedExUid: string | null;
+      label: string;
+    };
 
 interface WebSpeechRec {
   continuous: boolean;
@@ -46,6 +57,7 @@ interface WebSpeechRec {
 const ARM_WINDOW_MS = 6500;
 const BASE_BIAS = [
   'armory', 'check', 'done', 'log', 'undo', 'next exercise', 'previous exercise',
+  'add set', 'add set to last exercise', 'delete empty sets',
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'rpe',
 ];
 
@@ -63,6 +75,8 @@ class VoiceController {
   readonly toasted = new Emitter<{ msg: string; kind?: 'pr' }>();
 
   private sessionIdBound = '';
+  private lastLoggedExUid: string | null = null;
+  private liftScreenMounted = false;
   private undoStack: UndoEntry[] = [];
   private inited = false;
   private lastFinalSig = '';
@@ -85,8 +99,18 @@ class VoiceController {
     this.syncSessionFromSettings();
   }
 
-  setCursor(ref: CursorRef | null): void {
+  setLiftScreenMounted(mounted: boolean): void {
+    this.liftScreenMounted = mounted;
     this.syncSessionFromSettings();
+  }
+
+  recordLoggedExercise(exUid: string): void {
+    this.syncCursorToSession();
+    this.lastLoggedExUid = exUid;
+  }
+
+  setCursor(ref: CursorRef | null): void {
+    this.syncCursorToSession();
     this.cursor = ref;
     this.changed.emit();
   }
@@ -107,7 +131,18 @@ class VoiceController {
 
   async setEnabled(on: boolean): Promise<boolean> {
     updateSettings({ voiceEnabled: on });
-    return this.applyListening(on);
+    if (on && !this.liftScreenMounted && isNative()) {
+      const ok = await ensureNativeVoicePermission();
+      if (!ok) {
+        updateSettings({ voiceEnabled: false });
+        this.toasted.emit({ msg: 'Microphone permission denied' });
+        this.changed.emit();
+        return false;
+      }
+      this.changed.emit();
+      return true;
+    }
+    return this.applyListening(on && this.liftScreenMounted);
   }
 
   async refreshStatus(): Promise<void> {
@@ -137,12 +172,13 @@ class VoiceController {
     if (curId !== this.sessionIdBound) {
       this.sessionIdBound = curId;
       this.cursor = null;
+      this.lastLoggedExUid = null;
       this.undoStack = [];
     }
   }
 
   private syncSessionFromSettings(): void {
-    const want = getSettings().voiceEnabled;
+    const want = getSettings().voiceEnabled && this.liftScreenMounted;
     if (want && !this.listening && (isNative() || typeof window !== 'undefined')) {
       void this.applyListening(true);
     } else if (!want && (this.listening || this.webRec)) {
@@ -329,6 +365,76 @@ class VoiceController {
     }
 
     const cur = resolveTargetSet(s.exs, this.cursor);
+    const pushExsUndo = (label: string): void => {
+      this.undoStack.push({
+        type: 'exs',
+        sessionId: s.id,
+        exsJson: JSON.stringify(s.exs),
+        prevCursor: this.cursor,
+        prevLastLoggedExUid: this.lastLoggedExUid,
+        label,
+      });
+      if (this.undoStack.length > 20) this.undoStack.shift();
+    };
+    const prevOf = (exId: string) => lifts.previous(exId, s.startMs, s.id);
+
+    if (intent.kind === 'add_set') {
+      const targetSe = cur ? s.exs[cur.exIdx] : (this.lastLoggedExUid ? s.exs.find((e) => e.uid === this.lastLoggedExUid) : undefined) ?? s.exs[s.exs.length - 1];
+      if (!targetSe) return this.notice('Add an exercise first', 'warn');
+      const name = lifts.exOrStub(targetSe.exId).name;
+      pushExsUndo(name);
+      const res = applyAddSet(s.exs, this.cursor, this.lastLoggedExUid, prevOf);
+      this.cursor = res.cursor;
+      lifts.saveSession(s, true);
+      buzz(25);
+      const setCount = targetSe.sets.filter((x) => x.kind !== 'w').length;
+      return this.notice(`+ Set ${setCount} added · ${name}`, 'info');
+    }
+
+    if (intent.kind === 'add_set_prev_ex') {
+      let prevSe = this.lastLoggedExUid ? s.exs.find((e) => e.uid === this.lastLoggedExUid) : undefined;
+      if (!prevSe && cur && cur.exIdx > 0) prevSe = s.exs[cur.exIdx - 1];
+      if (!prevSe) return this.notice('No previous exercise to add a set to', 'warn');
+      const name = lifts.exOrStub(prevSe.exId).name;
+      pushExsUndo(name);
+      const res = applyAddSetToLastEx(s.exs, this.cursor, this.lastLoggedExUid, prevOf);
+      if (!res.changed) return this.notice('No previous exercise to add a set to', 'warn');
+      this.cursor = res.cursor;
+      const labs = labels(s.exs);
+      lifts.saveSession(s, true);
+      buzz(25);
+      const setCount = prevSe.sets.filter((x) => x.kind !== 'w').length;
+      return this.notice(`+ Set ${setCount} on ${labs[res.exIdx] ?? ''} ${name}`, 'info');
+    }
+
+    if (intent.kind === 'delete_empty_sets') {
+      if (!cur) return this.notice('No empty sets on current exercise', 'warn');
+      const seCur = s.exs[cur.exIdx];
+      const nameCur = lifts.exOrStub(seCur.exId).name;
+      const snapJson = JSON.stringify(s.exs);
+      const snapCursor = this.cursor;
+      const snapLast = this.lastLoggedExUid;
+      const res = applyDeleteEmptySets(s.exs, this.cursor);
+      if (!res.changed || !res.deletedCount) {
+        return this.notice('No empty sets on current exercise', 'warn');
+      }
+      this.undoStack.push({
+        type: 'exs',
+        sessionId: s.id,
+        exsJson: snapJson,
+        prevCursor: snapCursor,
+        prevLastLoggedExUid: snapLast,
+        label: nameCur,
+      });
+      if (this.undoStack.length > 20) this.undoStack.shift();
+      this.cursor = res.cursor;
+      lifts.saveSession(s, true);
+      buzz(25);
+      const nextPtr = resolveTargetSet(s.exs, this.cursor);
+      const nextLabel = nextPtr ? ` → ${nextPtr.label} ${lifts.exOrStub(s.exs[nextPtr.exIdx].exId).name}` : '';
+      return this.notice(`Deleted ${res.deletedCount} empty set${res.deletedCount === 1 ? '' : 's'} · ${nameCur}${nextLabel}`, 'info');
+    }
+
     if (intent.kind === 'next_ex' || intent.kind === 'prev_ex') {
       const next = stepExerciseCursor(s.exs, cur, intent.kind === 'next_ex' ? 1 : -1);
       if (!next) return this.notice('All sets already logged', 'info');
@@ -350,6 +456,15 @@ class VoiceController {
     if (intent.kind === 'undo') {
       const last = this.undoStack.pop();
       if (!last || last.sessionId !== s.id) return this.notice('Nothing to undo', 'warn');
+      if (last.type === 'exs') {
+        s.exs = JSON.parse(last.exsJson);
+        this.cursor = last.prevCursor;
+        this.lastLoggedExUid = last.prevLastLoggedExUid;
+        void active.resetIfNoneLogged(s);
+        lifts.saveSession(s, true);
+        buzz(25);
+        return this.notice(`↶ Undid ${last.label}`, 'warn');
+      }
       const se = s.exs.find((e) => e.uid === last.exUid);
       const set = se?.sets.find((x) => x.id === last.setId);
       if (!se || !set) return this.notice('Set no longer exists', 'warn');
@@ -360,6 +475,7 @@ class VoiceController {
       if (last.rAuto) set.rAuto = true; else delete set.rAuto;
       if (last.rpe != null) set.rpe = last.rpe; else delete set.rpe;
       this.cursor = { exUid: se.uid, setId: set.id };
+      this.lastLoggedExUid = last.prevLastLoggedExUid;
       void active.resetIfNoneLogged(s);
       lifts.saveSession(s, true);
       buzz(25);
@@ -395,6 +511,7 @@ class VoiceController {
 
     // intent.kind === 'log_current'
     const undoSnap: UndoEntry = {
+      type: 'set',
       sessionId: s.id,
       exUid: se.uid,
       setId: set.id,
@@ -403,6 +520,7 @@ class VoiceController {
       wAuto: set.wAuto,
       rAuto: set.rAuto,
       rpe: set.rpe,
+      prevLastLoggedExUid: this.lastLoggedExUid,
     };
     if (intent.bodyweight) {
       editWeight(se, cur.setIdx, 0);
@@ -427,6 +545,7 @@ class VoiceController {
     this.undoStack.push(undoSnap);
     if (this.undoStack.length > 20) this.undoStack.shift();
 
+    this.lastLoggedExUid = se.uid;
     active.ensureStarted(s);
     active.afterSetLogged(s, cur.exIdx);
     this.cursor = advanceCursorAfterLog(s.exs, { exIdx: cur.exIdx, setIdx: cur.setIdx });

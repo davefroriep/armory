@@ -5,8 +5,8 @@ import { PHASE1_ROUTINES } from '../src/lifts/seed';
 import { defaultQueueState } from '../src/domain/plan';
 import { KG_PER_LB } from '../src/lifts/settings';
 import {
-  advanceCursorAfterLog, jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence,
-  resolveTargetSet, stepExerciseCursor,
+  advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
+  jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
 import { parseVoiceTranscript } from '../src/lifts/voiceParser';
 import { buildWallboardSnapshot } from '../src/wallboard/snapshot';
@@ -104,6 +104,46 @@ describe('superset cursor & alternation', () => {
     const afterPull = advanceCursorAfterLog(exs, { exIdx: 4, setIdx: 0 });
     expect(resolveTargetSet(exs, afterPull)!.label).toBe('3A');
   });
+
+  it('handles add set, add set to last exercise (focused), and delete empty sets with advance', () => {
+    const exs = mkUpper1();
+    exs[0].sets.forEach((s) => { s.done = true; });
+    exs[1].sets.forEach((s) => { s.done = true; });
+    exs[2].sets[0].done = true;
+    // Current target is 2B Row Set 2, last logged was 2B Row (or user switched after 2A Bench)
+    let cur = { exUid: 'u_row', setId: exs[2].sets[1].id };
+
+    // "armory add set" adds set 4 to 2B Row while keeping focus on open Set 2
+    const rAdd = applyAddSet(exs, cur, 'u_row', () => null);
+    expect(rAdd.changed).toBe(true);
+    expect(exs[2].sets).toHaveLength(4);
+    expect(rAdd.cursor).toEqual({ exUid: 'u_row', setId: exs[2].sets[1].id });
+
+    // User just finished 2A Bench and cursor advanced to 2B Row, then says "armory add set to last exercise"
+    const rPrev = applyAddSetToLastEx(exs, rAdd.cursor, 'u_bench', () => null);
+    expect(rPrev.changed).toBe(true);
+    expect(exs[1].sets).toHaveLength(4);
+    expect(rPrev.added).toBeDefined();
+    expect(rPrev.cursor).toEqual({ exUid: 'u_bench', setId: rPrev.added!.id });
+    expect(resolveTargetSet(exs, rPrev.cursor)!.label).toBe('2A');
+    expect(resolveTargetSet(exs, rPrev.cursor)!.setId).toBe(rPrev.added!.id);
+
+    // Move back to 2B Row and say "armory delete empty sets": removes 3 empty sets on Row ONLY, keeps Set 1, advances to 3A
+    const rDel = applyDeleteEmptySets(exs, { exUid: 'u_row', setId: exs[2].sets[1].id });
+    expect(rDel.changed).toBe(true);
+    expect(rDel.deletedCount).toBe(3);
+    expect(exs[2].sets).toHaveLength(1);
+    expect(exs[2].sets[0].done).toBe(true);
+    // Remaining empty set on 2A Bench (the newly added Set 4!) or next open exercise is focused cleanly
+    expect(resolveTargetSet(exs, rDel.cursor)!.label).toBe('3A');
+
+    // Delete empty sets when all sets of an exercise are unlogged drops that card cleanly and advances
+    const rDropAll = applyDeleteEmptySets(exs, { exUid: 'u_ohp', setId: exs[3].sets[0].id });
+    expect(rDropAll.changed).toBe(true);
+    expect(rDropAll.deletedCount).toBe(2);
+    expect(exs.some((e) => e.uid === 'u_ohp')).toBe(false);
+    expect(resolveTargetSet(exs, rDropAll.cursor)!.exUid).toBe('u_pull');
+  });
 });
 
 describe('voice transcript parser', () => {
@@ -123,6 +163,11 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('armory skip rest')).toEqual({ kind: 'rest_skip' });
     expect(parseVoiceTranscript('armory add 30 seconds')).toEqual({ kind: 'rest_add', deltaSec: 30 });
     expect(parseVoiceTranscript('armory start hold 45')).toEqual({ kind: 'start_hold', seconds: 45 });
+    expect(parseVoiceTranscript('armory add set')).toEqual({ kind: 'add_set' });
+    expect(parseVoiceTranscript('armory one more set')).toEqual({ kind: 'add_set' });
+    expect(parseVoiceTranscript('armory add set to last exercise')).toEqual({ kind: 'add_set_prev_ex' });
+    expect(parseVoiceTranscript('armory one more set on previous exercise')).toEqual({ kind: 'add_set_prev_ex' });
+    expect(parseVoiceTranscript('armory delete empty sets')).toEqual({ kind: 'delete_empty_sets' });
     expect(parseVoiceTranscript('armory undo')).toEqual({ kind: 'undo' });
 
     // Two-beat wake flow

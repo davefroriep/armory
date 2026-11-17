@@ -1,4 +1,4 @@
-# Armory Fit — Complete Technical & Programmer Reference (`v0.38+`)
+# Armory Fit — Complete Technical & Programmer Reference (`v0.39+`)
 
 Authoritative engineering specification for **Armory Fit** (`N:\Documents\Antigravity\Strength and Conditioning`, `com.froriep.armoryfit`), Dave Froriep's native Android Capacitor Strength & Conditioning application.
 
@@ -253,11 +253,11 @@ Because `PHASE1_ROUTINES` and `SEED_EX_ROWS` only run when `armory.lifts.seeded.
     - Direct numeric inputs with **floating keyboard dock** above virtual keyboard (`−10 −5 +5 +10` lb or `−5 −2.5 +2.5 +5` kg for weight; `8 10 12 15 −1 +1` for reps; `−15 −5 +5 +15` for time exercises; `+ LOG ✓` jumps to next unlogged set).
   - **Card Footer:** `− SET +` buttons (`removeLastSet` with toast `Undo`, `addSet` cloning last working set), plus conditional `Auto` pill (`showAutoTimer`) and `▶ m:ss` quick rest trigger (`showTimer`).
   - **Floating Rest Bar (`#restbar`):** Appears above dock whenever a countdown is active (`−15`, `+15`, `Skip`), turning red (`GO +m:ss`) after zero while triggering native `WorkoutChime` + vibration + minimized `RestOverlay`.
-- **Footer CTA:** `+ Add Exercise` / `+ Add Next Exercise` banner (`picker.ts` multi-select + `+ Custom` builder) and `Finish workout` (`Done` in edit mode). Unlogged sets trigger a confirmation stating how many sets will be marked skipped before calling `active.finish()` (`bwKg ??= settings.weightKg`, `pruneUnlogged(s)` populates `s.skipped`, saves IndexedDB, triggers `syncWorkout` -> `syncLiftWorkout`, navigates to `#/strength/summary/<id>`).
+- **Footer CTA:** `+ Add Exercise` / `+ Add Next Exercise` banner (`picker.ts` multi-select + `+ Custom` builder) and `Finish workout` (`Done` in edit mode). Unlogged sets trigger an explicit **"There are unfinished sets"** sheet (`Do later today`, `Do tomorrow`, `Delete unfinished sets & finish`, `Keep lifting`) without marking individual sets as skipped (`s.skipped` omitted on lift sessions; only whole scheduled gym sessions or Z5 workouts carry `(skipped)` status), before calling `active.finish()` (`bwKg ??= settings.weightKg`, `pruneUnlogged(s)`, saves IndexedDB, triggers `syncWorkout` -> `syncLiftWorkout`, navigates to `#/strength/summary/<id>`).
 
 ### 5.7 Remaining Strength & Utility Screens
-- **`#/strength/summary/<id>` (`summary.ts`):** Title, timestamp/duration, 4-stat grid (`SETS`, `VOLUME`, `EXERCISES`, `PRs`), `NEW RECORDS` card, `SKIPPED` card (via `skippedCard(s)` with 1-tap `Do later today` / `Carry to tomorrow` via `calendar.scheduleSkippedMakeup`), Polar H10 `Z1–Z5` bar chart, live Intervals.icu sync status (`✓ Logged · Open` or error + `Retry now`), 8-word RPE grid (`3..10` -> calls `resyncSession()`), `Share lift card` (`1080×1350` PNG), `Save as a day` (if custom), `Done`.
-- **`#/strength/history` & `#/strength/workout/<id>` (`history.ts`):** Navigable month grid with trained-day blue dots (`dayKey`), filterable workout feed. Workout detail view shows date, 4 stats, HR/kcal/RPE + Intervals link, note, per-exercise condensed header + set rows (warm-ups `W`, PR pills, clickable `▶` video buttons), `SKIPPED` card (with `Do later today` / `Carry to tomorrow`), `Do this workout again`, `Edit sets`, and `⋯` (`Edit sets`, `Delete workout`).
+- **`#/strength/summary/<id>` (`summary.ts`):** Title, timestamp/duration, 4-stat grid (`SETS`, `VOLUME`, `EXERCISES`, `PRs`), `NEW RECORDS` card, Polar H10 `Z1–Z5` bar chart, live Intervals.icu sync status (`✓ Logged · Open` or error + `Retry now`), 8-word RPE grid (`3..10` -> calls `resyncSession()`), `Share lift card` (`1080×1350` PNG), `Save as a day` (if custom), `Done`.
+- **`#/strength/history` & `#/strength/workout/<id>` (`history.ts`):** Navigable month grid with trained-day blue dots (`dayKey`), filterable workout feed. Workout detail view shows date, 4 stats, HR/kcal/RPE + Intervals link, note, per-exercise condensed header + set rows (warm-ups `W`, PR pills, clickable `▶` video buttons), `Do this workout again`, `Edit sets`, and `⋯` (`Edit sets`, `Delete workout`).
 - **`#/strength/progress` (`progress.ts`):** Week-by-week navigation (`This week`, `Last week`, …), 3-stat summary, `HARD SETS BY MUSCLE` across all 17 muscles (`1.0` primary / `0.5` secondary, `10–20/wk` reference lines), 12-week workouts bar chart, `YOUR LIFTS` e1RM table, `RECENT RECORDS`, horizontal `LIFT VIDEOS` reel.
 - **`#/strength/exercises` & `#/strength/exercise/<id>` (`exercises.ts`, `exercise.ts`):** Instant search across name + haystack aliases, filter chips (`All`, `Done before`, muscle groups), `+ Custom` exercise creator/editor. Detail view shows muscle tags, sticky clickable note, 4 stats (`EST 1RM` or `BEST HOLD`, `HEAVIEST`, `SESSIONS`, `LAST`), `1RM–5RM` expandable to `12RM` table (tap row to jump to session or play video), Epley e1RM SVG chart (`3M`, `6M`, `1Y`, `All`), video thumbnails, session history, per-exercise rest duration picker, and `⋯` menu (note, edit muscles/custom fields, archive/delete).
 - **`#/strength/hr` (`strength.ts`):** **Ruck / Outdoor HR** Polar H10 logger with `PACK WEIGHT` selector (`No pack`, `20`, `30`, `35`, `45 lb` — default `35 lb`), `START RUCK · 35 LB` / `PAUSE`, `Z1–Z5` summary + Keytel kcal + TCX upload (`programId: 'ruck'` uploaded as Intervals.icu `type: 'Walk'`).
@@ -290,8 +290,6 @@ Because `PHASE1_ROUTINES` and `SEED_EX_ROWS` only run when `armory.lifts.seeded.
   Barbell Bench Press: 185×12 · 225×8 · 225×7 lb  ★ 8RM PR
   Smith Machine Row: 3×15 @ 100 lb
 
-  Skipped: Seated Dumbbell Shoulder Press (0/3 sets) · Pull-Up (0/3 sets) ...
-
   avg HR 118 · max HR 151 · ~310 kcal · RPE 8/10
   ```
 
@@ -308,7 +306,7 @@ Because `PHASE1_ROUTINES` and `SEED_EX_ROWS` only run when `armory.lifts.seeded.
 | `WallboardServer` | Local Wi-Fi HTTP/1.1 + SSE server (`GET /`, `/state`, `/events`, LAN-restricted `POST /api/voice` injecting external speech transcripts) holding a `WifiLock` and auto-detecting `wlan`/`eth` IPv4 address. |
 | `VoiceRecognitionManager` | Foreground-only Android `SpeechRecognizer` (`createOnDeviceSpeechRecognizer` on API 31+ with segmented session & biasing strings + standard fallback), immediately torn down whenever `MainActivity` enters background. |
 | `RestOverlay` | System overlay pill (`SYSTEM_ALERT_WINDOW`) displayed only while `appVisible == false` and `restActive == true`; supports tap-to-open-app, `−15`, `+15`, and `Skip` syncing back to `session.ts`. |
-| `WorkoutServicePlugin` | Exposes `@PluginMethod`s (`start`, `update`, `stop`, `setRest`, `clearRest`, `canOverlay`, `requestOverlayPermission`, `openAppSettings`, `setKeepScreenOn`, `setMetronome`, `startWallboard`, `stopWallboard`, `getWallboardStatus`, `pushWallboardState`, `setVoiceListening`, `getVoiceStatus`, `launchVideoCamera`, `pickDcimVideo`, `openVideoUri`, `playChime`, `writeBackupFile`, `pickBackupFile`, `forceClose`). |
+| `WorkoutServicePlugin` | Exposes `@PluginMethod`s (`start`, `update`, `stop`, `setRest`, `clearRest`, `canOverlay`, `requestOverlayPermission`, `openAppSettings`, `setKeepScreenOn`, `setMetronome`, `startWallboard`, `stopWallboard`, `getWallboardStatus`, `pushWallboardState`, `setVoiceListening`, `getVoiceStatus`, `ensureVoicePermission`, `launchVideoCamera`, `pickDcimVideo`, `openVideoUri`, `playChime`, `writeBackupFile`, `pickBackupFile`, `forceClose`). |
 
 ---
 
@@ -317,11 +315,11 @@ Because `PHASE1_ROUTINES` and `SEED_EX_ROWS` only run when `armory.lifts.seeded.
 | Suite | Coverage |
 | :--- | :--- |
 | `tests/domain.test.ts` | `airbikeCurve`, `programs` scaling, `timeline`/`engine` (incl. `hydratePaused`), `gateOpen`, `pacerDecision`/`cueFor`/`hrCue`, `repStats`, `profileBar`, `arrange`/reordering. |
-| `tests/lifts.test.ts` | 120+ library integrity, unit conversion, auto-fill/forward-fill, lift session pause/resume elapsed exclusion, superset brackets & auto-rest rules, `pruneUnlogged` + `s.skipped` + `effectiveSkipped`, Epley e1RM, rep bests & PRs, muscle sets, `intervalsDescription`, `mp4` mvhd parser, `deriveDriveUrl`, `parentHash`. |
-| `tests/voice-wallboard.test.ts` | `plannedSetSequence` superset interleaving (`1 -> 2A -> 2B -> 2A -> 2B`), `resolveTargetSet`, `advanceCursorAfterLog`, `jumpToExerciseCursor`, `parseVoiceTranscript`, `buildWallboardSnapshot` (`lift`/`cardio`/`standby` + HR readiness), `#/wallboard` routing. |
+| `tests/lifts.test.ts` | 120+ library integrity, unit conversion, auto-fill/forward-fill, lift session pause/resume elapsed exclusion, superset brackets & auto-rest rules, `collectUnfinishedItems` + `pruneUnlogged` (zero set-level `skipped`), Epley e1RM, rep bests & PRs, muscle sets, `intervalsDescription`, `mp4` mvhd parser, `deriveDriveUrl`, `parentHash`. |
+| `tests/voice-wallboard.test.ts` | `plannedSetSequence` superset interleaving (`1 -> 2A -> 2B -> 2A -> 2B`), `resolveTargetSet`, `advanceCursorAfterLog`, `jumpToExerciseCursor`, `applyAddSet`, `applyAddSetToLastEx`, `applyDeleteEmptySets`, `parseVoiceTranscript`, `buildWallboardSnapshot` (`lift`/`cardio`/`standby` + HR readiness), `#/wallboard` routing. |
 | `tests/lifts-intervals.test.ts` | `createManualActivity` & `patchActivity` payloads/headers/error handling. |
 | `tests/plan.test.ts` | `reconcileQueue`, `projectPlan`, `todayItemsFromQueue`, `buildWeekGlimpse`, `restDay` skipping, skipped slots & carry-overs, MyWhoosh conflict matching. |
-| `tests/ui-domain.test.ts` | `WindowAvg`, `RPE_STEPS`, `buildTcx`, `msUntilNextLocalMidnight`, `hrDropStats`, `groupDayLogs`, `todayCompletedItems`, `renderDayZoomCard` (completed, skipped badges, `Skipped:` sets line, extras, shift/today pills). |
+| `tests/ui-domain.test.ts` | `WindowAvg`, `RPE_STEPS`, `buildTcx`, `msUntilNextLocalMidnight`, `hrDropStats`, `groupDayLogs`, `todayCompletedItems`, `renderDayZoomCard` (completed, schedule/Z5 skipped badges, extras, shift/today pills). |
 | `tests/recorder-energy.test.ts` | `Recorder` 5 Hz averaging & backfill, Keytel energy math. |
 | `tests/parsers.test.ts` | BLE `0x2A37` HR + NUS `LineBuffer` + `parseBikeLine` (including `fan`, `rfan`, `pls`, `dt`, `ratio`) + `summarize`. |
 | `tests/modal-backdrop.test.ts` | Modal inert focus safety & backdrop dismiss behavior. |

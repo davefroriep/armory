@@ -281,6 +281,24 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(VoiceRecognitionManager.status(getContext(), getPermissionState("microphone") == PermissionState.GRANTED));
     }
 
+    @PluginMethod
+    public void ensureVoicePermission(PluginCall call) {
+        if (getPermissionState("microphone") == PermissionState.GRANTED) {
+            JSObject ret = new JSObject();
+            ret.put("granted", true);
+            call.resolve(ret);
+            return;
+        }
+        requestPermissionForAlias("microphone", call, "onVoicePermOnlyResult");
+    }
+
+    @PermissionCallback
+    private void onVoicePermOnlyResult(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("granted", getPermissionState("microphone") == PermissionState.GRANTED);
+        call.resolve(ret);
+    }
+
     private static ArrayList<String> readBiasPhrases(PluginCall call) {
         ArrayList<String> out = new ArrayList<>();
         JSArray arr = call.getArray("biasPhrases");
