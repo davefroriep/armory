@@ -13,7 +13,7 @@ import {
 import { canLog, editReps, editWeight, labels, toggleDone } from './logic';
 import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
-import { parseVoiceTranscript, type VoiceIntent } from './voiceParser';
+import { hasWakeWord, parseVoiceTranscript, type VoiceIntent } from './voiceParser';
 
 export interface VoiceActionNotice {
   text: string;
@@ -82,6 +82,7 @@ class VoiceController {
   private inited = false;
   private lastFinalSig = '';
   private lastFinalAt = 0;
+  private nativeDesired = false;
   private webRec: WebSpeechRec | null = null;
   private armTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -188,15 +189,16 @@ class VoiceController {
 
   private syncSessionFromSettings(): void {
     const want = getSettings().voiceEnabled && this.liftScreenMounted;
-    if (want && !this.listening && (isNative() || typeof window !== 'undefined')) {
+    if (want && (!this.listening || (isNative() && !this.nativeDesired)) && (isNative() || typeof window !== 'undefined')) {
       void this.applyListening(true);
-    } else if (!want && (this.listening || this.webRec)) {
+    } else if (!want && (this.listening || this.webRec || (isNative() && this.nativeDesired))) {
       void this.applyListening(false);
     }
   }
 
   private async applyListening(on: boolean, forceRestart = false): Promise<boolean> {
     if (isNative()) {
+      this.nativeDesired = on;
       const res = await setNativeVoiceListening(on, on ? this.biasPhrases() : [], forceRestart);
       this.listening = res.listening;
       this.granted = res.granted;
@@ -287,13 +289,19 @@ class VoiceController {
       this.changed.emit();
       return;
     }
+    if (ev.state === 'recovering') {
+      this.listening = false;
+      this.lastError = ev.error ?? 'Recovering mic…';
+      this.changed.emit();
+      return;
+    }
     if (ev.state === 'error') {
       this.listening = false;
       this.lastError = ev.error ?? 'Voice recognition error';
       this.changed.emit();
       return;
     }
-    if (ev.state === 'listening' && !this.listening) {
+    if (ev.state === 'listening') {
       this.listening = true;
       this.lastError = null;
     }
@@ -306,11 +314,12 @@ class VoiceController {
 
     const wakeWord = getSettings().voiceWakeWord;
     if (!ev.isFinal && ev.source !== 'lan') {
-      if (!this.isArmed() && parseVoiceTranscript(txt, { wakeWord })?.kind === 'arm_wake') {
+      this.lastHeard = txt;
+      if (!this.isArmed() && hasWakeWord(txt, wakeWord)) {
         this.armNow();
-        this.lastHeard = txt;
-        this.changed.emit();
+        buzz(20);
       }
+      this.changed.emit();
       return;
     }
 

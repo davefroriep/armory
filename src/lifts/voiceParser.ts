@@ -262,6 +262,21 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
   return null;
 }
 
+function buildWakeRegex(wakeWord?: string): RegExp {
+  const wakeRaw = (wakeWord ?? 'armory').trim().toLowerCase() || 'armory';
+  const wakeAlts = wakeRaw === 'armory'
+    ? ['armory', 'armoury', 'armorys', 'armourys', 'armory fit', 'armoryfit', 'amory', 'emory', 'army', 'arm re', 'arm ree']
+    : [wakeRaw];
+  return new RegExp(`\\b(?:hey\\s+|ok\\s+|okay\\s+)?(?:${wakeAlts.map(escapeRe).join('|')})\\b`, 'gi');
+}
+
+/** True when `raw` contains the configured wake word (used to arm immediately on partial transcripts). */
+export function hasWakeWord(raw: string, wakeWord?: string): boolean {
+  const norm = normalizeVoiceText(raw);
+  if (!norm) return false;
+  return buildWakeRegex(wakeWord).test(norm);
+}
+
 /**
  * Parses a speech transcript gated by the configured wake word (e.g. `"armory"`).
  * When `armed` is true (user already said the wake word within the active window),
@@ -274,9 +289,7 @@ export function parseVoiceTranscript(
   const norm = normalizeVoiceText(raw);
   if (!norm) return null;
 
-  const wakeRaw = (opts.wakeWord ?? 'armory').trim().toLowerCase() || 'armory';
-  const wakeAlts = wakeRaw === 'armory' ? ['armory', 'armoury', 'armory fit'] : [wakeRaw];
-  const wakeRe = new RegExp(`\\b(?:hey\\s+|ok\\s+|okay\\s+)?(?:${wakeAlts.map(escapeRe).join('|')})\\b`, 'gi');
+  const wakeRe = buildWakeRegex(opts.wakeWord);
 
   let lastEnd = -1;
   let m: RegExpExecArray | null;

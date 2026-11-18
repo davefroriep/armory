@@ -9,7 +9,7 @@ import {
   jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
 import { buildExercise } from '../src/lifts/logic';
-import { parseVoiceTranscript } from '../src/lifts/voiceParser';
+import { hasWakeWord, parseVoiceTranscript } from '../src/lifts/voiceParser';
 import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
 import { buildWallboardSnapshot } from '../src/wallboard/snapshot';
@@ -186,6 +186,12 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('Armory, Done!')).toEqual({ kind: 'log_current' });
     expect(parseVoiceTranscript('Armory, 135 for 12')).toEqual({ kind: 'log_current', weight: 135, reps: 12 });
     expect(parseVoiceTranscript('Armory, for 15')).toEqual({ kind: 'log_current', reps: 15 });
+    expect(parseVoiceTranscript("Armory's 225 for 8")).toEqual({ kind: 'log_current', weight: 225, reps: 8 });
+    expect(parseVoiceTranscript('army')).toEqual({ kind: 'arm_wake' });
+    expect(parseVoiceTranscript('amory done')).toEqual({ kind: 'log_current' });
+    expect(hasWakeWord('Armory 22', 'armory')).toBe(true);
+    expect(hasWakeWord("Armory's", 'armory')).toBe(true);
+    expect(hasWakeWord('just talking', 'armory')).toBe(false);
   });
 });
 

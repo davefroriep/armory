@@ -19,16 +19,17 @@ import java.util.ArrayList;
 /**
  * Foreground-scoped Android SpeechRecognizer manager.
  * Strictly listens ONLY while Armory Fit is open in the foreground (`desiredEnabled && appVisible`).
- * Reuses the bound NPU recognizer across continuous cycles, guards callbacks by generation id,
- * runs a stall watchdog, and re-arms after transient audio focus chimes.
+ * Sets active state truthfully on `onReadyForSpeech`/speech results, escalates cleanly from
+ * on-device segmented SODA -> non-segmented -> standard RecognitionService on startup/binder
+ * failures, and recovers cleanly after audio focus chimes.
  */
 final class VoiceRecognitionManager {
     private static final String TAG = "ArmoryVoice";
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final int SEGMENT_WINDOW_MS = 30_000;
-    private static final long STARTUP_TIMEOUT_MS = 4_500L;
+    private static final long STARTUP_TIMEOUT_MS = 4_000L;
     private static final long SESSION_MAX_IDLE_MS = 38_000L;
-    private static final long WATCHDOG_PERIOD_MS = 5_000L;
+    private static final long WATCHDOG_PERIOD_MS = 4_000L;
 
     private static volatile boolean desiredEnabled = false;
     private static volatile boolean appVisible = true;
@@ -44,6 +45,8 @@ final class VoiceRecognitionManager {
     private static boolean listeningInProgress = false;
     private static boolean readyReceived = false;
     private static int consecutiveStartErrors = 0;
+    private static int consecutiveOnDevErrors = 0;
+    private static int consecutiveDeadRestarts = 0;
     private static long listenStartedElapsedMs = 0L;
     private static long lastCallbackElapsedMs = 0L;
     private static long lastSpeechElapsedMs = 0L;
@@ -73,6 +76,11 @@ final class VoiceRecognitionManager {
         desiredEnabled = enabled;
         biasStrings = bias != null ? new ArrayList<>(bias) : new ArrayList<>();
         lastError = null;
+        if (forceRestart) {
+            // Let a manual restart re-evaluate clean recognizer mode if desired
+            consecutiveOnDevErrors = 0;
+            consecutiveDeadRestarts = 0;
+        }
         Context app = c.getApplicationContext();
         MAIN.post(() -> {
             if (desiredEnabled && appVisible) {
@@ -96,7 +104,7 @@ final class VoiceRecognitionManager {
             if (!desiredEnabled || !appVisible) return;
             long now = SystemClock.elapsedRealtime();
             if (!listeningInProgress || (now - lastCallbackElapsedMs > 2_000L && now - lastSpeechElapsedMs > 2_000L)) {
-                scheduleRestart(app, 200, false);
+                scheduleRestart(app, 200, true);
             }
         });
     }
@@ -146,13 +154,16 @@ final class VoiceRecognitionManager {
                 if (!desiredEnabled || !appVisible || watchdogRunnable != this) return;
                 long now = SystemClock.elapsedRealtime();
                 if (!listeningInProgress && pendingRestart == null) {
-                    startListeningCycle(app, false);
+                    Log.w(TAG, "Watchdog: idle without pending restart, restarting");
+                    startListeningCycle(app, true);
                 } else if (listeningInProgress && !readyReceived && (now - listenStartedElapsedMs > STARTUP_TIMEOUT_MS)) {
-                    Log.w(TAG, "Watchdog: recognizer startup timed out (segmented=" + useSegmented + ")");
-                    if (usingOnDevice && useSegmented) useSegmented = false;
+                    Log.w(TAG, "Watchdog: startup timed out (onDev=" + usingOnDevice + ", seg=" + useSegmented + ")");
+                    active = false;
+                    escalateRecognizerMode("Recognizer startup timed out");
+                    WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
                     startListeningCycle(app, true);
                 } else if (listeningInProgress && (now - listenStartedElapsedMs > SESSION_MAX_IDLE_MS) && (now - lastSpeechElapsedMs > 6_000L)) {
-                    Log.w(TAG, "Watchdog: idle session exceeded limit, recreating recognizer");
+                    Log.w(TAG, "Watchdog: session idle > 38s, recreating recognizer");
                     startListeningCycle(app, true);
                 }
                 if (desiredEnabled && appVisible) {
@@ -161,6 +172,20 @@ final class VoiceRecognitionManager {
             }
         };
         MAIN.postDelayed(watchdogRunnable, WATCHDOG_PERIOD_MS);
+    }
+
+    private static void escalateRecognizerMode(String reason) {
+        lastError = reason;
+        if (usingOnDevice) {
+            consecutiveOnDevErrors++;
+            if (useSegmented) {
+                useSegmented = false;
+                Log.w(TAG, "Disabling segmented session (" + reason + ")");
+            } else if (consecutiveOnDevErrors >= 2) {
+                fallbackStandard = true;
+                Log.w(TAG, "Switching from on-device SODA to standard SpeechRecognizer (" + reason + ")");
+            }
+        }
     }
 
     private static void scheduleRestart(Context app, long delayMs, boolean forceRecreate) {
@@ -191,10 +216,13 @@ final class VoiceRecognitionManager {
     private static Intent buildIntent(boolean useOnDev) {
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US");
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
-        i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
-        if (useOnDev && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        if (!useOnDev) {
+            i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (useSegmented) {
                 i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, SEGMENT_WINDOW_MS);
                 i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200);
@@ -247,6 +275,7 @@ final class VoiceRecognitionManager {
         usingOnDevice = useOnDev;
         final SpeechRecognizer activeSr = sr;
         recognizer = activeSr;
+        Log.i(TAG, "ensureRecognizer created gen=" + myGen + " onDev=" + usingOnDevice + " seg=" + useSegmented);
 
         activeSr.setRecognitionListener(new RecognitionListener() {
             @Override
@@ -256,8 +285,10 @@ final class VoiceRecognitionManager {
                 readyReceived = true;
                 active = true;
                 consecutiveStartErrors = 0;
+                consecutiveDeadRestarts = 0;
                 lastError = null;
                 lastCallbackElapsedMs = now;
+                Log.i(TAG, "onReadyForSpeech gen=" + myGen + " onDev=" + usingOnDevice);
                 WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "listening", null);
             }
 
@@ -288,21 +319,11 @@ final class VoiceRecognitionManager {
             public void onError(int error) {
                 if (myGen != recognizerGen || recognizer != activeSr) return;
                 listeningInProgress = false;
+                boolean wasReady = readyReceived;
+                readyReceived = false;
+                Log.w(TAG, "onError code=" + error + " wasReady=" + wasReady + " onDev=" + usingOnDevice + " seg=" + useSegmented);
                 if (!desiredEnabled || !appVisible) return;
-                if ((error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
-                        || error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
-                        || error == SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT) && !fallbackStandard) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        try { activeSr.triggerModelDownload(buildIntent(usingOnDevice)); } catch (Exception ignored) {}
-                    }
-                    fallbackStandard = true;
-                    scheduleRestart(app, 400, true);
-                    return;
-                }
-                if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                    scheduleRestart(app, 180, false);
-                    return;
-                }
+
                 if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
                     desiredEnabled = false;
                     lastError = "Microphone permission denied";
@@ -310,14 +331,45 @@ final class VoiceRecognitionManager {
                     WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "error", lastError);
                     return;
                 }
-                if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
-                        || error == SpeechRecognizer.ERROR_CLIENT
-                        || error == SpeechRecognizer.ERROR_AUDIO
-                        || error == SpeechRecognizer.ERROR_SERVER_DISCONNECTED) {
-                    scheduleRestart(app, 850, true);
+
+                if (error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
+                        || error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
+                        || error == SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        try { activeSr.triggerModelDownload(buildIntent(usingOnDevice)); } catch (Exception ignored) {}
+                    }
+                    active = false;
+                    fallbackStandard = true;
+                    lastError = "Falling back to standard speech service";
+                    WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
+                    scheduleRestart(app, 350, true);
                     return;
                 }
-                scheduleRestart(app, 1200, true);
+
+                if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                    if (!wasReady) {
+                        consecutiveDeadRestarts++;
+                        if (usingOnDevice && consecutiveDeadRestarts >= 2) {
+                            active = false;
+                            escalateRecognizerMode("On-device recognizer timed out before ready");
+                            WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
+                            scheduleRestart(app, 250, true);
+                            return;
+                        }
+                    } else {
+                        consecutiveDeadRestarts = 0;
+                    }
+                    // Recreate cleanly on on-device cycles every few silent timeouts to avoid stale binder drops
+                    boolean recreate = !wasReady || usingOnDevice;
+                    scheduleRestart(app, 180, recreate);
+                    return;
+                }
+
+                // Real operational error (ERROR_RECOGNIZER_BUSY=8, ERROR_CLIENT=5, ERROR_AUDIO=3, ERROR_SERVER_DISCONNECTED=11, etc.)
+                active = false;
+                escalateRecognizerMode("Speech error #" + error);
+                WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
+                scheduleRestart(app, 750, true);
             }
 
             @Override
@@ -325,15 +377,18 @@ final class VoiceRecognitionManager {
                 if (myGen != recognizerGen || recognizer != activeSr) return;
                 listeningInProgress = false;
                 consecutiveStartErrors = 0;
+                consecutiveOnDevErrors = 0;
+                consecutiveDeadRestarts = 0;
                 long now = SystemClock.elapsedRealtime();
                 lastCallbackElapsedMs = now;
                 lastSpeechElapsedMs = now;
                 String text = extractTop(results);
                 lastPartial = "";
+                Log.i(TAG, "onResults: \"" + text + "\"");
                 if (!text.isEmpty()) {
                     WorkoutServicePlugin.deliverVoiceEvent(text, true, "mic", "listening", null);
                 }
-                if (desiredEnabled && appVisible) scheduleRestart(app, 180, false);
+                if (desiredEnabled && appVisible) scheduleRestart(app, 150, usingOnDevice);
             }
 
             @Override
@@ -342,11 +397,14 @@ final class VoiceRecognitionManager {
                 readyReceived = true;
                 active = true;
                 consecutiveStartErrors = 0;
+                consecutiveOnDevErrors = 0;
+                consecutiveDeadRestarts = 0;
                 long now = SystemClock.elapsedRealtime();
                 lastCallbackElapsedMs = now;
                 lastSpeechElapsedMs = now;
                 String text = extractTop(segmentResults);
                 lastPartial = "";
+                Log.i(TAG, "onSegmentResults: \"" + text + "\"");
                 if (!text.isEmpty()) {
                     WorkoutServicePlugin.deliverVoiceEvent(text, true, "mic", "listening", null);
                 }
@@ -356,7 +414,8 @@ final class VoiceRecognitionManager {
             public void onEndOfSegmentedSession() {
                 if (myGen != recognizerGen || recognizer != activeSr) return;
                 listeningInProgress = false;
-                if (desiredEnabled && appVisible) scheduleRestart(app, 180, false);
+                Log.i(TAG, "onEndOfSegmentedSession");
+                if (desiredEnabled && appVisible) scheduleRestart(app, 150, true);
             }
 
             @Override
@@ -365,12 +424,14 @@ final class VoiceRecognitionManager {
                 readyReceived = true;
                 active = true;
                 consecutiveStartErrors = 0;
+                consecutiveDeadRestarts = 0;
                 long now = SystemClock.elapsedRealtime();
                 lastCallbackElapsedMs = now;
                 lastSpeechElapsedMs = now;
                 String text = extractTop(partialResults);
                 if (!text.isEmpty() && !text.equals(lastPartial)) {
                     lastPartial = text;
+                    Log.i(TAG, "onPartialResults: \"" + text + "\"");
                     WorkoutServicePlugin.deliverVoiceEvent(text, false, "mic", "listening", null);
                 }
             }
@@ -384,7 +445,11 @@ final class VoiceRecognitionManager {
     private static void startListeningCycle(Context app, boolean forceRecreate) {
         cancelRestart();
         if (!desiredEnabled || !appVisible) return;
-        if (forceRecreate) destroyInternal();
+        if (forceRecreate) {
+            boolean keepActive = active;
+            destroyInternal();
+            active = keepActive;
+        }
         ensureWatchdog(app);
         if (!ensureRecognizer(app)) return;
 
@@ -394,10 +459,13 @@ final class VoiceRecognitionManager {
         listeningInProgress = true;
         listenStartedElapsedMs = SystemClock.elapsedRealtime();
         lastCallbackElapsedMs = listenStartedElapsedMs;
-        active = true;
+        if (lastSpeechElapsedMs == 0L || forceRecreate) {
+            lastSpeechElapsedMs = listenStartedElapsedMs;
+        }
 
         try {
             if (listeningInProgress) {
+                Log.i(TAG, "startListening gen=" + recognizerGen + " onDev=" + usingOnDevice + " seg=" + useSegmented);
                 recognizer.startListening(intent);
             }
         } catch (Exception e) {
@@ -411,7 +479,9 @@ final class VoiceRecognitionManager {
                 destroyInternal();
                 WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "error", lastError);
             } else {
-                scheduleRestart(app, 900, true);
+                escalateRecognizerMode("startListening exception: " + e.getMessage());
+                WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
+                scheduleRestart(app, 700, true);
             }
         }
     }
