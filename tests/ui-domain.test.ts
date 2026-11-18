@@ -201,6 +201,17 @@ describe('live HR sheet telemetry helpers', () => {
     expect(items[0].name).toBe('Upper 1');
     expect(items[0].sub).toContain('3 sets');
 
+    const extProj = projectPlan(PHASE1_PLAN, {
+      ...defaultQueueState(),
+      stepIndex: 3,
+      stagedDate: '2026-11-18',
+      stepDates: { 0: '2026-11-15', 1: '2026-11-16', 2: '2026-11-17' },
+    }, today, 0);
+    const extItems = todayCompletedItems(undefined, lookup, { today, proj: extProj });
+    expect(extItems).toEqual([
+      { equipment: 'spin', name: 'Spin Bike Z2 (45m)', sub: 'Spin Bike · 45 min' },
+    ]);
+
     const projDoneToday = projectPlan(PHASE1_PLAN, { ...defaultQueueState(), stepIndex: 2, stagedDate: '2026-11-18' }, today, 0);
     const doneHtml = renderDayZoomCard({
       ymd: today,

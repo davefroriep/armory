@@ -92,10 +92,14 @@ export function groupDayLogs(
 export function todayCompletedItems(
   dayLog: DayLogs | undefined,
   lookup: Pick<ZoomLookup, 'exOf' | 'prs' | 'unit'>,
+  opts?: { today?: string; proj?: ProjectedStep[]; extras?: ExtraWorkout[] },
 ): TodayCompletedItem[] {
-  if (!dayLog) return [];
+  const liftsDone = dayLog?.lifts ?? [];
+  const cardioDone = dayLog?.cardio ?? [];
+  const doneEqs = new Set<Equipment>();
   const out: TodayCompletedItem[] = [];
-  for (const s of dayLog.lifts) {
+  for (const s of liftsDone) {
+    doneEqs.add('strength');
     const st = sessionStats(s, lookup.exOf);
     const pr = sessionPRs(s, lookup.prs);
     const sub = [
@@ -107,7 +111,8 @@ export function todayCompletedItems(
     ].filter(Boolean).join(' · ');
     out.push({ equipment: 'strength', name: s.name, sub });
   }
-  for (const m of dayLog.cardio) {
+  for (const m of cardioDone) {
+    doneEqs.add(m.equipment);
     const sub = [
       EQUIPMENT_LABEL[m.equipment],
       `${Math.max(1, Math.round(m.seconds / 60))} min`,
@@ -115,6 +120,34 @@ export function todayCompletedItems(
       m.avgHr > 0 ? `${m.avgHr} bpm` : '',
     ].filter(Boolean).join(' · ');
     out.push({ equipment: m.equipment, name: m.name, sub });
+  }
+  if (opts?.today) {
+    for (const p of opts.proj ?? []) {
+      p.step.slots.forEach((slot, si) => {
+        const onToday = p.slotDates[si] === opts.today || (p.slotDates[si] == null && p.date === opts.today);
+        if (p.slotStates[si] === 'done' && onToday && !doneEqs.has(slot.equipment)) {
+          out.push({
+            equipment: slot.equipment,
+            name: slot.name,
+            sub: `${EQUIPMENT_LABEL[slot.equipment]} · ${Math.max(1, Math.round(slot.seconds / 60))} min`,
+          });
+        }
+      });
+    }
+    for (const x of opts.extras ?? []) {
+      if (x.doneDate === opts.today) {
+        const k = extraKey(x.id);
+        const hasLocal = liftsDone.some((ls) => ls.planSlot === k || ls.name === x.name)
+          || cardioDone.some((cm) => cm.planSlot === k || cm.name === x.name);
+        if (!hasLocal) {
+          out.push({
+            equipment: x.equipment,
+            name: x.name,
+            sub: `${EQUIPMENT_LABEL[x.equipment]} · ${Math.max(1, Math.round(x.seconds / 60))} min`,
+          });
+        }
+      }
+    }
   }
   return out;
 }

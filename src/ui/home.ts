@@ -39,7 +39,7 @@ export function homeScreen(root: HTMLElement): () => void {
     const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
     const todayEquipment = calendar.items.map((i) => i.equipment);
     const lookup = currentZoomLookup();
-    const completedToday = todayCompletedItems(dayLogsByDate.get(today), lookup);
+    const completedToday = todayCompletedItems(dayLogsByDate.get(today), lookup, { today, proj, extras: s.queue.extras });
     const weekCells = buildWeekGlimpse({ today, anchorYmd: selectedYmd, proj, todayEquipment, extras: s.queue.extras, loggedByDate });
     const zoomHtml = renderDayZoomCard({
       ymd: selectedYmd,

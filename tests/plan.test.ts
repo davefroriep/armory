@@ -303,4 +303,70 @@ describe('local rolling schedule & queue reconciliation', () => {
     expect(proj[2].slotStates).toEqual(['removed']);
     expect(proj[2].status).toBe('removed');
   });
+
+  it('shows externally synced and marked-done workouts as done (never REST) in week glimpse and preserves yesterday activity dates on overnight rollover', () => {
+    // 1) Past day & today satisfied externally or via Mark done without local IndexedDB logs
+    const today = '2026-11-18';
+    const logged = new Map<string, { equipment: Equipment; name: string }[]>([
+      ['2026-11-15', [{ equipment: 'strength', name: 'Lower 1' }]],
+      ['2026-11-16', [{ equipment: 'strength', name: 'Upper 1' }]],
+    ]);
+    const projPastDone = projectPlan(PHASE1_PLAN, {
+      ...defaultQueueState(),
+      stepIndex: 3,
+      stagedDate: today,
+      stepDates: { 0: '2026-11-15', 1: '2026-11-16', 2: '2026-11-17' },
+    }, today, 0);
+    const cells = buildWeekGlimpse({ today, proj: projPastDone, loggedByDate: logged });
+    expect(cells[2]).toMatchObject({ ymd: '2026-11-17', isPast: true, kind: 'done', equipments: ['spin'] });
+
+    // 2) Today finished via external activity or Mark done with zero remaining work renders as done, not rest
+    const projTodayDone = projectPlan(PHASE1_PLAN, {
+      ...defaultQueueState(),
+      stepIndex: 3,
+      stagedDate: '2026-11-18',
+      stepDates: { 0: '2026-11-15', 1: '2026-11-16', 2: '2026-11-17' },
+    }, '2026-11-17', 0);
+    const todayDoneCells = buildWeekGlimpse({ today: '2026-11-17', proj: projTodayDone, loggedByDate: logged });
+    expect(todayDoneCells[2]).toMatchObject({ ymd: '2026-11-17', isToday: true, kind: 'done', equipments: ['spin'] });
+
+    // 3) ExtraWorkout marked done on a past date without a local log also counts as done
+    const extraDoneCells = buildWeekGlimpse({
+      today: '2026-11-18',
+      proj: projTodayDone,
+      loggedByDate: logged,
+      extras: [{
+        id: 'manual-spin',
+        name: 'Spin Calibration',
+        date: '2026-11-17',
+        doneDate: '2026-11-17',
+        equipment: 'spin',
+        seconds: 1800,
+        description: 'Manual mark done',
+      }],
+    });
+    expect(extraDoneCells[2]).toMatchObject({ ymd: '2026-11-17', kind: 'done', equipments: ['spin'] });
+
+    // 4) Overnight rollover: syncLocalState bumped stagedDate to '2026-11-18' before fetchActivities returned yesterday's VirtualRide
+    const overnight = reconcileQueue({
+      plan: PHASE1_PLAN,
+      state: {
+        ...defaultQueueState(),
+        stepIndex: 2,
+        stagedDate: '2026-11-18',
+        stepDates: { 0: '2026-11-15', 1: '2026-11-16' },
+      },
+      activities: [{
+        id: 'i211470269',
+        type: 'VirtualRide',
+        name: 'Bowflex C7 Calibration',
+        start_date_local: '2026-11-17T19:46:20',
+      }],
+      today: '2026-11-18',
+      tomorrow: '2026-11-19',
+    });
+    expect(overnight.nextState.stepIndex).toBe(3);
+    expect(overnight.nextState.stepDates?.[2]).toBe('2026-11-17');
+    expect(overnight.nextState.stagedDate).toBe('2026-11-18');
+  });
 });

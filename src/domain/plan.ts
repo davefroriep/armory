@@ -418,9 +418,13 @@ export function reconcileQueue(args: {
   };
 
   let curLatest = absorbEarlyForCurrent();
+  if ((state.completedSlots ?? []).length > 0 && today > curLatest) curLatest = today;
 
   // Match recent external activities (non-Armory) against carried-over, current, or future audible slots
-  const since = stagedDate && stagedDate <= today ? stagedDate : today;
+  const prevStepDate = stepIndex > 0 ? stepDates[stepIndex - 1] : undefined;
+  const minAfterPrev = prevStepDate ? shiftYmd(prevStepDate, 1) : today;
+  const baseSince = stagedDate && stagedDate <= today ? stagedDate : today;
+  const since = minAfterPrev < baseSince ? minAfterPrev : baseSince;
   const recent = activities
     .filter((a) => !(a.external_id ?? '').startsWith('armory-') && !a.paired_event_id && !consumed.has(String(a.id)) && (a.start_date_local ?? '').slice(0, 10) >= since)
     .sort((a, b) => (a.start_date_local ?? '').localeCompare(b.start_date_local ?? ''));
@@ -439,6 +443,7 @@ export function reconcileQueue(args: {
       if (p.stepIndex === stepIndex) {
         completedSlots.add(p.slotIndex);
         delete slotDates[p.slotIndex];
+        if (actDate > curLatest) curLatest = actDate;
       } else {
         doneEarly[hit.planSlot] = actDate;
       }
@@ -457,6 +462,7 @@ export function reconcileQueue(args: {
         completedSlots.add(idx);
         consumed.add(String(act.id));
         delete slotDates[idx];
+        if (actDate > curLatest) curLatest = actDate;
         continue;
       }
       if (routineTag(act.name) || cardioTag(act.name)) {
@@ -479,7 +485,10 @@ export function reconcileQueue(args: {
 
   // Advance when every slot of the active step is resolved (completed, skipped, or carried over)
   if (stepIndex < plan.steps.length && allSlotsResolved()) {
-    stepDates[stepIndex] = curLatest || today;
+    let maxResolvedDate = '';
+    const d0 = curLatest || today;
+    stepDates[stepIndex] = d0;
+    if (d0 > maxResolvedDate) maxResolvedDate = d0;
     stepIndex = Math.min(stepIndex + 1, plan.steps.length);
     completedSlots = new Set();
     slotDates = {};
@@ -487,7 +496,9 @@ export function reconcileQueue(args: {
     while (stepIndex < plan.steps.length) {
       curLatest = absorbEarlyForCurrent();
       if (allSlotsResolved()) {
-        stepDates[stepIndex] = curLatest || today;
+        const dN = curLatest || today;
+        stepDates[stepIndex] = dN;
+        if (dN > maxResolvedDate) maxResolvedDate = dN;
         stepIndex = Math.min(stepIndex + 1, plan.steps.length);
         completedSlots = new Set();
         slotDates = {};
@@ -495,7 +506,8 @@ export function reconcileQueue(args: {
         break;
       }
     }
-    stagedDate = stepIndex < plan.steps.length ? nextTrainingDate(tomorrow, restDay) : null;
+    const nextBase = maxResolvedDate < today ? today : tomorrow;
+    stagedDate = stepIndex < plan.steps.length ? nextTrainingDate(nextBase, restDay) : null;
   }
 
   for (const [k, d] of Object.entries(slotDates)) {
@@ -754,22 +766,41 @@ export function buildWeekGlimpse(args: {
     const stepSet = new Set<number>();
     const eqSet = new Set<Equipment>();
 
-    if (ymd < today) {
+    let doneCount = logged.length;
+    if (ymd <= today) {
       for (const l of logged) eqSet.add(l.equipment);
+      for (const p of proj) {
+        p.step.slots.forEach((sl, si) => {
+          const onYmd = p.slotDates[si] === ymd || (p.slotDates[si] == null && p.date === ymd);
+          if (p.slotStates[si] === 'done' && onYmd) {
+            eqSet.add(sl.equipment);
+            stepSet.add(p.step.index);
+            doneCount++;
+          }
+        });
+      }
+      for (const x of extras) {
+        if (x.doneDate === ymd) {
+          eqSet.add(x.equipment);
+          doneCount++;
+        }
+      }
+    }
+
+    if (ymd < today) {
       cells.push({
         ymd,
         dow: d,
         isToday: false,
         isPast: true,
-        kind: logged.length ? 'done' : 'rest',
+        kind: doneCount > 0 ? 'done' : 'rest',
         equipments: Array.from(eqSet),
-        stepIndices: [],
+        stepIndices: Array.from(stepSet),
       });
       continue;
     }
 
     if (ymd === today) {
-      for (const l of logged) eqSet.add(l.equipment);
       let remaining = 0;
       for (const p of proj) {
         p.step.slots.forEach((sl, si) => {
@@ -790,7 +821,7 @@ export function buildWeekGlimpse(args: {
         eqSet.add(eq);
         remaining++;
       }
-      const kind: WeekDayCell['kind'] = remaining > 0 ? 'today' : logged.length > 0 ? 'done' : 'rest';
+      const kind: WeekDayCell['kind'] = remaining > 0 ? 'today' : doneCount > 0 ? 'done' : 'rest';
       cells.push({ ymd, dow: d, isToday: true, isPast: false, kind, equipments: Array.from(eqSet), stepIndices: Array.from(stepSet) });
       continue;
     }
