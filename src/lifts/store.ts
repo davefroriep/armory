@@ -2,7 +2,7 @@ import { Emitter } from '../emitter';
 import { idbAll, idbDelete, idbGet, idbPut, idbPutMany } from '../store/db';
 import { computePRs, doneSessions, e1rm, exerciseSessions, previousPerformance, type PRHit } from './calc';
 import { LIBRARY, LIBRARY_BY_ID } from './library';
-import { buildExercise } from './logic';
+import { buildExercise, isSessionStarted } from './logic';
 import { PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from './seed';
 import { liftSettings, updateLiftSettings } from './settings';
 import type { ExRow, Exercise, ExerciseRx, LiftSession, Routine, SessionEx, VideoMeta } from './types';
@@ -39,6 +39,7 @@ class LiftStore {
   private exCache = new Map<string, Exercise | undefined>();
   private prCache: { v: number; m: Map<string, PRHit> } | null = null;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  private deletedSessionIds = new Set<string>();
 
   constructor() {
     this.ready = this.load();
@@ -146,6 +147,24 @@ class LiftStore {
         if (actChanged) await idbPut('lift_sessions', actRx);
       }
       localStorage.setItem(SEED_RX_KEY, '1');
+    }
+
+    const BOOSTCAMP_SEED_KEY = 'armory.lifts.boostcamp_seed.v1';
+    if (typeof localStorage !== 'undefined' && !localStorage.getItem(BOOSTCAMP_SEED_KEY)) {
+      const { buildBoostcampSessions } = await import('./boostcampSeed');
+      const toInsert = buildBoostcampSessions().filter((bs) => !this.sessions.has(bs.id));
+      if (toInsert.length) {
+        for (const bs of toInsert) this.sessions.set(bs.id, bs);
+        await idbPutMany('lift_sessions', toInsert);
+      }
+      localStorage.setItem(BOOSTCAMP_SEED_KEY, '1');
+    }
+
+    // Discard any leftover unstarted preview session on cold start so scratch numbers never linger.
+    const stale = this.active;
+    if (stale && !isSessionStarted(stale)) {
+      this.sessions.delete(stale.id);
+      await idbDelete('lift_sessions', stale.id);
     }
 
     // Auto-heal an empty active workout launched from a planned day before routines were seeded.
@@ -270,17 +289,23 @@ class LiftStore {
   // ---------- sessions ----------
   /** Debounced write-through for the session being edited. */
   saveSession(s: LiftSession, immediate = false): void {
+    if (this.deletedSessionIds.has(s.id)) return;
     this.sessions.set(s.id, s);
     this.touch();
     const old = this.timers.get(s.id);
     if (old) clearTimeout(old);
     if (immediate) { this.timers.delete(s.id); void idbPut('lift_sessions', s); return; }
-    this.timers.set(s.id, setTimeout(() => { this.timers.delete(s.id); void idbPut('lift_sessions', this.sessions.get(s.id) ?? s); }, 300));
+    this.timers.set(s.id, setTimeout(() => {
+      this.timers.delete(s.id);
+      if (this.deletedSessionIds.has(s.id)) return;
+      void idbPut('lift_sessions', this.sessions.get(s.id) ?? s);
+    }, 300));
   }
 
   async flush(): Promise<void> {
     for (const [id, t] of this.timers) {
       clearTimeout(t);
+      if (this.deletedSessionIds.has(id)) continue;
       const s = this.sessions.get(id);
       if (s) await idbPut('lift_sessions', s);
     }
@@ -288,6 +313,7 @@ class LiftStore {
   }
 
   async deleteSession(id: string): Promise<void> {
+    this.deletedSessionIds.add(id);
     const t = this.timers.get(id);
     if (t) clearTimeout(t);
     this.timers.delete(id);

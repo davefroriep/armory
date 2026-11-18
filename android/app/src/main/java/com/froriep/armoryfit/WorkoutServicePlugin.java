@@ -3,6 +3,7 @@ package com.froriep.armoryfit;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentUris;
@@ -796,27 +797,40 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    /** Stops foreground workout service, voice recognizer, wallboard/media servers & metronome, and force-closes the process. */
+    /** Stops foreground workout service, voice recognizer, wallboard/media servers & metronome, and removes all Android Recents tasks cleanly. */
     @PluginMethod
     public void forceClose(PluginCall call) {
         WorkoutMetronome.stop();
         VoiceRecognitionManager.stop();
         WallboardServer.stop();
         LocalMediaServer.stop();
+        Context appCtx = getContext().getApplicationContext();
         Activity act = getActivity();
         call.resolve();
+        try {
+            appCtx.stopService(new Intent(appCtx, WorkoutForegroundService.class));
+        } catch (Exception ignored) {
+        }
         if (act == null) return;
         act.runOnUiThread(() -> {
+            boolean removedViaAppTasks = false;
             try {
-                if (WorkoutForegroundService.running) {
-                    act.stopService(new Intent(act, WorkoutForegroundService.class));
+                ActivityManager am = (ActivityManager) act.getSystemService(Context.ACTIVITY_SERVICE);
+                if (am != null) {
+                    List<ActivityManager.AppTask> tasks = am.getAppTasks();
+                    if (tasks != null && !tasks.isEmpty()) {
+                        for (ActivityManager.AppTask task : tasks) {
+                            task.setExcludeFromRecents(true);
+                            task.finishAndRemoveTask();
+                        }
+                        removedViaAppTasks = true;
+                    }
                 }
             } catch (Exception ignored) {
             }
-            act.finishAffinity();
-            act.finishAndRemoveTask();
-            act.getWindow().getDecorView().postDelayed(() ->
-                    android.os.Process.killProcess(android.os.Process.myPid()), 120);
+            if (!removedViaAppTasks) {
+                act.finishAndRemoveTask();
+            }
         });
     }
 }

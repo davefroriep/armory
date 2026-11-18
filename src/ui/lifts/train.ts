@@ -17,14 +17,6 @@ import { LI, actionSheet, confirmSheet, mount, relDay, tabBar, toast } from './k
 export async function startWorkout(o: { name: string; routine?: Routine; items?: RoutineItem[]; eventId?: number | null; planSlot?: string | null; replace?: boolean }): Promise<void> {
   if (lifts.active) {
     if (!isSessionStarted(lifts.active)) {
-      const same = o.routine
-        ? lifts.active.routineId === o.routine.id
-        : !o.items && !lifts.active.routineId && lifts.active.name === o.name;
-      if (same) {
-        if (o.replace) location.replace('#/strength/session');
-        else location.hash = '#/strength/session';
-        return;
-      }
       await active.discard();
     } else {
       if (o.replace) location.replace('#/strength/session');

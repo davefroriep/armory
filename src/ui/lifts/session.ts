@@ -64,7 +64,7 @@ function build(root: HTMLElement, id?: string): () => void {
       ? lifts.prs()
       : computePRs([...lifts.finished().filter((x) => x.id !== s.id), { ...s, status: 'done' as const, startMs: Date.now() + 1 }], exOf);
   };
-  const save = (): void => { dirty = true; lifts.saveSession(s); };
+  const save = (): void => { if (dead || finishing || (!edit && !lifts.sessions.has(s.id))) return; dirty = true; lifts.saveSession(s); };
   const find = (uid: string): SessionEx => s.exs.find((e) => e.uid === uid)!;
 
   // ---------- render ----------
@@ -790,7 +790,12 @@ function build(root: HTMLElement, id?: string): () => void {
       'Keep lifting',
     );
     if (!ok) return false;
+    (document.activeElement as HTMLElement | null)?.blur();
+    hideDock();
+    stopHold();
+    voice.setLiftScreenMounted(false);
     finishing = true;
+    dead = true;
     allowNextRoute();
     await active.discard();
     location.hash = '#/';

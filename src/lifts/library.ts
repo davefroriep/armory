@@ -30,6 +30,7 @@ Landmine Press|other|w|fd,ch|tri|
 Overhead Press|bb|w|fd|sd,tri|ohp military press
 Seated Dumbbell Shoulder Press|db|w|fd|sd,tri|db press
 Standing Dumbbell Shoulder Press|db|w|fd|sd,tri|
+Push Press|bb|w|fd|sd,tri,qu|behind the neck push press
 Arnold Press|db|w|fd|sd,tri|
 Smith Machine Overhead Press|smith|w|fd|sd,tri|smith ohp
 Machine Shoulder Press|machine|w|fd|sd,tri|
@@ -38,6 +39,7 @@ Dumbbell Lateral Raise|db|w|sd||lat raise side raise
 Cable Lateral Raise|cable|w|sd||
 Machine Lateral Raise|machine|w|sd||
 Dumbbell Front Raise|db|w|fd|sd|
+Barbell Upright Row|bb|w|sd,tr|bi,fa|upright row
 Rear Delt Fly|db|w|rd|ub|reverse fly
 Reverse Pec Deck|machine|w|rd|ub|rear delt machine
 Cable Rear Delt Fly|cable|w|rd|ub|
@@ -46,6 +48,7 @@ Dumbbell Shrug|db|w|tr|fa|
 Barbell Shrug|bb|w|tr|fa|
 # Back
 Deadlift|bb|w|gl,ha,lb|qu,tr,la,fa|conventional dl
+Paused Deadlift|bb|w|gl,ha,lb|qu,tr,la,fa|pause deadlift
 Deficit Deadlift|bb|w|gl,ha,lb,qu|tr,la,fa|
 Sumo Deadlift|bb|w|gl,qu,ad|ha,lb,tr,fa|
 Romanian Deadlift|bb|w|ha,gl|lb,fa|rdl
@@ -85,6 +88,7 @@ Machine Preacher Curl|machine|w|bi|fa|
 Dumbbell Preacher Curl|db|w|bi|fa|
 Cable Curl|cable|w|bi|fa|
 Bayesian Cable Curl|cable|w|bi|fa|
+Concentration Curl|db|w|bi|fa|
 Reverse Curl|bb|w|fa|bi|
 Wrist Curl|db|w|fa||
 Reverse Wrist Curl|db|w|fa||
@@ -93,6 +97,7 @@ Cable Triceps Pushdown|cable|w|tri||rope pushdown
 Straight-Bar Pushdown|cable|w|tri||
 Overhead Cable Triceps Extension|cable|w|tri||
 Skull Crusher|bb|w|tri||lying triceps extension
+JM Press|bb|w|tri|ch,fd|
 Dumbbell Overhead Triceps Extension|db|w|tri||
 Triceps Kickback|db|w|tri||
 Triceps Isometric Hold|other|t|tri||iso hold primer
@@ -132,6 +137,7 @@ Seated Calf Raise|machine|w|ca||
 Leg Press Calf Raise|machine|w|ca||
 Single-Leg Calf Raise|db|w|ca||
 # Core
+Crunch|bw|b|ab||abs crunch situp
 Cable Crunch|cable|w|ab||
 Hanging Leg Raise|bw|b|ab|fa|
 Hanging Knee Raise|bw|b|ab|fa|

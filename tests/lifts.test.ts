@@ -6,6 +6,7 @@ import {
   setVolumeKg, weekStart, addWeeks, DAY_MS,
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
+import { buildBoostcampSessions } from '../src/lifts/boostcampSeed';
 import {
   addSet, buildExercise, canLog, collectUnfinishedItems, driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec,
   hasSessionActivity, isSessionPaused, isSessionStarted, labels, midSuperset, newSet, pauseSessionClock,
@@ -688,5 +689,66 @@ describe('Phase 1 routine seed', () => {
     expect(s.pausedAt ?? null).toBeNull();
     expect(s.pausedMs ?? 0).toBe(0);
     expect(isSessionPaused(s)).toBe(false);
+  });
+});
+
+describe('Boostcamp history seed & SBD rep maxes', () => {
+  it('materializes all 136 Boostcamp sessions with valid library slugs, Phase 1 PREVIOUS baselines, and true SBD rep maxes', () => {
+    const sessions = buildBoostcampSessions();
+    expect(sessions).toHaveLength(136);
+    const totalSets = sessions.reduce((acc, s) => acc + s.exs.reduce((nSets, e) => nSets + e.sets.length, 0), 0);
+    expect(totalSets).toBeGreaterThan(1800);
+
+    for (const s of sessions) {
+      expect(s.status).toBe('done');
+      for (const e of s.exs) {
+        expect(LIBRARY_BY_ID.has(e.exId), `${s.id}:${e.exId}`).toBe(true);
+      }
+    }
+
+    for (const r of PHASE1_ROUTINES) {
+      for (const it of r.items) {
+        expect(previousPerformance(sessions, it.exId), `missing PREVIOUS for ${it.exId}`).not.toBeNull();
+      }
+    }
+
+    // Low Bar Squat merges barbell + low-bar history: latest 185x8 PREVIOUS and full 415 1RM..275x20 records
+    const sqPrev = previousPerformance(sessions, 'low-bar-squat')!;
+    expect(Math.round(toDisplay(sqPrev.sets[0].w!, 'lb'))).toBe(185);
+    expect(sqPrev.sets[0].r).toBe(8);
+    const sqBests = repBests(exerciseSessions(sessions, 'low-bar-squat'));
+    expect(Math.round(toDisplay(sqBests[1]!.kg, 'lb'))).toBe(415);
+    expect(Math.round(toDisplay(sqBests[2]!.kg, 'lb'))).toBe(385);
+    expect(Math.round(toDisplay(sqBests[5]!.kg, 'lb'))).toBe(355);
+    expect(Math.round(toDisplay(sqBests[8]!.kg, 'lb'))).toBe(340);
+    expect(Math.round(toDisplay(sqBests[11]!.kg, 'lb'))).toBe(305);
+    expect(Math.round(toDisplay(sqBests[20]!.kg, 'lb'))).toBe(275);
+    expect(sqBests[20]!.reps).toBe(20);
+
+    // Barbell Bench Press 1RM..17RM
+    const bpBests = repBests(exerciseSessions(sessions, 'barbell-bench-press'));
+    expect(Math.round(toDisplay(bpBests[1]!.kg, 'lb'))).toBe(315);
+    expect(Math.round(toDisplay(bpBests[2]!.kg, 'lb'))).toBe(295);
+    expect(Math.round(toDisplay(bpBests[8]!.kg, 'lb'))).toBe(275);
+    expect(Math.round(toDisplay(bpBests[10]!.kg, 'lb'))).toBe(265);
+    expect(Math.round(toDisplay(bpBests[17]!.kg, 'lb'))).toBe(225);
+    expect(bpBests[17]!.reps).toBe(17);
+
+    // Deadlift 1RM..18RM
+    const dlBests = repBests(exerciseSessions(sessions, 'deadlift'));
+    expect(Math.round(toDisplay(dlBests[1]!.kg, 'lb'))).toBe(455);
+    expect(Math.round(toDisplay(dlBests[3]!.kg, 'lb'))).toBe(385);
+    expect(Math.round(toDisplay(dlBests[7]!.kg, 'lb'))).toBe(355);
+    expect(Math.round(toDisplay(dlBests[10]!.kg, 'lb'))).toBe(340);
+    expect(Math.round(toDisplay(dlBests[12]!.kg, 'lb'))).toBe(310);
+    expect(Math.round(toDisplay(dlBests[17]!.kg, 'lb'))).toBe(295);
+    expect(Math.round(toDisplay(dlBests[18]!.kg, 'lb'))).toBe(270);
+
+    // Freestyle ramp warm-ups tagged 'w' so working sets stay clean for PREVIOUS
+    const nov11 = sessions.find((s) => s.id === 'bc-ZV8fPmFLS1L3jaKs')!;
+    const benchNov11 = nov11.exs.find((e) => e.exId === 'barbell-bench-press')!;
+    expect(benchNov11.sets[0].kind).toBe('w'); // 45x10
+    expect(benchNov11.sets[1].kind).toBe('w'); // 95x10
+    expect(benchNov11.sets[2].kind).toBe('n'); // 135x10 working
   });
 });
