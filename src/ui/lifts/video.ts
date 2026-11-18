@@ -164,6 +164,11 @@ async function handlePickedFile(t: VideoTarget, f: File, mode: 'capture' | 'pick
 export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
   if (isNative()) {
     const p = await pickNativeDcimVideo();
+    if (p?.error) {
+      toast('Pick a video file (.mp4, .mov, .webm)');
+      await resetTimerIfIdle(t.session);
+      return null;
+    }
     if (!p?.picked || !p.fileName) return null;
     return storeLinkClip(t, {
       fileName: p.fileName,

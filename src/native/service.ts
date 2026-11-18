@@ -2,6 +2,7 @@ import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor
 
 export interface PickedNativeVideo {
   picked?: boolean;
+  error?: string;
   uri?: string;
   fileName?: string;
   bytes?: number;

@@ -367,11 +367,12 @@ public class WorkoutServicePlugin extends Plugin {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE);
         i.setType("video/*");
+        i.putExtra(Intent.EXTRA_MIME_TYPES, new String[]{"video/*"});
         i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             i.putExtra(
                     DocumentsContract.EXTRA_INITIAL_URI,
-                    Uri.parse("content://com.android.externalstorage.documents/document/primary%3ADCIM%2FCamera"));
+                    DocumentsContract.buildRootUri("com.android.providers.media.documents", "videos_root"));
         }
         startActivityForResult(call, i, "onVideoPicked");
     }
@@ -406,6 +407,12 @@ public class WorkoutServicePlugin extends Plugin {
         } catch (Exception ignored) {
         }
         String mime = c.getContentResolver().getType(uri);
+        if (mime != null && !mime.startsWith("video/")) {
+            ret.put("picked", false);
+            ret.put("error", "Not a video file");
+            call.resolve(ret);
+            return;
+        }
         int durationSec = 0;
         String thumb = "";
         MediaMetadataRetriever mmr = new MediaMetadataRetriever();
