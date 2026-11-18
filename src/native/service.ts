@@ -49,6 +49,7 @@ export interface NativeVoiceStatus {
 
 export interface NativeVoiceEvent {
   transcript: string;
+  candidates?: string[];
   isFinal: boolean;
   source: 'mic' | 'lan';
   state: string;

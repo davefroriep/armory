@@ -42,6 +42,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.List;
 
 /** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, wallboard HTTP/SSE, voice recognition + video linking. */
 @CapacitorPlugin(
@@ -81,10 +82,21 @@ public class WorkoutServicePlugin extends Plugin {
     }
 
     static void deliverVoiceEvent(String transcript, boolean isFinal, String source, String state, String error) {
+        deliverVoiceEvent(transcript, null, isFinal, source, state, error);
+    }
+
+    static void deliverVoiceEvent(String transcript, List<String> candidates, boolean isFinal, String source, String state, String error) {
         WorkoutServicePlugin p = instance;
         if (p == null) return;
         JSObject ret = new JSObject();
         ret.put("transcript", transcript != null ? transcript : "");
+        if (candidates != null && !candidates.isEmpty()) {
+            JSArray arr = new JSArray();
+            for (String c : candidates) {
+                if (c != null && !c.isEmpty()) arr.put(c);
+            }
+            if (arr.length() > 0) ret.put("candidates", arr);
+        }
         ret.put("isFinal", isFinal);
         ret.put("source", source != null ? source : "mic");
         ret.put("state", state != null ? state : "listening");

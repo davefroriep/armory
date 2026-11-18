@@ -307,15 +307,18 @@ class VoiceController {
     }
 
     const txt = (ev.transcript ?? '').trim();
-    if (!txt) {
+    const pool = (ev.candidates?.length ? ev.candidates : [txt])
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!pool.length) {
       this.changed.emit();
       return;
     }
 
     const wakeWord = getSettings().voiceWakeWord;
     if (!ev.isFinal && ev.source !== 'lan') {
-      this.lastHeard = txt;
-      if (!this.isArmed() && hasWakeWord(txt, wakeWord)) {
+      this.lastHeard = pool[0];
+      if (!this.isArmed() && pool.some((c) => hasWakeWord(c, wakeWord))) {
         this.armNow();
         buzz(20);
       }
@@ -324,13 +327,23 @@ class VoiceController {
     }
 
     const now = Date.now();
-    const sig = txt.toLowerCase();
+    const sig = pool[0].toLowerCase();
     if (sig === this.lastFinalSig && now - this.lastFinalAt < 450) return;
     this.lastFinalSig = sig;
     this.lastFinalAt = now;
-    this.lastHeard = txt;
 
-    const intent = parseVoiceTranscript(txt, { wakeWord, armed: this.isArmed() });
+    const armed = this.isArmed();
+    let matchedCand: string | null = null;
+    let intent: VoiceIntent | null = null;
+    for (const cand of pool) {
+      const hit = parseVoiceTranscript(cand, { wakeWord, armed });
+      if (hit) {
+        matchedCand = cand;
+        intent = hit;
+        break;
+      }
+    }
+    this.lastHeard = matchedCand ?? pool[0];
     if (!intent) {
       this.changed.emit();
       return;

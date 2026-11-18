@@ -1,5 +1,6 @@
 package com.froriep.armoryfit;
 
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
@@ -8,6 +9,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.speech.RecognitionListener;
+import android.speech.RecognitionService;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
@@ -15,18 +17,22 @@ import android.util.Log;
 import com.getcapacitor.JSObject;
 
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 
 /**
  * Foreground-scoped Android SpeechRecognizer manager.
- * Strictly listens ONLY while Armory Fit is open in the foreground (`desiredEnabled && appVisible`).
- * Sets active state truthfully on `onReadyForSpeech`/speech results, escalates cleanly from
- * on-device segmented SODA -> non-segmented -> standard RecognitionService on startup/binder
- * failures, and recovers cleanly after audio focus chimes.
+ * Binds explicitly to GoogleTTSRecognitionService (`com.google.android.tts`) first on Pixel/Android
+ * devices to bypass deadlocking Android System Intelligence (`AiAiSpeechRecognitionService`) binders,
+ * reads both `RESULTS_RECOGNITION` and `UNSTABLE_TEXT` partial bundles, forwards full N-best
+ * candidate lists to JS, and falls back gracefully on older/non-GMS devices.
  */
 final class VoiceRecognitionManager {
     private static final String TAG = "ArmoryVoice";
+    private static final ComponentName GOOGLE_TTS_SERVICE = new ComponentName(
+            "com.google.android.tts",
+            "com.google.android.apps.speech.tts.googletts.service.GoogleTTSRecognitionService"
+    );
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
-    private static final int SEGMENT_WINDOW_MS = 30_000;
     private static final long STARTUP_TIMEOUT_MS = 4_000L;
     private static final long SESSION_MAX_IDLE_MS = 38_000L;
     private static final long WATCHDOG_PERIOD_MS = 4_000L;
@@ -34,9 +40,9 @@ final class VoiceRecognitionManager {
     private static volatile boolean desiredEnabled = false;
     private static volatile boolean appVisible = true;
     private static volatile boolean active = false;
-    private static volatile boolean fallbackStandard = false;
+    private static volatile boolean useGoogleTts = true;
+    private static volatile boolean usingGoogleTts = false;
     private static volatile boolean usingOnDevice = false;
-    private static volatile boolean useSegmented = true;
     private static volatile String lastError = null;
     private static volatile ArrayList<String> biasStrings = new ArrayList<>();
 
@@ -45,7 +51,7 @@ final class VoiceRecognitionManager {
     private static boolean listeningInProgress = false;
     private static boolean readyReceived = false;
     private static int consecutiveStartErrors = 0;
-    private static int consecutiveOnDevErrors = 0;
+    private static int consecutiveModeFailures = 0;
     private static int consecutiveDeadRestarts = 0;
     private static long listenStartedElapsedMs = 0L;
     private static long lastCallbackElapsedMs = 0L;
@@ -77,8 +83,7 @@ final class VoiceRecognitionManager {
         biasStrings = bias != null ? new ArrayList<>(bias) : new ArrayList<>();
         lastError = null;
         if (forceRestart) {
-            // Let a manual restart re-evaluate clean recognizer mode if desired
-            consecutiveOnDevErrors = 0;
+            consecutiveModeFailures = 0;
             consecutiveDeadRestarts = 0;
         }
         Context app = c.getApplicationContext();
@@ -119,16 +124,28 @@ final class VoiceRecognitionManager {
 
     static JSObject status(Context c, boolean permGranted) {
         Context app = c.getApplicationContext();
-        boolean onDevAvail = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-                && SpeechRecognizer.isOnDeviceRecognitionAvailable(app);
-        boolean avail = onDevAvail || SpeechRecognizer.isRecognitionAvailable(app);
+        boolean ttsAvail = hasGoogleTtsService(app);
+        boolean avail = ttsAvail
+                || SpeechRecognizer.isRecognitionAvailable(app)
+                || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(app));
         JSObject ret = new JSObject();
         ret.put("listening", active && desiredEnabled && appVisible);
         ret.put("granted", permGranted);
         ret.put("available", avail);
-        ret.put("onDevice", usingOnDevice || (onDevAvail && !fallbackStandard));
+        ret.put("onDevice", usingOnDevice || usingGoogleTts);
         if (lastError != null) ret.put("error", lastError);
         return ret;
+    }
+
+    private static boolean hasGoogleTtsService(Context app) {
+        try {
+            return app.getPackageManager().resolveService(
+                    new Intent(RecognitionService.SERVICE_INTERFACE).setComponent(GOOGLE_TTS_SERVICE),
+                    0
+            ) != null;
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static void cancelRestart() {
@@ -157,13 +174,13 @@ final class VoiceRecognitionManager {
                     Log.w(TAG, "Watchdog: idle without pending restart, restarting");
                     startListeningCycle(app, true);
                 } else if (listeningInProgress && !readyReceived && (now - listenStartedElapsedMs > STARTUP_TIMEOUT_MS)) {
-                    Log.w(TAG, "Watchdog: startup timed out (onDev=" + usingOnDevice + ", seg=" + useSegmented + ")");
+                    Log.w(TAG, "Watchdog: startup timed out (googleTts=" + usingGoogleTts + ", onDev=" + usingOnDevice + ")");
                     active = false;
                     escalateRecognizerMode("Recognizer startup timed out");
                     WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
                     startListeningCycle(app, true);
                 } else if (listeningInProgress && (now - listenStartedElapsedMs > SESSION_MAX_IDLE_MS) && (now - lastSpeechElapsedMs > 6_000L)) {
-                    Log.w(TAG, "Watchdog: session idle > 38s, recreating recognizer");
+                    Log.w(TAG, "Watchdog: idle cycle > 38s, refreshing recognizer");
                     startListeningCycle(app, true);
                 }
                 if (desiredEnabled && appVisible) {
@@ -176,15 +193,10 @@ final class VoiceRecognitionManager {
 
     private static void escalateRecognizerMode(String reason) {
         lastError = reason;
-        if (usingOnDevice) {
-            consecutiveOnDevErrors++;
-            if (useSegmented) {
-                useSegmented = false;
-                Log.w(TAG, "Disabling segmented session (" + reason + ")");
-            } else if (consecutiveOnDevErrors >= 2) {
-                fallbackStandard = true;
-                Log.w(TAG, "Switching from on-device SODA to standard SpeechRecognizer (" + reason + ")");
-            }
+        consecutiveModeFailures++;
+        if (usingGoogleTts && consecutiveModeFailures >= 3) {
+            useGoogleTts = false;
+            Log.w(TAG, "GoogleTTSRecognitionService failed 3x, falling back to default SpeechRecognizer (" + reason + ")");
         }
     }
 
@@ -213,53 +225,42 @@ final class VoiceRecognitionManager {
         }
     }
 
-    private static Intent buildIntent(boolean useOnDev) {
+    private static Intent buildIntent() {
         Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
         i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US");
         i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
-        if (!useOnDev) {
-            i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (useSegmented) {
-                i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, SEGMENT_WINDOW_MS);
-                i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200);
-                i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900);
-                i.putExtra(RecognizerIntent.EXTRA_SEGMENTED_SESSION, RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS);
-            }
-            if (biasStrings != null && !biasStrings.isEmpty()) {
-                i.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, new ArrayList<>(biasStrings));
-            }
+        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && biasStrings != null && !biasStrings.isEmpty()) {
+            i.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, new ArrayList<>(biasStrings));
         }
         return i;
     }
 
     private static boolean ensureRecognizer(Context app) {
         if (recognizer != null) return true;
-        boolean useOnDev = !fallbackStandard
-                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-                && SpeechRecognizer.isOnDeviceRecognitionAvailable(app);
+        boolean targetTts = useGoogleTts && hasGoogleTtsService(app);
+        boolean targetOnDev = false;
 
         SpeechRecognizer sr = null;
         try {
-            if (useOnDev) {
-                sr = SpeechRecognizer.createOnDeviceSpeechRecognizer(app);
+            if (targetTts) {
+                sr = SpeechRecognizer.createSpeechRecognizer(app, GOOGLE_TTS_SERVICE);
             } else if (SpeechRecognizer.isRecognitionAvailable(app)) {
                 sr = SpeechRecognizer.createSpeechRecognizer(app);
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(app)) {
+                targetOnDev = true;
+                sr = SpeechRecognizer.createOnDeviceSpeechRecognizer(app);
             }
         } catch (Exception e) {
-            Log.w(TAG, "createSpeechRecognizer failed (onDevice=" + useOnDev + ")", e);
-            if (useOnDev) {
-                fallbackStandard = true;
-                useOnDev = false;
-                try {
-                    if (SpeechRecognizer.isRecognitionAvailable(app)) {
-                        sr = SpeechRecognizer.createSpeechRecognizer(app);
-                    }
-                } catch (Exception ignored) {}
-            }
+            Log.w(TAG, "createSpeechRecognizer failed (targetTts=" + targetTts + ")", e);
+            targetTts = false;
+            try {
+                if (SpeechRecognizer.isRecognitionAvailable(app)) {
+                    sr = SpeechRecognizer.createSpeechRecognizer(app);
+                }
+            } catch (Exception ignored) {}
         }
 
         if (sr == null) {
@@ -272,10 +273,11 @@ final class VoiceRecognitionManager {
         }
 
         final int myGen = ++recognizerGen;
-        usingOnDevice = useOnDev;
+        usingGoogleTts = targetTts;
+        usingOnDevice = targetOnDev;
         final SpeechRecognizer activeSr = sr;
         recognizer = activeSr;
-        Log.i(TAG, "ensureRecognizer created gen=" + myGen + " onDev=" + usingOnDevice + " seg=" + useSegmented);
+        Log.i(TAG, "ensureRecognizer created gen=" + myGen + " googleTts=" + usingGoogleTts + " onDev=" + usingOnDevice);
 
         activeSr.setRecognitionListener(new RecognitionListener() {
             @Override
@@ -285,10 +287,11 @@ final class VoiceRecognitionManager {
                 readyReceived = true;
                 active = true;
                 consecutiveStartErrors = 0;
+                consecutiveModeFailures = 0;
                 consecutiveDeadRestarts = 0;
                 lastError = null;
                 lastCallbackElapsedMs = now;
-                Log.i(TAG, "onReadyForSpeech gen=" + myGen + " onDev=" + usingOnDevice);
+                Log.i(TAG, "onReadyForSpeech gen=" + myGen + " googleTts=" + usingGoogleTts);
                 WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "listening", null);
             }
 
@@ -321,7 +324,7 @@ final class VoiceRecognitionManager {
                 listeningInProgress = false;
                 boolean wasReady = readyReceived;
                 readyReceived = false;
-                Log.w(TAG, "onError code=" + error + " wasReady=" + wasReady + " onDev=" + usingOnDevice + " seg=" + useSegmented);
+                Log.w(TAG, "onError code=" + error + " wasReady=" + wasReady + " googleTts=" + usingGoogleTts);
                 if (!desiredEnabled || !appVisible) return;
 
                 if (error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
@@ -332,26 +335,12 @@ final class VoiceRecognitionManager {
                     return;
                 }
 
-                if (error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE
-                        || error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED
-                        || error == SpeechRecognizer.ERROR_CANNOT_CHECK_SUPPORT) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        try { activeSr.triggerModelDownload(buildIntent(usingOnDevice)); } catch (Exception ignored) {}
-                    }
-                    active = false;
-                    fallbackStandard = true;
-                    lastError = "Falling back to standard speech service";
-                    WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
-                    scheduleRestart(app, 350, true);
-                    return;
-                }
-
                 if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
                     if (!wasReady) {
                         consecutiveDeadRestarts++;
-                        if (usingOnDevice && consecutiveDeadRestarts >= 2) {
+                        if (consecutiveDeadRestarts >= 2) {
                             active = false;
-                            escalateRecognizerMode("On-device recognizer timed out before ready");
+                            escalateRecognizerMode("Recognizer ended before speech ready (#" + error + ")");
                             WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
                             scheduleRestart(app, 250, true);
                             return;
@@ -359,17 +348,14 @@ final class VoiceRecognitionManager {
                     } else {
                         consecutiveDeadRestarts = 0;
                     }
-                    // Recreate cleanly on on-device cycles every few silent timeouts to avoid stale binder drops
-                    boolean recreate = !wasReady || usingOnDevice;
-                    scheduleRestart(app, 180, recreate);
+                    scheduleRestart(app, 140, !wasReady);
                     return;
                 }
 
-                // Real operational error (ERROR_RECOGNIZER_BUSY=8, ERROR_CLIENT=5, ERROR_AUDIO=3, ERROR_SERVER_DISCONNECTED=11, etc.)
                 active = false;
                 escalateRecognizerMode("Speech error #" + error);
                 WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
-                scheduleRestart(app, 750, true);
+                scheduleRestart(app, 650, true);
             }
 
             @Override
@@ -377,18 +363,19 @@ final class VoiceRecognitionManager {
                 if (myGen != recognizerGen || recognizer != activeSr) return;
                 listeningInProgress = false;
                 consecutiveStartErrors = 0;
-                consecutiveOnDevErrors = 0;
+                consecutiveModeFailures = 0;
                 consecutiveDeadRestarts = 0;
                 long now = SystemClock.elapsedRealtime();
                 lastCallbackElapsedMs = now;
                 lastSpeechElapsedMs = now;
-                String text = extractTop(results);
+                ArrayList<String> cands = extractCandidates(results, false);
+                String text = cands.isEmpty() ? "" : cands.get(0);
                 lastPartial = "";
-                Log.i(TAG, "onResults: \"" + text + "\"");
+                Log.i(TAG, "onResults cands=" + cands);
                 if (!text.isEmpty()) {
-                    WorkoutServicePlugin.deliverVoiceEvent(text, true, "mic", "listening", null);
+                    WorkoutServicePlugin.deliverVoiceEvent(text, cands, true, "mic", "listening", null);
                 }
-                if (desiredEnabled && appVisible) scheduleRestart(app, 150, usingOnDevice);
+                if (desiredEnabled && appVisible) scheduleRestart(app, 120, false);
             }
 
             @Override
@@ -397,16 +384,17 @@ final class VoiceRecognitionManager {
                 readyReceived = true;
                 active = true;
                 consecutiveStartErrors = 0;
-                consecutiveOnDevErrors = 0;
+                consecutiveModeFailures = 0;
                 consecutiveDeadRestarts = 0;
                 long now = SystemClock.elapsedRealtime();
                 lastCallbackElapsedMs = now;
                 lastSpeechElapsedMs = now;
-                String text = extractTop(segmentResults);
+                ArrayList<String> cands = extractCandidates(segmentResults, false);
+                String text = cands.isEmpty() ? "" : cands.get(0);
                 lastPartial = "";
-                Log.i(TAG, "onSegmentResults: \"" + text + "\"");
+                Log.i(TAG, "onSegmentResults cands=" + cands);
                 if (!text.isEmpty()) {
-                    WorkoutServicePlugin.deliverVoiceEvent(text, true, "mic", "listening", null);
+                    WorkoutServicePlugin.deliverVoiceEvent(text, cands, true, "mic", "listening", null);
                 }
             }
 
@@ -424,15 +412,17 @@ final class VoiceRecognitionManager {
                 readyReceived = true;
                 active = true;
                 consecutiveStartErrors = 0;
+                consecutiveModeFailures = 0;
                 consecutiveDeadRestarts = 0;
                 long now = SystemClock.elapsedRealtime();
                 lastCallbackElapsedMs = now;
                 lastSpeechElapsedMs = now;
-                String text = extractTop(partialResults);
+                ArrayList<String> cands = extractCandidates(partialResults, true);
+                String text = cands.isEmpty() ? "" : cands.get(0);
                 if (!text.isEmpty() && !text.equals(lastPartial)) {
                     lastPartial = text;
-                    Log.i(TAG, "onPartialResults: \"" + text + "\"");
-                    WorkoutServicePlugin.deliverVoiceEvent(text, false, "mic", "listening", null);
+                    Log.i(TAG, "onPartialResults cands=" + cands);
+                    WorkoutServicePlugin.deliverVoiceEvent(text, cands, false, "mic", "listening", null);
                 }
             }
 
@@ -453,7 +443,7 @@ final class VoiceRecognitionManager {
         ensureWatchdog(app);
         if (!ensureRecognizer(app)) return;
 
-        final Intent intent = buildIntent(usingOnDevice);
+        final Intent intent = buildIntent();
         lastPartial = "";
         readyReceived = false;
         listeningInProgress = true;
@@ -465,7 +455,7 @@ final class VoiceRecognitionManager {
 
         try {
             if (listeningInProgress) {
-                Log.i(TAG, "startListening gen=" + recognizerGen + " onDev=" + usingOnDevice + " seg=" + useSegmented);
+                Log.i(TAG, "startListening gen=" + recognizerGen + " googleTts=" + usingGoogleTts);
                 recognizer.startListening(intent);
             }
         } catch (Exception e) {
@@ -481,15 +471,60 @@ final class VoiceRecognitionManager {
             } else {
                 escalateRecognizerMode("startListening exception: " + e.getMessage());
                 WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "recovering", lastError);
-                scheduleRestart(app, 700, true);
+                scheduleRestart(app, 650, true);
             }
         }
     }
 
-    private static String extractTop(Bundle b) {
-        if (b == null) return "";
+    private static ArrayList<String> extractCandidates(Bundle b, boolean isPartial) {
+        ArrayList<String> out = new ArrayList<>();
+        if (b == null) return out;
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+
         ArrayList<String> list = b.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-        if (list == null || list.isEmpty() || list.get(0) == null) return "";
-        return list.get(0).trim();
+        ArrayList<String> unstable = b.getStringArrayList("android.speech.extra.UNSTABLE_TEXT");
+        String topStable = "";
+        if (list != null) {
+            for (String s : list) {
+                if (s != null && !s.trim().isEmpty()) {
+                    topStable = s.trim();
+                    break;
+                }
+            }
+        }
+
+        // GoogleTTSRecognitionService places active streaming partial words into UNSTABLE_TEXT.
+        if (isPartial && unstable != null) {
+            for (String s : unstable) {
+                if (s == null) continue;
+                String u = s.trim();
+                if (!u.isEmpty()) {
+                    String combined = topStable.isEmpty() ? u : (topStable + " " + u).trim();
+                    if (seen.add(combined)) out.add(combined);
+                    if (seen.add(u)) out.add(u);
+                }
+            }
+        }
+
+        if (list != null) {
+            for (String s : list) {
+                if (s == null) continue;
+                String t = s.trim();
+                if (!t.isEmpty() && seen.add(t)) out.add(t);
+            }
+        }
+
+        if (!isPartial && unstable != null) {
+            for (String s : unstable) {
+                if (s == null) continue;
+                String u = s.trim();
+                if (!u.isEmpty()) {
+                    String combined = topStable.isEmpty() ? u : (topStable + " " + u).trim();
+                    if (seen.add(combined)) out.add(combined);
+                    if (seen.add(u)) out.add(u);
+                }
+            }
+        }
+        return out;
     }
 }

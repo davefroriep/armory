@@ -155,7 +155,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     const vxEl = $('#vxStatus', root);
     if (voice.lastError) vxEl.innerHTML = `<span style="color:#fca5a5">${esc(voice.lastError)}</span>`;
     else if (voice.lastAction) vxEl.innerHTML = `Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
-    else vxEl.textContent = cur.voiceEnabled ? (voice.listening ? `● Listening for “${cur.voiceWakeWord || 'armory'}”` : 'Ready while Armory Fit is open') : 'Off';
+    else vxEl.textContent = cur.voiceEnabled ? `${voice.listening ? `● Listening for “${cur.voiceWakeWord || 'armory'}”` : 'Ready while Armory Fit is open'}${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}` : 'Off';
   };
   paintFtpBox();
   const offSet = settingsChanged.on(paintFtpBox);
