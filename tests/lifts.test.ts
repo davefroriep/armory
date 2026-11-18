@@ -13,7 +13,9 @@ import {
   prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
   startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
-import { extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs } from '../src/lifts/mp4';
+import {
+  extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs, sortDeviceVideosNewestFirst,
+} from '../src/lifts/mp4';
 import {
   createTrimState, dragTrimHandle, fmtPreciseTime, isTrimDirty, isTrimmed, jogTrimDelta,
   MIN_TRIM_SPAN_SEC, resolvePlayStart, stepTrimFrames,
@@ -750,5 +752,19 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
     expect(benchNov11.sets[0].kind).toBe('w'); // 45x10
     expect(benchNov11.sets[1].kind).toBe('w'); // 95x10
     expect(benchNov11.sets[2].kind).toBe('n'); // 135x10 working
+  });
+
+  it('sorts device videos newest-first by timestamp then filename so newest clips never sink to the bottom', () => {
+    const oldest = { fileName: 'PXL_20220501_120000.mp4', fileMs: Date.UTC(2022, 4, 1, 12) };
+    const mid = { fileName: 'PXL_20250910_140000.mp4', fileMs: Date.UTC(2025, 8, 10, 14) };
+    const tieOlderName = { fileName: 'PXL_20261118_090000.mp4', fileMs: Date.UTC(2026, 10, 18, 14) };
+    const newest = { fileName: 'PXL_20261118_140000.mp4', fileMs: Date.UTC(2026, 10, 18, 14) };
+    const sorted = sortDeviceVideosNewestFirst([oldest, tieOlderName, mid, newest]);
+    expect(sorted.map((v) => v.fileName)).toEqual([
+      'PXL_20261118_140000.mp4',
+      'PXL_20261118_090000.mp4',
+      'PXL_20250910_140000.mp4',
+      'PXL_20220501_120000.mp4',
+    ]);
   });
 });

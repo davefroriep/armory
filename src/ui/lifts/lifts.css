@@ -508,3 +508,15 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .ecount { display: flex; flex-direction: column; align-items: flex-end; font-variant-numeric: tabular-nums; }
 .ecount b { font-size: .95rem; }
 .ecount small { color: var(--mut); font-size: .68rem; }
+
+/* In-app newest-first native video picker */
+.vpick-sub { font-size: .78rem; color: var(--mut); margin-top: -6px; }
+.vpick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.vpick-card { display: flex; flex-direction: column; gap: 6px; padding: 6px; border-radius: 14px; background: var(--card2); border: 1px solid var(--line); text-align: left; overflow: hidden; }
+.vpick-card:active { opacity: .82; }
+.vpick-th { position: relative; width: 100%; aspect-ratio: 16 / 10; border-radius: 10px; background: #141a22 center / cover no-repeat; display: block; overflow: hidden; }
+.vpick-dur { position: absolute; right: 6px; bottom: 6px; padding: 2px 6px; border-radius: 6px; background: rgba(0, 0, 0, .78); color: #f8fafc; font-style: normal; font-size: .7rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.vpick-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 0 2px 2px; }
+.vpick-meta b { font-size: .78rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vpick-meta small { font-size: .69rem; color: var(--mut); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.vpick-foot { display: flex; flex-direction: column; gap: 8px; padding-top: 4px; }

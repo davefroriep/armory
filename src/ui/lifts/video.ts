@@ -1,7 +1,9 @@
 import { active } from '../../lifts/active';
 import { gymCam, type GymCamBurst } from '../../lifts/gymCam';
 import { driveUrlFor } from '../../lifts/logic';
-import { extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink } from '../../lifts/mp4';
+import {
+  extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink, sortDeviceVideosNewestFirst,
+} from '../../lifts/mp4';
 import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
@@ -12,8 +14,8 @@ import {
 import type { LiftSession, LiftSet, SessionEx, VideoMeta } from '../../lifts/types';
 import { uid } from '../../lifts/types';
 import {
-  exportNativeVideo, getPlayableNativeVideoUrl, isNative, launchNativeVideoCamera,
-  openNativeVideoUri, pickNativeDcimVideo,
+  exportNativeVideo, getPlayableNativeVideoUrl, isNative, listNativeDeviceVideos,
+  openNativeVideoUri, pickNativeDcimVideo, recordNativeVideo, type DeviceVideoEntry,
 } from '../../native/service';
 import { esc } from '../dom';
 import { confirmSheet, openSheet, promptSheet, toast } from './kit';
@@ -157,29 +159,157 @@ async function handlePickedFile(t: VideoTarget, f: File, mode: 'capture' | 'pick
   return meta;
 }
 
+const fmtVideoDuration = (sec: number): string => {
+  const s = Math.max(0, Math.round(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, '0')}`;
+};
+
+const fmtVideoTimestamp = (ms: number): string => {
+  if (!ms) return 'Recent video';
+  const d = new Date(ms);
+  const now = new Date();
+  const ymd = (x: Date) => `${x.getFullYear()}-${x.getMonth()}-${x.getDate()}`;
+  const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (ymd(d) === ymd(now)) return `Today · ${time}`;
+  if (ymd(d) === ymd(yest)) return `Yesterday · ${time}`;
+  const date = d.toLocaleDateString([], {
+    month: 'short',
+    day: 'numeric',
+    ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' } : {}),
+  });
+  return `${date} · ${time}`;
+};
+
+async function pickDcimFromSaf(t: VideoTarget): Promise<VideoMeta | null> {
+  const p = await pickNativeDcimVideo();
+  if (p?.error) {
+    toast('Pick a video file (.mp4, .mov, .webm)');
+    await resetTimerIfIdle(t.session);
+    return null;
+  }
+  if (!p?.picked || !p.fileName) return null;
+  return storeLinkClip(t, {
+    fileName: p.fileName,
+    bytes: p.bytes ?? 0,
+    fileMs: p.fileMs,
+    mime: p.mime || 'video/mp4',
+    durationSec: p.durationSec,
+    thumb: p.thumb ?? '',
+    uri: p.uri,
+    source: 'dcim',
+  });
+}
+
+async function openNativeVideoPickerSheet(t: VideoTarget): Promise<VideoMeta | null> {
+  const initial = await listNativeDeviceVideos(48);
+  if (!initial?.granted) {
+    return pickDcimFromSaf(t);
+  }
+  return new Promise((resolve) => {
+    let resolved: VideoMeta | null = null;
+    let done = false;
+    let deferResolve = false;
+    let loadingMore = false;
+    let entries: DeviceVideoEntry[] = sortDeviceVideosNewestFirst(initial.videos);
+    let hasMore = !!initial.hasMore;
+
+    const renderBody = (): string => {
+      const cards = entries.length
+        ? `<div class="vpick-grid">${entries.map((v, idx) => `<button class="vpick-card" type="button" data-vidx="${idx}">
+            <span class="vpick-th" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}">
+              ${v.durationSec ? `<em class="vpick-dur">${esc(fmtVideoDuration(v.durationSec))}</em>` : ''}
+            </span>
+            <span class="vpick-meta">
+              <b>${esc(fmtVideoTimestamp(v.fileMs))}</b>
+              <small>${esc([v.bucket, v.bytes ? `${(v.bytes / 1048576).toFixed(1)} MB` : ''].filter(Boolean).join(' · ') || v.fileName)}</small>
+            </span>
+          </button>`).join('')}</div>`
+        : '<p class="sh-text" style="text-align:center;padding:18px 0">No device videos found.</p>';
+
+      return `<h3 class="sh-title">Select Video</h3>
+        <div class="vpick-sub">Newest first · Videos only</div>
+        ${cards}
+        <div class="vpick-foot">
+          ${hasMore ? `<button class="btn" type="button" data-vmore ${loadingMore ? 'disabled' : ''}>${loadingMore ? 'Loading…' : 'Show older videos'}</button>` : ''}
+          <button class="btn" type="button" data-vsaf>Browse system files…</button>
+          <button class="btn" type="button" data-vcancel>Cancel</button>
+        </div>`;
+    };
+
+    const finish = (meta: VideoMeta | null): void => {
+      if (done) return;
+      done = true;
+      resolved = meta;
+      sh.close();
+      resolve(resolved);
+    };
+
+    const sh = openSheet(renderBody(), {
+      full: true,
+      onClose: () => {
+        if (!done && !deferResolve) {
+          done = true;
+          resolve(resolved);
+        }
+      },
+    });
+
+    sh.body.addEventListener('click', async (e) => {
+      const el = e.target as HTMLElement;
+      const card = el.closest<HTMLElement>('[data-vidx]');
+      if (card) {
+        const entry = entries[Number(card.dataset.vidx)];
+        if (!entry) return;
+        card.setAttribute('disabled', 'disabled');
+        const meta = await storeLinkClip(t, {
+          fileName: entry.fileName,
+          bytes: entry.bytes,
+          fileMs: entry.fileMs || undefined,
+          mime: entry.mime || 'video/mp4',
+          durationSec: entry.durationSec || undefined,
+          thumb: entry.thumb,
+          uri: entry.uri,
+          source: 'dcim',
+        });
+        finish(meta);
+        return;
+      }
+      if (el.closest('[data-vmore]') && !loadingMore) {
+        loadingMore = true;
+        sh.body.innerHTML = renderBody();
+        const next = await listNativeDeviceVideos(200);
+        loadingMore = false;
+        if (next?.granted) {
+          entries = sortDeviceVideosNewestFirst(next.videos);
+          hasMore = !!next.hasMore;
+        }
+        if (!done) sh.body.innerHTML = renderBody();
+        return;
+      }
+      if (el.closest('[data-vsaf]')) {
+        deferResolve = true;
+        sh.close();
+        const meta = await pickDcimFromSaf(t);
+        finish(meta);
+        return;
+      }
+      if (el.closest('[data-vcancel]')) {
+        finish(null);
+      }
+    });
+  });
+}
+
 /**
- * Pick a video from the phone (native DCIM/Camera on APK, or Video picker on Web)
+ * Pick a video from the phone (newest-first native video gallery on APK, or Video picker on Web)
  * preserving filename & Google Drive DCIM Backup link without copying the file into IndexedDB.
  */
 export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
   if (isNative()) {
-    const p = await pickNativeDcimVideo();
-    if (p?.error) {
-      toast('Pick a video file (.mp4, .mov, .webm)');
-      await resetTimerIfIdle(t.session);
-      return null;
-    }
-    if (!p?.picked || !p.fileName) return null;
-    return storeLinkClip(t, {
-      fileName: p.fileName,
-      bytes: p.bytes ?? 0,
-      fileMs: p.fileMs,
-      mime: p.mime || 'video/mp4',
-      durationSec: p.durationSec,
-      thumb: p.thumb ?? '',
-      uri: p.uri,
-      source: 'dcim',
-    });
+    return openNativeVideoPickerSheet(t);
   }
   return new Promise((resolve) => {
     const inp = document.createElement('input');
@@ -223,11 +353,10 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     : '';
 
   const actionsHtml = native
-    ? `<div class="hint" id="vcam-hint" hidden style="color:#93c5fd">Camera opened — tap <b>Select Video</b> when finished.</div>
-       <div class="alist">
+    ? `<div class="alist">
          ${gymArmHtml}
          <button class="aitem" type="button" data-vact="cam"><b>Record Video</b><small>Phone camera</small></button>
-         <button class="aitem" type="button" data-vact="pick"><b>Select Video</b><small>Phone DCIM / Gallery</small></button>
+         <button class="aitem" type="button" data-vact="pick"><b>Select Video</b><small>Newest phone videos</small></button>
        </div>`
     : mobile
       ? `<div class="alist">
@@ -406,9 +535,24 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     if (act === 'cam') {
       if (native) {
         startTimerForVideo(t.session);
-        const ok = await launchNativeVideoCamera();
-        if (ok) sh.body.querySelector<HTMLElement>('#vcam-hint')!.hidden = false;
-        else { await resetTimerIfIdle(t.session); toast('Could not open Camera app'); }
+        const p = await recordNativeVideo();
+        if (p?.picked && p.uri && p.fileName) {
+          const meta = await storeLinkClip(t, {
+            fileName: p.fileName,
+            bytes: p.bytes ?? 0,
+            fileMs: p.fileMs,
+            mime: p.mime || 'video/mp4',
+            durationSec: p.durationSec,
+            thumb: p.thumb ?? '',
+            uri: p.uri,
+            source: 'phone',
+          });
+          toast(`Video recorded & linked (${meta.fileName ?? 'clip'})`);
+          sh.close();
+        } else {
+          await resetTimerIfIdle(t.session);
+          if (p?.error) toast(p.error);
+        }
       } else if (!mobile) {
         startTimerForVideo(t.session);
         sh.el.style.visibility = 'hidden';

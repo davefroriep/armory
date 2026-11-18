@@ -12,6 +12,24 @@ export interface PickedNativeVideo {
   thumb?: string;
 }
 
+export interface DeviceVideoEntry {
+  uri: string;
+  fileName: string;
+  bytes: number;
+  fileMs: number;
+  durationSec: number;
+  mime: string;
+  bucket?: string;
+  thumb: string;
+}
+
+export interface DeviceVideoListResult {
+  granted: boolean;
+  hasMore?: boolean;
+  videos: DeviceVideoEntry[];
+  error?: string;
+}
+
 export interface NativeRestEvent {
   action: 'fired' | 'adjust' | 'clear';
   remainingMs: number;
@@ -78,6 +96,8 @@ interface WorkoutServicePlugin {
   getVoiceStatus(): Promise<NativeVoiceStatus>;
   ensureVoicePermission(): Promise<{ granted: boolean }>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
+  recordVideo(): Promise<PickedNativeVideo>;
+  listDeviceVideos(o: { limit?: number }): Promise<DeviceVideoListResult>;
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
   getPlayableVideoUrl(o: { uri: string; mime?: string }): Promise<{ url?: string; error?: string }>;
@@ -159,6 +179,16 @@ export async function setNativeMetronome(play: boolean, bpm: number, volume: num
 export async function launchNativeVideoCamera(): Promise<boolean> {
   if (!plugin) return false;
   try { return (await plugin.launchVideoCamera()).opened; } catch { return false; }
+}
+
+export async function recordNativeVideo(): Promise<PickedNativeVideo | null> {
+  if (!plugin) return null;
+  try { return await plugin.recordVideo(); } catch { return { picked: false, error: 'Camera launch failed' }; }
+}
+
+export async function listNativeDeviceVideos(limit = 48): Promise<DeviceVideoListResult | null> {
+  if (!plugin) return null;
+  try { return await plugin.listDeviceVideos({ limit }); } catch { return null; }
 }
 
 export async function pickNativeDcimVideo(): Promise<PickedNativeVideo | null> {

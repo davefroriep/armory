@@ -125,3 +125,8 @@ export function inferPixelVideoLink(rawName: string, endMs: number, durationSec:
     : `PXL ${p1.ymd} type:video`;
   return { fileName, driveQuery };
 }
+
+/** Sort device video entries newest-first (fileMs desc, tie-broken reverse by filename). */
+export function sortDeviceVideosNewestFirst<T extends { fileMs: number; fileName: string }>(list: readonly T[]): T[] {
+  return [...list].sort((a, b) => (b.fileMs - a.fileMs) || b.fileName.localeCompare(a.fileName));
+}

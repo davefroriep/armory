@@ -10,6 +10,7 @@ import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.media.MediaMetadataRetriever;
@@ -21,6 +22,7 @@ import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.util.Base64;
+import android.util.Size;
 import android.view.WindowManager;
 
 import androidx.activity.result.ActivityResult;
@@ -47,19 +49,26 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
+import java.util.TimeZone;
 
 /** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, wallboard HTTP/SSE, voice recognition + video linking. */
 @CapacitorPlugin(
         name = "WorkoutService",
         permissions = {
-                @Permission(strings = { Manifest.permission.RECORD_AUDIO }, alias = "microphone")
+                @Permission(strings = { Manifest.permission.RECORD_AUDIO }, alias = "microphone"),
+                @Permission(strings = { Manifest.permission.READ_MEDIA_VIDEO }, alias = "videos"),
+                @Permission(strings = { Manifest.permission.READ_EXTERNAL_STORAGE }, alias = "videosLegacy")
         }
 )
 public class WorkoutServicePlugin extends Plugin {
     private static volatile WorkoutServicePlugin instance;
     private static volatile boolean keepScreenOnWanted = false;
+    private volatile File pendingCaptureFile;
 
     @Override
     public void load() {
@@ -362,6 +371,191 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
+    /** Captures a single video via ACTION_VIDEO_CAPTURE (with camera ✓ confirm), moves it into DCIM/Camera, and returns metadata for 1-step linking. */
+    @PluginMethod
+    public void recordVideo(PluginCall call) {
+        Context c = getContext();
+        File capDir = new File(c.getCacheDir(), "video_capture");
+        if (!capDir.exists()) capDir.mkdirs();
+        File temp = new File(capDir, "cap_" + System.currentTimeMillis() + ".mp4");
+        pendingCaptureFile = temp;
+        try {
+            Uri captureUri = FileProvider.getUriForFile(c, c.getPackageName() + ".fileprovider", temp);
+            Intent i = new Intent(MediaStore.ACTION_VIDEO_CAPTURE);
+            i.putExtra(MediaStore.EXTRA_OUTPUT, captureUri);
+            i.putExtra(MediaStore.EXTRA_VIDEO_QUALITY, 1);
+            i.setClipData(ClipData.newRawUri("", captureUri));
+            i.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            startActivityForResult(call, i, "onVideoCaptured");
+        } catch (Exception e) {
+            pendingCaptureFile = null;
+            temp.delete();
+            JSObject ret = new JSObject();
+            ret.put("picked", false);
+            ret.put("error", e.getMessage() != null ? e.getMessage() : "Could not open Camera app");
+            call.resolve(ret);
+        }
+    }
+
+    @ActivityCallback
+    private void onVideoCaptured(PluginCall call, ActivityResult result) {
+        if (call == null) return;
+        File capturedFile = pendingCaptureFile;
+        pendingCaptureFile = null;
+        Intent data = result.getData();
+        Uri dataUri = data != null ? data.getData() : null;
+        if (result.getResultCode() != Activity.RESULT_OK) {
+            if (capturedFile != null) capturedFile.delete();
+            JSObject ret = new JSObject();
+            ret.put("picked", false);
+            call.resolve(ret);
+            return;
+        }
+        Context appCtx = getContext().getApplicationContext();
+        new Thread(() -> {
+            JSObject ret = new JSObject();
+            try {
+                boolean hasFile = capturedFile != null && capturedFile.exists() && capturedFile.length() > 0;
+                if (!hasFile && dataUri == null) {
+                    ret.put("picked", false);
+                    call.resolve(ret);
+                    return;
+                }
+                SimpleDateFormat sdf = new SimpleDateFormat("yyyyMMdd_HHmmssSSS", Locale.US);
+                sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
+                long nowMs = System.currentTimeMillis();
+                String fileName = "PXL_" + sdf.format(new Date(nowMs)) + ".mp4";
+                long bytes = hasFile ? capturedFile.length() : 0L;
+                Uri dcimUri;
+                try (InputStream is = hasFile
+                        ? new FileInputStream(capturedFile)
+                        : appCtx.getContentResolver().openInputStream(dataUri)) {
+                    if (is == null) throw new IllegalStateException("Cannot read captured video");
+                    dcimUri = saveStreamToDcimCamera(appCtx, is, fileName);
+                }
+                ret = buildPickedVideoJson(appCtx, dcimUri, fileName, bytes, nowMs);
+            } catch (Exception e) {
+                ret.put("picked", false);
+                ret.put("error", e.getMessage() != null ? e.getMessage() : "Failed to save recorded video");
+            } finally {
+                if (capturedFile != null && capturedFile.exists()) capturedFile.delete();
+            }
+            call.resolve(ret);
+        }).start();
+    }
+
+    private static boolean hasVideoReadAccess(Context c) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(c, Manifest.permission.READ_MEDIA_VIDEO)
+                    == PackageManager.PERMISSION_GRANTED) {
+                return true;
+            }
+            return Build.VERSION.SDK_INT >= 34
+                    && ContextCompat.checkSelfPermission(c, Manifest.permission.READ_MEDIA_VISUAL_USER_SELECTED)
+                    == PackageManager.PERMISSION_GRANTED;
+        }
+        return ContextCompat.checkSelfPermission(c, Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    /** Queries device videos via MediaStore ordered newest-first (`DATE_MODIFIED DESC`). */
+    @PluginMethod
+    public void listDeviceVideos(PluginCall call) {
+        if (hasVideoReadAccess(getContext())) {
+            queryDeviceVideosAsync(call);
+            return;
+        }
+        String alias = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ? "videos" : "videosLegacy";
+        requestPermissionForAlias(alias, call, "onVideosPermission");
+    }
+
+    @PermissionCallback
+    private void onVideosPermission(PluginCall call) {
+        if (call == null) return;
+        if (hasVideoReadAccess(getContext())) {
+            queryDeviceVideosAsync(call);
+            return;
+        }
+        JSObject ret = new JSObject();
+        ret.put("granted", false);
+        ret.put("hasMore", false);
+        ret.put("videos", new JSArray());
+        call.resolve(ret);
+    }
+
+    private void queryDeviceVideosAsync(PluginCall call) {
+        Context appCtx = getContext().getApplicationContext();
+        int limit = Math.max(1, Math.min(250, call.getInt("limit", 48)));
+        new Thread(() -> {
+            JSObject ret = new JSObject();
+            JSArray videos = new JSArray();
+            boolean hasMore = false;
+            ContentResolver cr = appCtx.getContentResolver();
+            String[] proj = new String[] {
+                    MediaStore.Video.Media._ID,
+                    MediaStore.Video.Media.DISPLAY_NAME,
+                    MediaStore.Video.Media.SIZE,
+                    MediaStore.Video.Media.DURATION,
+                    MediaStore.Video.Media.DATE_MODIFIED,
+                    MediaStore.Video.Media.MIME_TYPE,
+                    MediaStore.Video.Media.BUCKET_DISPLAY_NAME
+            };
+            String sort = MediaStore.Video.Media.DATE_MODIFIED + " DESC, " + MediaStore.Video.Media._ID + " DESC";
+            try (Cursor cur = cr.query(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, proj, null, null, sort)) {
+                if (cur != null) {
+                    int idCol = cur.getColumnIndexOrThrow(MediaStore.Video.Media._ID);
+                    int nameCol = cur.getColumnIndex(MediaStore.Video.Media.DISPLAY_NAME);
+                    int sizeCol = cur.getColumnIndex(MediaStore.Video.Media.SIZE);
+                    int durCol = cur.getColumnIndex(MediaStore.Video.Media.DURATION);
+                    int dateCol = cur.getColumnIndex(MediaStore.Video.Media.DATE_MODIFIED);
+                    int mimeCol = cur.getColumnIndex(MediaStore.Video.Media.MIME_TYPE);
+                    int bucketCol = cur.getColumnIndex(MediaStore.Video.Media.BUCKET_DISPLAY_NAME);
+                    while (cur.moveToNext()) {
+                        long size = sizeCol >= 0 ? cur.getLong(sizeCol) : 0L;
+                        if (size <= 0L) continue;
+                        if (videos.length() >= limit) {
+                            hasMore = true;
+                            break;
+                        }
+                        long id = cur.getLong(idCol);
+                        Uri itemUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id);
+                        String fileName = (nameCol >= 0 && cur.getString(nameCol) != null)
+                                ? cur.getString(nameCol)
+                                : ("VID_" + id + ".mp4");
+                        long durMs = durCol >= 0 ? cur.getLong(durCol) : 0L;
+                        long dateSec = dateCol >= 0 ? cur.getLong(dateCol) : 0L;
+                        String mime = (mimeCol >= 0 && cur.getString(mimeCol) != null)
+                                ? cur.getString(mimeCol)
+                                : "video/mp4";
+                        String bucket = (bucketCol >= 0 && cur.getString(bucketCol) != null)
+                                ? cur.getString(bucketCol)
+                                : "";
+                        String thumb = extractVideoThumb(appCtx, cr, itemUri);
+                        JSObject item = new JSObject();
+                        item.put("uri", itemUri.toString());
+                        item.put("fileName", fileName);
+                        item.put("bytes", size);
+                        item.put("fileMs", dateSec > 0 ? dateSec * 1000L : 0L);
+                        item.put("durationSec", durMs > 0 ? (int) Math.round(durMs / 1000.0) : 0);
+                        item.put("mime", mime);
+                        if (!bucket.isEmpty()) item.put("bucket", bucket);
+                        item.put("thumb", thumb);
+                        videos.put(item);
+                    }
+                }
+                ret.put("granted", true);
+                ret.put("hasMore", hasMore);
+                ret.put("videos", videos);
+            } catch (Exception e) {
+                ret.put("granted", false);
+                ret.put("hasMore", false);
+                ret.put("videos", new JSArray());
+                ret.put("error", e.getMessage() != null ? e.getMessage() : "Video query failed");
+            }
+            call.resolve(ret);
+        }).start();
+    }
+
     @PluginMethod
     public void pickDcimVideo(PluginCall call) {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -380,8 +574,8 @@ public class WorkoutServicePlugin extends Plugin {
     @ActivityCallback
     private void onVideoPicked(PluginCall call, ActivityResult result) {
         if (call == null) return;
-        JSObject ret = new JSObject();
         if (result.getResultCode() != Activity.RESULT_OK || result.getData() == null || result.getData().getData() == null) {
+            JSObject ret = new JSObject();
             ret.put("picked", false);
             call.resolve(ret);
             return;
@@ -392,26 +586,75 @@ public class WorkoutServicePlugin extends Plugin {
             c.getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
         } catch (Exception ignored) {
         }
-        String fileName = uri.getLastPathSegment();
-        long size = 0;
-        long fileMs = 0;
-        try (Cursor cur = c.getContentResolver().query(uri, null, null, null, null)) {
+        JSObject ret = buildPickedVideoJson(c, uri, uri.getLastPathSegment(), 0L, 0L);
+        call.resolve(ret);
+    }
+
+    private static String encodeThumbDataUrl(Bitmap bmp, int maxW, int quality) {
+        if (bmp == null) return "";
+        int tw = Math.min(maxW, Math.max(1, bmp.getWidth()));
+        int th = Math.max(1, Math.round((float) tw * bmp.getHeight() / Math.max(1, bmp.getWidth())));
+        Bitmap scaled = (tw != bmp.getWidth() || th != bmp.getHeight())
+                ? Bitmap.createScaledBitmap(bmp, tw, th, true)
+                : bmp;
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        scaled.compress(Bitmap.CompressFormat.JPEG, quality, baos);
+        if (scaled != bmp) scaled.recycle();
+        bmp.recycle();
+        return "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
+    }
+
+    private static String extractVideoThumb(Context c, ContentResolver cr, Uri uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            try {
+                Bitmap bmp = cr.loadThumbnail(uri, new Size(240, 240), null);
+                if (bmp != null) return encodeThumbDataUrl(bmp, 200, 60);
+            } catch (Exception ignored) {
+            }
+        }
+        MediaMetadataRetriever mmr = new MediaMetadataRetriever();
+        try {
+            mmr.setDataSource(c, uri);
+            Bitmap bmp = mmr.getFrameAtTime(400_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
+            if (bmp == null) bmp = mmr.getFrameAtTime();
+            if (bmp != null) return encodeThumbDataUrl(bmp, 200, 60);
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                mmr.release();
+            } catch (Exception ignored) {
+            }
+        }
+        return "";
+    }
+
+    private static JSObject buildPickedVideoJson(Context c, Uri uri, String fallbackName, long fallbackBytes, long fallbackMs) {
+        JSObject ret = new JSObject();
+        ContentResolver cr = c.getContentResolver();
+        String fileName = fallbackName;
+        long size = fallbackBytes;
+        long fileMs = fallbackMs;
+        try (Cursor cur = cr.query(uri, null, null, null, null)) {
             if (cur != null && cur.moveToFirst()) {
                 int ni = cur.getColumnIndex(OpenableColumns.DISPLAY_NAME);
                 if (ni >= 0 && cur.getString(ni) != null) fileName = cur.getString(ni);
                 int si = cur.getColumnIndex(OpenableColumns.SIZE);
-                if (si >= 0) size = cur.getLong(si);
+                if (si >= 0 && cur.getLong(si) > 0) size = cur.getLong(si);
                 int mi = cur.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED);
-                if (mi >= 0) fileMs = cur.getLong(mi);
+                if (mi >= 0 && cur.getLong(mi) > 0) {
+                    fileMs = cur.getLong(mi);
+                } else {
+                    int di = cur.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED);
+                    if (di >= 0 && cur.getLong(di) > 0) fileMs = cur.getLong(di) * 1000L;
+                }
             }
         } catch (Exception ignored) {
         }
-        String mime = c.getContentResolver().getType(uri);
+        String mime = cr.getType(uri);
         if (mime != null && !mime.startsWith("video/")) {
             ret.put("picked", false);
             ret.put("error", "Not a video file");
-            call.resolve(ret);
-            return;
+            return ret;
         }
         int durationSec = 0;
         String thumb = "";
@@ -422,16 +665,7 @@ public class WorkoutServicePlugin extends Plugin {
             if (d != null) durationSec = (int) Math.round(Long.parseLong(d) / 1000.0);
             Bitmap bmp = mmr.getFrameAtTime(400_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC);
             if (bmp == null) bmp = mmr.getFrameAtTime();
-            if (bmp != null) {
-                int tw = 200;
-                int th = Math.max(1, Math.round((float) tw * bmp.getHeight() / Math.max(1, bmp.getWidth())));
-                Bitmap scaled = Bitmap.createScaledBitmap(bmp, tw, th, true);
-                ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                scaled.compress(Bitmap.CompressFormat.JPEG, 60, baos);
-                thumb = "data:image/jpeg;base64," + Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP);
-                if (scaled != bmp) scaled.recycle();
-                bmp.recycle();
-            }
+            if (bmp != null) thumb = encodeThumbDataUrl(bmp, 200, 60);
         } catch (Exception ignored) {
         } finally {
             try {
@@ -447,7 +681,50 @@ public class WorkoutServicePlugin extends Plugin {
         ret.put("mime", mime != null ? mime : "video/mp4");
         ret.put("durationSec", durationSec);
         ret.put("thumb", thumb);
-        call.resolve(ret);
+        return ret;
+    }
+
+    private static Uri saveStreamToDcimCamera(Context c, InputStream is, String fileName) throws Exception {
+        return saveVideoStream(c, is, Environment.DIRECTORY_DCIM, "Camera", fileName).uri;
+    }
+
+    private static class SavedVideoResult {
+        final Uri uri;
+        final String displayPath;
+        SavedVideoResult(Uri uri, String displayPath) {
+            this.uri = uri;
+            this.displayPath = displayPath;
+        }
+    }
+
+    private static SavedVideoResult saveVideoStream(Context c, InputStream is, String rootDir, String subDir, String fileName) throws Exception {
+        String relPath = rootDir + "/" + subDir;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentResolver cr = c.getContentResolver();
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+            cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+            cv.put(MediaStore.Video.Media.RELATIVE_PATH, relPath + "/");
+            cv.put(MediaStore.Video.Media.IS_PENDING, 1);
+            Uri dstUri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
+            if (dstUri == null) throw new IllegalStateException("MediaStore insert failed");
+            try (OutputStream os = cr.openOutputStream(dstUri, "w")) {
+                if (os == null) throw new IllegalStateException("MediaStore write failed");
+                copyStreams(is, os);
+            }
+            ContentValues done = new ContentValues();
+            done.put(MediaStore.Video.Media.IS_PENDING, 0);
+            cr.update(dstUri, done, null, null);
+            return new SavedVideoResult(dstUri, relPath + "/" + fileName);
+        } else {
+            File dir = new File(Environment.getExternalStoragePublicDirectory(rootDir), subDir);
+            if (!dir.exists()) dir.mkdirs();
+            File dst = new File(dir, fileName);
+            try (OutputStream os = new FileOutputStream(dst)) {
+                copyStreams(is, os);
+            }
+            return new SavedVideoResult(Uri.fromFile(dst), dst.getAbsolutePath());
+        }
     }
 
     @PluginMethod
@@ -618,32 +895,8 @@ public class WorkoutServicePlugin extends Plugin {
     }
 
     private static String saveVideoToGallery(Context c, File src, String fileName) throws Exception {
-        String relPath = Environment.DIRECTORY_MOVIES + "/ArmoryFit";
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ContentResolver cr = c.getContentResolver();
-            ContentValues cv = new ContentValues();
-            cv.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
-            cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
-            cv.put(MediaStore.Video.Media.RELATIVE_PATH, relPath + "/");
-            cv.put(MediaStore.Video.Media.IS_PENDING, 1);
-            Uri dstUri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
-            if (dstUri == null) throw new IllegalStateException("MediaStore insert failed");
-            try (InputStream is = new FileInputStream(src); OutputStream os = cr.openOutputStream(dstUri, "w")) {
-                if (os == null) throw new IllegalStateException("MediaStore write failed");
-                copyStreams(is, os);
-            }
-            ContentValues done = new ContentValues();
-            done.put(MediaStore.Video.Media.IS_PENDING, 0);
-            cr.update(dstUri, done, null, null);
-            return relPath + "/" + fileName;
-        } else {
-            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "ArmoryFit");
-            if (!dir.exists()) dir.mkdirs();
-            File dst = new File(dir, fileName);
-            try (InputStream is = new FileInputStream(src); OutputStream os = new FileOutputStream(dst)) {
-                copyStreams(is, os);
-            }
-            return dst.getAbsolutePath();
+        try (InputStream is = new FileInputStream(src)) {
+            return saveVideoStream(c, is, Environment.DIRECTORY_MOVIES, "ArmoryFit", fileName).displayPath;
         }
     }
 
