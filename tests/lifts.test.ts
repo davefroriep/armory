@@ -13,6 +13,10 @@ import {
   startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import { extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs } from '../src/lifts/mp4';
+import {
+  createTrimState, dragTrimHandle, fmtPreciseTime, isTrimDirty, isTrimmed, jogTrimDelta,
+  MIN_TRIM_SPAN_SEC, resolvePlayStart, stepTrimFrames,
+} from '../src/lifts/trimmer';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
 import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
 import { KG_PER_LB, fmtNum, fromDisplay, stepsFor, toDisplay } from '../src/lifts/settings';
@@ -339,6 +343,64 @@ describe('e1RM, rep records, PRs', () => {
     expect(ultraBests[PR_MAX_REPS + 1]).toBeUndefined();
     const ultraPrs = computePRs([ultra1, ultra2], exOf);
     expect(ultraPrs.has(ultra2.exs[0].sets[0].id)).toBe(false);
+  });
+});
+
+describe('precision active-edge trimmer', () => {
+  it('couples Left/Right grab bars, ±5f/±1f stepping, Thumb Jog, and playhead preview in lockstep', () => {
+    const s0 = createTrimState(20);
+    expect(s0.start).toBe(0);
+    expect(s0.end).toBe(20);
+    expect(s0.focus).toBe('playhead');
+    expect(isTrimmed(s0)).toBe(false);
+    expect(isTrimDirty(s0)).toBe(false);
+
+    // Drag Left (Start) rail to 4.000s and Right (End) rail to 14.000s
+    const s1 = dragTrimHandle(s0, 'in', 4.0);
+    expect(s1.focus).toBe('in');
+    expect(s1.start).toBe(4);
+    expect(s1.playhead).toBe(4);
+    expect(isTrimmed(s1)).toBe(true);
+    expect(isTrimDirty(s1)).toBe(true);
+
+    // ±5f / ±1f moves BOTH start rail and preview playhead at 1/30s (no 0.1s rounding drift)
+    const s1p5 = stepTrimFrames(s1, 5);
+    expect(s1p5.start).toBe(4.167);
+    expect(s1p5.playhead).toBe(4.167);
+    expect(fmtPreciseTime(s1p5.start)).toBe('0:04.17');
+
+    const s1p6 = stepTrimFrames(s1p5, 1);
+    expect(s1p6.start).toBe(4.2);
+    expect(s1p6.playhead).toBe(4.2);
+
+    // Grab Right (End) rail and nudge via jog strip + -5f
+    const s2 = dragTrimHandle(s1p6, 'out', 14.0);
+    expect(s2.focus).toBe('out');
+    expect(s2.end).toBe(14);
+    expect(s2.playhead).toBe(14);
+
+    const s2j = jogTrimDelta(s2, -0.5);
+    expect(s2j.end).toBe(13.5);
+    expect(s2j.playhead).toBe(13.5);
+
+    const s2m5 = stepTrimFrames(s2j, -5);
+    expect(s2m5.end).toBe(13.333);
+    expect(s2m5.playhead).toBe(13.333);
+
+    // Clamps by MIN_TRIM_SPAN_SEC (0.25s) so Start and End rails never cross
+    const crossed = dragTrimHandle(s2m5, 'in', 20);
+    expect(crossed.start).toBeCloseTo(13.333 - MIN_TRIM_SPAN_SEC, 3);
+
+    // Pressing Play after dialing End rail automatically jumps playhead back to Start and focuses playhead
+    const playing = resolvePlayStart(s2m5);
+    expect(playing.focus).toBe('playhead');
+    expect(playing.playhead).toBe(s2m5.start);
+
+    // Focusing playhead lets ±1f step just the preview frame without altering saved Start/End bounds
+    const steppedHead = stepTrimFrames(playing, 3);
+    expect(steppedHead.playhead).toBe(4.3);
+    expect(steppedHead.start).toBe(4.2);
+    expect(steppedHead.end).toBe(13.333);
   });
 });
 

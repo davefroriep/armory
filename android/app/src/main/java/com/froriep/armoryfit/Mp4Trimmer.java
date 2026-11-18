@@ -7,19 +7,152 @@ import android.media.MediaFormat;
 import android.media.MediaMetadataRetriever;
 import android.media.MediaMuxer;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.OptIn;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.MimeTypes;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.transformer.Composition;
+import androidx.media3.transformer.EditedMediaItem;
+import androidx.media3.transformer.EditedMediaItemSequence;
+import androidx.media3.transformer.ExportException;
+import androidx.media3.transformer.ExportResult;
+import androidx.media3.transformer.Transformer;
 
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Hardware-native MP4 trimmer (`MediaExtractor` + `MediaMuxer`) preserving video orientation
- * and copying strictly the primary video and audio tracks so camera metadata tracks never fail export.
+ * Hardware MP4 trimmer backed by AndroidX Jetpack Media3 Transformer for frame-exact
+ * clipping (never snaps start cuts 0.5-1.0s back to an I-frame, and tone-maps 10-bit HLG HDR
+ * captures to universal SDR H.264), falling back to stream-copy if needed.
  */
 final class Mp4Trimmer {
     private Mp4Trimmer() {}
 
+    @OptIn(markerClass = UnstableApi.class)
     static void trim(Context c, Uri srcUri, File srcFile, long startMs, long endMs, File dstFile) throws Exception {
+        Context appCtx = c.getApplicationContext();
+        Uri inputUri = (srcFile != null) ? Uri.fromFile(srcFile) : srcUri;
+        long safeStartMs = Math.max(0L, startMs);
+        long safeEndMs = Math.max(safeStartMs + 100L, endMs);
+
+        MediaItem.ClippingConfiguration clipCfg = new MediaItem.ClippingConfiguration.Builder()
+                .setStartPositionMs(safeStartMs)
+                .setEndPositionMs(safeEndMs)
+                .setStartsAtKeyFrame(false)
+                .build();
+
+        MediaItem mediaItem = new MediaItem.Builder()
+                .setUri(inputUri)
+                .setClippingConfiguration(clipCfg)
+                .build();
+
+        EditedMediaItem editedItem = new EditedMediaItem.Builder(mediaItem).build();
+
+        Exception firstErr = null;
+        try {
+            runMedia3Transform(appCtx, editedItem, dstFile, true);
+            if (dstFile.exists() && dstFile.length() > 0) return;
+        } catch (Exception e) {
+            firstErr = e;
+            if (dstFile.exists()) dstFile.delete();
+        }
+
+        try {
+            runMedia3Transform(appCtx, editedItem, dstFile, false);
+            if (dstFile.exists() && dstFile.length() > 0) return;
+        } catch (Exception secondErr) {
+            if (dstFile.exists()) dstFile.delete();
+            try {
+                streamCopyTrim(appCtx, srcUri, srcFile, safeStartMs, safeEndMs, dstFile);
+                return;
+            } catch (Exception ignored) {
+                if (firstErr != null) throw firstErr;
+                throw secondErr;
+            }
+        }
+
+        streamCopyTrim(appCtx, srcUri, srcFile, safeStartMs, safeEndMs, dstFile);
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private static void runMedia3Transform(
+            Context appCtx,
+            EditedMediaItem editedItem,
+            File dstFile,
+            boolean forceSdrH264
+    ) throws Exception {
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<Exception> errRef = new AtomicReference<>();
+        AtomicReference<Transformer> txRef = new AtomicReference<>();
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+
+        Runnable startTask = () -> {
+            try {
+                Transformer.Builder tb = new Transformer.Builder(appCtx);
+                if (forceSdrH264) {
+                    tb.setVideoMimeType(MimeTypes.VIDEO_H264);
+                }
+                tb.addListener(new Transformer.Listener() {
+                    @Override
+                    public void onCompleted(@NonNull Composition composition, @NonNull ExportResult exportResult) {
+                        latch.countDown();
+                    }
+
+                    @Override
+                    public void onError(
+                            @NonNull Composition composition,
+                            @NonNull ExportResult exportResult,
+                            @NonNull ExportException exportException
+                    ) {
+                        errRef.compareAndSet(null, exportException);
+                        latch.countDown();
+                    }
+                });
+                Transformer tx = tb.build();
+                txRef.set(tx);
+
+                if (forceSdrH264 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    EditedMediaItemSequence seq = new EditedMediaItemSequence(editedItem);
+                    Composition comp = new Composition.Builder(seq)
+                            .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
+                            .build();
+                    tx.start(comp, dstFile.getAbsolutePath());
+                } else {
+                    tx.start(editedItem, dstFile.getAbsolutePath());
+                }
+            } catch (Exception e) {
+                errRef.compareAndSet(null, e);
+                latch.countDown();
+            }
+        };
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            startTask.run();
+        } else {
+            mainHandler.post(startTask);
+        }
+
+        boolean finished = latch.await(120, TimeUnit.SECONDS);
+        if (!finished) {
+            Transformer tx = txRef.get();
+            if (tx != null) mainHandler.post(tx::cancel);
+            throw new IOException("Video trim timed out");
+        }
+        Exception err = errRef.get();
+        if (err != null) throw err;
+    }
+
+    private static void streamCopyTrim(Context c, Uri srcUri, File srcFile, long startMs, long endMs, File dstFile) throws Exception {
         int rotation = 0;
         MediaMetadataRetriever mmr = new MediaMetadataRetriever();
         try {

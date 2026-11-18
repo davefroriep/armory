@@ -5,6 +5,10 @@ import { extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink } from '
 import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
+import {
+  createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
+  jogTrimDelta, resolvePlayStart, roundMs, stepTrimFrames, type TrimFocus, type TrimState,
+} from '../../lifts/trimmer';
 import type { LiftSession, LiftSet, SessionEx, VideoMeta } from '../../lifts/types';
 import { uid } from '../../lifts/types';
 import {
@@ -27,14 +31,6 @@ const sessionFiles = new Map<string, Blob>();
 const isMobileWeb = (): boolean => !isNative() && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
-const round1 = (v: number): number => Math.round(v * 10) / 10;
-
-const fmtTenths = (sec: number): string => {
-  const s = Math.max(0, round1(sec));
-  const m = Math.floor(s / 60);
-  const rem = (s - m * 60).toFixed(1).padStart(4, '0');
-  return `${m}:${rem}`;
-};
 
 const fmtEpochClock = (ms: number): string =>
   new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
@@ -585,11 +581,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   const dateTxt = new Date(meta.fileMs ?? meta.ms).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
   const subTxt = [setTxt, dateTxt, meta.camera].filter(Boolean).join(' · ');
 
-  let dur = meta.durationSec ?? 0;
-  let draftStart = Math.max(0, meta.trimStartSec ?? 0);
-  let draftEnd = meta.trimEndSec != null && meta.trimEndSec > draftStart ? meta.trimEndSec : dur;
+  let st: TrimState = createTrimState(meta.durationSec ?? 0, meta.trimStartSec, meta.trimEndSec);
   let speed = 1;
-  let trimOpen = false;
   let shareOpen = false;
   let uiTicker: ReturnType<typeof setInterval> | null = null;
   let closed = false;
@@ -604,7 +597,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     `<div class="vp-head">
        <div class="vp-title"><h3 class="sh-title">${esc(ex.name)}</h3><p class="sh-text">${esc(subTxt)}</p></div>
        <div class="vp-pills">
-         ${playUrl ? '<button class="vp-pill" type="button" data-vp="trim">Trim</button>' : ''}
+         ${playUrl ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
          <button class="vp-pill" type="button" data-vp="share">Share ↗</button>
        </div>
      </div>
@@ -616,52 +609,44 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
      ${playUrl ? `
      <div class="vp-deck" id="vpDeck">
        <div class="vp-readout">
-         <span class="vp-time" id="vpTime">0:00.0 / 0:00.0</span>
-         <span class="vp-frame" id="vpFrame">f 0</span>
+         <span><span class="vp-time" id="vpTime">0:00.00 / 0:00.00</span> · <span class="vp-frame" id="vpFrame">f 0</span></span>
+         <button class="vp-focus" type="button" id="vpFocus" data-vfocus-cycle>Full clip</button>
        </div>
-       <div class="vp-seek" id="vpSeek">
-         <div class="vp-seek-keep" id="vpKeep" hidden></div>
-         <div class="vp-seek-fill" id="vpFill"></div>
-         <button class="vp-handle in" id="vpInH" type="button" aria-label="Trim start handle" hidden><span>[</span></button>
-         <button class="vp-handle out" id="vpOutH" type="button" aria-label="Trim end handle" hidden><span>]</span></button>
+       <div class="vp-rail" id="vpSeek">
+         <div class="vp-track" id="vpTrack">
+           <div class="vp-shade l" id="vpShadeL"></div>
+           <div class="vp-shade r" id="vpShadeR"></div>
+           <div class="vp-window" id="vpKeep"></div>
+           <div class="vp-head-line" id="vpHead"></div>
+           <button class="vp-bar-h in" id="vpInH" type="button" aria-label="Trim start bar"><span>‹</span></button>
+           <button class="vp-bar-h out" id="vpOutH" type="button" aria-label="Trim end bar"><span>›</span></button>
+         </div>
        </div>
-       <div class="jog-strip" id="vpJog"><i class="jog-needle"></i><span>◀ Drag to jog frame-by-frame ▶</span></div>
-       <div class="vp-bar">
+       <div class="jog-strip" id="vpJog"><i class="jog-needle"></i><span id="vpJogLbl">◀ Drag to jog frame-by-frame ▶</span></div>
+       <div class="vp-step-row">
+         <button class="vp-btn step" type="button" data-vstep="-5">−5f</button>
+         <button class="vp-btn step" type="button" data-vstep="-1">−1f</button>
+         <button class="vp-btn play" type="button" data-vplay>⏸</button>
+         <button class="vp-btn step" type="button" data-vstep="1">+1f</button>
+         <button class="vp-btn step" type="button" data-vstep="5">+5f</button>
+       </div>
+       <div class="vp-sub-bar">
          <div class="vp-speeds">
            <button class="vp-spd" type="button" data-vspeed="0.25">0.25×</button>
            <button class="vp-spd" type="button" data-vspeed="0.5">0.5×</button>
            <button class="vp-spd on" type="button" data-vspeed="1">1×</button>
          </div>
-         <div class="vp-trans">
-           <button class="vp-btn" type="button" data-vstep="-1">◀ 1f</button>
-           <button class="vp-btn play" type="button" data-vplay>⏸</button>
-           <button class="vp-btn" type="button" data-vstep="1">1f ▶</button>
+         <div class="vp-trim-quick" id="vpTrimQuick">
+           <span class="vp-trim-hint" id="vpTrimHint">Drag <b>‹</b> or <b>›</b> bars to trim</span>
+           <button class="vp-qbtn" type="button" id="vpTrimReset" data-vtrim="reset" hidden>Reset</button>
+           <button class="vp-qbtn pri" type="button" id="vpTrimSave" data-vtrim="save" hidden>Save</button>
+           <button class="vp-qbtn acc" type="button" id="vpTrimShare" data-vtrim="share" hidden>Trim &amp; Share ↗</button>
          </div>
-       </div>
-     </div>
-     <div class="vp-drawer" id="vpTrimBox" hidden>
-       <div class="vp-dr-head">
-         <span>Window: <b id="vpTrimSpan">0:00.0 – 0:00.0</b> · <span id="vpTrimDur">0.0s</span></span>
-         <button type="button" data-vp="trim" aria-label="Close trim">✕</button>
-       </div>
-       <div class="vp-trim-2">
-         <button class="vp-tbtn" type="button" data-vtrim="inHere">⇤ Start Here</button>
-         <button class="vp-tbtn" type="button" data-vtrim="outHere">End Here ⇥</button>
-       </div>
-       <div class="vp-nudge-row">
-         <div><small>Start</small><button class="vp-nbtn" type="button" data-vnudge="in:-0.5">−0.5s</button><button class="vp-nbtn" type="button" data-vnudge="in:0.5">+0.5s</button></div>
-         <div><small>End</small><button class="vp-nbtn" type="button" data-vnudge="out:-0.5">−0.5s</button><button class="vp-nbtn" type="button" data-vnudge="out:0.5">+0.5s</button></div>
        </div>
        <div class="vp-tape-row" id="vpTapeRow"${tapeAvail() ? '' : ' hidden'}>
          <small>2-Wk Tape</small>
          <button class="vp-nbtn" type="button" data-vtape="5:0">−5s Earlier</button>
          <button class="vp-nbtn" type="button" data-vtape="0:5">+5s Later</button>
-       </div>
-       <div class="vp-trim-acts">
-         <button class="vp-tbtn" type="button" data-vtrim="loop">▶ Preview</button>
-         <button class="vp-tbtn" type="button" data-vtrim="reset">Reset</button>
-         <button class="vp-tbtn pri" type="button" data-vtrim="save">Save Trim</button>
-         <button class="vp-tbtn acc" type="button" data-vtrim="share">Trim &amp; Share ↗</button>
        </div>
      </div>` : ''}
      <div class="vp-drawer" id="vpShareBox" hidden>
@@ -694,54 +679,95 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   const vid = sh.body.querySelector<HTMLVideoElement>('#vpVid');
   const q = <T extends HTMLElement>(sel: string): T | null => sh.body.querySelector<T>(sel);
 
-  const hasTrimBounds = (): boolean => dur > 0 && (draftStart > 0.05 || draftEnd < dur - 0.05);
-
   const syncUi = (): void => {
     if (closed) return;
-    const trimPill = q('[data-vp="trim"]');
     const sharePill = q('[data-vp="share"]');
-    const trimBox = q('#vpTrimBox');
     const shareBox = q('#vpShareBox');
-    trimPill?.classList.toggle('on', trimOpen);
     sharePill?.classList.toggle('on', shareOpen);
-    if (trimBox) trimBox.hidden = !trimOpen;
     if (shareBox) shareBox.hidden = !shareOpen;
 
+    const trimmed = isTrimmed(st);
+    const dirty = isTrimDirty(st);
+    const saveTop = q<HTMLButtonElement>('#vpSaveTop');
+    if (saveTop) saveTop.hidden = !dirty;
+
     if (!vid) return;
-    const total = dur > 0 ? dur : (Number.isFinite(vid.duration) ? vid.duration : 0);
-    const cur = clamp(vid.currentTime || 0, 0, Math.max(0.01, total));
+    const total = st.dur > 0 ? st.dur : (Number.isFinite(vid.duration) ? roundMs(vid.duration) : 0);
+    const cur = st.dur > 0 ? clamp(st.playhead, 0, total || 0) : (vid.currentTime || 0);
+    const edgeFocus = st.focus === 'in' || st.focus === 'out';
+    const winDur = Math.max(0, roundMs(st.end - st.start));
+
     const timeEl = q('#vpTime');
     const frameEl = q('#vpFrame');
-    const fillEl = q('#vpFill');
+    const focusEl = q('#vpFocus');
+    const railEl = q('#vpSeek');
+    const shadeL = q('#vpShadeL');
+    const shadeR = q('#vpShadeR');
+    const keepEl = q('#vpKeep');
+    const headEl = q('#vpHead');
+    const inH = q('#vpInH');
+    const outH = q('#vpOutH');
     const jogEl = q('#vpJog');
+    const jogLbl = q('#vpJogLbl');
     const playBtn = q('[data-vplay]');
-    if (timeEl) timeEl.textContent = `${fmtTenths(cur)} / ${fmtTenths(total)}`;
-    if (frameEl) frameEl.textContent = `f ${Math.round(cur * 30)}`;
-    if (fillEl && total > 0) fillEl.style.width = `${clamp((cur / total) * 100, 0, 100)}%`;
-    if (jogEl) jogEl.style.backgroundPositionX = `${cur * 36}px`;
+
+    if (timeEl) timeEl.textContent = `${fmtPreciseTime(cur)} / ${fmtPreciseTime(total)}`;
+    if (frameEl) frameEl.textContent = `f ${Math.round(cur * FRAME_FPS)}`;
+
+    if (focusEl) {
+      focusEl.classList.toggle('edge', edgeFocus);
+      if (st.focus === 'in') focusEl.textContent = `◀ Start · ${fmtPreciseTime(st.start)} (${winDur.toFixed(1)}s)`;
+      else if (st.focus === 'out') focusEl.textContent = `End ▶ · ${fmtPreciseTime(st.end)} (${winDur.toFixed(1)}s)`;
+      else focusEl.textContent = trimmed ? `Clip · ${winDur.toFixed(1)}s` : 'Full clip';
+    }
+
+    if (total > 0) {
+      const inPct = clamp((st.start / total) * 100, 0, 100);
+      const outPct = clamp((st.end / total) * 100, inPct, 100);
+      const headPct = clamp((cur / total) * 100, 0, 100);
+      if (railEl) railEl.classList.toggle('trimmed', trimmed);
+      if (shadeL) shadeL.style.width = `${inPct}%`;
+      if (shadeR) { shadeR.style.left = `${outPct}%`; shadeR.style.width = `${Math.max(0, 100 - outPct)}%`; }
+      if (keepEl) { keepEl.style.left = `${inPct}%`; keepEl.style.width = `${Math.max(1, outPct - inPct)}%`; }
+      if (headEl) headEl.style.left = `${headPct}%`;
+      if (inH) { inH.style.left = `${inPct}%`; inH.classList.toggle('active', st.focus === 'in'); }
+      if (outH) { outH.style.left = `${outPct}%`; outH.classList.toggle('active', st.focus === 'out'); }
+    }
+
+    if (jogEl) {
+      jogEl.style.backgroundPositionX = `${cur * 42}px`;
+      jogEl.classList.toggle('edge-focus', edgeFocus);
+    }
+    if (jogLbl) {
+      jogLbl.textContent = st.focus === 'in'
+        ? '◀ Fine-jog Start bar ▶'
+        : st.focus === 'out'
+          ? '◀ Fine-jog End bar ▶'
+          : '◀ Drag to jog frame-by-frame ▶';
+    }
     if (playBtn) playBtn.textContent = vid.paused ? '▶' : '⏸';
 
+    sh.body.querySelectorAll<HTMLElement>('[data-vstep]').forEach((b) => {
+      b.classList.toggle('edge', edgeFocus);
+    });
     sh.body.querySelectorAll<HTMLElement>('[data-vspeed]').forEach((b) => {
       b.classList.toggle('on', Number(b.dataset.vspeed) === speed);
     });
 
-    const showMarkers = trimOpen || hasTrimBounds();
-    const keepEl = q('#vpKeep');
-    const inH = q('#vpInH');
-    const outH = q('#vpOutH');
-    if (keepEl && total > 0) {
-      keepEl.hidden = !showMarkers;
-      const inPct = clamp((draftStart / total) * 100, 0, 100);
-      const outPct = clamp((draftEnd / total) * 100, inPct, 100);
-      keepEl.style.left = `${inPct}%`;
-      keepEl.style.width = `${Math.max(1, outPct - inPct)}%`;
-      if (inH) { inH.hidden = !trimOpen; inH.style.left = `${inPct}%`; }
-      if (outH) { outH.hidden = !trimOpen; outH.style.left = `${outPct}%`; }
+    const showActs = trimmed || dirty;
+    const hintEl = q('#vpTrimHint');
+    const resetEl = q('#vpTrimReset');
+    const saveEl = q<HTMLButtonElement>('#vpTrimSave');
+    const shareTrimEl = q('#vpTrimShare');
+    if (hintEl) hintEl.hidden = showActs;
+    if (resetEl) resetEl.hidden = !showActs;
+    if (saveEl) {
+      saveEl.hidden = !showActs;
+      saveEl.disabled = showActs && !dirty;
+      saveEl.textContent = dirty ? 'Save' : '✓ Saved';
     }
-    const spanEl = q('#vpTrimSpan');
-    const durEl = q('#vpTrimDur');
-    if (spanEl) spanEl.textContent = `${fmtTenths(draftStart)} – ${fmtTenths(draftEnd)}`;
-    if (durEl) durEl.textContent = `${Math.max(0.5, round1(draftEnd - draftStart)).toFixed(1)}s`;
+    if (shareTrimEl) shareTrimEl.hidden = !trimmed;
+
     const tapeRow = q('#vpTapeRow');
     if (tapeRow) tapeRow.hidden = !tapeAvail();
   };
@@ -749,10 +775,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   if (vid) {
     vid.onloadedmetadata = () => {
       if (Number.isFinite(vid.duration) && vid.duration > 0) {
-        dur = round1(vid.duration);
-        draftEnd = meta!.trimEndSec != null && meta!.trimEndSec > 0 ? Math.min(dur, meta!.trimEndSec) : dur;
-        draftStart = clamp(meta!.trimStartSec ?? 0, 0, Math.max(0, draftEnd - 0.5));
-        if (draftStart > 0.05 && vid.currentTime < draftStart) vid.currentTime = draftStart;
+        st = createTrimState(vid.duration, meta!.trimStartSec, meta!.trimEndSec);
+        if (st.start > 0.015 && vid.currentTime < st.start) vid.currentTime = st.start;
       }
       vid.playbackRate = speed;
       syncUi();
@@ -768,9 +792,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     };
     vid.onclick = () => {
       if (vid.paused) {
-        if (hasTrimBounds() && (vid.currentTime < draftStart || vid.currentTime >= draftEnd - 0.05)) {
-          vid.currentTime = draftStart;
-        }
+        st = resolvePlayStart(st);
+        vid.currentTime = st.playhead;
         void vid.play().catch(() => {});
       } else {
         vid.pause();
@@ -778,75 +801,86 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       syncUi();
     };
     vid.ontimeupdate = () => {
-      if (!vid.paused && hasTrimBounds() && vid.currentTime >= draftEnd - 0.03) {
-        vid.currentTime = draftStart;
+      if (vid.paused) return;
+      if (isTrimmed(st) && vid.currentTime >= st.end - 0.025) {
+        vid.currentTime = st.start;
       }
+      st = { ...st, playhead: st.dur > 0 ? clamp(vid.currentTime, 0, st.dur) : vid.currentTime };
       syncUi();
     };
     uiTicker = setInterval(() => {
-      if (closed || !vid) return;
-      if (!vid.paused) {
-        if (hasTrimBounds() && vid.currentTime >= draftEnd - 0.03) vid.currentTime = draftStart;
-        syncUi();
-      }
+      if (closed || !vid || vid.paused) return;
+      if (isTrimmed(st) && vid.currentTime >= st.end - 0.025) vid.currentTime = st.start;
+      st = { ...st, playhead: st.dur > 0 ? clamp(vid.currentTime, 0, st.dur) : vid.currentTime };
+      syncUi();
     }, 45);
 
-    // Draggable Start / End handles and seek bar
-    const seekEl = q('#vpSeek');
+    // Bracketed Start / End grab rails + seek track (zero-jump handle offset)
+    const railEl = q('#vpSeek');
+    const trackEl = q('#vpTrack');
     const inH = q('#vpInH');
     const outH = q('#vpOutH');
-    let dragMode: 'seek' | 'in' | 'out' | null = null;
+    let dragMode: TrimFocus | null = null;
+    let dragGrabOffsetPx = 0;
 
     const timeAtPtr = (clientX: number): number => {
-      if (!seekEl || dur <= 0) return 0;
-      const rect = seekEl.getBoundingClientRect();
-      return clamp(((clientX - rect.left) / Math.max(1, rect.width)) * dur, 0, dur);
+      if (!trackEl || st.dur <= 0) return 0;
+      const rect = trackEl.getBoundingClientRect();
+      return clamp(((clientX - rect.left) / Math.max(1, rect.width)) * st.dur, 0, st.dur);
     };
 
-    const startSeekDrag = (mode: 'seek' | 'in' | 'out', e: PointerEvent): void => {
-      if (!seekEl || dur <= 0) return;
+    const startSeekDrag = (mode: TrimFocus, e: PointerEvent): void => {
+      if (!railEl || !trackEl || st.dur <= 0) return;
       e.stopPropagation();
       dragMode = mode;
-      seekEl.setPointerCapture(e.pointerId);
+      railEl.setPointerCapture(e.pointerId);
       vid.pause();
-      const t = round1(timeAtPtr(e.clientX));
-      if (mode === 'in') { draftStart = clamp(t, 0, draftEnd - 0.5); vid.currentTime = draftStart; }
-      else if (mode === 'out') { draftEnd = clamp(t, draftStart + 0.5, dur); vid.currentTime = draftEnd; }
-      else { vid.currentTime = t; }
+      const rect = trackEl.getBoundingClientRect();
+      if (mode === 'in') {
+        dragGrabOffsetPx = e.clientX - (rect.left + (st.start / st.dur) * rect.width);
+        st = { ...st, focus: 'in', playhead: st.start };
+      } else if (mode === 'out') {
+        dragGrabOffsetPx = e.clientX - (rect.left + (st.end / st.dur) * rect.width);
+        st = { ...st, focus: 'out', playhead: st.end };
+      } else {
+        dragGrabOffsetPx = 0;
+        st = dragTrimHandle(st, 'playhead', timeAtPtr(e.clientX));
+      }
+      vid.currentTime = st.playhead;
       syncUi();
     };
+
     inH?.addEventListener('pointerdown', (e) => startSeekDrag('in', e));
     outH?.addEventListener('pointerdown', (e) => startSeekDrag('out', e));
-    seekEl?.addEventListener('pointerdown', (e) => startSeekDrag('seek', e));
-    seekEl?.addEventListener('pointermove', (e) => {
-      if (!dragMode || !seekEl.hasPointerCapture(e.pointerId)) return;
-      const t = round1(timeAtPtr(e.clientX));
-      if (dragMode === 'in') { draftStart = clamp(t, 0, draftEnd - 0.5); vid.currentTime = draftStart; }
-      else if (dragMode === 'out') { draftEnd = clamp(t, draftStart + 0.5, dur); vid.currentTime = draftEnd; }
-      else { vid.currentTime = t; }
+    trackEl?.addEventListener('pointerdown', (e) => startSeekDrag('playhead', e));
+    railEl?.addEventListener('pointermove', (e) => {
+      if (!dragMode || !railEl.hasPointerCapture(e.pointerId)) return;
+      st = dragTrimHandle(st, dragMode, timeAtPtr(e.clientX - dragGrabOffsetPx));
+      vid.currentTime = st.playhead;
       syncUi();
     });
-    const endSeekDrag = (): void => { dragMode = null; };
-    seekEl?.addEventListener('pointerup', endSeekDrag);
-    seekEl?.addEventListener('pointercancel', endSeekDrag);
+    const endSeekDrag = (): void => { dragMode = null; dragGrabOffsetPx = 0; };
+    railEl?.addEventListener('pointerup', endSeekDrag);
+    railEl?.addEventListener('pointercancel', endSeekDrag);
 
-    // Tactile scrolling Thumb Jog Strip (~3.0s across full width)
+    // Tactile scrolling Thumb Jog Strip (~2.5s across full width, coupled to active bar)
     const jogEl = q('#vpJog');
     let jogStartX = 0;
-    let jogStartSec = 0;
+    let jogBase: TrimState = st;
     jogEl?.addEventListener('pointerdown', (e) => {
-      if (dur <= 0) return;
+      if (st.dur <= 0) return;
       jogEl.setPointerCapture(e.pointerId);
       jogStartX = e.clientX;
-      jogStartSec = vid.currentTime;
+      jogBase = st;
       vid.pause();
       jogEl.classList.add('drag');
       syncUi();
     });
     jogEl?.addEventListener('pointermove', (e) => {
-      if (!jogEl.hasPointerCapture(e.pointerId) || dur <= 0) return;
-      const secPerPx = 3.0 / Math.max(220, jogEl.clientWidth);
-      vid.currentTime = clamp(jogStartSec + (e.clientX - jogStartX) * secPerPx, 0, dur);
+      if (!jogEl.hasPointerCapture(e.pointerId) || st.dur <= 0) return;
+      const secPerPx = 2.5 / Math.max(220, jogEl.clientWidth);
+      st = jogTrimDelta(jogBase, (e.clientX - jogStartX) * secPerPx);
+      vid.currentTime = st.playhead;
       syncUi();
     });
     const endJog = (): void => { jogEl?.classList.remove('drag'); };
@@ -856,14 +890,15 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
   const persistTrim = async (): Promise<void> => {
     const next: VideoMeta = { ...meta! };
-    if (hasTrimBounds()) {
-      next.trimStartSec = round1(draftStart);
-      next.trimEndSec = round1(draftEnd);
+    if (isTrimmed(st)) {
+      next.trimStartSec = roundMs(st.start);
+      next.trimEndSec = roundMs(st.end);
     } else {
       delete next.trimStartSec;
       delete next.trimEndSec;
     }
     meta = next;
+    st = { ...st, savedStart: st.start, savedEnd: st.end };
     await lifts.saveVideoMeta(next);
   };
 
@@ -871,8 +906,9 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     const orig = btn?.textContent ?? '';
     if (btn) { btn.disabled = true; btn.textContent = action === 'save' ? 'Saving…' : 'Preparing…'; }
     try {
-      const startMs = hasTrimBounds() ? Math.round(draftStart * 1000) : undefined;
-      const endMs = hasTrimBounds() ? Math.round(draftEnd * 1000) : undefined;
+      if (isTrimDirty(st)) await persistTrim();
+      const startMs = isTrimmed(st) ? Math.round(st.start * 1000) : undefined;
+      const endMs = isTrimmed(st) ? Math.round(st.end * 1000) : undefined;
       const title = `${ex.name}${setTxt ? ` · ${setTxt}` : ''}`;
       if (isNative()) {
         const uri = meta!.uri?.startsWith('content://') ? meta!.uri : undefined;
@@ -904,6 +940,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       }
     } finally {
       if (btn) { btn.disabled = false; btn.textContent = orig; }
+      syncUi();
     }
   };
 
@@ -914,15 +951,18 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     if (t.closest('[data-ok]')) { sh.close(); return; }
 
     const vp = t.closest<HTMLElement>('[data-vp]')?.dataset.vp;
-    if (vp === 'trim') {
-      trimOpen = !trimOpen;
-      if (trimOpen) shareOpen = false;
+    if (vp === 'share') {
+      shareOpen = !shareOpen;
       syncUi();
       return;
     }
-    if (vp === 'share') {
-      shareOpen = !shareOpen;
-      if (shareOpen) trimOpen = false;
+
+    if (t.closest('[data-vfocus-cycle]') && vid) {
+      vid.pause();
+      const nextFocus: TrimFocus = st.focus === 'playhead' ? 'in' : st.focus === 'in' ? 'out' : 'playhead';
+      const jump = nextFocus === 'in' ? st.start : nextFocus === 'out' ? st.end : st.playhead;
+      st = { ...st, focus: nextFocus, playhead: jump };
+      vid.currentTime = st.playhead;
       syncUi();
       return;
     }
@@ -936,9 +976,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     }
     if (t.closest('[data-vplay]') && vid) {
       if (vid.paused) {
-        if (hasTrimBounds() && (vid.currentTime < draftStart || vid.currentTime >= draftEnd - 0.05)) {
-          vid.currentTime = draftStart;
-        }
+        st = resolvePlayStart(st);
+        vid.currentTime = st.playhead;
         void vid.play().catch(() => {});
       } else {
         vid.pause();
@@ -949,50 +988,25 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     const step = t.closest<HTMLElement>('[data-vstep]');
     if (step && vid) {
       vid.pause();
-      const total = dur > 0 ? dur : (Number.isFinite(vid.duration) ? vid.duration : 0);
-      vid.currentTime = clamp(vid.currentTime + Number(step.dataset.vstep) / 30, 0, total);
+      st = stepTrimFrames(st, Number(step.dataset.vstep), FRAME_FPS);
+      vid.currentTime = st.playhead;
       syncUi();
       return;
     }
 
     const vtrim = t.closest<HTMLElement>('[data-vtrim]')?.dataset.vtrim;
     if (vtrim && vid) {
-      if (vtrim === 'inHere') {
+      if (vtrim === 'reset') {
         vid.pause();
-        draftStart = clamp(round1(vid.currentTime), 0, Math.max(0, draftEnd - 0.5));
-      } else if (vtrim === 'outHere') {
-        vid.pause();
-        draftEnd = clamp(round1(vid.currentTime), Math.min(dur, draftStart + 0.5), dur);
-      } else if (vtrim === 'loop') {
-        vid.currentTime = draftStart;
-        void vid.play().catch(() => {});
-      } else if (vtrim === 'reset') {
-        draftStart = 0;
-        draftEnd = dur;
+        st = { ...createTrimState(st.dur), savedStart: 0, savedEnd: st.dur };
+        vid.currentTime = st.playhead;
         await persistTrim();
         toast('Trim reset');
       } else if (vtrim === 'save') {
         await persistTrim();
         toast('Clip trimmed');
       } else if (vtrim === 'share') {
-        await persistTrim();
         await runExport('share', t.closest('button'));
-      }
-      syncUi();
-      return;
-    }
-
-    const vnudge = t.closest<HTMLElement>('[data-vnudge]');
-    if (vnudge && vid) {
-      vid.pause();
-      const [side, deltaStr] = vnudge.dataset.vnudge!.split(':');
-      const d = Number(deltaStr);
-      if (side === 'in') {
-        draftStart = clamp(round1(draftStart + d), 0, Math.max(0, draftEnd - 0.5));
-        vid.currentTime = draftStart;
-      } else {
-        draftEnd = clamp(round1(draftEnd + d), Math.min(dur, draftStart + 0.5), dur);
-        vid.currentTime = draftEnd;
       }
       syncUi();
       return;
@@ -1007,9 +1021,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (btn) btn.disabled = false;
       if (updated?.lanUrl) {
         meta = updated;
-        dur = updated.durationSec ?? dur;
-        draftStart = updated.trimStartSec ?? 0;
-        draftEnd = updated.trimEndSec ?? dur;
+        st = createTrimState(updated.durationSec ?? st.dur, updated.trimStartSec, updated.trimEndSec);
         vid.src = updated.lanUrl;
         vid.load();
         toast('Extended clip from 2-Week Tape');
