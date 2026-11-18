@@ -1,7 +1,7 @@
 import './style.css';
 import { App } from '@capacitor/app';
 import { retryPending } from './workout/sync';
-import { airbikeScreen, stubScreen } from './ui/equipment';
+import { airbikeScreen, spinScreen, stubScreen } from './ui/equipment';
 import { homeScreen } from './ui/home';
 import { hudScreen } from './ui/hud';
 import { cardioWorkoutScreen } from './ui/cardioWorkout';
@@ -26,7 +26,7 @@ const routes: Record<string, Screen> = {
   '': homeScreen,
   program: programScreen,
   airbike: (root, args, q) => (args[0] === 'p' ? hudScreen(root, args.slice(1), q) : args[0] === 'w' ? cardioWorkoutScreen(root, args.slice(1)) : airbikeScreen(root)),
-  spin: stubScreen('spin'),
+  spin: (root, args, q) => (args[0] === 'p' ? hudScreen(root, args.slice(1), q) : args[0] === 'w' ? cardioWorkoutScreen(root, args.slice(1)) : spinScreen(root)),
   treadmill: stubScreen('treadmill'),
   strength: liftsScreen,
   settings: settingsScreen,
@@ -82,8 +82,8 @@ function route(): void {
   cleanup?.();
   document.querySelectorAll<HTMLElement>('.lmodal, [data-exit-sheet]').forEach((m) => m.dispatchEvent(new CustomEvent('armory:dismiss')));
   syncModalInert();
-  // The bike link lives across every AirBike screen (list <-> workout); only leaving AirBike drops it.
-  if (name !== 'airbike') releaseBike();
+  // The bike link lives across every AirBike / Spin screen (list <-> workout); leaving both drops it.
+  if (name !== 'airbike' && name !== 'spin') releaseBike();
   root.className = 'screen';
   root.innerHTML = '';
   window.scrollTo(0, 0);

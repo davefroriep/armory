@@ -21,18 +21,10 @@ const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
 const BIKE_SILENCE_MS = 6000;
 
-class AirbikeLink extends BleLink {
+class NusBikeLink extends BleLink {
   private lines = new LineBuffer();
 
-  constructor() {
-    super('armory.ble.airbike', {
-      services: [NUS_SERVICE],
-      names: ['AssaultBike'],
-      matches: (n) => n === 'AssaultBike',
-    });
-  }
-
-  /** The bike streams at 5 Hz even when idle, so 6 s of silence means the link is dead. */
+  /** Both bikes stream at 5 Hz even when idle, so 6 s of silence means the link is dead. */
   protected isHealthy(): boolean {
     return Date.now() - Math.max(this.connectedAt, live.bikeAt) < BIKE_SILENCE_MS;
   }
@@ -47,11 +39,20 @@ class AirbikeLink extends BleLink {
     });
   }
 
-  /** ASCII command to the bike (SET_RATIO, RESET, ...). Not used by the HUD yet. */
+  /** ASCII command to the bike (AirBike: RESET_PULSES; SS2K Spin: SET_MODE:0|1, SET_WATTS:<w>, SET_LEVEL:<lvl>). */
   async command(cmd: string): Promise<void> {
     if (this.id) await transport.write(this.id, NUS_SERVICE, NUS_RX, new TextEncoder().encode(cmd + '\n'));
   }
 }
 
 export const hrLink = new PolarLink();
-export const bikeLink = new AirbikeLink();
+export const bikeLink = new NusBikeLink('armory.ble.airbike', {
+  services: [NUS_SERVICE],
+  names: ['AssaultBike'],
+  matches: (n) => n === 'AssaultBike',
+});
+export const spinLink = new NusBikeLink('armory.ble.spin', {
+  services: [NUS_SERVICE],
+  names: ['SS2K_Tuner'],
+  matches: (n) => /^SS2K/i.test(n),
+});

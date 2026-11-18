@@ -132,7 +132,7 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
       const r = slot.equipment === 'strength' ? matchRoutineByTitle(slot.name, routines) : undefined;
       if (slot.equipment === 'strength') {
         acts.push(`<button class="btn primary big" type="button" data-sact="early:${si}">Do ${esc(r?.name ?? 'Lifting')} Today</button>`);
-      } else if (slot.equipment === 'airbike') {
+      } else if (slot.equipment === 'airbike' || slot.equipment === 'spin') {
         acts.push(`<button class="btn primary big" type="button" data-sact="early:${si}">Do ${esc(slot.name)} Today</button>`);
       } else {
         acts.push(`<button class="btn primary big" type="button" data-sact="ext:${si}">Mark ${esc(slot.name)} Done Today</button>`);
@@ -168,8 +168,8 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
       if (slot.equipment === 'strength') {
         const r = matchRoutineByTitle(slot.name, routines);
         await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
-      } else if (slot.equipment === 'airbike') {
-        location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
+      } else if (slot.equipment === 'airbike' || slot.equipment === 'spin') {
+        location.hash = slot.programId ? `#/${slot.equipment}/p/${slot.programId}?pick=${pick}` : `#/${slot.equipment}?pick=${pick}`;
       } else {
         location.hash = `#/${slot.equipment}?pick=${pick}`;
       }
@@ -184,8 +184,8 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
       if (slot.equipment === 'strength') {
         const r = matchRoutineByTitle(slot.name, routines);
         await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
-      } else if (slot.equipment === 'airbike') {
-        location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
+      } else if (slot.equipment === 'airbike' || slot.equipment === 'spin') {
+        location.hash = slot.programId ? `#/${slot.equipment}/p/${slot.programId}?pick=${pick}` : `#/${slot.equipment}?pick=${pick}`;
       }
       return;
     }
@@ -242,10 +242,10 @@ export async function launchDayZoomSlot(planSlot: string): Promise<void> {
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, routines);
     await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot });
-  } else if (slot.equipment === 'airbike') {
+  } else if (slot.equipment === 'airbike' || slot.equipment === 'spin') {
     location.hash = slot.programId
-      ? `#/airbike/p/${slot.programId}?pick=${encodeURIComponent(planSlot)}`
-      : `#/airbike?pick=${encodeURIComponent(planSlot)}`;
+      ? `#/${slot.equipment}/p/${slot.programId}?pick=${encodeURIComponent(planSlot)}`
+      : `#/${slot.equipment}?pick=${encodeURIComponent(planSlot)}`;
   } else if (p.status === 'current') {
     location.hash = `#/${slot.equipment}?pick=${encodeURIComponent(planSlot)}`;
   } else {
@@ -293,8 +293,8 @@ export async function launchDayZoomWorkout(ymd: string): Promise<void> {
         if (slot.equipment === 'strength') {
           const r = matchRoutineByTitle(slot.name, routines);
           await startWorkout({ name: r?.name ?? slot.name, routine: r, planSlot: pick });
-        } else if (slot.equipment === 'airbike') {
-          location.hash = slot.programId ? `#/airbike/p/${slot.programId}?pick=${pick}` : `#/airbike?pick=${pick}`;
+        } else if (slot.equipment === 'airbike' || slot.equipment === 'spin') {
+          location.hash = slot.programId ? `#/${slot.equipment}/p/${slot.programId}?pick=${pick}` : `#/${slot.equipment}?pick=${pick}`;
         } else if (p.status === 'current') {
           location.hash = `#/${slot.equipment}?pick=${pick}`;
         } else {

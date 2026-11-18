@@ -246,6 +246,7 @@ const z5Slot = (programId: 'v5x3' | 'n4x4' | 'b6030', label: string, desc: strin
 
 const z2Slot = (mins: number, desc: string): PlanSlot => ({
   equipment: 'spin',
+  programId: mins === 25 ? 'spin-z2-25' : mins === 20 ? 'spin-z2-20' : 'spin-z2',
   intervalsType: 'VirtualRide',
   name: `Spin Bike Z2 (${mins}m)`,
   description: desc,

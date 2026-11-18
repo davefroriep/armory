@@ -4,7 +4,7 @@ vi.mock('../src/store/db', () => ({ putMeta: vi.fn(), putSample: vi.fn() }));
 
 import { ageOn, bodyProfile, kcalFromSamples, keytelKcalPerMin } from '../src/domain/energy';
 import { buildTcx } from '../src/domain/tcx';
-import { clearHrLog, hrAtTime, pushHr } from '../src/ble/telemetry';
+import { clearHrLog, hrAtTime, live, pushBike, pushHr, resetSpinOdometer } from '../src/ble/telemetry';
 import { Recorder } from '../src/workout/recorder';
 
 const T0 = 1_800_000_000_000;
@@ -112,5 +112,15 @@ describe('HR-based calories (Keytel et al. 2005)', () => {
     expect(hrTcx).toContain('<Calories>412</Calories>');
     const bikeTcx = buildTcx({ startEpochMs: T0, seconds: 1, kj: 250.4, samples, kind: 'bike' }, 'Ride');
     expect(bikeTcx).toContain('<Calories>250</Calories>');
+  });
+
+  it('integrates virtual distance and 1:1 kJ=kcal odometer for SS2K Spin frames', () => {
+    resetSpinOdometer();
+    pushBike({ dev: 'spin', w: 200, cad: 85, dist: 0, kcal: 0, spd: 0, tgt_w: 200, mode: 1 }, T0);
+    pushBike({ dev: 'spin', w: 200, cad: 85, dist: 0, kcal: 0, spd: 0, tgt_w: 200, mode: 1 }, T0 + 1000);
+    expect(live.dev).toBe('spin');
+    expect(live.spd).toBeGreaterThan(25);
+    expect(live.dist).toBeGreaterThan(7);
+    expect(live.kcal).toBeCloseTo(0.2, 2); // 200 W * 1 s = 0.2 kJ = 0.2 kcal
   });
 });

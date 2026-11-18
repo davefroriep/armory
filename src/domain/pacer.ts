@@ -73,6 +73,28 @@ export const OVERSHOOT_RPM = 2.5;
 export const CHIRP_RPM = 3.0;
 const FLOAT_FLOOR_RPM = 35;
 
+export const CORRIDOR_WATTS = 10;
+export const OVERSHOOT_WATTS = 25;
+export const CHIRP_WATTS = 35;
+
+/** Live wattage/cadence cue for Auto-ERG Spin Bike workouts (`SS2K_Tuner`). */
+export function wattsCueFor(seg: Segment | null, w: number, cad: number, into: number): Cue {
+  const idle: Cue = { level: 'idle', text: '', chirp: false };
+  if (!seg || seg.watts == null) return idle;
+  if (cad < 10) return { level: 'warn', text: 'START PEDALING', chirp: false };
+  if (seg.kind === 'work' && cad < 60) {
+    return { level: 'warn', text: `SPIN FASTER (${seg.rpm ?? 85} RPM)`, chirp: false };
+  }
+  const diff = w - seg.watts;
+  const effort = seg.kind === 'work' || seg.kind === 'steady';
+  if (diff > OVERSHOOT_WATTS) {
+    return { level: 'bad', text: `+${Math.round(diff)} W TOO HOT — EASE OFF`, chirp: effort && diff > CHIRP_WATTS && into <= 15 };
+  }
+  if (diff < -15) return { level: 'warn', text: `${Math.round(seg.watts - w)} W UNDER — PUSH`, chirp: false };
+  if (Math.abs(diff) <= CORRIDOR_WATTS) return { level: 'ok', text: 'ERG ON TARGET', chirp: false };
+  return { level: 'ok', text: 'ON TARGET', chirp: false };
+}
+
 export function cueFor(seg: Segment | null, cad: number, into: number): Cue {
   const idle: Cue = { level: 'idle', text: '', chirp: false };
   if (!seg || seg.rpm == null) return idle;

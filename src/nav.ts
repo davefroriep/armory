@@ -9,7 +9,7 @@ export function parentHash(path: string): string | null {
   const [section, sub, arg] = parts;
   if (section === 'program') return '#/';
   if (section === 'wallboard') return '#/settings';
-  if (section === 'airbike') return sub === 'w' ? '#/airbike' : '#/';
+  if (section === 'airbike' || section === 'spin') return sub === 'w' ? `#/${section}` : '#/';
   if (section === 'strength') {
     if (!sub || sub === 'hr' || sub === 'history' || sub === 'progress' || sub === 'exercises') return '#/';
     if (sub === 'session') return arg ? `#/strength/workout/${arg}` : '#/';

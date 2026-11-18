@@ -143,7 +143,9 @@ export const hrLive = () => (hrFresh() ? live.hr : 0);
 const href = (it: TodayItem): string => {
   const pick = `?pick=${encodeURIComponent(it.planSlot)}`;
   if (it.equipment === 'strength') return `#/strength${pick}&start=1`;
-  if (it.equipment === 'airbike') return it.programId ? `#/airbike/p/${it.programId}${pick}` : `#/airbike${pick}`;
+  if (it.equipment === 'airbike' || it.equipment === 'spin') {
+    return it.programId ? `#/${it.equipment}/p/${it.programId}${pick}` : `#/${it.equipment}${pick}`;
+  }
   return `#/${it.equipment}${pick}`;
 };
 
@@ -167,7 +169,7 @@ function calItemRow(it: TodayItem, actionMode: 'link' | 'strength' = 'link', com
     const subParts = [
       eq === 'strength'
         ? `Strength${it.items ? ` · ${it.items.length} exercises` : r ? ` · ${r.name}` : ''}`
-        : EQUIPMENT_LABEL[eq] + (eq === 'airbike' && !it.programId ? ' · pick a program' : ''),
+        : EQUIPMENT_LABEL[eq] + ((eq === 'airbike' || eq === 'spin') && !it.programId ? ' · pick a program' : ''),
       mins ? `${mins} min` : '',
       it.carried ? 'carry-over' : '',
     ].filter(Boolean);

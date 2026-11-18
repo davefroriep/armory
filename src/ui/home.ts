@@ -91,10 +91,10 @@ export function homeScreen(root: HTMLElement): () => void {
     const pend = await pendingCount();
     let h = '';
     for (const m of activeIncomplete) {
-      const canResume = m.equipment === 'airbike' && m.programId;
+      const canResume = (m.equipment === 'airbike' || m.equipment === 'spin') && m.programId;
       h += `<section class="card warn"><b>Unfinished workout</b>
         <p>${esc(m.name)} — started ${new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. The app closed before you finished.</p>
-        <div class="row">${canResume ? `<a class="btn primary sm" href="#/airbike/p/${esc(m.programId)}?resume=${esc(m.id)}">Resume</a>` : ''}<button class="btn ${canResume ? '' : 'primary '}sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
+        <div class="row">${canResume ? `<a class="btn primary sm" href="#/${esc(m.equipment)}/p/${esc(m.programId)}?resume=${esc(m.id)}">Resume</a>` : ''}<button class="btn ${canResume ? '' : 'primary '}sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
     }
     if (pend) {
       const why = metas.find((m) => m.status === 'saved' && m.upload === 'pending')?.lastError;

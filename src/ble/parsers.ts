@@ -32,15 +32,22 @@ export interface BikeFrame {
   pls?: number;
   dt?: number;
   ratio?: number;
+  dev?: 'airbike' | 'spin';
+  lvl?: number;
+  tlvl?: number;
+  tgt_w?: number;
+  mode?: number;
+  pot?: number;
+  pos?: number;
 }
 
-/** AirBike 5 Hz NUS frame: {"dev":"airbike","w":127.0,"cad":44.0,"dist":452.1,"kcal":15.42,"spd":16.87,...} */
+/** AirBike / SS2K Spin 5 Hz NUS frame: {"dev":"airbike"|"spin","w":127.0,"cad":44.0,...} */
 export function parseBikeLine(line: string): BikeFrame | null {
   try {
     const o = JSON.parse(line);
     if (typeof o !== 'object' || o === null || typeof o.w !== 'number' || typeof o.cad !== 'number') return null;
-    if (o.dev && o.dev !== 'airbike') return null;
-    return {
+    if (o.dev && o.dev !== 'airbike' && o.dev !== 'spin') return null;
+    const out: BikeFrame = {
       w: o.w,
       cad: o.cad,
       dist: Number(o.dist) || 0,
@@ -52,6 +59,16 @@ export function parseBikeLine(line: string): BikeFrame | null {
       ...(typeof o.dt === 'number' ? { dt: o.dt } : {}),
       ...(typeof o.ratio === 'number' ? { ratio: o.ratio } : {}),
     };
+    if (o.dev === 'spin') {
+      out.dev = 'spin';
+      if (typeof o.lvl === 'number') out.lvl = o.lvl;
+      if (typeof o.tlvl === 'number') out.tlvl = o.tlvl;
+      if (typeof o.tgt_w === 'number') out.tgt_w = o.tgt_w;
+      if (typeof o.mode === 'number') out.mode = o.mode;
+      if (typeof o.pot === 'number') out.pot = o.pot;
+      if (typeof o.pos === 'number') out.pos = o.pos;
+    }
+    return out;
   } catch {
     return null;
   }

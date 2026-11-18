@@ -32,6 +32,10 @@ export interface Settings {
   programOrder: string[];
   /** Hidden AirBike programs; null = never customised (library defaults). */
   programHidden: string[] | null;
+  /** Spin Bike program order (ids). Programs not listed follow in library order. */
+  spinProgramOrder: string[];
+  /** Hidden Spin Bike programs; null = never customised (library defaults). */
+  spinProgramHidden: string[] | null;
   metroEnabled: boolean;
   metroMode: MetroMode;
   metroLead: number;
@@ -75,6 +79,8 @@ export const DEFAULTS: Settings = {
   recoveryHrPct: 72,
   programOrder: [],
   programHidden: null,
+  spinProgramOrder: [],
+  spinProgramHidden: null,
   metroEnabled: true,
   metroMode: 'transitions',
   metroLead: 5,

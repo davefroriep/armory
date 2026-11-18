@@ -2,6 +2,7 @@ import { Emitter } from '../emitter';
 
 /** Live values from whichever source is active (real BLE or the simulator). */
 export interface Live {
+  dev: 'airbike' | 'spin';
   hr: number;
   hrAt: number;
   w: number;
@@ -15,12 +16,20 @@ export interface Live {
   pls: number;
   dt: number;
   ratio: number;
+  lvl: number;
+  tlvl: number;
+  tgtW: number;
+  mode: number;
+  pot: number;
+  pos: number;
   bikeAt: number;
 }
 
 export const live: Live = {
+  dev: 'airbike',
   hr: 0, hrAt: 0, w: 0, cad: 0, dist: 0, kcal: 0, spd: 0,
-  fan: 0, rfan: 0, pls: 0, dt: 0, ratio: 11.11, bikeAt: 0,
+  fan: 0, rfan: 0, pls: 0, dt: 0, ratio: 11.11,
+  lvl: 0, tlvl: 0, tgtW: 0, mode: 0, pot: 0, pos: 0, bikeAt: 0,
 };
 
 export const HR_STALE_MS = 5000;
@@ -116,20 +125,54 @@ export function clearHrLog(): void {
   hrLog.length = 0;
 }
 
+let spinDistM = 0;
+let spinKcal = 0;
+let spinLastAt = 0;
+
+/** Reset virtual odometer accumulators (useful when starting a Spin ride or in tests). */
+export function resetSpinOdometer(): void {
+  spinDistM = 0;
+  spinKcal = 0;
+  spinLastAt = 0;
+}
+
 export function pushBike(f: {
   w: number; cad: number; dist: number; kcal: number; spd: number;
   fan?: number; rfan?: number; pls?: number; dt?: number; ratio?: number;
-}): void {
+  dev?: 'airbike' | 'spin'; lvl?: number; tlvl?: number; tgt_w?: number; mode?: number; pot?: number; pos?: number;
+}, now = Date.now()): void {
+  const dev = f.dev ?? 'airbike';
+  live.dev = dev;
   live.w = f.w;
   live.cad = f.cad;
-  live.dist = f.dist;
-  live.kcal = f.kcal;
-  live.spd = f.spd;
+  if (dev === 'spin' && f.dist <= 0 && f.kcal <= 0 && f.spd <= 0) {
+    const dtSec = spinLastAt && now > spinLastAt ? Math.min(2, (now - spinLastAt) / 1000) : 0;
+    spinLastAt = now;
+    const pedaling = f.cad > 2 && f.w > 0;
+    const vMps = pedaling ? Math.cbrt(f.w / 0.23) : 0;
+    if (dtSec > 0 && pedaling) {
+      spinDistM += vMps * dtSec;
+      spinKcal += (f.w / 1000) * dtSec; // Spin Bike convention: 1 kJ = 1 kcal
+    }
+    live.spd = vMps * 3.6;
+    live.dist = spinDistM;
+    live.kcal = spinKcal;
+  } else {
+    live.dist = f.dist;
+    live.kcal = f.kcal;
+    live.spd = f.spd;
+  }
   if (f.fan !== undefined) live.fan = f.fan;
   if (f.rfan !== undefined) live.rfan = f.rfan;
   if (f.pls !== undefined) live.pls = f.pls;
   if (f.dt !== undefined) live.dt = f.dt;
   if (f.ratio !== undefined) live.ratio = f.ratio;
-  live.bikeAt = Date.now();
+  if (f.lvl !== undefined) live.lvl = f.lvl;
+  if (f.tlvl !== undefined) live.tlvl = f.tlvl;
+  if (f.tgt_w !== undefined) live.tgtW = f.tgt_w;
+  if (f.mode !== undefined) live.mode = f.mode;
+  if (f.pot !== undefined) live.pot = f.pot;
+  if (f.pos !== undefined) live.pos = f.pos;
+  live.bikeAt = now;
   bikeFrame.emit(live);
 }

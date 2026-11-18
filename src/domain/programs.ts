@@ -16,8 +16,10 @@ export interface Segment {
   /** Rep / set chip (e.g. "REP 2/4"). */
   tag?: string;
   seconds: number;
-  /** Target pedal RPM (null = free / full rest). */
+  /** Target pedal RPM (null = free / full rest; recommended spin cadence when `watts` is set). */
   rpm: number | null;
+  /** Direct ERG wattage target (used by Bowflex C7 / SS2K Spin; null/undefined = derive from AirBike RPM curve). */
+  watts?: number | null;
   /** All-out effort: `rpm` is a minimum, not a corridor. */
   allOut?: boolean;
   /**
@@ -51,6 +53,8 @@ export interface Program {
   blurb: string;
   group: ProgramGroup | 'free';
   zone: 'Z2' | 'Z5' | null;
+  /** Owning machine (defaults to `'airbike'` for existing programs). */
+  equipment?: 'airbike' | 'spin';
   segments: Segment[];
   goal?: GoalSpec;
   /** Pace used by the metronome when the program has no segment targets (free ride / goals). */
@@ -161,11 +165,106 @@ export const PROGRAMS: Program[] = [
   },
 ];
 
+export const SPIN_FREE_PACE_RPM = 85;
+
+function spinRepeats(n: number, workSec: number, workW: number, workRpm: number, easySec: number, gateMaxSec: number): Segment[] {
+  const out: Segment[] = [s('warmup', 'WARM-UP', 300, 82, { watts: 105 })];
+  for (let i = 1; i <= n; i++) {
+    out.push(s('work', 'WORK', workSec, workRpm, { watts: workW, tag: `REP ${i}/${n}` }));
+    out.push(i < n
+      ? s('rest', 'EASY SPIN', easySec, 80, { watts: 105, tag: `REP ${i}/${n}`, gate: { minSec: easySec, maxSec: gateMaxSec } })
+      : s('cooldown', 'COOL-DOWN', easySec, 78, { watts: 95 }));
+  }
+  return out;
+}
+
+function spinBillat(): Segment[] {
+  const out: Segment[] = [s('warmup', 'WARM-UP', 300, 82, { watts: 105 })];
+  const sets = 2, reps = 8;
+  for (let st = 1; st <= sets; st++) {
+    for (let r = 1; r <= reps; r++) {
+      out.push(s('work', 'WORK', 60, 90, { watts: 245, tag: `SET ${st}/${sets} - REP ${r}/${reps}` }));
+      if (r < reps) out.push(s('float', 'FLOAT', 30, 78, { watts: 110, tag: `SET ${st}/${sets} - KEEP SPINNING` }));
+    }
+    if (st < sets) out.push(s('rest', 'SET REST', 180, 75, { watts: 95, tag: 'EASY RECOVERY', gate: { minSec: 180, maxSec: 300 } }));
+  }
+  out.push(s('cooldown', 'COOL-DOWN', 120, 78, { watts: 95 }));
+  return out;
+}
+
+/**
+ * Calibrated Bowflex C7 + SS2K Auto-ERG Spin library (`0%–50%`, 20–542 W model).
+ * Work blocks drive SS2K `SET_MODE:1` / `SET_WATTS:<w>` automatically, keeping load locked across 50–110 RPM.
+ */
+export const SPIN_PROGRAMS: Program[] = [
+  {
+    id: 'spin-z2', name: 'Zone 2 Base (45m)', intervalsName: 'Spin Bike Z2 (45m)', group: 'z2', zone: 'Z2', equipment: 'spin',
+    blurb: 'Aerobic base · 35m @ 129 W (71% FTP, ~85 RPM) + 5m WU/CD. Auto-ERG.',
+    segments: [
+      s('warmup', 'WARM-UP', 300, 82, { watts: 100 }),
+      s('steady', 'ZONE 2', 2100, 85, { watts: 129 }),
+      s('cooldown', 'COOL-DOWN', 300, 80, { watts: 95 }),
+    ],
+  },
+  {
+    id: 'spin-z2-25', name: 'Zone 2 Top-Off (25m)', intervalsName: 'Spin Bike Z2 (25m)', group: 'z2', zone: 'Z2', equipment: 'spin',
+    blurb: 'Galloway run top-off · 19m @ 129 W (~85 RPM) + 3m WU/CD. Auto-ERG.',
+    segments: [
+      s('warmup', 'WARM-UP', 180, 82, { watts: 100 }),
+      s('steady', 'ZONE 2', 1140, 85, { watts: 129 }),
+      s('cooldown', 'COOL-DOWN', 180, 80, { watts: 95 }),
+    ],
+  },
+  {
+    id: 'spin-z2-20', name: 'Zone 2 Top-Off (20m)', intervalsName: 'Spin Bike Z2 (20m)', group: 'z2', zone: 'Z2', equipment: 'spin', hidden: true,
+    blurb: 'Wk 4 top-off · 16m @ 129 W (~85 RPM) + 2m WU/CD. Auto-ERG.',
+    segments: [
+      s('warmup', 'WARM-UP', 120, 82, { watts: 95 }),
+      s('steady', 'ZONE 2', 960, 85, { watts: 129 }),
+      s('cooldown', 'COOL-DOWN', 120, 80, { watts: 90 }),
+    ],
+  },
+  {
+    id: 'spin-n4x4', name: 'Norwegian 4×4 (ERG)', intervalsName: 'Spin Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5', equipment: 'spin',
+    blurb: 'NTNU CERG · 4 × 4:00 @ 220 W (121% FTP, ~85 RPM) Auto-ERG, recover to HR ≤ target.',
+    segments: spinRepeats(4, 240, 220, 85, 180, 300),
+  },
+  {
+    id: 'spin-v5x3', name: 'Classic VO2 5×3 (ERG)', intervalsName: 'Spin Z5 — Classic VO2 5×3', group: 'z5', zone: 'Z5', equipment: 'spin',
+    blurb: 'Macro-intervals · 5 × 3:00 @ 225 W (124% FTP, ~85 RPM) Auto-ERG, recover to HR ≤ target.',
+    segments: spinRepeats(5, 180, 225, 85, 120, 240),
+  },
+  {
+    id: 'spin-b6030', name: '60/30 Billat (ERG)', intervalsName: 'Spin Z5 — Billat 60/30', group: 'z5', zone: 'Z5', equipment: 'spin',
+    blurb: '2 × 8 × (60s @ 245 W / 30s @ 110 W) Auto-ERG, HR-gated set rest.',
+    segments: spinBillat(),
+  },
+  {
+    id: 'spin-p6x2', name: 'Cardiac Power 6×2 (ERG)', intervalsName: 'Spin Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5', equipment: 'spin', hidden: true,
+    blurb: 'Jamieson-style · 6 × 2:00 @ 235 W (129% FTP, ~88 RPM) Auto-ERG, recover to HR ≤ target.',
+    segments: spinRepeats(6, 120, 235, 88, 120, 300),
+  },
+  {
+    id: 'spin-free', name: 'Free Ride', intervalsName: 'Spin Bike Free Ride', group: 'free', zone: null, equipment: 'spin',
+    blurb: 'Manual SS2K gear control. Ride freely and record power, cadence & HR.',
+    segments: [], paceRpm: SPIN_FREE_PACE_RPM,
+  },
+];
+
+export const programsForEquipment = (eq: 'airbike' | 'spin'): Program[] => (eq === 'spin' ? SPIN_PROGRAMS : PROGRAMS);
+
 export function resolveProgram(p: Program, ftp = BASE_FTP, offsetWatts = 0): Program {
   if ((p.zone !== 'Z5' && p.zone !== 'Z2') || (ftp === BASE_FTP && offsetWatts === 0)) return p;
   return {
     ...p,
     segments: p.segments.map((g) => {
+      if (g.watts != null) {
+        if (g.kind === 'work' || g.kind === 'steady') {
+          return { ...g, watts: Math.max(50, Math.round(g.watts * (ftp / BASE_FTP)) + offsetWatts) };
+        }
+        if (ftp === BASE_FTP) return g;
+        return { ...g, watts: Math.max(50, Math.round(g.watts * (ftp / BASE_FTP))) };
+      }
       if (g.rpm == null || g.allOut) return g;
       if (g.kind === 'work' || g.kind === 'steady') {
         const w = Math.max(50, Math.round(wattsForRpm(g.rpm) * (ftp / BASE_FTP)) + offsetWatts);
@@ -178,13 +277,17 @@ export function resolveProgram(p: Program, ftp = BASE_FTP, offsetWatts = 0): Pro
   };
 }
 
-export const programById = (id: string | null | undefined): Program | undefined => PROGRAMS.find((p) => p.id === id);
+export const programById = (id: string | null | undefined): Program | undefined =>
+  PROGRAMS.find((p) => p.id === id) ?? SPIN_PROGRAMS.find((p) => p.id === id);
 
 export const totalSeconds = (p: Program): number => p.segments.reduce((a, g) => a + g.seconds, 0);
 export const workSeconds = (p: Program): number =>
   p.segments.filter((g) => g.kind === 'work').reduce((a, g) => a + g.seconds, 0);
 
-export const targetWatts = (g: Segment): number | null => (g.rpm == null ? null : Math.round(wattsForRpm(g.rpm)));
+export const targetWatts = (g: Segment): number | null => {
+  if (g.watts != null) return Math.round(g.watts);
+  return g.rpm == null ? null : Math.round(wattsForRpm(g.rpm));
+};
 
 export function fmtDur(sec: number): string {
   const m = Math.floor(sec / 60);

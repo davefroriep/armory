@@ -1,5 +1,4 @@
-import { wattsForRpm } from './airbikeCurve';
-import type { Segment } from './programs';
+import { targetWatts, type Segment } from './programs';
 
 /** Top of the profile chart, as % of FTP. Anything at or above it draws full height. */
 export const PROFILE_MAX_PCT = 150;
@@ -27,10 +26,11 @@ export function intensityColor(pct: number, allOut = false): string {
   return '#ef4444'; // Z6+ anaerobic
 }
 
-/** Height and colour for one block of a program, from its (already FTP-resolved) target cadence. */
+/** Height and colour for one block of a program, from its (already FTP-resolved) target wattage. */
 export function profileBar(seg: Segment, ftp: number): ProfileBar {
   if (seg.allOut) return { pct: ALL_OUT_PCT, h: 1, color: intensityColor(ALL_OUT_PCT, true) };
-  const pct = seg.rpm == null || ftp <= 0 ? 0 : (wattsForRpm(seg.rpm) / ftp) * 100;
+  const w = targetWatts(seg);
+  const pct = w == null || ftp <= 0 ? 0 : (w / ftp) * 100;
   const h = Math.min(1, Math.max(PROFILE_MIN_H, pct / PROFILE_MAX_PCT));
   return { pct, h, color: intensityColor(pct) };
 }

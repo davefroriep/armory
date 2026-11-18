@@ -1,4 +1,4 @@
-import { bikeLink, hrLink } from '../ble/devices';
+import { bikeLink, hrLink, spinLink } from '../ble/devices';
 import { transport } from '../ble/transport';
 import { sim } from '../ble/sim';
 import { ensureSensors } from '../ble/sources';
@@ -36,7 +36,7 @@ export function settingsScreen(root: HTMLElement): () => void {
   <main class="page settings">
     <h2 class="sec">TRAINING &amp; FTP</h2>
     <section class="card">
-      <div class="line"><span>AirBike FTP<small>Scales Z2 &amp; Z5 % FTP targets (182 W baseline)</small></span>${num('ftp', s.ftp, 80, 450)}<em>W</em></div>
+      <div class="line"><span>Cycling &amp; AirBike FTP<small>Scales AirBike &amp; Spin Z2/Z5 % FTP targets (182 W baseline)</small></span>${num('ftp', s.ftp, 80, 450)}<em>W</em></div>
       <div class="line"><span>Bodyweight<small>Auto-pulls latest smart-scale weigh-in from Intervals.icu</small></span><input class="num" type="number" inputmode="decimal" step="0.1" id="bwIn" placeholder="195" value="${bwVal}"><em>${unit}</em></div>
       <div class="line"><span>Auto-sync eFTP from Intervals<small>Updates FTP automatically when Intervals models a new eFTP</small></span>${tog('ftpAutoSync', s.ftpAutoSync)}</div>
       <div class="hint" id="ftpInfo">${ftpStatus()}</div>
@@ -115,7 +115,7 @@ export function settingsScreen(root: HTMLElement): () => void {
 
     <h2 class="sec">DEVICES</h2>
     <section class="card">
-      <div class="row"><button class="btn sm" id="forget">Forget Polar H10 &amp; AirBike</button></div>
+      <div class="row"><button class="btn sm" id="forget">Forget Polar H10, AirBike &amp; Spin</button></div>
       <p class="hint">Remembers paired sensors so the app can reconnect silently. Use this if one stops reconnecting, then tap the chip to pair again.</p>
       <div class="line"><span>Simulator<small>Fake H10 + AirBike to try the app without hardware</small></span>${tog('simulator', s.simulator)}</div>
     </section>
@@ -181,7 +181,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
       if (name === 'simulator') {
-        if (on) { hrLink.release(); bikeLink.release(); }
+        if (on) { hrLink.release(); bikeLink.release(); spinLink.release(); }
         else sim.stop();
         ensureSensors({ bike: false });
       }
@@ -196,7 +196,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     if (t.closest('#syncFtp')) void syncFtp();
     if (t.closest('#forget')) void forget();
     if (t.closest('#resetProgs')) {
-      updateSettings({ programOrder: [], programHidden: null });
+      updateSettings({ programOrder: [], programHidden: null, spinProgramOrder: [], spinProgramHidden: null });
       $('#resetOut', root).textContent = '✓ Back to the default list';
     }
     if (t.closest('#test')) void test();
@@ -264,8 +264,9 @@ export function settingsScreen(root: HTMLElement): () => void {
   async function forget() {
     hrLink.forget();
     bikeLink.forget();
+    spinLink.forget();
     await transport.forgetAll();
-    toast('Sensors forgotten — tap the HR chip to pair again');
+    toast('Sensors forgotten — tap the HR or Bike chip to pair again');
   }
 
   const offBackup = wireBackupCard(root, paintFtpBox);

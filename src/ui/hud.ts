@@ -1,13 +1,13 @@
 import { bikeFrame, bikeFresh, hrFresh, live } from '../ble/telemetry';
+import { spinLink } from '../ble/devices';
 import { sim } from '../ble/sim';
 import { bikeStatusNote, ensureSensors } from '../ble/sources';
 import { audio, buzz } from '../audio/audio';
 import { WorkoutEngine } from '../domain/engine';
-import { CORRIDOR_RPM, cueFor, hrCue, pacerDecision, type Cue, type PacerConfig } from '../domain/pacer';
+import { CORRIDOR_RPM, CORRIDOR_WATTS, cueFor, hrCue, pacerDecision, wattsCueFor, type Cue, type PacerConfig } from '../domain/pacer';
 import { recoveryLimitBpm } from '../domain/gate';
 import { repNote, repStats, type RepStat } from '../domain/reps';
 import { PHASE_COLOR, fmtDur, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
-import { wattsForRpm } from '../domain/airbikeCurve';
 import { FTP_LINE_H, profileBar } from '../domain/profile';
 import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
@@ -40,8 +40,13 @@ export function hudScreen(root: HTMLElement, args: string[], query: URLSearchPar
 
 class Hud {
   private baseProgram: Program;
+  private eq: 'airbike' | 'spin';
   private p: Program;
   private offsetWatts = 0;
+  private manualLvl = 10;
+  private lastErgMode: number | null = null;
+  private lastErgWatts: number | null = null;
+  private lastErgAt = 0;
   private engine: WorkoutEngine;
   private rec: Recorder | null = null;
   private goal: number;
@@ -73,6 +78,7 @@ class Hud {
     private resumeId: string | null = null,
   ) {
     this.baseProgram = baseProgram;
+    this.eq = baseProgram.equipment ?? 'airbike';
     this.p = resolveProgram(baseProgram, getSettings().ftp, 0);
     this.engine = new WorkoutEngine(this.p);
     this.goal = this.p.goal?.def ?? 0;
@@ -81,7 +87,7 @@ class Hud {
   // ------------------------------------------------------------------ mount / teardown
 
   mount(): () => void {
-    ensureSensors({ bike: true });
+    ensureSensors({ bike: this.eq });
     this.paintHud();
     if (this.resumeId) void this.hydrateResume(this.resumeId);
     this.loop();
@@ -103,7 +109,8 @@ class Hud {
       this.offSmooth?.();
       this.offChips?.();
       audio.setMetronome(false, null);
-      sim.setTarget(0);
+      sim.setTarget(0, 0);
+      this.releaseErg();
       setWallboardCardioState(null);
       this.releaseLock();
       void setKeepScreenOn(false);
@@ -151,11 +158,18 @@ class Hud {
       ? `<div class="goal" id="goalCtl"><button data-goal="-1" aria-label="Less">−</button><div><b id="goalVal">${this.goal}</b> <small>${p.goal.unit}</small></div><button data-goal="1" aria-label="More">+</button></div>`
       : '';
     const hasTrim = this.baseProgram.zone === 'Z5' || this.baseProgram.zone === 'Z2';
+    const hasFreeLvl = this.eq === 'spin' && !segs.length;
     const trimRow = hasTrim
       ? `<div class="trim" id="trimCtl">
           <button type="button" data-trim="-5" aria-label="Lower target 5 watts">−5 W</button>
           <button type="button" class="trim-mid" id="trimLbl" title="Tap to reset trim"></button>
           <button type="button" data-trim="5" aria-label="Raise target 5 watts">+5 W</button>
+        </div>`
+      : hasFreeLvl
+      ? `<div class="trim" id="trimCtl">
+          <button type="button" data-lvl="-2" aria-label="Lower resistance level">−2 Lvl</button>
+          <button type="button" class="trim-mid" id="lvlLbl">GEAR LVL ${this.manualLvl}</button>
+          <button type="button" data-lvl="2" aria-label="Raise resistance level">+2 Lvl</button>
         </div>`
       : '';
 
@@ -214,6 +228,7 @@ class Hud {
     if (segs.length) this.el.tlHead = q('tlHead');
     else this.el.tlFill = q('tlFill');
     if (hasTrim) this.el.trimLbl = q('trimLbl');
+    if (hasFreeLvl) this.el.lvlLbl = q('lvlLbl');
 
     this.offChips?.();
     this.offChips = wireChips(this.root);
@@ -245,6 +260,8 @@ class Hud {
     this.root.querySelectorAll<HTMLElement>('[data-trim]').forEach((b) =>
       b.addEventListener('click', () => this.adjustTarget(this.offsetWatts + Number(b.dataset.trim))));
     this.root.querySelector('#trimLbl')?.addEventListener('click', () => this.adjustTarget(0));
+    this.root.querySelectorAll<HTMLElement>('[data-lvl]').forEach((b) =>
+      b.addEventListener('click', () => this.adjustManualLevel(Number(b.dataset.lvl))));
     this.root.querySelectorAll<HTMLElement>('[data-goal]').forEach((b) =>
       b.addEventListener('click', () => {
         if (this.engine.state !== 'ready' || !this.p.goal) return;
@@ -288,13 +305,54 @@ class Hud {
     });
   }
 
+  private adjustManualLevel(delta: number): void {
+    const base = live.tlvl > 0 ? live.tlvl : live.lvl > 0 ? Math.round(live.lvl) : this.manualLvl;
+    this.manualLvl = Math.max(3, Math.min(80, Math.round(base + delta)));
+    if (this.el.lvlLbl) this.el.lvlLbl.textContent = `GEAR LVL ${this.manualLvl}`;
+    if (!getSettings().simulator && spinLink.connected) {
+      void spinLink.command('SET_MODE:0').catch(() => {});
+      void spinLink.command(`SET_LEVEL:${this.manualLvl}`).catch(() => {});
+    }
+  }
+
+  private syncErg(running: boolean, seg: Segment | null): void {
+    if (this.eq !== 'spin' || getSettings().simulator || !spinLink.connected) return;
+    const now = Date.now();
+    const desiredW = running && seg?.watts != null ? Math.max(50, Math.min(800, Math.round(seg.watts))) : null;
+    if (desiredW != null) {
+      if (this.lastErgMode !== 1) {
+        this.lastErgMode = 1;
+        this.lastErgWatts = null;
+        void spinLink.command('SET_MODE:1').catch(() => {});
+      }
+      const needWatts = this.lastErgWatts !== desiredW || (now - this.lastErgAt > 3000 && (live.mode !== 1 || Math.abs(live.tgtW - desiredW) > 1));
+      if (needWatts) {
+        this.lastErgWatts = desiredW;
+        this.lastErgAt = now;
+        void spinLink.command(`SET_WATTS:${desiredW}`).catch(() => {});
+      }
+    } else if (this.lastErgMode === 1) {
+      this.releaseErg();
+    }
+  }
+
+  private releaseErg(): void {
+    if (this.eq !== 'spin') return;
+    const hadErg = this.lastErgMode === 1;
+    this.lastErgMode = 0;
+    this.lastErgWatts = null;
+    if (!hadErg || getSettings().simulator || !spinLink.connected) return;
+    void spinLink.command('SET_MODE:0').catch(() => {});
+    void spinLink.command('SET_LEVEL:5').catch(() => {});
+  }
+
   private start(): void {
     audio.unlock();
     audio.setVolume(getSettings().metroVolume);
     const s = getSettings();
-    const slot = this.planSlot ?? calendar.forEquipment('airbike').find((i) => i.programId === this.p.id)?.planSlot ?? null;
+    const slot = this.planSlot ?? calendar.forEquipment(this.eq).find((i) => i.programId === this.p.id)?.planSlot ?? null;
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    this.rec = new Recorder(id, 'airbike', this.p.id, this.p.intervalsName, null, s.hrMax, undefined, slot);
+    this.rec = new Recorder(id, this.eq, this.p.id, this.p.intervalsName, null, s.hrMax, undefined, slot);
     this.attachRecorderSensors();
     this.engine.start(Date.now());
     this.guard.arm();
@@ -310,6 +368,7 @@ class Hud {
     if (this.engine.state !== 'running') return;
     this.engine.pause(Date.now());
     audio.setMetronome(false, null);
+    this.releaseErg();
     this.releaseLock();
     this.el.pauseSub.textContent = `${hms(this.engine.elapsed(Date.now()))} elapsed`;
     this.el.pauseModal.hidden = false;
@@ -331,7 +390,8 @@ class Hud {
     this.offRec?.();
     this.offRec = null;
     audio.setMetronome(false, null);
-    sim.setTarget(0);
+    sim.setTarget(0, 0);
+    this.releaseErg();
     this.el.pauseModal.hidden = true;
     this.el.doneModal.hidden = true;
     this.releaseLock();
@@ -348,7 +408,8 @@ class Hud {
     this.offRec?.();
     this.offRec = null;
     audio.setMetronome(false, null);
-    sim.setTarget(0);
+    sim.setTarget(0, 0);
+    this.releaseErg();
     this.el.pauseModal.hidden = true;
     this.el.doneModal.hidden = true;
     this.releaseLock();
@@ -384,8 +445,10 @@ class Hud {
       ? { waiting, timerOnly: st.recoveryMode === 'timed' || hrNow == null, into: loc.into, minSec: seg.gate.minSec, nominal: this.p.segments[loc.index]?.seconds ?? seg.seconds, hrLimit }
       : null;
     const targetRpm = seg?.rpm ?? (this.p.segments.length === 0 ? this.p.paceRpm ?? 0 : 0);
+    const spinTargetW = this.eq === 'spin' ? (seg?.watts ?? 0) : 0;
 
-    sim.setTarget(running ? targetRpm : 0);
+    sim.setTarget(running ? targetRpm : 0, running ? spinTargetW : 0);
+    this.syncErg(running, seg);
     if (running) this.rec?.tick(elapsed, targetRpm);
 
     // transitions
@@ -405,9 +468,18 @@ class Hud {
     // bar needle + cue use their own (shorter) window so they agree with each other
     const needleMs = Number(st.needleSmooth) * 1000;
     const cadN = !bike ? 0 : needleMs <= 0 ? live.cad : this.cadAvg.value(now, needleMs) ?? 0;
+    const wN = !bike ? 0 : needleMs <= 0 ? live.w : this.wAvg.value(now, needleMs) ?? 0;
 
-    if (running && seg?.rpm != null && !seg.allOut && Math.abs(cadS - seg.rpm) <= CORRIDOR_RPM) this.lockSince ??= now;
-    else this.lockSince = null;
+    const isErgSeg = seg?.watts != null;
+    if (running && seg && !seg.allOut) {
+      const onTarget = isErgSeg
+        ? (cadS >= 65 && Math.abs(wS - seg.watts!) <= CORRIDOR_WATTS)
+        : (seg.rpm != null && Math.abs(cadS - seg.rpm) <= CORRIDOR_RPM);
+      if (onTarget) this.lockSince ??= now;
+      else this.lockSince = null;
+    } else {
+      this.lockSince = null;
+    }
     const lockedIn = this.lockSince != null && now - this.lockSince >= 3000;
 
     // metronome
@@ -416,7 +488,9 @@ class Hud {
     audio.setMetronome(running && dec.play, dec.bpm);
 
     // cue + overshoot chirp (smoothed, so a single hard pedal stroke doesn't nag)
-    let cue = running ? cueFor(seg, cadN, loc.into) : ({ level: 'idle', text: '', chirp: false } as Cue);
+    let cue = running
+      ? (isErgSeg ? wattsCueFor(seg, wN, cadS, loc.into) : cueFor(seg, cadN, loc.into))
+      : ({ level: 'idle', text: '', chirp: false } as Cue);
     if (running && cue.level !== 'bad') {
       const gateLimit = waiting && !this.gateState?.timerOnly ? hrLimit : null;
       const extra = hrCue(seg, hrNow ?? 0, st.hrMax, gateLimit);
@@ -450,13 +524,13 @@ class Hud {
       void workoutService.update(`Armory Fit · ${this.p.name}`, `${mmss(elapsed)} · ${Math.round(wS)} W · ${hr || '--'} BPM`);
     }
 
-    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running, cadS, wS, cadN);
+    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running, cadS, wS, cadN, wN);
   }
 
   // ------------------------------------------------------------------ painting
 
   private paint(seg: Segment | null, next: Segment | null, remaining: number, index: number, elapsed: number,
-    cue: Cue, bpm: number | null, playing: boolean, running: boolean, cadS: number, wS: number, cadN: number): void {
+    cue: Cue, bpm: number | null, playing: boolean, running: boolean, cadS: number, wS: number, cadN: number, wN: number): void {
     const e = this.el;
     const p = this.p;
     const st = getSettings();
@@ -486,7 +560,7 @@ class Hud {
       e.cd.classList.toggle('hot', !ready && shownLeft <= 5 && running && !hrWait);
       e.next.innerHTML = ready
         ? `FIRST UP: ${esc(p.segments[0].label)}`
-        : next ? `NEXT: <b>${esc(next.label)}</b>${next.rpm != null ? ` · ${rpmTxt(next)} RPM${next.allOut ? '' : ` · ${targetWatts(next)} W`}` : ' · full rest'}` : 'LAST BLOCK';
+        : next ? `NEXT: <b>${esc(next.label)}</b>${next.watts != null ? ` · ${Math.round(next.watts)} W` : next.rpm != null ? ` · ${rpmTxt(next)} RPM${next.allOut ? '' : ` · ${targetWatts(next)} W`}` : ' · full rest'}` : 'LAST BLOCK';
     } else if (p.goal?.type === 'time') {
       e.cd.textContent = mmss(Math.ceil(Math.max(0, this.goal * 60 - elapsed)));
     } else if (p.goal?.type === 'cal') {
@@ -521,7 +595,7 @@ class Hud {
     // cue + center bar (the bar uses the Settings → cadence bar smoothing window, default 2 s)
     e.cue.textContent = cue.text || '\u00a0';
     e.cue.className = `cue ${cue.level}`;
-    this.paintGauge(shown, cadN, cue);
+    this.paintGauge(shown, cadN, wN, cue);
 
     // metrics: integers only
     e.hr.textContent = hr ? String(hr) : '--';
@@ -529,17 +603,31 @@ class Hud {
     e.hrSub.textContent = hz ? `Z${hz.z} · ${Math.round(hz.pct * 100)}%` : 'bpm';
     e.mHr.style.setProperty('--c', hz ? ZONE_COLOR[hz.z] : '#8a94a3');
     e.w.textContent = String(Math.round(wS));
-    e.wSub.textContent = shown?.rpm != null && !ready ? `target ${segWatts(shown)}` : 'watts';
+    e.wSub.textContent = shown?.watts != null && !ready
+      ? `target ${targetWatts(shown)} W${live.lvl > 0 ? ` · Lvl ${Math.round(live.lvl)}` : ''}`
+      : shown?.rpm != null && !ready
+      ? `target ${segWatts(shown)}`
+      : (this.eq === 'spin' && live.lvl > 0 ? `Lvl ${Math.round(live.lvl)}` : 'watts');
     e.cad.textContent = String(Math.round(cadS));
-    e.cadSub.textContent = shown?.rpm != null ? `target ${rpmTxt(shown)}` : 'rpm';
+    e.cadSub.textContent = shown?.watts != null && shown.rpm != null
+      ? `ideal ~${rpmTxt(shown)}`
+      : shown?.rpm != null ? `target ${rpmTxt(shown)}` : 'rpm';
     e.mCad.dataset.level = cue.level;
     e.mW.dataset.level = cue.level === 'bad' ? 'bad' : 'idle';
     if (e.trimLbl) {
       const ref = p.segments.find((g) => g.kind === 'work' || g.kind === 'steady');
-      if (ref?.rpm != null) {
+      if (ref) {
         const off = this.offsetWatts ? ` (${this.offsetWatts > 0 ? '+' : '−'}${Math.abs(this.offsetWatts)} W)` : '';
-        e.trimLbl.textContent = `WORK ${targetWatts(ref)} W · ${fmtRpm(ref.rpm)} RPM${off}`;
+        e.trimLbl.textContent = ref.watts != null
+          ? `WORK ${targetWatts(ref)} W · ERG${off}`
+          : ref.rpm != null
+          ? `WORK ${targetWatts(ref)} W · ${fmtRpm(ref.rpm)} RPM${off}`
+          : '';
       }
+    }
+    if (e.lvlLbl && live.lvl > 0) {
+      const shownLvl = live.tlvl > 0 ? live.tlvl : Math.round(live.lvl);
+      e.lvlLbl.textContent = `GEAR LVL ${shownLvl}`;
     }
 
     // strip
@@ -556,7 +644,7 @@ class Hud {
       : running && playing && bpm ? `${Math.round(bpm)} BPM`
       : st.metroMode === 'whole' ? 'METRONOME ON' : 'ARMED · TRANSITIONS';
 
-    e.sigNote.textContent = !bike ? bikeStatusNote() || 'Waiting for AirBike signal…' : '';
+    e.sigNote.textContent = !bike ? bikeStatusNote() || `Waiting for ${this.eq === 'spin' ? 'SS2K Spin' : 'AirBike'} signal…` : '';
 
     e.skip.hidden = !(running && seg && (seg.kind === 'rest' || seg.kind === 'warmup'));
     e.skip.textContent = seg?.kind === 'warmup' ? 'SKIP WARM-UP' : 'READY ▶';
@@ -579,7 +667,7 @@ class Hud {
         countdownText: e.cd.textContent || '0:00',
         targetText: e.tgt.textContent || '',
         watts: wS,
-        targetWatts: shown?.rpm != null ? Math.round(wattsForRpm(shown.rpm)) : null,
+        targetWatts: shown ? targetWatts(shown) : null,
         rpm: cadS,
         targetRpm: shown?.rpm ?? null,
         elapsedSec: elapsed,
@@ -603,22 +691,34 @@ class Hud {
     return Math.min(1, (before + Math.min(1, into / len) * nominal) / total);
   }
 
-  /** Center-bar: target in the middle, smoothed needle left/right of it. */
-  private paintGauge(seg: Segment | null, cad: number, cue: Cue): void {
+  /** Center-bar: target in the middle, smoothed needle left/right of it (RPM for AirBike, W for Spin ERG). */
+  private paintGauge(seg: Segment | null, cad: number, w: number, cue: Cue): void {
     const e = this.el;
-    if (!seg || seg.rpm == null) {
+    if (!seg || (seg.watts == null && seg.rpm == null)) {
       e.gauge.classList.add('off');
       return;
     }
     e.gauge.classList.remove('off');
-    const lo = seg.allOut ? seg.rpm - 15 : seg.rpm - 10;
-    const hi = seg.allOut ? seg.rpm + 25 : seg.rpm + 10;
-    const pct = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
-    const zl = seg.allOut ? pct(seg.rpm) : pct(seg.rpm - CORRIDOR_RPM);
-    const zh = seg.allOut ? 100 : pct(seg.rpm + CORRIDOR_RPM);
-    e.gZone.style.left = `${zl}%`;
-    e.gZone.style.width = `${zh - zl}%`;
-    e.gNeedle.style.left = `${pct(cad)}%`;
+    if (seg.watts != null) {
+      const lo = seg.watts - 40;
+      const hi = seg.watts + 40;
+      const pct = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
+      const zl = pct(seg.watts - CORRIDOR_WATTS);
+      const zh = pct(seg.watts + CORRIDOR_WATTS);
+      e.gZone.style.left = `${zl}%`;
+      e.gZone.style.width = `${zh - zl}%`;
+      e.gNeedle.style.left = `${pct(w)}%`;
+    } else {
+      const rpm = seg.rpm!;
+      const lo = seg.allOut ? rpm - 15 : rpm - 10;
+      const hi = seg.allOut ? rpm + 25 : rpm + 10;
+      const pct = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
+      const zl = seg.allOut ? pct(rpm) : pct(rpm - CORRIDOR_RPM);
+      const zh = seg.allOut ? 100 : pct(rpm + CORRIDOR_RPM);
+      e.gZone.style.left = `${zl}%`;
+      e.gZone.style.width = `${zh - zl}%`;
+      e.gNeedle.style.left = `${pct(cad)}%`;
+    }
     e.gauge.dataset.level = cue.level;
   }
 
@@ -647,19 +747,20 @@ class Hud {
       ['AVG HR', meta.avgHr ? `${Math.round(meta.avgHr)}` : '--'],
       ['MAX HR', meta.maxHr ? `${Math.round(meta.maxHr)}` : '--'],
       ['WORK', `${Math.round(meta.kj)} kJ`],
-      ['ASSAULT CAL', `${Math.round(rec.lastKcal)}`],
+      [this.eq === 'spin' ? 'SPIN CAL' : 'ASSAULT CAL', `${Math.round(rec.lastKcal)}`],
       ['DISTANCE', `${(rec.lastDist / 1609.344).toFixed(2)} mi`],
       this.p.zone === 'Z5' ? ['Z5 BANK (≥88%)', mmss(rec.z5Seconds)] : ['TIME', hms(meta.seconds)],
     ];
-    renderSummary(this.root, { title: this.p.name, meta, stats, extra: repTable(reps), backHref: '#/airbike' });
+    renderSummary(this.root, { title: this.p.name, meta, stats, extra: repTable(reps), backHref: `#/${this.eq}` });
   }
 }
 
 function segTarget(g: Segment): string {
+  if (g.watts != null) return `${Math.round(g.watts)} W${g.rpm != null ? ` · ~${fmtRpm(g.rpm)} RPM` : ''}`;
   if (g.rpm == null) return 'full rest';
   return g.allOut ? `${rpmTxt(g)} RPM · all out` : `${rpmTxt(g)} RPM · ${segWatts(g)}`;
 }
-const segWatts = (g: Segment): string => `${Math.round(wattsForRpm(g.rpm ?? 0))} W`;
+const segWatts = (g: Segment): string => `${targetWatts(g) ?? 0} W`;
 
 const mmssR = (s: number): string => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`;
 

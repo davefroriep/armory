@@ -23,6 +23,13 @@ describe('BLE parsers', () => {
     expect(parseBikeLine('{"dev":"treadmill","w":1,"cad":2}')).toBeNull();
     expect(parseBikeLine('{"foo":1}')).toBeNull();
   });
+  it('Spin Bike (SS2K) frame', () => {
+    const s = parseBikeLine('{"dev":"spin","w":132,"cad":85.2,"lvl":24.3,"tlvl":24,"tgt_w":130,"mode":1,"pot":1158,"pos":8600}');
+    expect(s).toEqual({
+      dev: 'spin', w: 132, cad: 85.2, dist: 0, kcal: 0, spd: 0,
+      lvl: 24.3, tlvl: 24, tgt_w: 130, mode: 1, pot: 1158, pos: 8600,
+    });
+  });
 });
 
 describe('summarize', () => {

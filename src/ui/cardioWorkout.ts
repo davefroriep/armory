@@ -48,7 +48,7 @@ export function cardioWorkoutScreen(root: HTMLElement, args: string[]): () => vo
         ? `<div class="status ok">✓ Synced to Intervals.icu${m.rpe ? ` · ${esc(rpeLabel(m.rpe))} (RPE ${m.rpe})` : ''}${m.activityId ? ` · <a class="link" target="_blank" rel="noopener" href="https://intervals.icu/activities/${esc(m.activityId)}">Open ↗</a>` : ''}</div>`
         : `<div class="status warn">Saved on this phone.${m.lastError ? ` ${esc(m.lastError)}` : ''} <button class="btn sm" data-act="retry">Retry upload</button></div>`;
 
-      const backTo = m.equipment === 'strength' ? '#/strength/history' : m.equipment === 'airbike' ? '#/airbike' : '#/';
+      const backTo = m.equipment === 'strength' ? '#/strength/history' : (m.equipment === 'airbike' || m.equipment === 'spin') ? `#/${m.equipment}` : '#/';
       root.innerHTML = `${topbar({ back: backTo, title: EQUIPMENT_LABEL[m.equipment] })}
         <main class="page summary">
           <h1 class="sum-title">${esc(m.name)}</h1>
@@ -89,7 +89,7 @@ export function cardioWorkoutScreen(root: HTMLElement, args: string[]): () => vo
         return;
       }
       if (act === 'del') {
-        const backTo = m.equipment === 'strength' ? '#/strength/history' : '#/';
+        const backTo = m.equipment === 'strength' ? '#/strength/history' : (m.equipment === 'airbike' || m.equipment === 'spin') ? `#/${m.equipment}` : '#/';
         if (await confirmSheet('Delete workout?', 'Removes this workout and its 1 Hz samples from your phone. Any Intervals.icu copy stays.', 'Delete', true)) {
           await discard(id);
           toast('Workout deleted');

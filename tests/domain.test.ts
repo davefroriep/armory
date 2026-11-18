@@ -1,13 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { bpmForRpm, rpmForWatts, wattsForRpm } from '../src/domain/airbikeCurve';
-import { PROGRAMS, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds } from '../src/domain/programs';
+import { PROGRAMS, SPIN_PROGRAMS, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds } from '../src/domain/programs';
 import { locate } from '../src/domain/timeline';
 import { WorkoutEngine } from '../src/domain/engine';
 import { gateOpen } from '../src/domain/gate';
 import { arrange, moveProgram, restoreOrder, toggleHidden } from '../src/domain/library';
 import { repNote, repStats } from '../src/domain/reps';
-import { hrCue } from '../src/domain/pacer';
-import { cueFor, pacerDecision, type PacerConfig } from '../src/domain/pacer';
+import { cueFor, hrCue, pacerDecision, wattsCueFor, type PacerConfig } from '../src/domain/pacer';
 import { buildTcx } from '../src/domain/tcx';
 
 describe('Assault curve', () => {
@@ -339,5 +338,28 @@ describe('rep stats', () => {
     expect(r[1].hrEnd).toBeLessThan(r[1].hrStart);
     expect(repNote(r)).toContain('Reps 200W@172 · 210W@171');
     expect(repNote(r)).toContain('Recoveries 0:05');
+  });
+});
+
+describe('Spin Bike ERG programs & cues', () => {
+  it('defines Z2 and Z5 Spin ERG programs matching the calibrated primer targets', () => {
+    expect(SPIN_PROGRAMS.every((p) => p.equipment === 'spin')).toBe(true);
+    expect(new Set(SPIN_PROGRAMS.map((p) => p.id)).size).toBe(SPIN_PROGRAMS.length);
+    const z2 = programById('spin-z2')!;
+    expect(totalSeconds(z2)).toBe(45 * 60);
+    expect(targetWatts(z2.segments.find((g) => g.kind === 'steady')!)).toBe(129);
+    const n4 = programById('spin-n4x4')!;
+    expect(totalSeconds(n4)).toBe(33 * 60);
+    expect(targetWatts(n4.segments.find((g) => g.kind === 'work')!)).toBe(220);
+    const scaled = resolveProgram(n4, 200, -10);
+    expect(targetWatts(scaled.segments.find((g) => g.kind === 'work')!)).toBe(Math.round(220 * (200 / 182)) - 10);
+  });
+
+  it('wattsCueFor tracks ERG target corridor, low cadence risk, and overshoot', () => {
+    const seg = { kind: 'work' as const, label: 'WORK', seconds: 240, rpm: 85, watts: 220 };
+    expect(wattsCueFor(seg, 220, 85, 30)).toMatchObject({ level: 'ok', text: 'ERG ON TARGET' });
+    expect(wattsCueFor(seg, 180, 50, 30)).toMatchObject({ level: 'warn' });
+    expect(wattsCueFor(seg, 260, 90, 5)).toMatchObject({ level: 'bad', chirp: true });
+    expect(wattsCueFor(seg, 0, 2, 10)).toMatchObject({ level: 'warn', text: 'START PEDALING' });
   });
 });
