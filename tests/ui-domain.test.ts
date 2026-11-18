@@ -225,8 +225,11 @@ describe('live HR sheet telemetry helpers', () => {
       restDay: 0,
       lookup,
     });
-    expect(tomorrowHtml).toContain('Do this workout now');
+    expect(tomorrowHtml).toContain('Do this workout');
     expect(tomorrowHtml).toContain('Shift schedule to here');
+    expect(tomorrowHtml).toContain('<div class="dz-row"><button class="btn primary dz-btn" type="button" data-zact="do-slot"');
+    expect(tomorrowHtml).toContain('data-zact="shift"');
+    expect(tomorrowHtml).toContain('class="btn dz-btn dz-full"');
     expect(tomorrowHtml).toContain('View Full Program');
     expect(tomorrowHtml).toContain('data-back-today');
     expect(tomorrowHtml).not.toContain('data-inline-dismiss');
@@ -239,7 +242,7 @@ describe('live HR sheet telemetry helpers', () => {
       restDay: 0,
       lookup,
     });
-    expect(todayPendingHtml).toContain('Do this workout now');
+    expect(todayPendingHtml).toContain('Do this workout');
     expect(todayPendingHtml).toContain('data-zact="do-slot" data-slot="1:0"');
     expect(todayPendingHtml).toContain('data-zact="do-slot" data-slot="1:1"');
     expect(todayPendingHtml).not.toContain('data-zact="do-now"');

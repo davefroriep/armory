@@ -213,7 +213,7 @@ export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: Zoom
   const mins = Math.round(slot.seconds / 60);
   const { badge, cls } = slotBadgeAndClass(state);
   const doBtn = state === 'pending' && planSlot
-    ? `<button class="btn primary sh-do-btn" type="button" data-zact="do-slot" data-slot="${esc(planSlot)}">Do this workout now</button>`
+    ? `<button class="btn primary sh-do-btn" type="button" data-zact="do-slot" data-slot="${esc(planSlot)}">Do this workout</button>`
     : '';
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, lookup.routines);
@@ -246,7 +246,7 @@ function renderExtraSlot(x: ExtraWorkout, state: SlotState, lookup: ZoomLookup, 
     ? renderItemList(x.items, lookup)
     : `<p class="sh-text">${esc(x.description)}</p>`;
   const doBtn = state === 'pending' && planSlot
-    ? `<button class="btn primary sh-do-btn" type="button" data-zact="do-slot" data-slot="${esc(planSlot)}">Do this workout now</button>`
+    ? `<button class="btn primary sh-do-btn" type="button" data-zact="do-slot" data-slot="${esc(planSlot)}">Do this workout</button>`
     : '';
   return `<div class="sh-slot${cls}">
     <div class="sh-slot-h">
@@ -385,6 +385,12 @@ export function renderDayZoomCard(args: {
   const fullDate = new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' });
   const isRestPref = restDay != null && dayOfWeek(ymd) === restDay;
 
+  const pendingList = [
+    ...res.pendingExtras.map((x) => ({ kind: 'extra' as const, x, key: extraKey(x.id) })),
+    ...res.pendingSlots.map(({ p, slot, slotIndex }) => ({ kind: 'plan' as const, slot, key: slotKey(p.step.index, slotIndex) })),
+  ];
+  const singlePendingKey = pendingList.length === 1 ? pendingList[0].key : null;
+
   const slotCards = [
     ...res.liftsDone.map((s) => renderCompletedLiftSlot(s, lookup)),
     ...res.cardioDone.map((cm) => renderCompletedCardioSlot(cm)),
@@ -392,8 +398,9 @@ export function renderDayZoomCard(args: {
     ...res.externalDoneSlots.map(({ slot }) => renderPlannedSlot(slot, 'done', lookup)),
     ...res.skippedExtras.map((x) => renderExtraSlot(x, 'skipped', lookup)),
     ...res.skippedSlots.map(({ slot }) => renderPlannedSlot(slot, 'skipped', lookup)),
-    ...res.pendingExtras.map((x) => renderExtraSlot(x, 'pending', lookup, extraKey(x.id))),
-    ...res.pendingSlots.map(({ p, slot, slotIndex }) => renderPlannedSlot(slot, 'pending', lookup, slotKey(p.step.index, slotIndex))),
+    ...pendingList.map((item) => item.kind === 'extra'
+      ? renderExtraSlot(item.x, 'pending', lookup, singlePendingKey ? undefined : item.key)
+      : renderPlannedSlot(item.slot, 'pending', lookup, singlePendingKey ? undefined : item.key)),
   ];
 
   const body = slotCards.length
@@ -408,11 +415,14 @@ export function renderDayZoomCard(args: {
           <small>${isRestPref ? 'Configured weekly rest day — skipped in future projections.' : ymd < today ? 'No workouts saved on this date.' : 'Open training day — tap or swipe to pull a future day ahead.'}</small>
         </div>`;
 
-  const acts: string[] = [];
-  if (res.canShift && res.associatedStep) {
-    acts.push(`<button class="btn dz-btn" type="button" data-zact="shift" data-step-idx="${res.associatedStep.step.index}">Shift schedule to here</button>`);
+  const topRowActs: string[] = [];
+  if (singlePendingKey) {
+    topRowActs.push(`<button class="btn primary dz-btn" type="button" data-zact="do-slot" data-slot="${esc(singlePendingKey)}">Do this workout</button>`);
   }
-  acts.push(`<a class="btn dz-btn" href="#/program?w=${res.week}">View Full Program</a>`);
+  if (res.canShift && res.associatedStep) {
+    topRowActs.push(`<button class="btn primary dz-btn" type="button" data-zact="shift" data-step-idx="${res.associatedStep.step.index}">Shift schedule to here</button>`);
+  }
+  const actsHtml = `${topRowActs.length ? `<div class="dz-row">${topRowActs.join('')}</div>` : ''}<a class="btn dz-btn dz-full" href="#/program?w=${res.week}">View Full Program</a>`;
 
   return `<section class="card day-zoom${anim ? ` ${anim}` : ''}" id="dayZoom" data-zoom-ymd="${ymd}">
     <div class="dz-top">
@@ -431,6 +441,6 @@ export function renderDayZoomCard(args: {
       ${res.associatedStep ? `<small class="dz-sub">${esc(res.associatedStep.step.title)}</small>` : ''}
     </div>
     ${body}
-    <div class="dz-acts">${acts.join('')}</div>
+    <div class="dz-acts">${actsHtml}</div>
   </section>`;
 }

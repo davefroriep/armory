@@ -378,8 +378,10 @@ a.metro { text-decoration: none; }
 .dz-sub { color: var(--mut); font-size: .78rem; }
 .dz-stats { display: flex; flex-wrap: wrap; gap: 6px; }
 .dz-stats i { font-style: normal; font-size: .74rem; font-weight: 700; color: #e2e8f0; background: rgba(255, 255, 255, .06); padding: 4px 9px; border-radius: 999px; font-variant-numeric: tabular-nums; }
-.dz-acts { display: flex; flex-direction: row; gap: 8px; padding-top: 2px; }
-.dz-btn { flex: 1; padding: 9px 10px; font-size: .82rem; border-radius: 11px; white-space: nowrap; }
+.dz-acts { display: flex; flex-direction: column; gap: 7px; padding-top: 2px; }
+.dz-row { display: flex; flex-direction: row; gap: 8px; }
+.dz-btn { flex: 1; padding: 9px 8px; font-size: .78rem; border-radius: 11px; white-space: nowrap; }
+.dz-full { width: 100%; }
 
 .cal-next { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 0 2px; }
 .cal-next > span { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
