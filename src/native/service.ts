@@ -79,6 +79,17 @@ interface WorkoutServicePlugin {
   launchVideoCamera(): Promise<{ opened: boolean }>;
   pickDcimVideo(): Promise<PickedNativeVideo>;
   openVideoUri(o: { uri: string }): Promise<{ opened: boolean }>;
+  getPlayableVideoUrl(o: { uri: string; mime?: string }): Promise<{ url?: string; error?: string }>;
+  exportVideo(o: {
+    uri?: string;
+    httpUrl?: string;
+    base64?: string;
+    fileName?: string;
+    title?: string;
+    startMs?: number;
+    endMs?: number;
+    action: 'share' | 'save';
+  }): Promise<{ ok: boolean; savedPath?: string; error?: string }>;
   playChime(o: { wavBase64?: string; volume: number }): Promise<void>;
   writeBackupFile(o: { fileName: string; content: string }): Promise<NativeBackupWriteResult>;
   pickBackupFile(): Promise<NativeBackupPickResult>;
@@ -157,6 +168,30 @@ export async function pickNativeDcimVideo(): Promise<PickedNativeVideo | null> {
 export async function openNativeVideoUri(uri: string): Promise<boolean> {
   if (!plugin || !uri) return false;
   try { return (await plugin.openVideoUri({ uri })).opened; } catch { return false; }
+}
+
+export async function getPlayableNativeVideoUrl(uri: string, mime?: string): Promise<string | null> {
+  if (!plugin || !uri) return null;
+  try {
+    const res = await plugin.getPlayableVideoUrl({ uri, ...(mime ? { mime } : {}) });
+    return res.url ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function exportNativeVideo(o: {
+  uri?: string;
+  httpUrl?: string;
+  base64?: string;
+  fileName?: string;
+  title?: string;
+  startMs?: number;
+  endMs?: number;
+  action: 'share' | 'save';
+}): Promise<{ ok: boolean; savedPath?: string; error?: string }> {
+  if (!plugin) return { ok: false, error: 'not native' };
+  try { return await plugin.exportVideo(o); } catch (e) { return { ok: false, error: (e as Error).message }; }
 }
 
 /** Terminates any foreground workout service, removes the Android Recents task, and exits the process. */

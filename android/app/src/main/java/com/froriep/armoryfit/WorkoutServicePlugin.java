@@ -3,6 +3,7 @@ package com.froriep.armoryfit;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ClipData;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
@@ -23,6 +24,7 @@ import android.view.WindowManager;
 
 import androidx.activity.result.ActivityResult;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -37,9 +39,12 @@ import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -456,6 +461,184 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
+    /** Registers a `content://` DCIM video on the loopback HTTP range server so `<video>` plays in-app. */
+    @PluginMethod
+    public void getPlayableVideoUrl(PluginCall call) {
+        String u = call.getString("uri", "");
+        String mime = call.getString("mime", "video/mp4");
+        JSObject ret = new JSObject();
+        if (u == null || u.isEmpty()) {
+            ret.put("error", "Missing uri");
+            call.resolve(ret);
+            return;
+        }
+        try {
+            String url = LocalMediaServer.register(getContext(), Uri.parse(u), mime);
+            ret.put("url", url);
+        } catch (Exception e) {
+            ret.put("error", e.getMessage());
+        }
+        call.resolve(ret);
+    }
+
+    /** Hardware-trims (optional) and shares or saves an MP4 clip from `content://`, LAN HTTP, or base64. */
+    @PluginMethod
+    public void exportVideo(PluginCall call) {
+        String uriStr = call.getString("uri", "");
+        String httpUrl = call.getString("httpUrl", "");
+        String base64 = call.getString("base64", "");
+        String rawName = call.getString("fileName", "armory-clip.mp4");
+        String title = call.getString("title", "Armory Fit Lift Clip");
+        double startMsD = call.getDouble("startMs", -1.0);
+        double endMsD = call.getDouble("endMs", -1.0);
+        String action = call.getString("action", "share");
+        Context c = getContext().getApplicationContext();
+
+        new Thread(() -> {
+            JSObject ret = new JSObject();
+            File srcTemp = null;
+            File outFile = null;
+            try {
+                File exportDir = new File(c.getCacheDir(), "video_export");
+                if (!exportDir.exists()) exportDir.mkdirs();
+                File[] stale = exportDir.listFiles();
+                if (stale != null) {
+                    long cutoff = System.currentTimeMillis() - 3_600_000L;
+                    for (File f : stale) {
+                        if (f.lastModified() < cutoff) f.delete();
+                    }
+                }
+
+                String base = (rawName != null ? rawName.trim() : "armory-clip.mp4")
+                        .replaceAll("[^a-zA-Z0-9._-]", "_")
+                        .replaceAll("^\\.+", "");
+                if (base.isEmpty()) base = "armory-clip.mp4";
+                if (!base.toLowerCase().endsWith(".mp4")) base = base + ".mp4";
+                String safeName = base;
+
+                Uri srcUri = null;
+                File srcFile = null;
+                if (uriStr != null && uriStr.startsWith("content://")) {
+                    srcUri = Uri.parse(uriStr);
+                } else if (httpUrl != null && (httpUrl.startsWith("http://") || httpUrl.startsWith("https://"))) {
+                    srcTemp = new File(exportDir, "src_" + System.currentTimeMillis() + ".mp4");
+                    downloadToFile(httpUrl, srcTemp);
+                    srcFile = srcTemp;
+                } else if (base64 != null && !base64.isEmpty()) {
+                    srcTemp = new File(exportDir, "src_" + System.currentTimeMillis() + ".mp4");
+                    byte[] raw = Base64.decode(base64, Base64.DEFAULT);
+                    try (FileOutputStream fos = new FileOutputStream(srcTemp)) {
+                        fos.write(raw);
+                    }
+                    srcFile = srcTemp;
+                } else {
+                    ret.put("ok", false);
+                    ret.put("error", "No video source");
+                    call.resolve(ret);
+                    return;
+                }
+
+                outFile = new File(exportDir, safeName);
+                if (outFile.exists()) outFile.delete();
+                boolean hasTrim = startMsD >= 0 && endMsD > startMsD + 100.0;
+                if (hasTrim) {
+                    Mp4Trimmer.trim(c, srcUri, srcFile, Math.round(startMsD), Math.round(endMsD), outFile);
+                } else if (srcFile != null) {
+                    try (InputStream is = new FileInputStream(srcFile); OutputStream os = new FileOutputStream(outFile)) {
+                        copyStreams(is, os);
+                    }
+                } else {
+                    try (InputStream is = c.getContentResolver().openInputStream(srcUri); OutputStream os = new FileOutputStream(outFile)) {
+                        if (is == null) throw new IllegalStateException("Cannot read video URI");
+                        copyStreams(is, os);
+                    }
+                }
+
+                if ("save".equals(action)) {
+                    String savedPath = saveVideoToGallery(c, outFile, safeName);
+                    outFile.delete();
+                    ret.put("ok", true);
+                    ret.put("savedPath", savedPath);
+                } else {
+                    Uri contentUri = FileProvider.getUriForFile(c, c.getPackageName() + ".fileprovider", outFile);
+                    Intent send = new Intent(Intent.ACTION_SEND);
+                    send.setType("video/mp4");
+                    send.putExtra(Intent.EXTRA_STREAM, contentUri);
+                    send.putExtra(Intent.EXTRA_SUBJECT, title);
+                    send.setClipData(ClipData.newRawUri(title, contentUri));
+                    send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    Intent chooser = Intent.createChooser(send, title);
+                    chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    c.startActivity(chooser);
+                    ret.put("ok", true);
+                }
+            } catch (Exception e) {
+                if (outFile != null && outFile.exists()) outFile.delete();
+                ret.put("ok", false);
+                ret.put("error", e.getMessage() != null ? e.getMessage() : "Video export failed");
+            } finally {
+                if (srcTemp != null && srcTemp.exists()) srcTemp.delete();
+            }
+            call.resolve(ret);
+        }).start();
+    }
+
+    private static void downloadToFile(String httpUrl, File dst) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(httpUrl).openConnection();
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(30_000);
+        try {
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IllegalStateException("HTTP " + code);
+            }
+            try (InputStream is = conn.getInputStream(); OutputStream os = new FileOutputStream(dst)) {
+                copyStreams(is, os);
+            }
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    private static void copyStreams(InputStream is, OutputStream os) throws Exception {
+        byte[] buf = new byte[65_536];
+        int n;
+        while ((n = is.read(buf)) >= 0) {
+            os.write(buf, 0, n);
+        }
+        os.flush();
+    }
+
+    private static String saveVideoToGallery(Context c, File src, String fileName) throws Exception {
+        String relPath = Environment.DIRECTORY_MOVIES + "/ArmoryFit";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentResolver cr = c.getContentResolver();
+            ContentValues cv = new ContentValues();
+            cv.put(MediaStore.Video.Media.DISPLAY_NAME, fileName);
+            cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+            cv.put(MediaStore.Video.Media.RELATIVE_PATH, relPath + "/");
+            cv.put(MediaStore.Video.Media.IS_PENDING, 1);
+            Uri dstUri = cr.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
+            if (dstUri == null) throw new IllegalStateException("MediaStore insert failed");
+            try (InputStream is = new FileInputStream(src); OutputStream os = cr.openOutputStream(dstUri, "w")) {
+                if (os == null) throw new IllegalStateException("MediaStore write failed");
+                copyStreams(is, os);
+            }
+            ContentValues done = new ContentValues();
+            done.put(MediaStore.Video.Media.IS_PENDING, 0);
+            cr.update(dstUri, done, null, null);
+            return relPath + "/" + fileName;
+        } else {
+            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "ArmoryFit");
+            if (!dir.exists()) dir.mkdirs();
+            File dst = new File(dir, fileName);
+            try (InputStream is = new FileInputStream(src); OutputStream os = new FileOutputStream(dst)) {
+                copyStreams(is, os);
+            }
+            return dst.getAbsolutePath();
+        }
+    }
+
     /** Plays a short WAV alert with USAGE_MEDIA + transient ducking and abandons AudioFocus right after. */
     @PluginMethod
     public void playChime(PluginCall call) {
@@ -613,12 +796,13 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    /** Stops foreground workout service, voice recognizer, wallboard server & metronome, and force-closes the process. */
+    /** Stops foreground workout service, voice recognizer, wallboard/media servers & metronome, and force-closes the process. */
     @PluginMethod
     public void forceClose(PluginCall call) {
         WorkoutMetronome.stop();
         VoiceRecognitionManager.stop();
         WallboardServer.stop();
+        LocalMediaServer.stop();
         Activity act = getActivity();
         call.resolve();
         if (act == null) return;

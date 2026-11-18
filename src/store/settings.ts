@@ -56,6 +56,10 @@ export interface Settings {
   /** Foreground-only hands-free voice command listener ("armory ..."). */
   voiceEnabled: boolean;
   voiceWakeWord: string;
+  /** OptiPlex Gym Camera LAN DVR integration (probes silently; hidden off home Wi-Fi). */
+  gymCamEnabled: boolean;
+  gymCamUrl: string;
+  gymCamAutoPr: boolean;
   /** Current position in the rolling training queue. */
   queue: QueueState;
 }
@@ -96,6 +100,9 @@ export const DEFAULTS: Settings = {
   wallboardPort: 8765,
   voiceEnabled: false,
   voiceWakeWord: 'armory',
+  gymCamEnabled: true,
+  gymCamUrl: 'http://192.168.1.152:8766',
+  gymCamAutoPr: true,
   queue: defaultQueueState(),
 };
 

@@ -172,6 +172,11 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('armory one more set on previous exercise')).toEqual({ kind: 'add_set_prev_ex' });
     expect(parseVoiceTranscript('armory delete empty sets')).toEqual({ kind: 'delete_empty_sets' });
     expect(parseVoiceTranscript('armory finish workout')).toEqual({ kind: 'finish_workout' });
+    expect(parseVoiceTranscript('Armory camera')).toEqual({ kind: 'cam_arm' });
+    expect(parseVoiceTranscript('armory record set')).toEqual({ kind: 'cam_arm' });
+    expect(parseVoiceTranscript('armory start camera')).toEqual({ kind: 'cam_arm' });
+    expect(parseVoiceTranscript('Armory clip that')).toEqual({ kind: 'cam_clip_last' });
+    expect(parseVoiceTranscript('armory save clip')).toEqual({ kind: 'cam_clip_last' });
     expect(parseVoiceTranscript('armory undo')).toEqual({ kind: 'undo' });
 
     // Two-beat wake flow & natural dumbbell/same shortcuts

@@ -3,8 +3,10 @@ import { PRIMARY_WEIGHT, SECONDARY_WEIGHT } from './muscles';
 
 export type ExOf = (id: string) => Exercise | undefined;
 
-/** Highest rep count tracked for rep records / PR detection. */
+/** Highest rep count used for Epley estimated 1RM. */
 export const MAX_RM = 12;
+/** Highest rep count tracked for true Rep-Max PRs & records (1RM through 40RM). */
+export const PR_MAX_REPS = 40;
 
 // ---------- sets ----------
 /** A logged working set (warm-ups never count toward volume, records or PRs). */
@@ -98,15 +100,15 @@ export interface RepBest {
   vidId?: string;
 }
 
-/** Heaviest load for at least n reps, for n = 1..MAX_RM. Ties keep the earliest. */
+/** Heaviest load for at least n reps, for n = 1..PR_MAX_REPS. Ties keep the earliest. */
 export function repBests(hist: ExSession[]): (RepBest | null)[] {
-  const best: (RepBest | null)[] = Array(MAX_RM + 1).fill(null);
+  const best: (RepBest | null)[] = Array(PR_MAX_REPS + 1).fill(null);
   for (const { s, e } of hist) {
     for (const set of e.sets) {
       if (!isWorking(set) || !set.r || set.r < 1) continue;
       const kg = set.w ?? 0;
       const vidId = set.vids?.[0];
-      for (let n = 1; n <= Math.min(set.r, MAX_RM); n++) {
+      for (let n = 1; n <= Math.min(set.r, PR_MAX_REPS); n++) {
         const b = best[n];
         if (!b || kg > b.kg + 0.005) {
           best[n] = { kg, reps: set.r, ms: s.startMs, sessionId: s.id, setId: set.id, ...(vidId ? { vidId } : {}) };
@@ -141,14 +143,14 @@ export function computePRs(sessions: LiftSession[], exOf: ExOf): Map<string, PRH
       if (ex?.type === 'time') continue;
       let b = bests.get(e.exId);
       if (!b) {
-        b = Array(MAX_RM + 1).fill(-1);
+        b = Array(PR_MAX_REPS + 1).fill(-1);
         bests.set(e.exId, b);
       }
       for (const set of e.sets) {
         if (!isWorking(set) || !set.r || set.r < 1) continue;
         const kg = set.w ?? 0;
-        const n = Math.min(set.r, MAX_RM);
-        if (hadHistory.has(e.exId) && set.r <= MAX_RM && kg > b[n] + 0.005 && (kg > 0 || ex?.type === 'bodyweight')) hits.set(set.id, { n: set.r, kg });
+        const n = Math.min(set.r, PR_MAX_REPS);
+        if (hadHistory.has(e.exId) && set.r <= PR_MAX_REPS && kg > b[n] + 0.005 && (kg > 0 || ex?.type === 'bodyweight')) hits.set(set.id, { n: set.r, kg });
         for (let i = 1; i <= n; i++) if (kg > b[i]) b[i] = kg;
       }
     }

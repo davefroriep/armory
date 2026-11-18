@@ -14,7 +14,9 @@ export type VoiceIntent =
   | { kind: 'finish_workout' }
   | { kind: 'add_set' }
   | { kind: 'add_set_prev_ex' }
-  | { kind: 'delete_empty_sets' };
+  | { kind: 'delete_empty_sets' }
+  | { kind: 'cam_arm' }
+  | { kind: 'cam_clip_last' };
 
 const ONES: Record<string, number> = {
   zero: 0, oh: 0, o: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
@@ -195,6 +197,8 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
   if (/^pause(?:\s+workout)?$/.test(tail)) return { kind: 'pause_workout' };
   if (/^resume(?:\s+workout)?$/.test(tail)) return { kind: 'resume_workout' };
   if (/^(?:finish|end|complete)\s+workout$/.test(tail)) return { kind: 'finish_workout' };
+  if (/^(?:camera|cam|record|record\s+set|start\s+camera|arm\s+camera|stop\s+camera)$/.test(tail)) return { kind: 'cam_arm' };
+  if (/^(?:clip\s+that|save\s+clip|clip\s+last(?:\s+set)?|clip\s+set)$/.test(tail)) return { kind: 'cam_clip_last' };
 
   if (/^(?:(?:add(?:\s+a|\s+1|\s+another)?\s+set)|(?:(?:1|one|another|extra)\s+(?:more\s+)?set))\s+(?:(?:to|on|of|for)\s+)?(?:the\s+)?(?:last|previous|prev|prior)\s+exercise$/.test(tail)) {
     return { kind: 'add_set_prev_ex' };

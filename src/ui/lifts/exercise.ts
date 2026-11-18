@@ -1,4 +1,4 @@
-import { MAX_RM, e1rmTrend, exerciseSessions, repBests, isWorking } from '../../lifts/calc';
+import { PR_MAX_REPS, e1rmTrend, exerciseSessions, repBests, isWorking } from '../../lifts/calc';
 import { EQUIP_LABEL, MUSCLE_LABEL } from '../../lifts/muscles';
 import { fmtKg, liftSettings, toDisplay } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
@@ -64,6 +64,13 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
       const clips = lifts.videosForExercise(exId);
       const sessList = [...hist].reverse().slice(0, 25);
 
+      const rmList = more
+        ? [
+            ...Array.from({ length: 12 }, (_, i) => i + 1),
+            ...Array.from({ length: PR_MAX_REPS - 12 }, (_, i) => i + 13).filter((n) => bests[n] != null && bests[n]!.reps === n),
+          ]
+        : [1, 2, 3, 4, 5];
+
       root.innerHTML = `<header class="bar"><button class="icon-btn" data-act="back" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></button><h1>${esc(ex.name)}</h1>
           <div class="chips"><button class="icon-btn" data-act="menu" aria-label="More">${LI.more}</button></div></header>
         <main class="page has-tabs">
@@ -74,8 +81,8 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
             <div><small>SESSIONS</small><b>${hist.length}</b></div>
             <div><small>LAST</small><b class="sm">${hist.length ? relDay(hist[hist.length - 1].s.startMs) : '–'}</b></div></section>
           ${isTime ? '' : `<section class="card"><div class="card-h"><span>REP RECORDS</span><button class="link" data-act="more">${more ? 'Show less' : 'Show more'}</button></div>
-            <div class="recs">${Array.from({ length: more ? MAX_RM : 5 }, (_, i) => recRow(i + 1)).join('')}</div>
-            <p class="hint">Heaviest load for at least that many reps. Tap a record to open that workout (or play its video).</p></section>
+            <div class="recs">${rmList.map((n) => recRow(n)).join('')}</div>
+            <p class="hint">Heaviest load for at least that many reps (1RM–${PR_MAX_REPS}RM). Tap a record to open that workout (or play its video).</p></section>
             <section class="card"><div class="card-h"><span>EST 1RM · ${unit.toUpperCase()}</span><div class="seg mini">${RANGES.map(([l], i) => `<button class="${i === range ? 'on' : ''}" data-range="${i}">${l}</button>`).join('')}</div></div>${lineChart(pts)}</section>`}
           ${clips.length ? `<section class="card"><div class="card-h"><span>VIDEOS</span></div><div class="vgrid">${clips.map((v) => {
             const set = lifts.sessions.get(v.sessionId)?.exs.flatMap((x) => x.sets).find((x) => x.id === v.setId);

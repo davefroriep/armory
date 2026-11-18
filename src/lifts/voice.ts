@@ -59,6 +59,7 @@ const BASE_BIAS = [
   'armory', 'check', 'done', 'log', 'undo', 'next exercise', 'previous exercise',
   'add set', 'add set to last exercise', 'delete empty sets',
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
+  'camera', 'record set', 'clip that', 'save clip',
 ];
 
 class VoiceController {
@@ -71,6 +72,7 @@ class VoiceController {
   lastAction: VoiceActionNotice | null = null;
   holdStarter: ((exUid: string, setId: string, seconds?: number) => boolean) | null = null;
   finishTrigger: (() => void) | null = null;
+  camHandler: ((mode: 'arm' | 'clip_last') => Promise<string | null> | string | null) | null = null;
 
   readonly changed = new Emitter<void>();
   readonly toasted = new Emitter<{ msg: string; kind?: 'pr' }>();
@@ -401,6 +403,17 @@ class VoiceController {
         return this.notice('Finishing workout…', 'info', false);
       }
       return this.notice('Open active Strength workout to finish', 'warn');
+    }
+    if (intent.kind === 'cam_arm' || intent.kind === 'cam_clip_last') {
+      if (!this.camHandler) {
+        return this.notice('Open active Strength workout to use camera commands', 'warn');
+      }
+      const mode = intent.kind === 'cam_arm' ? 'arm' : 'clip_last';
+      void Promise.resolve(this.camHandler(mode)).then((msg) => {
+        if (msg) this.notice(msg, 'info');
+      });
+      buzz(25);
+      return this.notice(mode === 'arm' ? 'Camera toggled…' : 'Clipping last set…', 'info', false);
     }
 
     const cur = resolveTargetSet(s.exs, this.cursor);

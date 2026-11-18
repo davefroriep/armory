@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ALERT_SAMPLE_RATE, ALERT_SPECS, encodeWav, synthesizeBellPcm } from '../src/audio/audio';
 import { parentHash } from '../src/nav';
 import {
-  MAX_RM, computePRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
+  MAX_RM, PR_MAX_REPS, computePRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
   setVolumeKg, weekStart, addWeeks, DAY_MS,
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
@@ -307,6 +307,38 @@ describe('e1RM, rep records, PRs', () => {
     expect(p).toBe(s2.exs[0]);
     expect(previousPerformance([s1], 'curl')).toBeNull();
     expect(previousPerformance([{ ...s2, status: 'active' }], 'bench')).toBeNull();
+  });
+
+  it('tracks high-rep 13RM..40RM PRs and repBests with video links while keeping Epley e1rm capped at 12 and ignoring volume-only extra sets', () => {
+    expect(MAX_RM).toBe(12);
+    expect(PR_MAX_REPS).toBe(40);
+    expect(e1rm(lb(225), 15)).toBeNull();
+
+    const hr1 = sess('hr1', t0, [sx('bench', [set(lb(225), 15)])]);
+    const hr2 = sess('hr2', t0 + 7 * DAY_MS, [sx('bench', [set(lb(225), 18, { vids: ['vid-225x18'] })])]);
+    const prs = computePRs([hr1, hr2], exOf);
+    expect(prs.get(hr2.exs[0].sets[0].id)).toEqual({ n: 18, kg: lb(225) });
+
+    const bests = repBests(exerciseSessions([hr1, hr2], 'bench'));
+    expect(bests[18]!.reps).toBe(18);
+    expect(bests[18]!.vidId).toBe('vid-225x18');
+    expect(bests[18]!.kg).toBeCloseTo(lb(225));
+
+    // Additional working sets at the exact same weight x reps produce zero volume-only PRs
+    const vol1 = sess('vol1', t0 + 14 * DAY_MS, [sx('bench', [set(lb(185), 8), set(lb(185), 8), set(lb(185), 8)])]);
+    const vol2 = sess('vol2', t0 + 21 * DAY_MS, [sx('bench', [set(lb(185), 8), set(lb(185), 8), set(lb(185), 8), set(lb(185), 8)])]);
+    const volPrs = computePRs([vol1, vol2], exOf);
+    expect(volPrs.size).toBe(0);
+
+    // Sets above 40 reps clamp repBests to PR_MAX_REPS (40RM) and do not emit 45RM hits
+    const ultra1 = sess('u1', t0 + 28 * DAY_MS, [sx('bench', [set(lb(125), 40)])]);
+    const ultra2 = sess('u2', t0 + 35 * DAY_MS, [sx('bench', [set(lb(135), 45)])]);
+    const ultraBests = repBests(exerciseSessions([ultra1, ultra2], 'bench'));
+    expect(ultraBests).toHaveLength(PR_MAX_REPS + 1);
+    expect(ultraBests[PR_MAX_REPS]!.kg).toBeCloseTo(lb(135));
+    expect(ultraBests[PR_MAX_REPS + 1]).toBeUndefined();
+    const ultraPrs = computePRs([ultra1, ultra2], exOf);
+    expect(ultraPrs.has(ultra2.exs[0].sets[0].id)).toBe(false);
   });
 });
 

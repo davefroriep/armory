@@ -12,7 +12,8 @@ import { revFooter } from '../chrome';
 import { esc, hms } from '../dom';
 import { ZONE_COLOR, hrZone } from '../hr';
 import { openShareCard, stat } from './cards';
-import { mount, promptSheet, toast } from './kit';
+import { LI, mount, promptSheet, toast } from './kit';
+import { playVideo } from './video';
 
 /** Post-workout: numbers, PRs, effort rating, share card. The Intervals.icu upload has already started by itself. */
 export function summaryScreen(root: HTMLElement, args: string[]): () => void {
@@ -34,7 +35,8 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
       ${prLines.length ? `<section class="card prs"><div class="card-h"><span>NEW RECORDS</span></div>${prLines.map(({ e, x, h }) => {
         const ex = lifts.exOrStub(e.exId);
         const wTxt = ex.type === 'bodyweight' && h.kg === 0 ? 'BW' : `${fmtKg(h.kg)} ${unit}`;
-        return `<div class="prl"><i>★</i><b>${esc(ex.name)}</b><span>${h.n}RM · ${wTxt}${x.vids?.length ? ' 🎥' : ''}</span></div>`;
+        const vBtn = (x.vids ?? []).filter((vid) => lifts.videos.has(vid)).slice(0, 1).map((vid) => ` <button class="vmini" data-play="${esc(vid)}" aria-label="Play video">${LI.video}</button>`).join('');
+        return `<div class="prl"><i>★</i><b>${esc(ex.name)}</b><span>${h.n}RM · ${wTxt}${vBtn}</span></div>`;
       }).join('')}</section>` : ''}
       <div id="hrzones"></div>
       <div id="sync" class="status busy"><span class="spinner"></span> Logging to Intervals.icu…</div>
@@ -84,6 +86,8 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
 
     root.addEventListener('click', async (e) => {
       const t = e.target as HTMLElement;
+      const play = t.closest<HTMLElement>('[data-play]');
+      if (play) return void (await playVideo(play.dataset.play!));
       const rpe = t.closest<HTMLElement>('[data-rpe]');
       if (rpe) {
         s.rpe = Number(rpe.dataset.rpe);

@@ -14,6 +14,7 @@ import {
   resumeSessionClock, startSessionClock,
 } from './logic';
 import { liftSettings } from './settings';
+import { gymCam } from './gymCam';
 import { lifts } from './store';
 import type { LiftSession, SessionEx } from './types';
 import { uid } from './types';
@@ -120,6 +121,7 @@ class ActiveWorkout {
     }
     lifts.saveSession(s, true);
     void this.attach(s, false);
+    void gymCam.sessionEnter(s);
     this.tick.emit();
     return true;
   }
@@ -132,6 +134,7 @@ class ActiveWorkout {
     this.rec?.tick(elapsedSessionSec(s, now), 0, now);
     lifts.saveSession(s, true);
     this.teardown();
+    void gymCam.sessionPause(s);
     return true;
   }
 
@@ -141,6 +144,7 @@ class ActiveWorkout {
     if (!s || !resumeSessionClock(s, Date.now())) return false;
     lifts.saveSession(s, true);
     void this.attach(s, true);
+    void gymCam.sessionResume(s);
     this.tick.emit();
     return true;
   }
@@ -151,6 +155,7 @@ class ActiveWorkout {
     if (!s.started && !this.timer && !this.rec && !this.rest) return false;
     resetSessionClock(s);
     this.teardown();
+    void gymCam.sessionDiscard(s);
     lifts.saveSession(s, true);
     await discardWorkout(s.id);
     return true;
@@ -344,6 +349,7 @@ class ActiveWorkout {
     lifts.saveSession(s, true);
     if (s.planSlot) calendar.markSlotDoneEarly(s.planSlot, null, localDate(new Date(s.startMs)));
     this.teardown();
+    void gymCam.sessionFinish(s);
     const sync = syncWorkout(meta);
     return { session: s, meta, sync };
   }
@@ -353,6 +359,7 @@ class ActiveWorkout {
     if (!s) return;
     const id = s.id;
     this.teardown();
+    void gymCam.sessionDiscard(s);
     await lifts.deleteSession(id);
     await discardWorkout(id);
   }

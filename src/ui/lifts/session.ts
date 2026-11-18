@@ -12,6 +12,7 @@ import { resolvePrescription } from '../../lifts/prescriptions';
 import { PHASE1_PLAN } from '../../domain/plan';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
+import { gymCam } from '../../lifts/gymCam';
 import { resyncSession } from '../../lifts/intervals';
 import { setText } from '../../lifts/summary';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
@@ -130,6 +131,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const pr = set.done && hits.has(set.id);
     const wShow = set.w != null ? fmtKg(set.w) : '';
     const hasVid = !!set.vids?.length;
+    const isRec = !edit && gymCam.isArmed(set.id);
     const rpeTag = set.rpe != null ? `<u class="srpe">@${set.rpe}</u>` : '';
     const isTime = ex.type === 'time';
     const holdActive = hold?.setId === set.id;
@@ -142,7 +144,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '–' : 'BW'}" aria-label="Weight">
       <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${isTime ? 'sec' : '–'}" aria-label="${isTime ? 'Seconds' : 'Reps'}">
       ${holdBtn}
-      <button class="svid${hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${hasVid ? 'Manage linked video' : 'Link or record lift video'}">${LI.video}</button>
+      <button class="svid${isRec ? ' rec' : hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${isRec ? 'Stop camera recording' : hasVid ? 'Play clip' : 'Arm camera or link video'}">${LI.video}</button>
       <button class="schk${set.done ? ' on' : ''}" type="button" data-act="done" aria-label="Log set"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7.5"/></svg></button>
     </div>`;
   };
@@ -198,9 +200,23 @@ function build(root: HTMLElement, id?: string): () => void {
     const micBtn = edit ? '' : '<button class="s-mic" id="smic" type="button" data-act="voice" aria-label="Voice commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg><span class="s-mic-lbl" id="smicLbl"></span></button>';
     return `<header class="bar sbar">
       <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
-      <button class="stitle" data-act="rename"><b>${esc(s.name)}</b><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span>'}</small></button>
+      <div class="stitle"><button class="stitle-btn" type="button" data-act="rename"><b>${esc(s.name)}</b></button><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span><span id="scampill"></span>'}</small></div>
       <div class="chips"><span id="sclkctl">${clockCtlHtml()}</span>${micBtn}<button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
+  };
+
+  const paintCamPill = (): void => {
+    if (edit) return;
+    const holder = root.querySelector<HTMLElement>('#scampill');
+    if (!holder) return;
+    if (!gymCam.online) {
+      holder.innerHTML = '';
+      return;
+    }
+    const armed = !!gymCam.armed;
+    const cls = armed ? ' rec' : gymCam.recording && !gymCam.paused ? '' : ' off';
+    const txt = armed ? '● REC' : gymCam.recording && !gymCam.paused ? '● CAM' : '○ CAM';
+    holder.innerHTML = `<button class="cam-pill${cls}" type="button" data-act="camstatus">${txt}</button>`;
   };
 
   const paintTarget = (): void => {
@@ -254,6 +270,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <div class="dock" id="dock" hidden></div>`;
     paintRest();
     paintClock();
+    paintCamPill();
     paintTarget();
     paintMic();
   };
@@ -274,7 +291,9 @@ function build(root: HTMLElement, id?: string): () => void {
       if (document.activeElement !== r) r.value = set.r != null ? String(set.r) : '';
       w.classList.toggle('auto', !!set.wAuto);
       r.classList.toggle('auto', !!set.rAuto);
-      row.querySelector('.svid')?.classList.toggle('on', !!set.vids?.length);
+      const svid = row.querySelector('.svid');
+      svid?.classList.toggle('on', !!set.vids?.length);
+      svid?.classList.toggle('rec', !edit && gymCam.isArmed(set.id));
       const star = row.querySelector('.prstar');
       const pr = set.done && hits.has(set.id);
       if (pr && !star) row.querySelector('.snum')!.insertAdjacentHTML('beforeend', '<i class="prstar">★</i>');
@@ -326,8 +345,10 @@ function build(root: HTMLElement, id?: string): () => void {
     paintTarget();
     paintMic();
     paintClock();
+    paintCamPill();
   };
   const offVoice = edit ? () => {} : voice.changed.on(syncVisibleCards);
+  const offCam = edit ? () => {} : gymCam.changed.on(() => { if (!dead) syncVisibleCards(); });
   if (!edit) {
     voice.setLiftScreenMounted(true);
     voice.holdStarter = (exUid, setId, seconds) => {
@@ -475,17 +496,34 @@ function build(root: HTMLElement, id?: string): () => void {
         buzz(25);
       }
     };
+    const maybeCamOnLog = (hadPr: boolean, wasArmed: boolean): void => {
+      if (edit || !gymCam.online) return;
+      if (wasArmed) {
+        void gymCam.stopAndSaveArmed(s, se, set).then((meta) => {
+          if (!dead && meta) { toast(`Clip saved · ${ex.name}`); save(); syncVisibleCards(); }
+        });
+        return;
+      }
+      if (!hadPr && hits.has(set.id) && getSettings().gymCamAutoPr && !set.vids?.length) {
+        void gymCam.autoClipPr(s, se, set).then((meta) => {
+          if (!dead && meta) { toast('★ PR auto-clipped from Gym Cam'); save(); syncVisibleCards(); }
+        });
+      }
+    };
     if (fromDock && was) {
       if (!canLog(set, ex)) return shakeIncomplete();
       const hadPr = hits.has(set.id);
+      const wasArmed = !edit && gymCam.isArmed(set.id);
       recomputePRs();
       commitBuzz(hadPr);
+      maybeCamOnLog(hadPr, wasArmed);
       syncCard(card);
       save();
       focused?.blur();
       hideDock();
       return;
     }
+    const wasArmed = !edit && gymCam.isArmed(set.id);
     const r = toggleDone(se, i, ex);
     if (r === null) return shakeIncomplete();
     if (r && !was) {
@@ -500,6 +538,7 @@ function build(root: HTMLElement, id?: string): () => void {
         paintClock();
       }
       commitBuzz(false);
+      maybeCamOnLog(false, wasArmed);
     } else {
       recomputePRs();
       if (!r && was && !edit) {
@@ -897,6 +936,33 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'finish') return void (await finish());
     if (act === 'discard') return void (await discardCurrentWorkout());
     if (act === 'rename') return void (await rename());
+    if (act === 'camstatus') {
+      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam'];
+      const sh = openSheet(`
+        <h3 class="sh-title">Gym Camera DVR</h3>
+        <p class="sh-text">${gymCam.online ? `Connected to <code>${esc(gymCam.baseUrl())}</code>${cams.length ? ` · ${esc(cams.join(', '))}` : ''}` : 'Gym Cam offline'}</p>
+        ${gymCam.online ? `<img class="cam-snap" id="camSnap" src="${esc(gymCam.snapshotUrl(cams[0]))}" alt="Live camera framing" onerror="this.hidden=true">` : ''}
+        <div class="vp-foot-row" style="margin-top:4px">
+          ${gymCam.online ? '<button class="btn sm" type="button" data-crefresh>Refresh framing</button>' : ''}
+          <button class="btn sm" type="button" data-cprobe>Re-probe LAN</button>
+        </div>
+        <button class="btn big" type="button" data-cok>Close</button>`);
+      sh.body.addEventListener('click', (ev) => {
+        const el = ev.target as HTMLElement;
+        if (el.closest('[data-cok]')) { sh.close(); return; }
+        if (el.closest('[data-crefresh]')) {
+          const img = sh.body.querySelector<HTMLImageElement>('#camSnap');
+          if (img) { img.hidden = false; img.src = gymCam.snapshotUrl(cams[0]); }
+        } else if (el.closest('[data-cprobe]')) {
+          void gymCam.probe(1500).then((r) => {
+            toast(r.online ? `Gym Cam connected (${r.latencyMs} ms)` : 'Gym Cam offline');
+            if (!dead) paintCamPill();
+            sh.close();
+          });
+        }
+      });
+      return;
+    }
     if (act === 'wkmenu') return void (await wkMenu());
     if (act === 'start' || act === 'resume') {
       if (!edit) {
@@ -972,12 +1038,35 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'hold') { startHold(se, i, card, row); return; }
     if (act === 'done') return logSet(card, row, false);
     if (act === 'vid') {
+      const set = se.sets[i];
+      const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
+      const setLabel = set.kind === 'w' ? 'Warm-up' : `Set ${n}`;
+      if (set.vids?.length) {
+        await playVideo(set.vids[0], { target: { session: s, se, set }, setLabel });
+        if (!dead) { save(); paint(); }
+        return;
+      }
       if (!edit) {
         active.ensureStarted(s, true);
         paintClock();
+        if (gymCam.isArmed(set.id)) {
+          const meta = await gymCam.stopAndSaveArmed(s, se, set);
+          if (!dead) {
+            toast(meta ? 'Clip saved & linked' : 'Could not save clip from Gym Cam');
+            save();
+            syncVisibleCards();
+          }
+          return;
+        }
+        if (gymCam.online && !set.done) {
+          gymCam.armSet(s, se, set);
+          buzz(25);
+          syncVisibleCards();
+          toast(`Recording ${exOf(se.exId).name} ${setLabel} — tap ✓ or camera to stop`);
+          return;
+        }
       }
-      const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
-      await openSetVideoSheet({ session: s, se, set: se.sets[i] }, se.sets[i].kind === 'w' ? 'Warm-up' : `Set ${n}`);
+      await openSetVideoSheet({ session: s, se, set }, setLabel);
       if (!dead) { save(); paint(); }
       return;
     }
@@ -991,13 +1080,53 @@ function build(root: HTMLElement, id?: string): () => void {
     }
   });
 
+  const probeAndEnterCam = (): void => {
+    void gymCam.probe().then((r) => {
+      if (dead) return;
+      paintCamPill();
+      if (r.online) void gymCam.sessionEnter(s);
+    });
+  };
   const onVisKeepAwake = (): void => {
-    if (!document.hidden && !dead && !edit) void setKeepScreenOn(true);
+    if (!document.hidden && !dead && !edit) {
+      void setKeepScreenOn(true);
+      probeAndEnterCam();
+    }
   };
   if (!edit) {
     void setKeepScreenOn(true);
     document.addEventListener('visibilitychange', onVisKeepAwake);
     voice.finishTrigger = () => { void finish(); };
+    voice.camHandler = async (mode) => {
+      if (mode === 'arm') {
+        const ptr = resolveTargetSet(s.exs, voice.cursor);
+        if (!ptr) return 'No open set to record';
+        const se = s.exs[ptr.exIdx];
+        const set = se.sets[ptr.setIdx];
+        if (gymCam.isArmed(set.id)) {
+          const meta = await gymCam.stopAndSaveArmed(s, se, set);
+          if (!dead) { save(); syncVisibleCards(); }
+          return meta ? `Clip saved · ${exOf(se.exId).name}` : 'Could not save clip from Gym Cam';
+        }
+        if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
+        active.ensureStarted(s, true);
+        gymCam.armSet(s, se, set);
+        if (!dead) syncVisibleCards();
+        return `Recording ${exOf(se.exId).name} Set ${ptr.setNumber}`;
+      }
+      if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
+      let latest: { se: SessionEx; set: typeof s.exs[0]['sets'][0]; at: number } | null = null;
+      for (const se of s.exs) {
+        for (const st of se.sets) {
+          if (st.done && (st.at ?? 0) >= (latest?.at ?? -1)) latest = { se, set: st, at: st.at ?? 0 };
+        }
+      }
+      if (!latest) return 'Log a set first to clip it';
+      const meta = await gymCam.autoClipPr(s, latest.se, latest.set);
+      if (!dead && meta) { save(); syncVisibleCards(); }
+      return meta ? `Clipped ${exOf(latest.se.exId).name}` : 'No motion burst found yet';
+    };
+    probeAndEnterCam();
   }
 
   paint();
@@ -1007,10 +1136,11 @@ function build(root: HTMLElement, id?: string): () => void {
     stopHold();
     document.removeEventListener('visibilitychange', onVisKeepAwake);
     window.visualViewport?.removeEventListener('resize', onVvResize);
-    offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice();
+    offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice(); offCam();
     if (!edit) {
       voice.holdStarter = null;
       voice.finishTrigger = null;
+      voice.camHandler = null;
       voice.setLiftScreenMounted(false);
       void setKeepScreenOn(false);
     }

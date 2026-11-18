@@ -8,7 +8,8 @@ import { audio } from '../audio/audio';
 import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
-import { fmtNum, fromDisplay, liftSettings, toDisplay } from '../lifts/settings';
+import { liftSettings, toDisplay, fmtNum, fromDisplay } from '../lifts/settings';
+import { gymCam } from '../lifts/gymCam';
 import { voice } from '../lifts/voice';
 import { wallboard } from '../wallboard/sync';
 import { backupCardHtml, wireBackupCard } from './backupUi';
@@ -62,6 +63,10 @@ export function settingsScreen(root: HTMLElement): () => void {
         <input class="lf-input" id="vxTest" style="flex:1;padding:8px 10px;font-size:.88rem" placeholder="Test phrase (e.g. armory 225 for 8)" autocomplete="off">
         <button class="btn sm" id="vxRun">Run</button>
       </div>
+      <div class="line" style="margin-top:12px"><span>Gym Camera DVR<small>Probes OptiPlex silently on home Wi-Fi; stays hidden away</small></span>${tog('gymCamEnabled', s.gymCamEnabled)}</div>
+      <div class="line"><span>Auto-clip PR sets (★)<small>Automatically clips new 1RM–40RM personal records</small></span>${tog('gymCamAutoPr', s.gymCamAutoPr)}</div>
+      <label class="field">Gym Camera DVR URL<input id="camUrl" value="${esc(s.gymCamUrl || 'http://192.168.1.152:8766')}" placeholder="http://192.168.1.152:8766" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
+      <div class="row" style="margin-top:6px"><button class="btn sm" id="camTest">Test Cam</button><span id="camOut" class="hint"></span></div>
     </section>
 
     <h2 class="sec">INTERVALS.ICU</h2>
@@ -156,6 +161,11 @@ export function settingsScreen(root: HTMLElement): () => void {
     if (voice.lastError) vxEl.innerHTML = `<span style="color:#fca5a5">${esc(voice.lastError)}</span>`;
     else if (voice.lastAction) vxEl.innerHTML = `Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
     else vxEl.textContent = cur.voiceEnabled ? `${voice.listening ? `● Listening for “${cur.voiceWakeWord || 'armory'}”` : 'Ready while Armory Fit is open'}${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}` : 'Off';
+
+    const camIn = root.querySelector<HTMLInputElement>('#camUrl');
+    if (camIn && document.activeElement !== camIn) {
+      camIn.value = cur.gymCamUrl || 'http://192.168.1.152:8766';
+    }
   };
   paintFtpBox();
   const offSet = settingsChanged.on(paintFtpBox);
@@ -174,12 +184,13 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
+      if (name === 'gymCamEnabled') void gymCam.probe();
       if (name === 'simulator') {
         if (on) { hrLink.release(); bikeLink.release(); spinLink.release(); }
         else sim.stop();
@@ -214,11 +225,21 @@ export function settingsScreen(root: HTMLElement): () => void {
         paintFtpBox();
       }
     }
+    if (t.closest('#camTest')) {
+      const out = $('#camOut', root);
+      out.textContent = 'Probing…';
+      void gymCam.probe(1500).then((r) => {
+        out.textContent = r.online
+          ? `✓ Connected (${r.latencyMs} ms${r.cameras.length ? ` · ${r.cameras.join(', ')}` : ''})`
+          : 'Offline (normal when away from Armory Wi-Fi)';
+      });
+    }
   };
   const onInput = (e: Event) => {
     const t = e.target as HTMLInputElement;
     if (t.id === 'aid') updateSettings({ athleteId: t.value.trim() });
     else if (t.id === 'vxWake') updateSettings({ voiceWakeWord: t.value.trim().toLowerCase() || 'armory' });
+    else if (t.id === 'camUrl') updateSettings({ gymCamUrl: t.value.trim().replace(/\/+$/, '') || 'http://192.168.1.152:8766' });
     else if (t.id === 'restDay') {
       updateSettings({ restDay: t.value === 'none' ? null : Number(t.value) });
       void calendar.refresh();

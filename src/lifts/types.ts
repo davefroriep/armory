@@ -118,6 +118,8 @@ export interface LiftSession {
   rpe: number | null;
   /** Bodyweight snapshot (kg) for bodyweight exercises. */
   bwKg: number | null;
+  /** Optional OptiPlex Gym-Cam DVR session identifier for 2-week Session Tape lookup. */
+  camSessionId?: string;
 }
 
 export interface RoutineItem {
@@ -158,6 +160,18 @@ export interface VideoMeta {
   linkOnly?: boolean;
   /** Google Drive search query when filename was inferred from MP4 timestamp (e.g. "PXL 20261116 1856 type:video"). */
   driveQuery?: string;
+  /** Clip capture origin. */
+  source?: 'gymcam' | 'phone' | 'dcim';
+  /** Gym-Cam camera label (e.g. "Rack Cam" or "Smith Cam"). */
+  camera?: string;
+  /** Direct LAN HTTP stream/MP4 URL on the OptiPlex Gym-Cam DVR. */
+  lanUrl?: string;
+  /** Original clip start/end UTC epoch ms on Gym-Cam server (supports ±5s tape pulls). */
+  clipStartMs?: number;
+  clipEndMs?: number;
+  /** Non-destructive in-app trim start/end in seconds within the clip. */
+  trimStartSec?: number;
+  trimEndSec?: number;
 }
 
 export const uid = (): string => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
