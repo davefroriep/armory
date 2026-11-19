@@ -31,11 +31,13 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
     <section class="rpe" id="rpe">
       ${RPE_STEPS.map((s) => `<button data-rpe="${s.value}" class="rpe-${s.value}">${s.label}</button>`).join('')}
     </section>
-    <div id="saveBox">
-      <button class="btn primary big" id="save" disabled>Save &amp; upload to Intervals.icu</button>
-      <button class="btn danger big" id="discard">Discard workout</button>
+    <div class="sum-foot">
+      <div id="saveBox">
+        <button class="btn primary big" id="save" disabled>Save &amp; upload to Intervals.icu</button>
+        <button class="btn danger" id="discard">Discard workout</button>
+      </div>
+      ${revFooter()}
     </div>
-    ${revFooter()}
   </main>`;
 
   let rpe = 0;
@@ -64,8 +66,10 @@ export function renderSummary(root: HTMLElement, o: SummaryOpts): void {
     const r = await syncWorkout(meta);
     if (r.upload === 'done') {
       box.innerHTML = `<div class="status ok">✓ Synced to Intervals.icu · ${esc(rpeLabel(rpe))} (RPE ${rpe})</div>
-        <a class="btn big" href="https://intervals.icu/activities/${esc(r.activityId ?? '')}" target="_blank" rel="noopener">Open in Intervals.icu</a>
-        <a class="btn primary big" href="#/">Done</a>`;
+        <div class="sum-sec-row">
+          <a class="btn" href="https://intervals.icu/activities/${esc(r.activityId ?? '')}" target="_blank" rel="noopener">Open in Intervals.icu</a>
+          <a class="btn primary" href="#/">Done</a>
+        </div>`;
     } else {
       box.innerHTML = `<div class="status warn">Saved on this phone. Upload didn’t go through:<br><small>${esc(r.lastError ?? 'unknown error')}</small><br><small>It will retry automatically next time you open the app.</small></div>
         <a class="btn primary big" href="#/">Done</a>`;

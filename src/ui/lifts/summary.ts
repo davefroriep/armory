@@ -42,10 +42,14 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
       <div id="sync" class="status busy"><span class="spinner"></span> Logging to Intervals.icu…</div>
       <h2 class="sec">HOW HARD WAS IT?</h2>
       <section class="rpe" id="rpe">${RPE_STEPS.map((r) => `<button data-rpe="${r.value}" class="rpe-${r.value}${s.rpe === r.value ? ' on' : ''}">${r.label}</button>`).join('')}</section>
-      <button class="btn big" id="share">Share lift card</button>
-      ${s.routineId && lifts.routines.has(s.routineId) ? '' : '<button class="btn big" id="asday">Save as a day</button>'}
-      <a class="btn primary big" href="#/strength">Done</a>
-      ${revFooter()}</main>`;
+      <div class="sum-foot">
+        <div class="sum-sec-row">
+          <button class="btn" id="share">Share lift card</button>
+          ${s.routineId && lifts.routines.has(s.routineId) ? '' : '<button class="btn" id="asday">Save as a day</button>'}
+        </div>
+        <a class="btn primary big" href="#/strength">Done</a>
+        ${revFooter()}
+      </div></main>`;
 
     const q = <T extends HTMLElement>(id: string): T | null => root.querySelector<T>('#' + id);
 
