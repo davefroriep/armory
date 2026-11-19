@@ -47,6 +47,7 @@ class Hud {
   private lastErgMode: number | null = null;
   private lastErgWatts: number | null = null;
   private lastErgAt = 0;
+  private ergAcked = false;
   private engine: WorkoutEngine;
   private rec: Recorder | null = null;
   private goal: number;
@@ -306,7 +307,7 @@ class Hud {
   }
 
   private adjustManualLevel(delta: number): void {
-    const base = live.tlvl > 0 ? live.tlvl : live.lvl > 0 ? Math.round(live.lvl) : this.manualLvl;
+    const base = Math.max(3, live.tlvl >= 3 ? live.tlvl : live.lvl >= 3 ? Math.round(live.lvl) : this.manualLvl);
     this.manualLvl = Math.max(3, Math.min(80, Math.round(base + delta)));
     if (this.el.lvlLbl) this.el.lvlLbl.textContent = `GEAR LVL ${this.manualLvl}`;
     if (!getSettings().simulator && spinLink.connected) {
@@ -323,16 +324,41 @@ class Hud {
       if (this.lastErgMode !== 1) {
         this.lastErgMode = 1;
         this.lastErgWatts = null;
+        this.ergAcked = false;
         void spinLink.command('SET_MODE:1').catch(() => {});
       }
-      const needWatts = this.lastErgWatts !== desiredW || (now - this.lastErgAt > 3000 && (live.mode !== 1 || Math.abs(live.tgtW - desiredW) > 1));
-      if (needWatts) {
+      if (this.lastErgWatts !== desiredW) {
         this.lastErgWatts = desiredW;
         this.lastErgAt = now;
+        this.ergAcked = false;
+        void spinLink.command(`SET_WATTS:${desiredW}`).catch(() => {});
+      } else if (!this.ergAcked && live.mode === 1 && Math.abs(live.tgtW - desiredW) <= 1) {
+        this.ergAcked = true;
+      } else if (
+        this.ergAcked &&
+        live.mode === 1 &&
+        live.tgtW >= 50 &&
+        live.tgtW !== desiredW &&
+        now - this.lastErgAt > 1500 &&
+        (this.baseProgram.zone === 'Z2' || this.baseProgram.zone === 'Z5')
+      ) {
+        const delta = live.tgtW - desiredW;
+        if (Math.abs(delta) <= 25) {
+          this.lastErgWatts = live.tgtW;
+          this.lastErgAt = now;
+          this.adjustTarget(this.offsetWatts + delta);
+          return;
+        }
+      } else if (!this.ergAcked && now - this.lastErgAt > 3000 && (live.mode !== 1 || Math.abs(live.tgtW - desiredW) > 1)) {
+        this.lastErgAt = now;
+        if (live.mode !== 1) void spinLink.command('SET_MODE:1').catch(() => {});
         void spinLink.command(`SET_WATTS:${desiredW}`).catch(() => {});
       }
     } else if (this.lastErgMode === 1) {
       this.releaseErg();
+    } else if (running && this.p.segments.length === 0 && live.mode === 1 && now - this.lastErgAt > 2000) {
+      this.lastErgAt = now;
+      void spinLink.command('SET_MODE:0').catch(() => {});
     }
   }
 
@@ -341,6 +367,7 @@ class Hud {
     const hadErg = this.lastErgMode === 1;
     this.lastErgMode = 0;
     this.lastErgWatts = null;
+    this.ergAcked = false;
     if (!hadErg || getSettings().simulator || !spinLink.connected) return;
     void spinLink.command('SET_MODE:0').catch(() => {});
     void spinLink.command('SET_LEVEL:5').catch(() => {});
