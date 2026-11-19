@@ -1,5 +1,5 @@
 import { resolvePrescription } from './prescriptions';
-import { uid, type Exercise, type ExerciseRx, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type VideoMeta } from './types';
+import { uid, type ExRow, type Exercise, type ExerciseRx, type LiftSession, type LiftSet, type Routine, type SessionEx, type SetKind, type VideoMeta } from './types';
 
 export const newSet = (kind: SetKind = 'n', w: number | null = null, r: number | null = null, auto = false): LiftSet => ({
   id: uid(), w, r, done: false, kind, wAuto: auto && w != null, rAuto: auto && r != null,
@@ -323,4 +323,37 @@ export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri' | 'driveQue
   const q = meta.driveQuery || meta.fileName;
   if (q) return `https://drive.google.com/drive/search?q=${encodeURIComponent(q)}`;
   return null;
+}
+
+/** Smart station default inferred from exercise equipment and name (Dave's gym layout). */
+export function inferredCamForExercise(ex: Pick<Exercise, 'name' | 'equip'>): string | undefined {
+  if (ex.equip === 'smith' || /\bsmith\b/i.test(ex.name)) return 'Smith Cam';
+  if (
+    ex.equip === 'cable'
+    || /\b(?:cable|pulley|lat\s*pull|pull[\s-]*down|push[\s-]*down|face\s*pull)\b/i.test(ex.name)
+    || (ex.equip !== 'db' && /\btriceps?\s*(?:pushdown|extension|pressdown)\b/i.test(ex.name))
+  ) {
+    return 'Rack Cam';
+  }
+  if (
+    ex.equip === 'bb'
+    || /\b(?:pull[\s-]*up|chin[\s-]*up|dead\s*hang|hanging\s*(?:leg|knee)\s*raise|rack\s*pull)\b/i.test(ex.name)
+    || (ex.equip !== 'db' && ex.equip !== 'machine' && /\b(?:squat|bench|deadlift)\b/i.test(ex.name))
+  ) {
+    return 'Rack Cam';
+  }
+  return undefined;
+}
+
+/** Resolved preferred camera for an exercise: session override > persisted ExRow > inferred smart default. */
+export function preferredCamForExercise(
+  ex: Pick<Exercise, 'name' | 'equip'>,
+  row?: Pick<ExRow, 'camPref'> | null,
+  sessionCamPref?: string,
+): string | undefined {
+  const sess = sessionCamPref?.trim();
+  if (sess) return sess === 'auto' ? undefined : sess;
+  const saved = row?.camPref?.trim();
+  if (saved) return saved === 'auto' ? undefined : saved;
+  return inferredCamForExercise(ex);
 }

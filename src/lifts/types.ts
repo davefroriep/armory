@@ -30,6 +30,8 @@ export interface ExRow extends Partial<Exercise> {
   restSec?: number;
   /** Per-exercise auto-rest override (when checking a set). */
   restAuto?: boolean;
+  /** Permanent preferred Gym Cam ("Rack Cam" | "Smith Cam" | ... | "auto"). */
+  camPref?: string;
 }
 
 export interface LiftSet {

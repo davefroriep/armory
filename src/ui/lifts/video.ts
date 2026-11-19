@@ -542,10 +542,11 @@ export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
 /** Legacy alias for callers. */
 export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDcimVideo(t);
 
-/** Quick 1-tap chooser asking "Rack or Smith?" before arming Gym Cam on an unchecked set. */
+/** Quick 1-tap chooser asking which station camera to arm, highlighting any default camera first. */
 export function pickRecordCameraSheet(
   exName: string,
   setLabel: string,
+  preferredCam?: string,
 ): Promise<{ kind: 'cam'; camera?: string } | { kind: 'link' } | { kind: 'cancel' }> {
   const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
   return new Promise((resolve) => {
@@ -555,9 +556,9 @@ export function pickRecordCameraSheet(
        <div class="fl">WHICH CAMERA TO RECORD?</div>
        <div class="vcam-pick">
          ${cams.map((c) => `
-           <button class="vcam-btn" type="button" data-rcam="${esc(c)}">
+           <button class="vcam-btn${c === preferredCam ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
              <b>${esc(shortCamLabel(c))}</b>
-             <small>Auto-stops when you tap ✓</small>
+             <small>${c === preferredCam ? '★ Default · stops on ✓' : 'Auto-stops when you tap ✓'}</small>
            </button>`).join('')}
        </div>
        <button class="btn big" type="button" data-rcam="">Auto (Strongest Motion Zone)</button>
@@ -2038,7 +2039,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     const camSw = q<HTMLButtonElement>('#vpCamSwitch');
     if (camSw) {
       const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-      const other = cams.find((c) => c !== meta!.camera);
+      const curIdx = cams.indexOf(meta!.camera || '');
+      const other = cams.length > 1 ? cams[(curIdx + 1) % cams.length] : undefined;
       camSw.hidden = !(tapeAvail() && other);
       if (other) camSw.textContent = `⇄ ${shortCamLabel(other)}`;
     }
@@ -2377,7 +2379,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
     if (t.closest('[data-vcam-switch]') && vid && meta!.clipStartMs != null && meta!.clipEndMs != null) {
       const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-      const other = cams.find((c) => c !== meta!.camera);
+      const curIdx = cams.indexOf(meta!.camera || '');
+      const other = cams.length > 1 ? cams[(curIdx + 1) % cams.length] : undefined;
       if (!other) return;
       const btn = t.closest<HTMLButtonElement>('button');
       if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }

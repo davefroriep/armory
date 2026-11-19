@@ -9,8 +9,8 @@ import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import { buildBoostcampSessions } from '../src/lifts/boostcampSeed';
 import {
   addSet, buildExercise, canLog, collectUnfinishedItems, driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec,
-  hasSessionActivity, isSessionPaused, isSessionStarted, labels, midSuperset, newSet, pauseSessionClock,
-  prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
+  hasSessionActivity, inferredCamForExercise, isSessionPaused, isSessionStarted, labels, midSuperset, newSet, pauseSessionClock,
+  preferredCamForExercise, prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
   startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import {
@@ -786,5 +786,30 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
       'PXL_20250910_140000.mp4',
       'PXL_20220501_120000.mp4',
     ]);
+  });
+
+  it('infers Smith vs Rack station defaults and respects persistent ExRow camPref overrides', () => {
+    expect(inferredCamForExercise({ name: 'Smith Machine Row', equip: 'smith' })).toBe('Smith Cam');
+    expect(inferredCamForExercise({ name: 'Smith Calf Raise', equip: 'other' })).toBe('Smith Cam');
+    expect(inferredCamForExercise({ name: 'Low Bar Squat', equip: 'bb' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Barbell Bench Press', equip: 'bb' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Deadlift', equip: 'bb' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Lat Pulldown', equip: 'cable' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Seated Cable Row', equip: 'cable' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Cable Triceps Pushdown', equip: 'cable' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Tricep Extension', equip: 'other' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Dumbbell Curl', equip: 'db' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Dumbbell Bench Press', equip: 'db' })).toBeUndefined();
+
+    // Persistent ExRow.camPref & explicit 'auto' opt-out + session precedence
+    const curl = { name: 'Dumbbell Curl', equip: 'db' as const };
+    expect(preferredCamForExercise(curl, null)).toBeUndefined();
+    expect(preferredCamForExercise(curl, { camPref: 'Rack Cam' })).toBe('Rack Cam');
+    expect(preferredCamForExercise(curl, { camPref: 'Rack Cam' }, 'Smith Cam')).toBe('Smith Cam');
+
+    const bench = { name: 'Barbell Bench Press', equip: 'bb' as const };
+    expect(preferredCamForExercise(bench, null)).toBe('Rack Cam');
+    expect(preferredCamForExercise(bench, { camPref: 'auto' })).toBeUndefined();
+    expect(preferredCamForExercise(bench, { camPref: 'Low Knee Cam' })).toBe('Low Knee Cam');
   });
 });

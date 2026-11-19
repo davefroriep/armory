@@ -1,8 +1,11 @@
 import { PR_MAX_REPS, e1rmTrend, exerciseSessions, repBests, isWorking } from '../../lifts/calc';
+import { gymCam } from '../../lifts/gymCam';
+import { inferredCamForExercise, preferredCamForExercise } from '../../lifts/logic';
 import { EQUIP_LABEL, MUSCLE_LABEL } from '../../lifts/muscles';
 import { fmtKg, liftSettings, toDisplay } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { condenseSets } from '../../lifts/summary';
+import { shortCamLabel } from '../../lifts/tape';
 import { esc } from '../dom';
 import { lineChart } from './charts';
 import { LI, actionSheet, clock, confirmSheet, mount, relDay, resumeBar, tabBar, toast, wireClock } from './kit';
@@ -90,7 +93,15 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
             return `<button class="vthumb lg" data-play="${v.id}" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}"><i>▶</i><small>${esc(lbl)} · ${new Date(v.ms).toLocaleDateString([], { month: 'short', day: 'numeric' })}</small></button>`;
           }).join('')}</div></section>` : ''}
           <section class="card"><div class="card-h"><span>HISTORY</span></div>${sessList.length ? sessList.map(({ s, e }) => `<a class="ehr" href="#/strength/workout/${s.id}"><b>${new Date(s.startMs).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}</b><span>${esc(condenseSets(e, ex, unit))}</span></a>`).join('') : '<div class="empty">Not logged yet.</div>'}</section>
-          <section class="card"><div class="line"><span>Rest timer<small>For this exercise</small></span><button class="btn sm" data-act="rest">${clock(row?.restSec ?? liftSettings().restSec)}</button></div></section>
+          <section class="card">
+            <div class="line"><span>Rest timer<small>For this exercise</small></span><button class="btn sm" data-act="rest">${clock(row?.restSec ?? liftSettings().restSec)}</button></div>
+            <div class="line"><span>Preferred camera<small>Auto station for this exercise</small></span><button class="btn sm" data-act="cam">${(() => {
+              const res = preferredCamForExercise(ex, row);
+              const inf = inferredCamForExercise(ex);
+              if (!row?.camPref) return inf ? `${shortCamLabel(inf)} (default)` : 'Auto';
+              return row.camPref === 'auto' ? 'Auto' : shortCamLabel(res || row.camPref);
+            })()}</button></div>
+          </section>
         </main>${resumeBar()}${tabBar('exercises')}`;
     };
     paint();
@@ -112,6 +123,24 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
         const opts = [30, 45, 60, 90, 120, 150, 180, 240, 300];
         const k = await actionSheet('Rest timer', opts.map((o) => ({ key: String(o), label: clock(o), on: o === (lifts.row(exId)?.restSec ?? liftSettings().restSec) })));
         if (k) await lifts.saveRow({ ...(lifts.row(exId) ?? { id: exId }), restSec: Number(k) });
+        return;
+      }
+      if (a === 'cam') {
+        const curEx = lifts.exercise(exId)!;
+        const curRow = lifts.row(exId);
+        const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+        const inf = inferredCamForExercise(curEx);
+        const k = await actionSheet('Preferred camera', [
+          { key: '__default__', label: inf ? `Default (${shortCamLabel(inf)})` : 'Default (Auto)', on: !curRow?.camPref },
+          ...cams.map((c) => ({ key: c, label: shortCamLabel(c), sub: c, on: curRow?.camPref === c })),
+          ...(inf ? [{ key: 'auto', label: 'Auto (Motion)', sub: 'Override default with strongest motion', on: curRow?.camPref === 'auto' }] : []),
+        ]);
+        if (k) {
+          const nextRow = { ...(curRow ?? { id: exId }) };
+          if (k === '__default__') delete nextRow.camPref;
+          else nextRow.camPref = k;
+          await lifts.saveRow(nextRow);
+        }
         return;
       }
       if (a === 'menu') {

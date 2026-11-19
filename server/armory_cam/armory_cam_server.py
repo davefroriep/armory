@@ -563,8 +563,9 @@ def select_camera_for_window(
     end_ms: int,
     preferred_camera: str | None = None,
     fallback_camera: str = "Rack Cam",
+    primary_cameras: set[str] | None = None,
 ) -> str:
-    """Pick explicit `preferred_camera` or the camera with strongest motion inside `[start_ms, end_ms]`."""
+    """Pick explicit `preferred_camera` or the primary camera with strongest motion inside `[start_ms, end_ms]`."""
     if preferred_camera and preferred_camera.strip():
         return preferred_camera.strip()
     totals: dict[str, list[float]] = {}
@@ -575,6 +576,10 @@ def select_camera_for_window(
             totals.setdefault(str(s["camera"]), []).append(float(s.get("energy", 0.0)))
     if not totals:
         return fallback_camera
+    if primary_cameras:
+        prim_totals = {k: v for k, v in totals.items() if k in primary_cameras}
+        if prim_totals:
+            totals = prim_totals
     best_cam = max(totals.items(), key=lambda kv: (sum(kv[1]) / len(kv[1]), max(kv[1])))[0]
     return best_cam or fallback_camera
 
@@ -615,6 +620,7 @@ class CameraConfig:
     slug: str
     rtsp_url: str = ""
     enabled: bool = True
+    primary: bool = True
     motion_threshold: float = DEFAULT_MOTION_THRESHOLD
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     exclusions: list[tuple[float, float, float, float]] = field(default_factory=list)
@@ -632,6 +638,7 @@ class CameraConfig:
             "slug": self.slug,
             "rtspUrl": self.rtsp_url,
             "enabled": self.enabled,
+            "primary": self.primary,
             "motionThreshold": self.motion_threshold,
             "roi": list(self.roi),
             "exclusions": [list(b) for b in self.exclusions],
@@ -1303,6 +1310,7 @@ class ArmoryCamService:
                         slug=slug,
                         rtsp_url=str(item.get("rtspUrl", "")).strip(),
                         enabled=bool(item.get("enabled", True)),
+                        primary=bool(item.get("primary", True)),
                         motion_threshold=float(item.get("motionThreshold", DEFAULT_MOTION_THRESHOLD)),
                         roi=normalize_crop(item.get("roi")),
                         exclusions=normalize_exclusions(item.get("exclusions")),
@@ -1387,6 +1395,7 @@ class ArmoryCamService:
                     old = prev_by_slug.get(slug)
                     rtsp_url = str(item["rtspUrl"]).strip() if "rtspUrl" in item else (old.rtsp_url if old else "")
                     enabled = bool(item["enabled"]) if "enabled" in item else (old.enabled if old else True)
+                    primary = bool(item["primary"]) if "primary" in item else (old.primary if old else True)
                     thresh = float(item["motionThreshold"]) if "motionThreshold" in item else (old.motion_threshold if old else DEFAULT_MOTION_THRESHOLD)
                     roi = normalize_crop(item["roi"]) if "roi" in item else (old.roi if old else (0.0, 0.0, 1.0, 1.0))
                     exclusions = (
@@ -1402,6 +1411,7 @@ class ArmoryCamService:
                             slug=slug,
                             rtsp_url=rtsp_url,
                             enabled=enabled,
+                            primary=primary,
                             motion_threshold=thresh,
                             roi=roi,
                             exclusions=exclusions,
@@ -2338,9 +2348,15 @@ class ArmoryCamService:
             end_ms = start_ms + 5000
 
         samples = self.session_samples(session_id)
-        fallback_cam = self.cameras[0].name if self.cameras else "Rack Cam"
+        primary_cams = {c.name for c in self.cameras if c.enabled and c.primary}
+        fallback_cam = next((c.name for c in self.cameras if c.enabled and c.primary), self.cameras[0].name if self.cameras else "Rack Cam")
         chosen_cam = select_camera_for_window(
-            samples, start_ms, end_ms, preferred_camera=camera_override, fallback_camera=fallback_cam
+            samples,
+            start_ms,
+            end_ms,
+            preferred_camera=camera_override,
+            fallback_camera=fallback_cam,
+            primary_cameras=primary_cams or None,
         )
         segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
         if not segs and not camera_override:
@@ -3686,6 +3702,11 @@ def create_app(service: ArmoryCamService) -> Flask:
         cam_override = str(cam_raw).strip() if cam_raw else None
 
         samples = service.session_samples(sid)
+        primary_cams = {c.name for c in service.cameras if c.enabled and c.primary}
+        if not cam_override and primary_cams:
+            prim_samples = [s for s in samples if s.get("camera") in primary_cams]
+            if prim_samples:
+                samples = prim_samples
         min_thresh = min((c.motion_threshold for c in service.cameras), default=DEFAULT_MOTION_THRESHOLD)
         bursts = cluster_motion_bursts(
             samples,

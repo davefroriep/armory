@@ -3,8 +3,8 @@ import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import { advanceCursorAfterLog, jumpToExerciseCursor, resolveTargetSet } from '../../lifts/cursor';
 import {
-  addSet, buildExercise, canLog, collectUnfinishedItems, deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
-  prevSetFor, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
+  addSet, buildExercise, canLog, collectUnfinishedItems, deleteSet, editReps, editWeight, hasLogged, inferredCamForExercise, isSessionPaused, isSessionStarted, labels, midSuperset,
+  preferredCamForExercise, prevSetFor, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
@@ -532,7 +532,8 @@ function build(root: HTMLElement, id?: string): () => void {
       }
       if (!gymCam.online) return;
       if (!hadPr && hits.has(set.id) && getSettings().gymCamAutoPr && !set.vids?.length) {
-        const prefCam = se.camPref || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+        const resolved = preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref);
+        const prefCam = resolved || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
         void gymCam.autoClipPr(s, se, set, prefCam).then((meta) => {
           if (!dead && meta) { toast('★ PR auto-clipped from Gym Cam'); save(); syncVisibleCards(); }
         });
@@ -597,13 +598,18 @@ function build(root: HTMLElement, id?: string): () => void {
   const restore = (snap: string): void => { s.exs = JSON.parse(snap); save(); paint(); };
   const defaultSets = (ex: Exercise): number => (ex.type === 'time' ? 2 : 3);
 
+  const camForEx = (se: SessionEx): string | undefined =>
+    preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref);
+
   const exMenu = async (se: SessionEx): Promise<void> => {
     const ex = exOf(se.exId);
     const idx = s.exs.indexOf(se);
+    const resolvedCam = camForEx(se);
+    const camSub = resolvedCam ? shortCamLabel(resolvedCam) : 'Auto Cam';
     const k = await actionSheet(ex.name, [
       { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
       ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
-      { key: 'rest', label: 'Settings', sub: `${clock(active.restSecFor(se))} · Auto ${active.restAutoFor(s, idx) ? 'on' : 'off'}` },
+      { key: 'rest', label: 'Settings', sub: `${clock(active.restSecFor(se))} · Auto ${active.restAutoFor(s, idx) ? 'on' : 'off'} · ${camSub}` },
       ...(idx > 0 ? [{ key: 'up', label: 'Move up' }] : []),
       ...(idx < s.exs.length - 1 ? [{ key: 'down', label: 'Move down' }] : []),
       { key: 'records', label: 'Records & history' },
@@ -643,6 +649,8 @@ function build(root: HTMLElement, id?: string): () => void {
        <div class="line"><span>Show auto-timer<small>Show Auto toggle pill on exercise cards</small></span><button class="switch" type="button" data-tcfg="showAutoTimer" role="switch"><i></i></button></div>
        <div class="fl">REST DURATION <small>THIS EXERCISE</small></div>
        <div class="chips-row wrap" id="tdur"></div>
+       <div class="fl">PREFERRED CAMERA <small>SAVED FOR THIS EXERCISE</small></div>
+       <div class="chips-row wrap" id="tcam"></div>
        <div class="fl">THIS CARD</div>
        <div class="line"><span>Auto-timer on check<small>Starts countdown automatically when logging a set here</small></span><button class="switch" type="button" data-tcfg="cardAuto" role="switch"><i></i></button></div>
        <div class="fl">ALL EXERCISES (DEFAULTS)</div>
@@ -665,6 +673,18 @@ function build(root: HTMLElement, id?: string): () => void {
       sh.body.querySelector('#tdur')!.innerHTML = opts
         .map((o) => `<button class="fchip${o === cur ? ' on' : ''}" type="button" data-d="${o}">${clock(o)}</button>`)
         .join('');
+      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+      const inferred = inferredCamForExercise(ex);
+      const savedPref = lifts.row(se.exId)?.camPref ?? '';
+      const defLabel = inferred ? `Default (${shortCamLabel(inferred)})` : 'Default (Auto)';
+      const camChoices: [string, string][] = [
+        ['', defLabel],
+        ...cams.map((c): [string, string] => [c, shortCamLabel(c)]),
+        ...(inferred ? [['auto', 'Auto (Motion)'] as [string, string]] : []),
+      ];
+      sh.body.querySelector('#tcam')!.innerHTML = camChoices
+        .map(([val, lbl]) => `<button class="fchip${savedPref === val ? ' on' : ''}" type="button" data-xcam="${esc(val)}">${esc(lbl)}</button>`)
+        .join('');
       syncTog('[data-tcfg="showTimer"]', ls.showTimer);
       syncTog('[data-tcfg="showAutoTimer"]', ls.showAutoTimer);
       syncTog('[data-tcfg="cardAuto"]', active.restAutoFor(s, idx));
@@ -681,6 +701,16 @@ function build(root: HTMLElement, id?: string): () => void {
       if (d) {
         delete se.rest;
         await lifts.saveRow({ ...(lifts.row(se.exId) ?? { id: se.exId }), restSec: Number(d.dataset.d) });
+        draw();
+        return;
+      }
+      const xc = t.closest<HTMLElement>('[data-xcam]');
+      if (xc) {
+        delete se.camPref;
+        const val = xc.dataset.xcam!;
+        const nextRow = { ...(lifts.row(se.exId) ?? { id: se.exId }) };
+        if (val) nextRow.camPref = val; else delete nextRow.camPref;
+        await lifts.saveRow(nextRow);
         draw();
         return;
       }
@@ -1173,7 +1203,7 @@ function build(root: HTMLElement, id?: string): () => void {
           return;
         }
         if (gymCam.online && !set.done) {
-          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel);
+          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel, camForEx(se));
           if (dead || choice.kind === 'cancel') return;
           if (choice.kind === 'cam') {
             active.ensureStarted(s, true);
@@ -1182,7 +1212,7 @@ function build(root: HTMLElement, id?: string): () => void {
               se.camPref = choice.camera;
               save();
             }
-            const effCam = choice.camera || se.camPref || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+            const effCam = choice.camera || camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
             gymCam.armSet(s, se, set, effCam);
             buzz(25);
             syncVisibleCards();
@@ -1257,7 +1287,7 @@ function build(root: HTMLElement, id?: string): () => void {
           se.camPref = camera;
           save();
         }
-        const effCam = camera || se.camPref || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+        const effCam = camera || camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
         gymCam.armSet(s, se, set, effCam);
         if (!dead) syncVisibleCards();
         const camLbl = effCam ? shortCamLabel(effCam) : 'Auto';
@@ -1275,7 +1305,7 @@ function build(root: HTMLElement, id?: string): () => void {
         latest.se.camPref = camera;
         save();
       }
-      const effCam = camera || latest.se.camPref || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+      const effCam = camera || camForEx(latest.se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
       const meta = await gymCam.autoClipPr(s, latest.se, latest.set, effCam, true);
       if (!dead && meta) { save(); syncVisibleCards(); }
       return meta ? `Clipped ${exOf(latest.se.exId).name}` : 'No motion burst found yet';
@@ -1328,7 +1358,7 @@ function build(root: HTMLElement, id?: string): () => void {
       let meta = set.vids?.length ? lifts.videos.get(set.vids[set.vids.length - 1]) : undefined;
       if ((!meta || !meta.lanUrl) && gymCam.online && set.done) {
         toast(`Pulling ${exOf(se.exId).name} ${setLabel} for TV…`);
-        const effCam = se.camPref || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+        const effCam = camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
         meta = (await gymCam.autoClipPr(s, se, set, effCam, true)) ?? undefined;
         if (meta && !dead) { save(); syncVisibleCards(); }
       }

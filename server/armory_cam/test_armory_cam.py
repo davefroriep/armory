@@ -46,6 +46,23 @@ class ArmoryCamTests(unittest.TestCase):
         overridden = ac.select_camera_for_window(samples, base + 10_000, base + 16_000, preferred_camera="Smith Cam")
         self.assertEqual(overridden, "Smith Cam")
 
+        # Secondary (primary=False) 3rd angle camera does not steal Auto selection even with stronger motion
+        extra_samples = samples + [
+            {"camera": "Low Knee Cam", "startMs": base + 10_000, "endMs": base + 14_000, "energy": 25.0},
+        ]
+        prim_picked = ac.select_camera_for_window(
+            extra_samples, base + 10_000, base + 16_000, primary_cameras={"Rack Cam", "Smith Cam"}
+        )
+        self.assertEqual(prim_picked, "Rack Cam")
+        explicit_third = ac.select_camera_for_window(
+            extra_samples,
+            base + 10_000,
+            base + 16_000,
+            preferred_camera="Low Knee Cam",
+            primary_cameras={"Rack Cam", "Smith Cam"},
+        )
+        self.assertEqual(explicit_third, "Low Knee Cam")
+
     def test_select_pr_window_respects_prev_set_and_batch_boundary(self) -> None:
         base = 1_763_500_000_000
         bursts = [
