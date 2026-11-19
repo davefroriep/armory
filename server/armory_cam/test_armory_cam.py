@@ -107,6 +107,10 @@ class ArmoryCamTests(unittest.TestCase):
             dash_html = client.get("/").get_data(as_text=True)
             self.assertIn("+ Mask Mirror (Red)", dash_html)
             self.assertIn("data-addexcl", dash_html)
+            self.assertIn("maskModal", dash_html)
+            self.assertIn("mmSaveBtn", dash_html)
+            self.assertIn("quad-dot", dash_html)
+            self.assertIn("Saved!", dash_html)
 
             cfg_res = client.post(
                 "/api/config",
@@ -134,7 +138,26 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(client.get("/api/ping").get_json()["retentionDays"], 21)
             self.assertEqual(saved_cfg["cameras"][0]["crop"], [0.25, 0.25, 0.75, 0.75])
             self.assertEqual(saved_cfg["cameras"][0]["roi"], [0.3, 0.3, 0.7, 0.7])
-            self.assertEqual(saved_cfg["cameras"][0]["exclusions"], [[0.55, 0.1, 0.9, 0.6]])
+            self.assertEqual(
+                saved_cfg["cameras"][0]["exclusions"],
+                [[[0.55, 0.1], [0.9, 0.1], [0.9, 0.6], [0.55, 0.6]]],
+            )
+
+            skew_quad = [[0.4, 0.1], [0.7, 0.2], [0.65, 0.8], [0.35, 0.7]]
+            skew_res = client.post(
+                "/api/config",
+                json={
+                    "cameras": [
+                        {"name": "Rack Cam", "slug": "rack_cam", "exclusions": [skew_quad]},
+                        {"name": "Smith Cam", "slug": "smith_cam"},
+                    ]
+                },
+            )
+            self.assertEqual(skew_res.status_code, 200)
+            saved_skew = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_skew["cameras"][0]["exclusions"], [skew_quad])
+            got_cfg = client.get("/api/config").get_json()
+            self.assertEqual(got_cfg["cameras"][0]["exclusions"], [skew_quad])
 
             # 2. Start session and synthesize real 2s MPEG-TS segments in Rack Cam ring
             self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-1", "name": "Lower 1"}).status_code, 200)
@@ -512,6 +535,7 @@ class ArmoryCamTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_exclusion_zones_mask_mirror_motion(self) -> None:
+        import cv2
         import numpy as np
 
         f0 = np.zeros((180, 320, 3), dtype=np.uint8)
@@ -535,6 +559,62 @@ class ArmoryCamTests(unittest.TestCase):
             exclusions=[(0.6, 0.05, 1.0, 0.95)],
         )
         self.assertGreater(with_lifter, 5.0)
+
+        # Angled / skewed 4-dot quad mask rejects mirror motion while preserving pocket pixels inside bounding box
+        skew_quad = ((0.49, 0.07), (0.76, 0.07), (0.96, 0.93), (0.69, 0.93))
+        f_skew_mirror = f0.copy()
+        mirror_pts = np.array([[int(x * 320), int(y * 180)] for x, y in [(0.52, 0.12), (0.73, 0.12), (0.92, 0.88), (0.72, 0.88)]], dtype=np.int32)
+        cv2.fillPoly(f_skew_mirror, [mirror_pts], (245, 245, 245))
+
+        self.assertGreater(ac.compute_motion_energy_from_frames([f0, f_skew_mirror]), 5.0)
+        self.assertLess(ac.compute_motion_energy_from_frames([f0, f_skew_mirror], exclusions=[skew_quad]), 0.5)
+
+        # Lifter motion in lower-left pocket of skew_quad's bounding box [0.49..0.59, 0.60..0.92]
+        # (outside skew_quad, inside axis-aligned rect [0.49, 0.07, 0.96, 0.93])
+        f_pocket = f_skew_mirror.copy()
+        f_pocket[108:166, 157:189] = 240
+        pocket_with_quad = ac.compute_motion_energy_from_frames([f0, f_pocket], exclusions=[skew_quad])
+        pocket_with_rect = ac.compute_motion_energy_from_frames(
+            [f0, f_pocket], exclusions=[(0.49, 0.07, 0.96, 0.93)]
+        )
+        self.assertGreater(pocket_with_quad, 3.0)
+        self.assertLess(pocket_with_rect, 0.5)
+
+        # Degenerate collinear / zero-area quads rejected and MAX_EXCLUSIONS respected
+        many = [
+            [[0.0, 0.0], [0.5, 0.0], [0.5, 0.0], [0.0, 0.0]],  # collapsed area=0
+            [[0.1, 0.1], [0.2, 0.1], [0.2, 0.2], [0.1, 0.2]],
+        ] * 8
+        normed = ac.normalize_exclusions(many)
+        self.assertEqual(len(normed), ac.MAX_EXCLUSIONS)
+
+        # Hi-res snapshot endpoint returns valid JPEG when ring segments exist
+        tmp = Path(tempfile.mkdtemp(prefix="armory_snap_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            ff = shutil.which("ffmpeg") or svc.ffmpeg
+            seg_dir = svc.ring_root / "rack_cam"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            seg_path = seg_dir / "seg_20261119_120000.ts"
+            subprocess.run(
+                [
+                    ff, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=red:s=320x240:r=20:d=1",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                ],
+                check=True,
+            )
+            svc.ring_segments["rack_cam"] = [
+                ac.SegmentInfo(path=seg_path, start_ms=1_763_500_000_000, end_ms=1_763_500_001_000, energy=1.0, camera="Rack Cam")
+            ]
+            snap = client.get("/api/snapshot?camera=Rack%20Cam&raw=1&hires=1")
+            self.assertEqual(snap.status_code, 200)
+            self.assertEqual(snap.mimetype, "image/jpeg")
+            self.assertTrue(snap.data.startswith(b"\xff\xd8"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_drive_backup_mirror_and_backfill(self) -> None:
         from unittest import mock

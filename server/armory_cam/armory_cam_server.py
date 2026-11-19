@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +50,7 @@ DEFAULT_SCRUB_THUMB_Q = 58
 MIN_CROP_SPAN = 0.15
 MIN_EXCL_SPAN = 0.04
 MAX_EXCLUSIONS = 6
+Quad = tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]
 RING_KEEP_MIN_SEC = 300
 PREVIEW_KEEP_SEC = 24 * 3600
 PREVIEW_MAX_FILES = 120
@@ -266,6 +267,10 @@ def normalize_crop(raw: Any) -> tuple[float, float, float, float]:
         return (0.0, 0.0, 1.0, 1.0)
 
 
+def _tri_area(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    return 0.5 * abs((b[0] - a[0]) * (c[1] - a[1]) - (c[0] - a[0]) * (b[1] - a[1]))
+
+
 def normalize_excl_box(raw: Any) -> tuple[float, float, float, float] | None:
     """Clamp normalized `[x0, y0, x1, y1]` exclusion box with >= MIN_EXCL_SPAN, or None if invalid."""
     try:
@@ -286,15 +291,53 @@ def normalize_excl_box(raw: Any) -> tuple[float, float, float, float] | None:
         return None
 
 
-def normalize_exclusions(raw: Any) -> list[tuple[float, float, float, float]]:
-    """Normalize up to MAX_EXCLUSIONS `[x0, y0, x1, y1]` motion exclusion boxes."""
+def normalize_excl_quad(raw: Any) -> Quad | None:
+    """Normalize a 4-point quad `[[x,y], ...]` or legacy `[x0,y0,x1,y1]` rect to clamped 4-point Quad."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in raw):
+        box = normalize_excl_box(raw)
+        if box is None:
+            return None
+        x0, y0, x1, y1 = box
+        return ((x0, y0), (x1, y0), (x1, y1), (x0, y1))
+
+    pts: list[tuple[float, float]] = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return None
+        px_raw, py_raw = item
+        if (
+            not isinstance(px_raw, (int, float))
+            or isinstance(px_raw, bool)
+            or not isinstance(py_raw, (int, float))
+            or isinstance(py_raw, bool)
+        ):
+            return None
+        px, py = float(px_raw), float(py_raw)
+        if not np.isfinite(px) or not np.isfinite(py):
+            return None
+        pts.append((round(max(0.0, min(1.0, px)), 4), round(max(0.0, min(1.0, py)), 4)))
+
+    p0, p1, p2, p3 = pts[0], pts[1], pts[2], pts[3]
+    area = max(
+        _tri_area(p0, p1, p2) + _tri_area(p0, p2, p3),
+        _tri_area(p0, p1, p3) + _tri_area(p1, p2, p3),
+    )
+    if area < 1e-4:
+        return None
+    return (p0, p1, p2, p3)
+
+
+def normalize_exclusions(raw: Any) -> list[Quad]:
+    """Normalize up to MAX_EXCLUSIONS 4-point quad (or legacy rect) motion exclusion masks."""
     if not isinstance(raw, (list, tuple)):
         return []
-    out: list[tuple[float, float, float, float]] = []
+    out: list[Quad] = []
     for item in raw:
-        box = normalize_excl_box(item)
-        if box is not None:
-            out.append(box)
+        quad = normalize_excl_quad(item)
+        if quad is not None:
+            out.append(quad)
             if len(out) >= MAX_EXCLUSIONS:
                 break
     return out
@@ -373,9 +416,9 @@ def apply_frame_transform(
 def compute_motion_energy_from_frames(
     frames: list[np.ndarray],
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
-    exclusions: list[tuple[float, float, float, float]] | tuple[tuple[float, float, float, float], ...] = (),
+    exclusions: Sequence[Any] = (),
 ) -> float:
-    """Compute lightweight motion score (0..100) across sampled BGR frames inside normalized ROI minus exclusion boxes."""
+    """Compute lightweight motion score (0..100) across sampled BGR frames inside normalized ROI minus exclusion quads."""
     if len(frames) < 2:
         return 0.0
     x0, y0, x1, y1 = normalize_crop(roi)
@@ -392,15 +435,19 @@ def compute_motion_energy_from_frames(
         rx1, ry1 = min(w, max(rx0 + 2, cx1)), min(h, max(ry0 + 2, cy1))
         crop = small[ry0:ry1, rx0:rx1]
         if include_mask is None and excl_list:
-            mask = np.ones((crop.shape[0], crop.shape[1]), dtype=bool)
-            for ex0, ey0, ex1, ey1 in excl_list:
-                mx0 = max(0, min(crop.shape[1], int(round(ex0 * w)) - rx0))
-                my0 = max(0, min(crop.shape[0], int(round(ey0 * h)) - ry0))
-                mx1 = max(0, min(crop.shape[1], int(round(ex1 * w)) - rx0))
-                my1 = max(0, min(crop.shape[0], int(round(ey1 * h)) - ry0))
-                if mx1 > mx0 and my1 > my0:
-                    mask[my0:my1, mx0:mx1] = False
-            include_mask = mask
+            mask_u8 = np.ones((crop.shape[0], crop.shape[1]), dtype=np.uint8)
+            shift = 4
+            scale = 1 << shift
+            for quad in excl_list:
+                pts = np.array(
+                    [
+                        [int(round((px * w - rx0) * scale)), int(round((py * h - ry0) * scale))]
+                        for px, py in quad
+                    ],
+                    dtype=np.int32,
+                )
+                cv2.fillPoly(mask_u8, [pts], 0, shift=shift)
+            include_mask = mask_u8.astype(bool)
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         prep.append(cv2.GaussianBlur(gray, (5, 5), 0))
 
@@ -422,7 +469,7 @@ def compute_motion_energy_from_frames(
 def analyze_ts_segment(
     seg_path: Path,
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
-    exclusions: list[tuple[float, float, float, float]] | tuple[tuple[float, float, float, float], ...] = (),
+    exclusions: Sequence[Any] = (),
     rotate: int = 0,
     fallback_dur_ms: int = 2000,
 ) -> tuple[int, float]:
@@ -646,7 +693,7 @@ class CameraConfig:
     primary: bool = True
     motion_threshold: float = DEFAULT_MOTION_THRESHOLD
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
-    exclusions: list[tuple[float, float, float, float]] = field(default_factory=list)
+    exclusions: list[Quad] = field(default_factory=list)
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     rotate: int = 0
 
@@ -664,7 +711,7 @@ class CameraConfig:
             "primary": self.primary,
             "motionThreshold": self.motion_threshold,
             "roi": list(self.roi),
-            "exclusions": [list(b) for b in self.exclusions],
+            "exclusions": [[[pt[0], pt[1]] for pt in q] for q in self.exclusions],
             "crop": list(self.crop),
             "rotate": self.rotate,
         }
@@ -2353,10 +2400,31 @@ class ArmoryCamService:
             return ""
         return "data:image/jpeg;base64," + base64.b64encode(jpg).decode("ascii")
 
-    def get_snapshot_jpeg(self, camera_name: str | None = None, raw: bool = False) -> bytes | None:
+    def get_snapshot_jpeg(self, camera_name: str | None = None, raw: bool = False, hires: bool = False) -> bytes | None:
         cam = self._find_camera(camera_name)
         if not cam:
             return None
+
+        if hires:
+            with self.lock:
+                segs = list(self.ring_segments.get(cam.slug, []))
+            for seg in reversed(segs[-4:]):
+                if seg.path.exists():
+                    cap = cv2.VideoCapture(str(seg.path))
+                    if cap.isOpened():
+                        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                        if total > 1:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+                        ok, frm = cap.read()
+                        if (not ok or frm is None) and total > 1:
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            ok, frm = cap.read()
+                        cap.release()
+                        if ok and frm is not None:
+                            frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=not raw)
+                            ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                            if ok_jpg:
+                                return buf.tobytes()
 
         live_jpg = self.live_hub.recent_frame(cam.slug, max_age_sec=2.0)
         if live_jpg:
@@ -2922,6 +2990,7 @@ DASHBOARD_HTML = """<!doctype html>
 <style>
   :root{--bg:#0b0f14;--card:#131a22;--line:#233040;--fg:#edf2f7;--mut:#8b9bb0;--blue:#1e9bff;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  [hidden]{display:none!important}
   .wrap{max-width:1120px;margin:0 auto;padding:18px}
   h1{margin:0 0 6px;font-size:22px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
   .pill{font-size:11px;padding:3px 10px;border-radius:999px;background:#1d2836;color:var(--mut);font-weight:800;letter-spacing:.04em}
@@ -2931,27 +3000,33 @@ DASHBOARD_HTML = """<!doctype html>
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
   .card h2{margin:0 0 10px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px}
   .stage{position:relative;width:100%;aspect-ratio:16/9;background:#06090d;border-radius:10px;border:1px solid var(--line);overflow:hidden;user-select:none;touch-action:none}
-  .stage.rot90,.stage.rot270{aspect-ratio:9/16;max-height:480px;margin:0 auto}
+  .stage.rot90,.stage.rot270{width:auto;height:480px;max-width:100%;aspect-ratio:9/16;margin:0 auto}
   .stage img.stream{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
   .crop-layer{position:absolute;inset:0;pointer-events:auto}
   .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none}
   .crop-box{position:absolute;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
   .crop-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(255,255,255,.28);pointer-events:none}
-  .roi-box{position:absolute;border:2px solid var(--green);background:rgba(34,197,94,.08);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none;z-index:2}
-  .roi-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(134,239,172,.35);pointer-events:none}
-  .roi-box .handle{background:var(--green)}
   .box-tag{position:absolute;left:4px;top:4px;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:900;letter-spacing:.06em;pointer-events:none;background:rgba(6,9,13,.82);color:var(--blue)}
-  .roi-box .box-tag{color:#86efac}
-  .crop-box.passive,.roi-box.passive,.excl-box.passive{border-style:dashed;opacity:.55;pointer-events:none;cursor:default}
-  .crop-box.passive .handle,.roi-box.passive .handle,.excl-box.passive .handle,.excl-box.passive .excl-del{display:none}
-  .excl-box{position:absolute;border:2px solid var(--red);background:rgba(239,68,68,.18);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none;z-index:3}
-  .excl-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(252,165,165,.45);pointer-events:none}
-  .excl-box .handle{background:var(--red)}
-  .excl-box .box-tag{color:#fecaca}
-  .excl-del{position:absolute;right:4px;top:4px;width:18px;height:18px;border:0;border-radius:4px;background:rgba(239,68,68,.92);color:#fff;font:900 11px/1 system-ui,sans-serif;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;z-index:4}
-  .btn.red{background:rgba(239,68,68,.18);border:1px solid rgba(239,68,68,.55);color:#fecaca}
-  .btn.red:hover{background:rgba(239,68,68,.28)}
-  .btn:disabled{opacity:.42;cursor:not-allowed}
+  .crop-box.passive{border-style:dashed;opacity:.52;pointer-events:none;cursor:default}
+  .crop-box.passive .handle{display:none}
+  .excl-wrap{position:absolute;inset:0;pointer-events:none;z-index:3}
+  .excl-wrap.passive{opacity:.6}
+  .excl-wrap.passive .quad-poly{stroke-dasharray:6 4;pointer-events:none;cursor:default}
+  .excl-wrap.passive .quad-dot{display:none}
+  .excl-svg{position:absolute;inset:0;width:100%;height:100%;overflow:visible;pointer-events:none}
+  .quad-poly{fill:rgba(239,68,68,.24);stroke:#ef4444;stroke-width:2;pointer-events:all;cursor:move;transition:fill .12s,stroke .12s}
+  .quad-poly.active{fill:rgba(239,68,68,.30);stroke:#fca5a5;stroke-width:2.4}
+  .quad-poly.crossed{stroke:var(--amber);fill:rgba(245,158,11,.22)}
+  .quad-tag{position:absolute;transform:translate(-50%,-50%);padding:1px 6px;border-radius:4px;font-size:10px;font-weight:900;letter-spacing:.06em;pointer-events:none;background:rgba(6,9,13,.84);color:#fecaca;border:1px solid rgba(239,68,68,.45);white-space:nowrap}
+  .quad-dot{position:absolute;width:28px;height:28px;transform:translate(-50%,-50%);cursor:grab;pointer-events:auto;touch-action:none;z-index:6;display:flex;align-items:center;justify-content:center;background:transparent}
+  .mm-canvas .quad-dot{width:34px;height:34px}
+  .quad-ring{position:relative;width:16px;height:16px;border-radius:50%;border:2px solid #fff;box-shadow:0 0 0 1.5px rgba(239,68,68,.95),0 1px 6px rgba(0,0,0,.85);background:rgba(239,68,68,.10);pointer-events:none;transition:transform .08s ease,border-color .1s ease,box-shadow .1s ease}
+  .mm-canvas .quad-ring{width:20px;height:20px}
+  .quad-ring::before{content:'';position:absolute;left:50%;top:1px;bottom:1px;width:1px;transform:translateX(-50%);background:rgba(255,255,255,.55)}
+  .quad-ring::after{content:'';position:absolute;top:50%;left:1px;right:1px;height:1px;transform:translateY(-50%);background:rgba(255,255,255,.55)}
+  .quad-dot:hover .quad-ring,.quad-dot.dragging .quad-ring{border-color:#fde047;box-shadow:0 0 0 2px rgba(245,158,11,.95),0 0 12px rgba(250,204,21,.65);transform:scale(1.14)}
+  .quad-dot.dragging{cursor:grabbing;z-index:8}
+  .quad-num{position:absolute;left:100%;top:-2px;margin-left:2px;font-size:9px;font-weight:900;color:#fff;background:rgba(6,9,13,.88);padding:0 3px;border-radius:3px;border:1px solid rgba(255,255,255,.22);pointer-events:none;line-height:1.2}
   .handle{position:absolute;width:22px;height:22px;border-radius:50%;background:var(--blue);border:2px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.7);touch-action:none}
   .handle.nw{left:-11px;top:-11px;cursor:nwse-resize}
   .handle.ne{right:-11px;top:-11px;cursor:nesw-resize}
@@ -2966,11 +3041,43 @@ DASHBOARD_HTML = """<!doctype html>
   .mbar-th{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
   label{display:block;font-size:12px;color:var(--mut);margin:8px 0 4px}
   input[type=text],input[type=number],select{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:#0d1218;color:var(--fg);font:inherit}
-  .btn{background:var(--blue);color:#00131f;border:0;border-radius:9px;padding:7px 12px;font-weight:800;font-size:12px;cursor:pointer}
+  .btn{background:var(--blue);color:#00131f;border:0;border-radius:9px;padding:7px 12px;font-weight:800;font-size:12px;cursor:pointer;transition:transform .08s ease,background-color .15s ease,border-color .15s ease,box-shadow .15s ease,filter .15s ease,color .15s ease;user-select:none}
+  .btn:hover:not(:disabled){filter:brightness(1.12);box-shadow:0 2px 10px rgba(0,0,0,.35)}
+  .btn:active:not(:disabled){transform:translateY(2px) scale(.96);filter:brightness(.92);box-shadow:inset 0 2px 5px rgba(0,0,0,.45)}
+  .btn:disabled{opacity:.42;cursor:not-allowed}
   .btn.sm{padding:5px 10px}
   .btn.sec{background:#1d2836;color:var(--fg);border:1px solid var(--line)}
   .btn.sec.on{background:rgba(30,155,255,.2);border-color:var(--blue);color:#7cc4ff}
   .btn.ok{background:rgba(34,197,94,.22);border:1px solid rgba(34,197,94,.5);color:#86efac}
+  .btn.red{background:rgba(239,68,68,.18);border:1px solid rgba(239,68,68,.55);color:#fecaca}
+  .btn.red:hover:not(:disabled){background:rgba(239,68,68,.28)}
+  .btn.saving{opacity:.82;cursor:wait}
+  .btn.saved{background:#22c55e!important;border-color:#4ade80!important;color:#031a0c!important;box-shadow:0 0 0 2px rgba(34,197,94,.4),0 2px 12px rgba(34,197,94,.35)}
+  .btn.save-err{background:#ef4444!important;border-color:#f87171!important;color:#fff!important}
+  .btn.dirty{box-shadow:0 0 0 2px rgba(245,158,11,.55)}
+  .mask-modal{position:fixed;inset:0;z-index:9999;background:rgba(4,7,11,.96);display:flex;flex-direction:column;padding:10px 14px;gap:8px;user-select:none}
+  .mm-top{display:flex;flex-wrap:wrap;align-items:center;gap:8px;justify-content:space-between}
+  .mm-title{font-weight:900;font-size:15px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .mm-tabs{display:flex;flex-wrap:wrap;align-items:center;gap:6px}
+  .mm-tab{display:inline-flex;align-items:center;gap:6px;background:#1d2836;border:1px solid var(--line);border-radius:9px;padding:3px 6px 3px 10px;font-size:12px;font-weight:800;color:var(--fg);cursor:pointer}
+  .mm-tab.on{background:rgba(239,68,68,.22);border-color:var(--red);color:#fecaca}
+  .mm-tab-del{border:0;background:rgba(239,68,68,.3);color:#fecaca;border-radius:5px;width:18px;height:18px;font:900 12px/1 system-ui,sans-serif;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0}
+  .mm-tab-del:hover{background:var(--red);color:#fff}
+  .mm-zoombar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 10px}
+  .mm-zoombar input[type=range]{width:140px;accent-color:var(--blue)}
+  .mm-viewport{flex:1;min-height:0;position:relative;overflow:hidden;background:#05080d;border:1px solid var(--line);border-radius:12px;touch-action:none;cursor:grab}
+  .mm-viewport.panning{cursor:grabbing}
+  .mm-canvas{position:absolute;transform-origin:0 0;touch-action:none}
+  .mm-img{width:100%;height:100%;display:block;pointer-events:none}
+  .mm-crop-ref{position:absolute;border:1.5px dashed rgba(30,155,255,.72);background:rgba(30,155,255,.04);pointer-events:none}
+  .mm-mbar{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+  .mm-mbar-track{position:relative;width:72px;height:8px;border-radius:999px;background:#0b1017;border:1px solid var(--line);overflow:hidden}
+  .mm-mbar-fill{position:absolute;left:0;top:0;bottom:0;width:0%;background:var(--blue);transition:width .2s}
+  .mm-mbar-fill.hot{background:var(--green)}
+  #toast{position:fixed;left:50%;bottom:20px;transform:translate(-50%,16px);opacity:0;pointer-events:none;z-index:10050;padding:10px 18px;border-radius:10px;font-weight:800;font-size:13px;background:#1d2836;color:var(--fg);border:1px solid var(--line);box-shadow:0 8px 24px rgba(0,0,0,.55);transition:opacity .18s ease,transform .18s ease}
+  #toast.show{opacity:1;transform:translate(-50%,0)}
+  #toast.ok{background:#15803d;border-color:#4ade80;color:#f0fdf4}
+  #toast.err{background:#b91c1c;border-color:#f87171;color:#fef2f2}
   table{width:100%;border-collapse:collapse;font-size:13px}
   th,td{text-align:left;padding:7px 6px;border-top:1px solid var(--line)}
   a{color:#7cc4ff;text-decoration:none}
@@ -3049,17 +3156,195 @@ DASHBOARD_HTML = """<!doctype html>
     <div id="clipList" style="color:var(--mut)">No clips saved yet.</div>
   </div>
 </div>
+
+<div id="maskModal" class="mask-modal" hidden>
+  <div class="mm-top">
+    <div class="mm-title">
+      <span id="mmTitle">Mirror Mask Editor</span>
+      <div class="mm-mbar">
+        <div class="mm-mbar-track"><div id="mmMotionBar" class="mm-mbar-fill"></div></div>
+        <span id="mmMotionTxt">Motion: 0.0</span>
+      </div>
+    </div>
+    <div id="mmMaskTabs" class="mm-tabs"></div>
+    <div class="ctrl-row" style="margin-top:0">
+      <button class="btn red sm" id="mmAddBtn" type="button">+ Add Mask</button>
+      <button class="btn sec sm" id="mmClearBtn" type="button">Clear All</button>
+      <button class="btn sec sm" id="mmHiresBtn" type="button">1080p Still</button>
+      <button class="btn sec sm" id="mmRefreshBtn" type="button" hidden>↻ Grab Frame</button>
+      <button class="btn ok sm" id="mmSaveBtn" type="button">Save Masks</button>
+      <button class="btn sec sm" id="mmCloseBtn" type="button">Done</button>
+    </div>
+  </div>
+  <div class="mm-zoombar">
+    <span style="font-size:12px;color:var(--mut)">Zoom:</span>
+    <button class="btn sec sm" type="button" data-mmz="1">1×</button>
+    <button class="btn sec sm" type="button" data-mmz="2">2×</button>
+    <button class="btn sec sm" type="button" data-mmz="3">3×</button>
+    <button class="btn sec sm" type="button" data-mmz="5">5×</button>
+    <button class="btn sec sm" type="button" data-mmz="8">8×</button>
+    <button class="btn sec sm" type="button" id="mmFitMaskBtn">Fit Mask</button>
+    <button class="btn sec sm" type="button" id="mmFitCropBtn">Fit Crop</button>
+    <input type="range" id="mmZoomRange" min="1" max="8" step="0.1" value="1">
+    <span id="mmZoomVal" style="font-size:12px;font-weight:800;min-width:38px;font-variant-numeric:tabular-nums">1.0×</span>
+    <span id="mmHint" style="margin-left:auto;font-size:12px;color:var(--mut)">Drag 4 dots to match angled mirror corners · Wheel/pinch to zoom · Drag outside mask to pan</span>
+  </div>
+  <div id="mmViewport" class="mm-viewport">
+    <div id="mmCanvas" class="mm-canvas">
+      <img id="mmStream" class="mm-img" alt="Zoomed mirror mask view">
+      <div id="mmCropRef" class="mm-crop-ref"></div>
+      <svg id="mmSvg" class="excl-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
+      <div id="mmDots"></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" role="status" aria-live="polite"></div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 let cfg = null;
 const previewCropped = {};
 const aspectLock = {};
 const editTarget = {};
+let isDirty = false;
+let toastTimer = null;
+const btnTimers = new WeakMap();
+
+const mmState = {
+  open: false,
+  camIdx: 0,
+  activeMask: 0,
+  zoom: 1,
+  panX: 0,
+  panY: 0,
+  hires: false,
+  pendingFit: false,
+  dragDot: null,
+};
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const MIN_SPAN = 0.15;
-const MIN_EXCL_SPAN = 0.04;
 const MAX_EXCLUSIONS = 6;
+const MM_MIN_ZOOM = 1;
+const MM_MAX_ZOOM = 8;
+const MM_PAN_MARGIN = 56;
+
+function normQuad(item) {
+  if (!Array.isArray(item) || item.length !== 4) return null;
+  if (item.every(v => typeof v === 'number' && Number.isFinite(v))) {
+    const x0 = clamp(Math.min(item[0], item[2]), 0, 1);
+    const y0 = clamp(Math.min(item[1], item[3]), 0, 1);
+    const x1 = clamp(Math.max(item[0], item[2]), 0, 1);
+    const y1 = clamp(Math.max(item[1], item[3]), 0, 1);
+    return [[+x0.toFixed(4), +y0.toFixed(4)], [+x1.toFixed(4), +y0.toFixed(4)], [+x1.toFixed(4), +y1.toFixed(4)], [+x0.toFixed(4), +y1.toFixed(4)]];
+  }
+  if (item.every(pt => Array.isArray(pt) && pt.length === 2 && Number.isFinite(Number(pt[0])) && Number.isFinite(Number(pt[1])))) {
+    return item.map(pt => [+clamp(Number(pt[0]), 0, 1).toFixed(4), +clamp(Number(pt[1]), 0, 1).toFixed(4)]);
+  }
+  return null;
+}
+
+function defaultQuadFor(cam, k, viewNorm = null) {
+  const b = viewNorm || (cam && Array.isArray(cam.crop) ? cam.crop : [0, 0, 1, 1]);
+  const bw = Math.max(0.12, b[2] - b[0]);
+  const bh = Math.max(0.12, b[3] - b[1]);
+  const qw = Math.min(0.32, bw * 0.34);
+  const qh = Math.min(0.42, bh * 0.44);
+  const sx = (k % 3) * (bw * 0.08);
+  const sy = Math.floor(k / 3) * (bh * 0.09);
+  const x0 = clamp(b[0] + bw * 0.52 - sx, 0.01, 0.99 - qw);
+  const y0 = clamp(b[1] + bh * 0.16 + sy, 0.01, 0.99 - qh);
+  const x1 = +(x0 + qw).toFixed(4);
+  const y1 = +(y0 + qh).toFixed(4);
+  return [[+x0.toFixed(4), +y0.toFixed(4)], [x1, +y0.toFixed(4)], [x1, y1], [+x0.toFixed(4), y1]];
+}
+
+function quadBounds(q) {
+  const xs = q.map(p => p[0]);
+  const ys = q.map(p => p[1]);
+  return [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)];
+}
+
+function quadCentroid(q) {
+  return [
+    (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4,
+    (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4,
+  ];
+}
+
+function segsCross(a, b, c, d) {
+  const ccw = (p1, p2, p3) => (p3[1] - p1[1]) * (p2[0] - p1[0]) - (p2[1] - p1[1]) * (p3[0] - p1[0]);
+  const d1 = ccw(c, d, a), d2 = ccw(c, d, b), d3 = ccw(a, b, c), d4 = ccw(a, b, d);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+function quadHasCrossing(q) {
+  if (!q || q.length !== 4) return false;
+  return segsCross(q[0], q[1], q[2], q[3]) || segsCross(q[1], q[2], q[3], q[0]);
+}
+
+function showToast(msg, kind = 'ok') {
+  const t = $('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.className = 'show ' + kind;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ''; }, 2400);
+}
+
+function allSaveButtons() {
+  return [$('saveAllTop'), $('saveBtn'), $('wbSaveBtn'), $('mmSaveBtn'), ...document.querySelectorAll('[data-save]')].filter(Boolean);
+}
+
+function markDirty(flag = true) {
+  isDirty = flag;
+  allSaveButtons().forEach(b => b.classList.toggle('dirty', flag && !b.classList.contains('saved')));
+}
+
+function setBtnFeedback(btn, state, label, restoreMs = 0) {
+  if (!btn) return;
+  if (!btn.dataset.origLabel) btn.dataset.origLabel = btn.textContent;
+  const oldT = btnTimers.get(btn);
+  if (oldT) { clearTimeout(oldT); btnTimers.delete(btn); }
+  btn.classList.remove('saving', 'saved', 'save-err');
+  if (state) btn.classList.add(state);
+  btn.textContent = label || btn.dataset.origLabel;
+  btn.disabled = (state === 'saving');
+  if (restoreMs > 0) {
+    const tid = setTimeout(() => {
+      btn.classList.remove('saving', 'saved', 'save-err');
+      btn.textContent = btn.dataset.origLabel;
+      btn.disabled = false;
+      btn.classList.toggle('dirty', isDirty);
+      btnTimers.delete(btn);
+    }, restoreMs);
+    btnTimers.set(btn, tid);
+  }
+}
+
+function renderQuadLayer(svgEl, dotsEl, excls, opts = {}) {
+  if (!svgEl || !dotsEl) return;
+  const activeIdx = opts.activeIdx ?? -1;
+  const dragDot = opts.dragDot || null;
+  const showNums = !!opts.showNums;
+
+  svgEl.innerHTML = excls.map((q, ei) => {
+    const pts = q.map(p => `${(p[0] * 1000).toFixed(1)},${(p[1] * 1000).toFixed(1)}`).join(' ');
+    const cls = ['quad-poly', activeIdx === ei ? 'active' : '', quadHasCrossing(q) ? 'crossed' : ''].filter(Boolean).join(' ');
+    return `<polygon class="${cls}" fill-rule="evenodd" vector-effect="non-scaling-stroke" data-excl-idx="${ei}" points="${pts}"></polygon>`;
+  }).join('');
+
+  dotsEl.innerHTML = excls.map((q, ei) => {
+    const c = quadCentroid(q);
+    const tag = `<div class="quad-tag" style="left:${(c[0] * 100).toFixed(3)}%;top:${(c[1] * 100).toFixed(3)}%">MASK ${ei + 1}</div>`;
+    const dots = q.map((p, ci) => {
+      const isDrag = dragDot && dragDot.ei === ei && dragDot.ci === ci;
+      return `<div class="quad-dot${isDrag ? ' dragging' : ''}" data-excl-idx="${ei}" data-corner-idx="${ci}" style="left:${(p[0] * 100).toFixed(3)}%;top:${(p[1] * 100).toFixed(3)}%"><div class="quad-ring"></div>${showNums ? `<span class="quad-num">${ci + 1}</span>` : ''}</div>`;
+    }).join('');
+    return tag + dots;
+  }).join('');
+}
 
 function cropZoomFactor(c) {
   const w = Math.max(MIN_SPAN, c[2] - c[0]);
@@ -3078,13 +3363,17 @@ function setZoomAroundCenter(idx, zoom) {
   cfg.cameras[idx].crop = [
     +x0.toFixed(4), +y0.toFixed(4), +(x0 + span).toFixed(4), +(y0 + span).toFixed(4)
   ];
+  markDirty();
   syncCropOverlay(idx);
 }
 
 function syncCropOverlay(idx) {
   const cam = cfg.cameras[idx];
   const c = cam.crop;
-  const excls = Array.isArray(cam.exclusions) ? cam.exclusions : (cam.exclusions = []);
+  const rawExcls = Array.isArray(cam.exclusions) ? cam.exclusions : (cam.exclusions = []);
+  const excls = rawExcls.map(normQuad).filter(Boolean);
+  cam.exclusions = excls;
+
   let mode = editTarget[idx] || 'crop';
   if (mode === 'excl' && !excls.length) {
     mode = 'crop';
@@ -3106,29 +3395,13 @@ function syncCropOverlay(idx) {
   boxEl.classList.toggle('passive', mode === 'excl');
 
   const exclWrap = $(`exclWrap-${idx}`);
-  if (exclWrap) {
-    while (exclWrap.children.length > excls.length) exclWrap.removeChild(exclWrap.lastElementChild);
-    while (exclWrap.children.length < excls.length) {
-      const ei = exclWrap.children.length;
-      const el = document.createElement('div');
-      el.className = 'excl-box';
-      el.innerHTML = `<span class="box-tag">MASK ${ei + 1}</span>` +
-        `<button class="excl-del" type="button" title="Remove mask">×</button>` +
-        `<div class="handle nw" data-handle="nw"></div>` +
-        `<div class="handle ne" data-handle="ne"></div>` +
-        `<div class="handle sw" data-handle="sw"></div>` +
-        `<div class="handle se" data-handle="se"></div>`;
-      exclWrap.appendChild(el);
-    }
-    Array.from(exclWrap.children).forEach((el, ei) => {
-      const b = excls[ei];
-      el.dataset.exclIdx = String(ei);
-      el.classList.toggle('passive', mode !== 'excl');
-      el.style.cssText = `left:${b[0]*100}%;top:${b[1]*100}%;width:${(b[2]-b[0])*100}%;height:${(b[3]-b[1])*100}%;`;
-      const tag = el.querySelector('.box-tag');
-      if (tag) tag.textContent = `MASK ${ei + 1}`;
-      const del = el.querySelector('.excl-del');
-      if (del) del.dataset.excldel = `${idx}:${ei}`;
+  const exclSvg = $(`exclSvg-${idx}`);
+  const exclDots = $(`exclDots-${idx}`);
+  if (exclWrap && exclSvg && exclDots) {
+    exclWrap.classList.toggle('passive', mode !== 'excl');
+    renderQuadLayer(exclSvg, exclDots, excls, {
+      activeIdx: mode === 'excl' ? (mmState.open && mmState.camIdx === idx ? mmState.activeMask : 0) : -1,
+      showNums: false,
     });
   }
 
@@ -3155,6 +3428,7 @@ function syncCropOverlay(idx) {
   if (rotBtn) rotBtn.textContent = `Rotate ${rot}°`;
   const mCrop = $(`modeCrop-${idx}`);
   const mExcl = $(`modeExcl-${idx}`);
+  const zExcl = $(`zoomExcl-${idx}`);
   const addExcl = $(`addExcl-${idx}`);
   if (mCrop) mCrop.classList.toggle('on', mode === 'crop');
   if (mExcl) {
@@ -3162,6 +3436,7 @@ function syncCropOverlay(idx) {
     mExcl.disabled = !excls.length;
     mExcl.textContent = excls.length ? `Edit Masks (${excls.length})` : 'Edit Masks';
   }
+  if (zExcl) zExcl.disabled = !excls.length;
   if (addExcl) addExcl.disabled = excls.length >= MAX_EXCLUSIONS;
 }
 
@@ -3171,35 +3446,39 @@ function wireCropDrag(idx) {
   let drag = null;
 
   layer.addEventListener('pointerdown', (e) => {
-    if (e.target.closest('.excl-del')) return;
     const mode = editTarget[idx] || 'crop';
-    const exclEl = e.target.closest('.excl-box:not(.passive)');
+    const dotEl = e.target.closest('.quad-dot');
+    const polyEl = e.target.closest('.quad-poly');
     const handleEl = e.target.closest('[data-handle]');
     const cropEl = e.target.closest('.crop-box:not(.passive)');
-    if (!exclEl && !cropEl) return;
+    if (mode === 'excl' && (dotEl || polyEl)) {
+      e.preventDefault();
+      const rect = layer.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      layer.setPointerCapture(e.pointerId);
+      const ei = Number((dotEl || polyEl).dataset.exclIdx);
+      const q = cfg.cameras[idx].exclusions[ei];
+      if (!q) return;
+      drag = {
+        pid: e.pointerId,
+        dragKey: dotEl ? 'quad-dot' : 'quad-move',
+        exclIdx: ei,
+        cornerIdx: dotEl ? Number(dotEl.dataset.cornerIdx) : -1,
+        sx: e.clientX,
+        sy: e.clientY,
+        rect,
+        origQuad: q.map(p => [...p]),
+      };
+      return;
+    }
+    if (!cropEl) return;
     e.preventDefault();
     const rect = layer.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
     layer.setPointerCapture(e.pointerId);
-    if (mode === 'excl' && exclEl) {
-      const ei = Number(exclEl.dataset.exclIdx);
-      drag = {
-        pid: e.pointerId,
-        dragKey: 'excl',
-        exclIdx: ei,
-        minSpan: MIN_EXCL_SPAN,
-        mode: handleEl ? handleEl.dataset.handle : 'move',
-        sx: e.clientX,
-        sy: e.clientY,
-        rect,
-        orig: [...(cfg.cameras[idx].exclusions[ei] || [0.5, 0.15, 0.85, 0.55])],
-      };
-      return;
-    }
     drag = {
       pid: e.pointerId,
       dragKey: 'crop',
-      exclIdx: -1,
       minSpan: MIN_SPAN,
       mode: handleEl ? handleEl.dataset.handle : 'move',
       sx: e.clientX,
@@ -3211,6 +3490,26 @@ function wireCropDrag(idx) {
 
   layer.addEventListener('pointermove', (e) => {
     if (!drag || e.pointerId !== drag.pid) return;
+    if (drag.dragKey === 'quad-dot') {
+      const nx = +clamp((e.clientX - drag.rect.left) / drag.rect.width, 0, 1).toFixed(4);
+      const ny = +clamp((e.clientY - drag.rect.top) / drag.rect.height, 0, 1).toFixed(4);
+      cfg.cameras[idx].exclusions[drag.exclIdx][drag.cornerIdx] = [nx, ny];
+      markDirty();
+      syncCropOverlay(idx);
+      return;
+    }
+    if (drag.dragKey === 'quad-move') {
+      const dxRaw = (e.clientX - drag.sx) / drag.rect.width;
+      const dyRaw = (e.clientY - drag.sy) / drag.rect.height;
+      const [bx0, by0, bx1, by1] = quadBounds(drag.origQuad);
+      const dx = clamp(dxRaw, -bx0, 1 - bx1);
+      const dy = clamp(dyRaw, -by0, 1 - by1);
+      cfg.cameras[idx].exclusions[drag.exclIdx] = drag.origQuad.map(p => [+(p[0] + dx).toFixed(4), +(p[1] + dy).toFixed(4)]);
+      markDirty();
+      syncCropOverlay(idx);
+      return;
+    }
+
     const dx = (e.clientX - drag.sx) / drag.rect.width;
     const dy = (e.clientY - drag.sy) / drag.rect.height;
     let [x0, y0, x1, y1] = drag.orig;
@@ -3228,12 +3527,11 @@ function wireCropDrag(idx) {
       if (drag.mode.includes('n')) y0 = clamp(y0 + dy, 0, y1 - minS);
       if (drag.mode.includes('s')) y1 = clamp(y1 + dy, y0 + minS, 1);
 
-      const lock = drag.dragKey === 'crop' ? aspectLock[idx] : null;
+      const lock = aspectLock[idx];
       if (lock) {
         const rot = cfg.cameras[idx].rotate || 0;
         const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
         const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
-        // Desired normalized height/width ratio to match target output pixel ratio (lock = W/H)
         const targetNormRatio = lock * (srcH / srcW);
         let nw = x1 - x0;
         let nh = nw / targetNormRatio;
@@ -3249,15 +3547,468 @@ function wireCropDrag(idx) {
         else x1 = clamp(x0 + nw, x0 + minS, 1);
       }
     }
-    const nextBox = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
-    if (drag.dragKey === 'excl') cfg.cameras[idx].exclusions[drag.exclIdx] = nextBox;
-    else cfg.cameras[idx].crop = nextBox;
+    cfg.cameras[idx].crop = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
+    markDirty();
     syncCropOverlay(idx);
   });
 
   const endDrag = (e) => { if (drag && e.pointerId === drag.pid) drag = null; };
   layer.addEventListener('pointerup', endDrag);
   layer.addEventListener('pointercancel', endDrag);
+}
+
+function modalBaseMetrics() {
+  const vp = $('mmViewport');
+  const img = $('mmStream');
+  const cam = cfg?.cameras?.[mmState.camIdx];
+  const rot = cam ? (cam.rotate || 0) : 0;
+  const vw = Math.max(120, vp ? vp.clientWidth : 800);
+  const vh = Math.max(120, vp ? vp.clientHeight : 500);
+  const ratio = (img && img.naturalWidth > 0 && img.naturalHeight > 0)
+    ? (img.naturalWidth / img.naturalHeight)
+    : ((rot === 90 || rot === 270) ? (9 / 16) : (16 / 9));
+  const maxW = Math.max(100, vw - 24);
+  const maxH = Math.max(100, vh - 24);
+  let baseW, baseH;
+  if (maxW / maxH > ratio) {
+    baseH = maxH;
+    baseW = maxH * ratio;
+  } else {
+    baseW = maxW;
+    baseH = maxW / ratio;
+  }
+  return { vw, vh, baseW, baseH };
+}
+
+function clampModalPan() {
+  const { vw, vh, baseW, baseH } = modalBaseMetrics();
+  const dispW = baseW * mmState.zoom;
+  const dispH = baseH * mmState.zoom;
+  if (dispW <= vw) mmState.panX = (vw - dispW) / 2;
+  else mmState.panX = clamp(mmState.panX, vw - dispW - MM_PAN_MARGIN, MM_PAN_MARGIN);
+  if (dispH <= vh) mmState.panY = (vh - dispH) / 2;
+  else mmState.panY = clamp(mmState.panY, vh - dispH - MM_PAN_MARGIN, MM_PAN_MARGIN);
+}
+
+function setModalZoom(nextZoom, anchorClientX = null, anchorClientY = null) {
+  const { vw, vh, baseW, baseH } = modalBaseMetrics();
+  const oldDispW = baseW * mmState.zoom;
+  const oldDispH = baseH * mmState.zoom;
+  const vp = $('mmViewport');
+  let ax = vw / 2, ay = vh / 2;
+  if (vp && anchorClientX !== null && anchorClientY !== null) {
+    const r = vp.getBoundingClientRect();
+    ax = anchorClientX - r.left;
+    ay = anchorClientY - r.top;
+  }
+  const ux = (ax - mmState.panX) / Math.max(1, oldDispW);
+  const uy = (ay - mmState.panY) / Math.max(1, oldDispH);
+  mmState.zoom = clamp(nextZoom, MM_MIN_ZOOM, MM_MAX_ZOOM);
+  const newDispW = baseW * mmState.zoom;
+  const newDispH = baseH * mmState.zoom;
+  mmState.panX = ax - ux * newDispW;
+  mmState.panY = ay - uy * newDispH;
+  clampModalPan();
+  renderMaskModal();
+}
+
+function centerModalOnNormBox(x0, y0, x1, y1, fillFraction = 0.62, minZ = 1.8, maxZ = 6.5) {
+  const { vw, vh, baseW, baseH } = modalBaseMetrics();
+  const bw = Math.max(0.05, x1 - x0);
+  const bh = Math.max(0.05, y1 - y0);
+  const zx = (vw * fillFraction) / (baseW * bw);
+  const zy = (vh * fillFraction) / (baseH * bh);
+  mmState.zoom = clamp(Math.min(zx, zy), minZ, maxZ);
+  const cx = (x0 + x1) / 2;
+  const cy = (y0 + y1) / 2;
+  mmState.panX = vw / 2 - cx * baseW * mmState.zoom;
+  mmState.panY = vh / 2 - cy * baseH * mmState.zoom;
+  clampModalPan();
+  renderMaskModal();
+}
+
+function fitMaskInModal() {
+  const cam = cfg?.cameras?.[mmState.camIdx];
+  const excls = cam?.exclusions || [];
+  if (!excls.length) {
+    fitCropInModal();
+    return;
+  }
+  const ei = clamp(mmState.activeMask, 0, excls.length - 1);
+  mmState.activeMask = ei;
+  const [x0, y0, x1, y1] = quadBounds(excls[ei]);
+  centerModalOnNormBox(x0, y0, x1, y1, 0.58, 2.0, 6.5);
+}
+
+function fitCropInModal() {
+  const cam = cfg?.cameras?.[mmState.camIdx];
+  const c = cam?.crop || [0, 0, 1, 1];
+  centerModalOnNormBox(c[0], c[1], c[2], c[3], 0.86, 1.0, 6.0);
+}
+
+function modalVisibleNormBox() {
+  const { vw, vh, baseW, baseH } = modalBaseMetrics();
+  const dispW = Math.max(1, baseW * mmState.zoom);
+  const dispH = Math.max(1, baseH * mmState.zoom);
+  const x0 = clamp((0 - mmState.panX) / dispW, 0, 0.9);
+  const y0 = clamp((0 - mmState.panY) / dispH, 0, 0.9);
+  const x1 = clamp((vw - mmState.panX) / dispW, x0 + 0.1, 1);
+  const y1 = clamp((vh - mmState.panY) / dispH, y0 + 0.1, 1);
+  return [x0, y0, x1, y1];
+}
+
+function updateModalMediaSrc() {
+  const cam = cfg?.cameras?.[mmState.camIdx];
+  const img = $('mmStream');
+  if (!cam || !img) return;
+  if (mmState.hires) {
+    img.src = `/api/snapshot?camera=${encodeURIComponent(cam.name)}&raw=1&hires=1&t=${Date.now()}`;
+  } else {
+    img.src = `/api/stream?camera=${encodeURIComponent(cam.name)}&cropped=0&t=${Date.now()}`;
+  }
+  const hBtn = $('mmHiresBtn');
+  const rBtn = $('mmRefreshBtn');
+  if (hBtn) {
+    hBtn.classList.toggle('on', mmState.hires);
+    hBtn.textContent = mmState.hires ? '▶ Live Stream' : '1080p Still';
+  }
+  if (rBtn) rBtn.hidden = !mmState.hires;
+}
+
+function renderMaskModal() {
+  if (!mmState.open || !cfg) return;
+  const cam = cfg.cameras[mmState.camIdx];
+  if (!cam) return;
+  const excls = cam.exclusions || [];
+  if (mmState.activeMask >= excls.length) mmState.activeMask = Math.max(0, excls.length - 1);
+
+  $('mmTitle').textContent = `Mirror Mask Editor · ${cam.name}`;
+  const tabsEl = $('mmMaskTabs');
+  if (tabsEl) {
+    tabsEl.innerHTML = excls.map((_, ei) => `
+      <div class="mm-tab${ei === mmState.activeMask ? ' on' : ''}" data-mm-tab="${ei}">
+        <span>Mask ${ei + 1}</span>
+        <button class="mm-tab-del" type="button" data-mm-del="${ei}" title="Remove Mask ${ei + 1}">×</button>
+      </div>
+    `).join('');
+  }
+  const addBtn = $('mmAddBtn');
+  if (addBtn) addBtn.disabled = excls.length >= MAX_EXCLUSIONS;
+  const fitBtn = $('mmFitMaskBtn');
+  if (fitBtn) fitBtn.disabled = !excls.length;
+
+  clampModalPan();
+  const { baseW, baseH } = modalBaseMetrics();
+  const dispW = baseW * mmState.zoom;
+  const dispH = baseH * mmState.zoom;
+  const canvas = $('mmCanvas');
+  if (canvas) {
+    canvas.style.width = dispW.toFixed(1) + 'px';
+    canvas.style.height = dispH.toFixed(1) + 'px';
+    canvas.style.left = mmState.panX.toFixed(1) + 'px';
+    canvas.style.top = mmState.panY.toFixed(1) + 'px';
+  }
+
+  const c = cam.crop || [0, 0, 1, 1];
+  const cropRef = $('mmCropRef');
+  if (cropRef) {
+    cropRef.style.cssText = `left:${c[0]*100}%;top:${c[1]*100}%;width:${(c[2]-c[0])*100}%;height:${(c[3]-c[1])*100}%;`;
+  }
+
+  renderQuadLayer($('mmSvg'), $('mmDots'), excls, {
+    activeIdx: mmState.activeMask,
+    dragDot: mmState.dragDot,
+    showNums: true,
+  });
+
+  const zr = $('mmZoomRange');
+  const zv = $('mmZoomVal');
+  if (zr) zr.value = mmState.zoom.toFixed(1);
+  if (zv) zv.textContent = mmState.zoom.toFixed(1) + '×';
+
+  const activeQ = excls[mmState.activeMask];
+  const hint = $('mmHint');
+  if (hint) {
+    if (activeQ && quadHasCrossing(activeQ)) {
+      hint.innerHTML = `<span style="color:var(--amber);font-weight:800">Corners crossed on Mask ${mmState.activeMask + 1} — drag dots to uncross</span>`;
+    } else if (mmState.dragDot && excls[mmState.dragDot.ei]) {
+      const pt = excls[mmState.dragDot.ei][mmState.dragDot.ci];
+      const rot = cam.rotate || 0;
+      const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
+      const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
+      hint.textContent = `Mask ${mmState.dragDot.ei + 1} · Corner ${mmState.dragDot.ci + 1} · px (${Math.round(pt[0] * srcW)}, ${Math.round(pt[1] * srcH)})`;
+    } else {
+      hint.textContent = 'Drag 4 dots onto mirror corners · Drag mask to slide · Wheel/pinch or drag background to pan';
+    }
+  }
+}
+
+function openMaskModal(idx, focusMaskIdx = 0) {
+  if (!cfg || !cfg.cameras[idx]) return;
+  if (previewCropped[idx]) {
+    previewCropped[idx] = false;
+    $(`stream-${idx}`).src = streamUrlFor(idx);
+  }
+  editTarget[idx] = 'excl';
+  syncCropOverlay(idx);
+
+  mmState.open = true;
+  mmState.camIdx = idx;
+  mmState.activeMask = focusMaskIdx;
+  mmState.hires = false;
+  mmState.dragDot = null;
+  mmState.pendingFit = true;
+
+  $('maskModal').hidden = false;
+  document.body.style.overflow = 'hidden';
+  updateModalMediaSrc();
+  if ((cfg.cameras[idx].exclusions || []).length) fitMaskInModal();
+  else fitCropInModal();
+}
+
+function closeMaskModal() {
+  if (!mmState.open) return;
+  mmState.open = false;
+  mmState.dragDot = null;
+  $('maskModal').hidden = true;
+  document.body.style.overflow = '';
+  const img = $('mmStream');
+  if (img) img.removeAttribute('src');
+  syncCropOverlay(mmState.camIdx);
+}
+
+function wireMaskModal() {
+  const vp = $('mmViewport');
+  const img = $('mmStream');
+  if (!vp || !img) return;
+
+  img.addEventListener('load', () => {
+    if (!mmState.open) return;
+    if (mmState.pendingFit) {
+      mmState.pendingFit = false;
+      if ((cfg.cameras[mmState.camIdx]?.exclusions || []).length) fitMaskInModal();
+      else fitCropInModal();
+    }
+  });
+
+  const activePointers = new Map();
+  let drag = null;
+  let pinch = null;
+
+  vp.addEventListener('pointerdown', (e) => {
+    if (!mmState.open) return;
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.size === 2) {
+      drag = null;
+      mmState.dragDot = null;
+      const pts = Array.from(activePointers.values());
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const midX = (pts[0].x + pts[1].x) / 2;
+      const midY = (pts[0].y + pts[1].y) / 2;
+      const vpRect = vp.getBoundingClientRect();
+      const { baseW, baseH } = modalBaseMetrics();
+      const ax = midX - vpRect.left;
+      const ay = midY - vpRect.top;
+      pinch = {
+        startDist: Math.max(10, dist),
+        startZoom: mmState.zoom,
+        ux: (ax - mmState.panX) / Math.max(1, baseW * mmState.zoom),
+        uy: (ay - mmState.panY) / Math.max(1, baseH * mmState.zoom),
+      };
+      return;
+    }
+
+    e.preventDefault();
+    vp.setPointerCapture(e.pointerId);
+    const camIdx = mmState.camIdx;
+    const dotEl = e.target.closest('.quad-dot');
+    const polyEl = e.target.closest('.quad-poly');
+    const canvas = $('mmCanvas');
+    const rect = canvas.getBoundingClientRect();
+
+    if (dotEl && rect.width && rect.height) {
+      const ei = Number(dotEl.dataset.exclIdx);
+      const ci = Number(dotEl.dataset.cornerIdx);
+      mmState.activeMask = ei;
+      mmState.dragDot = { ei, ci };
+      drag = { pid: e.pointerId, type: 'dot', ei, ci };
+      renderMaskModal();
+      return;
+    }
+
+    if (polyEl && rect.width && rect.height) {
+      const ei = Number(polyEl.dataset.exclIdx);
+      const q = cfg.cameras[camIdx].exclusions[ei];
+      if (!q) return;
+      mmState.activeMask = ei;
+      drag = {
+        pid: e.pointerId,
+        type: 'move',
+        ei,
+        sx: e.clientX,
+        sy: e.clientY,
+        w: rect.width,
+        h: rect.height,
+        origQuad: q.map(p => [...p]),
+      };
+      renderMaskModal();
+      return;
+    }
+
+    vp.classList.add('panning');
+    drag = {
+      pid: e.pointerId,
+      type: 'pan',
+      sx: e.clientX,
+      sy: e.clientY,
+      origPanX: mmState.panX,
+      origPanY: mmState.panY,
+    };
+  });
+
+  vp.addEventListener('pointermove', (e) => {
+    if (!mmState.open) return;
+    if (activePointers.has(e.pointerId)) activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pinch && activePointers.size >= 2) {
+      const pts = Array.from(activePointers.values());
+      const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      const midX = (pts[0].x + pts[1].x) / 2;
+      const midY = (pts[0].y + pts[1].y) / 2;
+      const vpRect = vp.getBoundingClientRect();
+      const { baseW, baseH } = modalBaseMetrics();
+      mmState.zoom = clamp(pinch.startZoom * (dist / pinch.startDist), MM_MIN_ZOOM, MM_MAX_ZOOM);
+      mmState.panX = (midX - vpRect.left) - pinch.ux * baseW * mmState.zoom;
+      mmState.panY = (midY - vpRect.top) - pinch.uy * baseH * mmState.zoom;
+      clampModalPan();
+      renderMaskModal();
+      return;
+    }
+
+    if (!drag || e.pointerId !== drag.pid) return;
+    const camIdx = mmState.camIdx;
+    if (drag.type === 'dot') {
+      const rect = $('mmCanvas').getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const nx = +clamp((e.clientX - rect.left) / rect.width, 0, 1).toFixed(4);
+      const ny = +clamp((e.clientY - rect.top) / rect.height, 0, 1).toFixed(4);
+      cfg.cameras[camIdx].exclusions[drag.ei][drag.ci] = [nx, ny];
+      markDirty();
+      renderMaskModal();
+      syncCropOverlay(camIdx);
+      return;
+    }
+    if (drag.type === 'move') {
+      const dxRaw = (e.clientX - drag.sx) / drag.w;
+      const dyRaw = (e.clientY - drag.sy) / drag.h;
+      const [bx0, by0, bx1, by1] = quadBounds(drag.origQuad);
+      const dx = clamp(dxRaw, -bx0, 1 - bx1);
+      const dy = clamp(dyRaw, -by0, 1 - by1);
+      cfg.cameras[camIdx].exclusions[drag.ei] = drag.origQuad.map(p => [+(p[0] + dx).toFixed(4), +(p[1] + dy).toFixed(4)]);
+      markDirty();
+      renderMaskModal();
+      syncCropOverlay(camIdx);
+      return;
+    }
+    if (drag.type === 'pan') {
+      mmState.panX = drag.origPanX + (e.clientX - drag.sx);
+      mmState.panY = drag.origPanY + (e.clientY - drag.sy);
+      clampModalPan();
+      renderMaskModal();
+    }
+  });
+
+  const endPtr = (e) => {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) pinch = null;
+    if (drag && e.pointerId === drag.pid) {
+      drag = null;
+      mmState.dragDot = null;
+      vp.classList.remove('panning');
+      if (mmState.open) renderMaskModal();
+    }
+  };
+  vp.addEventListener('pointerup', endPtr);
+  vp.addEventListener('pointercancel', endPtr);
+
+  vp.addEventListener('wheel', (e) => {
+    if (!mmState.open) return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
+    setModalZoom(mmState.zoom * factor, e.clientX, e.clientY);
+  }, { passive: false });
+
+  $('mmMaskTabs').addEventListener('click', (e) => {
+    const delBtn = e.target.closest('[data-mm-del]');
+    const camIdx = mmState.camIdx;
+    const list = cfg.cameras[camIdx].exclusions || [];
+    if (delBtn) {
+      const ei = Number(delBtn.dataset.mmDel);
+      if (ei >= 0 && ei < list.length) list.splice(ei, 1);
+      if (mmState.activeMask >= list.length) mmState.activeMask = Math.max(0, list.length - 1);
+      if (!list.length) editTarget[camIdx] = 'crop';
+      markDirty();
+      syncCropOverlay(camIdx);
+      renderMaskModal();
+      return;
+    }
+    const tab = e.target.closest('[data-mm-tab]');
+    if (tab) {
+      mmState.activeMask = Number(tab.dataset.mmTab);
+      fitMaskInModal();
+    }
+  });
+
+  $('mmAddBtn').onclick = () => {
+    const cam = cfg.cameras[mmState.camIdx];
+    const list = (cam.exclusions ||= []);
+    if (list.length >= MAX_EXCLUSIONS) return;
+    list.push(defaultQuadFor(cam, list.length, modalVisibleNormBox()));
+    mmState.activeMask = list.length - 1;
+    editTarget[mmState.camIdx] = 'excl';
+    markDirty();
+    syncCropOverlay(mmState.camIdx);
+    fitMaskInModal();
+  };
+
+  $('mmClearBtn').onclick = () => {
+    cfg.cameras[mmState.camIdx].exclusions = [];
+    mmState.activeMask = 0;
+    editTarget[mmState.camIdx] = 'crop';
+    markDirty();
+    syncCropOverlay(mmState.camIdx);
+    renderMaskModal();
+  };
+
+  $('mmHiresBtn').onclick = () => {
+    mmState.hires = !mmState.hires;
+    updateModalMediaSrc();
+  };
+
+  $('mmRefreshBtn').onclick = () => {
+    if (mmState.hires) updateModalMediaSrc();
+  };
+
+  $('mmSaveBtn').onclick = () => saveConfig($('mmSaveBtn'));
+  $('mmCloseBtn').onclick = closeMaskModal;
+  $('mmFitMaskBtn').onclick = fitMaskInModal;
+  $('mmFitCropBtn').onclick = fitCropInModal;
+  $('mmZoomRange').oninput = (e) => setModalZoom(Number(e.target.value));
+
+  document.querySelectorAll('[data-mmz]').forEach(btn => {
+    btn.onclick = () => setModalZoom(Number(btn.dataset.mmz));
+  });
+
+  window.addEventListener('resize', () => { if (mmState.open) renderMaskModal(); });
+  window.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && mmState.open) {
+      closeMaskModal();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      saveConfig(mmState.open ? $('mmSaveBtn') : $('saveAllTop'));
+    }
+  });
 }
 
 function streamUrlFor(idx) {
@@ -3286,7 +4037,10 @@ function renderCameras() {
             <div class="handle sw" data-handle="sw"></div>
             <div class="handle se" data-handle="se"></div>
           </div>
-          <div id="exclWrap-${idx}"></div>
+          <div class="excl-wrap" id="exclWrap-${idx}">
+            <svg class="excl-svg" id="exclSvg-${idx}" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
+            <div id="exclDots-${idx}"></div>
+          </div>
         </div>
       </div>
       <div class="crop-info">
@@ -3301,6 +4055,7 @@ function renderCameras() {
         <span style="font-size:12px;color:var(--mut)">Edit:</span>
         <button class="btn sec sm on" type="button" data-emode="${idx}:crop" id="modeCrop-${idx}">Frame Crop (Blue)</button>
         <button class="btn sec sm" type="button" data-emode="${idx}:excl" id="modeExcl-${idx}" disabled>Edit Masks</button>
+        <button class="btn sec sm" type="button" data-zoomexcl="${idx}" id="zoomExcl-${idx}" disabled>⤢ Zoom Masks</button>
         <button class="btn red sm" type="button" data-addexcl="${idx}" id="addExcl-${idx}">+ Mask Mirror (Red)</button>
         <button class="btn sec sm" type="button" data-exclclear="${idx}">Clear Masks</button>
       </div>
@@ -3338,7 +4093,10 @@ function renderCameras() {
       cfg.cameras[idx].motionThreshold = th;
       const tick = $(`mth-${idx}`);
       if (tick) tick.style.left = clamp((th / 20) * 100, 2, 98) + '%';
+      markDirty();
     };
+    $(`rtsp-${idx}`).oninput = () => markDirty();
+    $(`en-${idx}`).onchange = () => markDirty();
   });
 }
 
@@ -3348,12 +4106,14 @@ $('camGrid').addEventListener('click', (e) => {
   if (b.dataset.reset !== undefined) {
     const idx = Number(b.dataset.reset);
     cfg.cameras[idx].crop = [0, 0, 1, 1];
+    markDirty();
     syncCropOverlay(idx);
     return;
   }
   if (b.dataset.rot !== undefined) {
     const idx = Number(b.dataset.rot);
     cfg.cameras[idx].rotate = ((cfg.cameras[idx].rotate || 0) + 90) % 360;
+    markDirty();
     syncCropOverlay(idx);
     if (previewCropped[idx]) saveConfig();
     return;
@@ -3362,7 +4122,6 @@ $('camGrid').addEventListener('click', (e) => {
     const idx = Number(b.dataset.prev);
     previewCropped[idx] = !previewCropped[idx];
     syncCropOverlay(idx);
-    // Persist crop first if enabling Preview Crop so server stream matches drag box right away.
     if (previewCropped[idx]) saveConfig().then(() => { $(`stream-${idx}`).src = streamUrlFor(idx); });
     else $(`stream-${idx}`).src = streamUrlFor(idx);
     return;
@@ -3375,37 +4134,29 @@ $('camGrid').addEventListener('click', (e) => {
     if (aspectLock[idx]) setZoomAroundCenter(idx, cropZoomFactor(cfg.cameras[idx].crop));
     return;
   }
-  if (b.dataset.excldel !== undefined) {
-    const [iStr, eStr] = b.dataset.excldel.split(':');
-    const idx = Number(iStr);
-    const ei = Number(eStr);
-    const list = cfg.cameras[idx].exclusions || [];
-    if (ei >= 0 && ei < list.length) list.splice(ei, 1);
-    if (!list.length) editTarget[idx] = 'crop';
-    syncCropOverlay(idx);
-    return;
-  }
   if (b.dataset.addexcl !== undefined) {
     const idx = Number(b.dataset.addexcl);
-    if (previewCropped[idx]) {
-      previewCropped[idx] = false;
-      $(`stream-${idx}`).src = streamUrlFor(idx);
-    }
     const list = (cfg.cameras[idx].exclusions ||= []);
+    let focusIdx = Math.max(0, list.length - 1);
     if (list.length < MAX_EXCLUSIONS) {
-      const k = list.length;
-      const dx = (k % 3) * 0.07;
-      const dy = Math.floor(k / 3) * 0.08;
-      list.push([+(0.58 - dx).toFixed(4), +(0.12 + dy).toFixed(4), +(0.86 - dx).toFixed(4), +(0.48 + dy).toFixed(4)]);
+      list.push(defaultQuadFor(cfg.cameras[idx], list.length));
+      focusIdx = list.length - 1;
+      markDirty();
     }
-    editTarget[idx] = 'excl';
-    syncCropOverlay(idx);
+    openMaskModal(idx, focusIdx);
+    return;
+  }
+  if (b.dataset.zoomexcl !== undefined) {
+    const idx = Number(b.dataset.zoomexcl);
+    if (!(cfg.cameras[idx].exclusions || []).length) return;
+    openMaskModal(idx, 0);
     return;
   }
   if (b.dataset.exclclear !== undefined) {
     const idx = Number(b.dataset.exclclear);
     cfg.cameras[idx].exclusions = [];
     editTarget[idx] = 'crop';
+    markDirty();
     syncCropOverlay(idx);
     return;
   }
@@ -3414,22 +4165,22 @@ $('camGrid').addEventListener('click', (e) => {
     const idx = Number(iStr);
     if (mode === 'excl') {
       if (!(cfg.cameras[idx].exclusions || []).length) return;
-      if (previewCropped[idx]) {
-        previewCropped[idx] = false;
-        $(`stream-${idx}`).src = streamUrlFor(idx);
-      }
+      openMaskModal(idx, 0);
+      return;
     }
     editTarget[idx] = mode;
     syncCropOverlay(idx);
     return;
   }
   if (b.dataset.save !== undefined) {
-    saveConfig();
+    saveConfig(b);
   }
 });
 
-async function saveConfig() {
+async function saveConfig(triggerBtn = null) {
   if (!cfg) return;
+  if (triggerBtn) setBtnFeedback(triggerBtn, 'saving', 'Saving…');
+
   const cameras = cfg.cameras.map((c, idx) => ({
     ...c,
     rtspUrl: $(`rtsp-${idx}`).value.trim(),
@@ -3453,14 +4204,32 @@ async function saveConfig() {
     wallboard,
   };
   const prevUrls = cfg.cameras.map(c => c.rtspUrl);
-  const res = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(r => r.json());
-  $('saveMsg').textContent = res.ok ? 'Saved & applied live!' : 'Save failed';
-  $('wbOut').textContent = res.ok ? 'Saved!' : 'Save failed';
-  cfg.cameras = cameras;
-  cfg.wallboard = wallboard;
-  cameras.forEach((c, idx) => {
-    if (c.rtspUrl !== prevUrls[idx]) $(`stream-${idx}`).src = streamUrlFor(idx);
-  });
+  try {
+    const resp = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const res = await resp.json();
+    if (!res || !res.ok) throw new Error('Save rejected');
+    const stamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    $('saveMsg').textContent = `Saved & applied live! (${stamp})`;
+    $('wbOut').textContent = `Saved! (${stamp})`;
+    cfg.cameras = cameras;
+    cfg.wallboard = wallboard;
+    cameras.forEach((c, idx) => {
+      if (c.rtspUrl !== prevUrls[idx]) $(`stream-${idx}`).src = streamUrlFor(idx);
+    });
+    markDirty(false);
+    if (triggerBtn) {
+      setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2200);
+      showToast(triggerBtn === $('mmSaveBtn') ? '✓ Masks saved & applied live' : '✓ Saved & applied live', 'ok');
+    }
+  } catch (err) {
+    $('saveMsg').textContent = 'Save failed';
+    $('wbOut').textContent = 'Save failed';
+    if (triggerBtn) {
+      setBtnFeedback(triggerBtn, 'save-err', '✗ Save Failed', 3000);
+      showToast('✗ Save failed — check OptiPlex server', 'err');
+    }
+  }
 }
 
 async function pollStatus() {
@@ -3469,7 +4238,7 @@ async function pollStatus() {
     const badge = $('svcBadge');
     badge.textContent = st.recording ? (st.paused ? 'PAUSED' : 'RECORDING') : 'STANDBY RING';
     badge.className = 'pill ' + (st.recording ? 'ok' : 'live');
-    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB · Drag box corners to zoom/crop, toggle <b>Preview Crop</b>, then hit <b>Save</b>.`;
+    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB · Drag crop corners or <b>4-dot Mirror Masks</b> (use <b>Zoom Masks</b> for angled corners), then click <b>Save</b>.`;
     st.cameras.forEach((c, idx) => {
       const sEl = $(`camState-${idx}`);
       if (sEl) {
@@ -3482,6 +4251,15 @@ async function pollStatus() {
       if (mEl) {
         mEl.style.width = clamp((c.latestEnergy / 20) * 100, 0, 100) + '%';
         mEl.classList.toggle('hot', c.latestEnergy >= c.motionThreshold);
+      }
+      if (mmState.open && mmState.camIdx === idx) {
+        const mmTxt = $('mmMotionTxt');
+        const mmBar = $('mmMotionBar');
+        if (mmTxt) mmTxt.textContent = `Motion: ${c.latestEnergy.toFixed(2)} / ${c.motionThreshold}`;
+        if (mmBar) {
+          mmBar.style.width = clamp((c.latestEnergy / 20) * 100, 0, 100) + '%';
+          mmBar.classList.toggle('hot', c.latestEnergy >= c.motionThreshold);
+        }
       }
     });
     if (st.wallboard) {
@@ -3529,6 +4307,9 @@ async function pollClips() {
 
 async function init() {
   cfg = await fetch('/api/config').then(r => r.json());
+  (cfg.cameras || []).forEach(c => {
+    c.exclusions = (Array.isArray(c.exclusions) ? c.exclusions : []).map(normQuad).filter(Boolean);
+  });
   $('retDays').value = cfg.retentionDays;
   $('preRoll').value = cfg.preRollSec;
   $('driveDir').value = cfg.driveBackupDir || '';
@@ -3540,14 +4321,22 @@ async function init() {
   $('wbWake').value = wb.wakeOnStart === false ? '0' : '1';
   $('wbSleep').value = wb.sleepOnStop === false ? '0' : '1';
   renderCameras();
+  wireMaskModal();
   await Promise.all([pollStatus(), pollClips()]);
   setInterval(pollStatus, 1000);
   setInterval(pollClips, 6000);
 }
 
-$('saveBtn').onclick = saveConfig;
-$('saveAllTop').onclick = saveConfig;
-$('wbSaveBtn').onclick = saveConfig;
+['retDays', 'preRoll', 'driveDir', 'wbHost', 'wbPort', 'wbIdleMin'].forEach(id => {
+  $(id).addEventListener('input', () => markDirty());
+});
+['wbClient', 'wbWake', 'wbSleep'].forEach(id => {
+  $(id).addEventListener('change', () => markDirty());
+});
+
+$('saveBtn').onclick = () => saveConfig($('saveBtn'));
+$('saveAllTop').onclick = () => saveConfig($('saveAllTop'));
+$('wbSaveBtn').onclick = () => saveConfig($('wbSaveBtn'));
 $('wbPairBtn').onclick = async () => {
   await saveConfig();
   $('wbOut').textContent = 'Connecting ADB…';
@@ -3858,7 +4647,8 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_snapshot() -> Response:
         cam = request.args.get("camera")
         raw = request.args.get("raw") in ("1", "true", "yes")
-        jpg = service.get_snapshot_jpeg(cam, raw=raw)
+        hires = request.args.get("hires") in ("1", "true", "yes")
+        jpg = service.get_snapshot_jpeg(cam, raw=raw, hires=hires)
         if not jpg:
             return Response(status=404)
         resp = Response(jpg, mimetype="image/jpeg")
