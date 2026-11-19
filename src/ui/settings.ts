@@ -9,6 +9,7 @@ import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { liftSettings, toDisplay, fmtNum, fromDisplay } from '../lifts/settings';
+import { lifts } from '../lifts/store';
 import { gymCam } from '../lifts/gymCam';
 import { voice } from '../lifts/voice';
 import { VOICE_ALIAS_SLOTS, VOICE_COMMAND_GROUPS, type VoiceAliasSlot } from '../lifts/voiceParser';
@@ -59,6 +60,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       </div>
       <div class="line" style="margin-top:10px"><span>Gym Camera DVR<small>Probes OptiPlex silently on home Wi-Fi; stays hidden away</small></span>${tog('gymCamEnabled', s.gymCamEnabled)}</div>
       <div class="line"><span>Auto-clip PR sets (★)<small>Automatically clips new 1RM–40RM personal records</small></span>${tog('gymCamAutoPr', s.gymCamAutoPr)}</div>
+      <div class="line"><span>Lifting With a Buddy<small>Locks Auto camera fallbacks to your exercise default (or Rack) across workouts</small></span>${tog('gymCamBuddyMode', s.gymCamBuddyMode)}</div>
       <label class="field">Gym Camera DVR URL<input id="camUrl" value="${esc(s.gymCamUrl || 'http://192.168.1.152:8766')}" placeholder="http://192.168.1.152:8766" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
       <div class="row" style="margin-top:6px"><button class="btn sm" id="camTest">Test Cam</button><span id="camOut" class="hint"></span></div>
     </section>
@@ -233,6 +235,11 @@ export function settingsScreen(root: HTMLElement): () => void {
     if (camIn && document.activeElement !== camIn) {
       camIn.value = cur.gymCamUrl || 'http://192.168.1.152:8766';
     }
+    const buddyTg = root.querySelector<HTMLElement>('[data-tog="gymCamBuddyMode"]');
+    if (buddyTg) {
+      buddyTg.classList.toggle('on', !!cur.gymCamBuddyMode);
+      buddyTg.setAttribute('aria-checked', String(!!cur.gymCamBuddyMode));
+    }
   };
   paintFtpBox();
   const offSet = settingsChanged.on(paintFtpBox);
@@ -251,13 +258,17 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'wallboardRelayEnabled' | 'voiceReadback';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'gymCamBuddyMode' | 'wallboardRelayEnabled' | 'voiceReadback';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
       if (name === 'gymCamEnabled') void gymCam.probe();
+      if (name === 'gymCamBuddyMode' && lifts.active) {
+        lifts.active.buddyMode = on;
+        lifts.saveSession(lifts.active, true);
+      }
       if (name === 'simulator') {
         if (on) { hrLink.release(); bikeLink.release(); spinLink.release(); }
         else sim.stop();

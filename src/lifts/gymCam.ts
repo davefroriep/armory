@@ -233,6 +233,7 @@ class GymCamController {
 
   async sessionFinish(s: LiftSession): Promise<void> {
     this.armed = null;
+    this.guestArmed = null;
     if (!this.online) return;
     await this.postJson('/api/session/stop', { sessionId: s.camSessionId ?? s.id, discard: false });
     this.recording = false;
@@ -242,6 +243,7 @@ class GymCamController {
 
   async sessionDiscard(s: LiftSession): Promise<void> {
     this.armed = null;
+    this.guestArmed = null;
     if (!this.online) return;
     await this.postJson('/api/session/stop', { sessionId: s.camSessionId ?? s.id, discard: true });
     this.recording = false;
@@ -610,7 +612,7 @@ class GymCamController {
     const res = await this.postJson<ClipApiResponse>('/api/clip', {
       sessionId: s?.camSessionId ?? meta.sessionId,
       exId: meta.exId,
-      exName: lifts.exOrStub(meta.exId).name,
+      exName: meta.guest ? 'Guest Clip' : lifts.exOrStub(meta.exId).name,
       setId: meta.setId,
       startMs: nextStartMs,
       endMs: nextEndMs,
@@ -656,7 +658,7 @@ class GymCamController {
     const res = await this.postJson<ClipApiResponse>('/api/clip', {
       sessionId: s?.camSessionId ?? meta.sessionId,
       exId: meta.exId,
-      exName: lifts.exOrStub(meta.exId).name,
+      exName: meta.guest ? 'Guest Clip' : lifts.exOrStub(meta.exId).name,
       setId: meta.setId,
       startMs: meta.clipStartMs,
       endMs: meta.clipEndMs,

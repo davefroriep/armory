@@ -67,6 +67,8 @@ export interface Settings {
   gymCamEnabled: boolean;
   gymCamUrl: string;
   gymCamAutoPr: boolean;
+  /** Persistent Buddy Mode lock: avoids motion-based Auto camera fallbacks across workouts. */
+  gymCamBuddyMode: boolean;
   /** Current position in the rolling training queue. */
   queue: QueueState;
 }
@@ -113,6 +115,7 @@ export const DEFAULTS: Settings = {
   gymCamEnabled: true,
   gymCamUrl: 'http://192.168.1.152:8766',
   gymCamAutoPr: true,
+  gymCamBuddyMode: false,
   queue: defaultQueueState(),
 };
 
@@ -137,6 +140,7 @@ function load(): Settings {
       ...parsed,
       apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
       voiceReadback: typeof parsed.voiceReadback === 'boolean' ? parsed.voiceReadback : DEFAULTS.voiceReadback,
+      gymCamBuddyMode: typeof parsed.gymCamBuddyMode === 'boolean' ? parsed.gymCamBuddyMode : DEFAULTS.gymCamBuddyMode,
       voiceCustomAliases: sanitizeAliases(parsed.voiceCustomAliases),
       queue: q,
     };

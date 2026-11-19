@@ -3,6 +3,7 @@ import { GROUPS, MUSCLE_LABEL, WEEKLY_BAND } from '../../lifts/muscles';
 import { fmtKg, liftSettings, toDisplay } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { fmtVolume } from '../../lifts/summary';
+import { shortCamLabel } from '../../lifts/tape';
 import { esc } from '../dom';
 import { barChart } from './charts';
 import { LI, mount, relDay, resumeBar, tabBar, wireClock } from './kit';
@@ -85,7 +86,7 @@ export function progressScreen(root: HTMLElement): () => void {
           <section class="card"><div class="card-h"><span>WORKOUTS PER WEEK</span></div>${barChart(bars)}</section>
           ${top ? `<section class="card"><div class="card-h"><span>YOUR LIFTS</span><a class="link" href="#/strength/exercises">All exercises</a></div>${top}</section>` : ''}
           ${prHtml ? `<section class="card prs"><div class="card-h"><span>RECENT RECORDS</span></div>${prHtml}</section>` : ''}
-          ${clips.length ? `<section class="card"><div class="card-h"><span>LIFT VIDEOS</span></div><div class="vscroll">${clips.map((v) => `<button class="vthumb lg" data-play="${v.id}" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}"><i>▶</i><small>${esc(exOf(v.exId).name)}</small></button>`).join('')}</div></section>` : ''}
+          ${clips.length ? `<section class="card"><div class="card-h"><span>LIFT VIDEOS</span></div><div class="vscroll">${clips.map((v) => `<button class="vthumb lg" data-play="${v.id}" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}"><i>▶</i><small>${esc(v.guest ? (v.camera ? `Guest · ${shortCamLabel(v.camera)}` : 'Guest Clip') : exOf(v.exId).name)}</small></button>`).join('')}</div></section>` : ''}
           ${sessions.length ? '' : '<div class="empty big">Nothing to chart yet.<br>Your numbers show up after the first workout.</div>'}
         </main>${resumeBar()}${tabBar('progress')}`;
     };

@@ -550,21 +550,23 @@ export function pickRecordCameraSheet(
   exName: string,
   setLabel: string,
   preferredCam?: string,
-): Promise<{ kind: 'cam'; camera?: string } | { kind: 'link' } | { kind: 'cancel' }> {
+  buddyMode = false,
+): Promise<{ kind: 'cam'; camera?: string; explicitAuto?: boolean } | { kind: 'link' } | { kind: 'cancel' }> {
   const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+  const effectiveDef = preferredCam || (buddyMode ? cams[0] : undefined);
   return new Promise((resolve) => {
-    let out: { kind: 'cam'; camera?: string } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
+    let out: { kind: 'cam'; camera?: string; explicitAuto?: boolean } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
     const sh = openSheet(
       `<h3 class="sh-title">${esc(exName)} · ${esc(setLabel)}</h3>
-       <div class="fl">WHICH CAMERA TO RECORD?</div>
+       <div class="fl">${buddyMode ? 'WHICH CAMERA TO RECORD? · 👥 BUDDY MODE' : 'WHICH CAMERA TO RECORD?'}</div>
        <div class="vcam-pick">
          ${cams.map((c) => `
-           <button class="vcam-btn${c === preferredCam ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
+           <button class="vcam-btn${c === effectiveDef ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
              <b>${esc(shortCamLabel(c))}</b>
-             <small>${c === preferredCam ? '★ Default · stops on ✓' : 'Auto-stops when you tap ✓'}</small>
+             <small>${c === preferredCam ? '★ Default · stops on ✓' : (buddyMode && c === effectiveDef ? '★ Buddy lock · stops on ✓' : 'Auto-stops when you tap ✓')}</small>
            </button>`).join('')}
        </div>
-       <button class="btn big" type="button" data-rcam="">Auto (Strongest Motion Zone)</button>
+       ${buddyMode ? '' : '<button class="btn big" type="button" data-rcam="">Auto (Strongest Motion Zone)</button>'}
        <button class="btn big" type="button" data-rlink>Link Existing Tape / Phone Video…</button>
        <button class="btn big" type="button" data-rcancel>Cancel</button>`,
       { onClose: () => resolve(out) },
@@ -574,7 +576,7 @@ export function pickRecordCameraSheet(
       const camBtn = el.closest<HTMLElement>('[data-rcam]');
       if (camBtn) {
         const picked = camBtn.dataset.rcam?.trim();
-        out = picked ? { kind: 'cam', camera: picked } : { kind: 'cam' };
+        out = picked ? { kind: 'cam', camera: picked } : { kind: 'cam', explicitAuto: true };
         sh.close();
         return;
       }
@@ -1930,7 +1932,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
      ${ctx?.target ? '<button class="btn big" type="button" data-vmanage>+ Add / Manage Clips</button>' : ''}
      <div class="vp-foot-row">
        <button class="btn sm" type="button" data-vedit>Edit filename / URL</button>
-       <button class="btn sm danger" type="button" data-del>${meta.linkOnly ? 'Unlink' : 'Delete'}</button>
+       <button class="btn sm danger" type="button" data-del>${meta.linkOnly && meta.source !== 'gymcam' ? 'Unlink' : 'Delete'}</button>
      </div>
      <button class="btn big" type="button" data-ok>Close</button>`,
     {
@@ -2832,9 +2834,11 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       void playVideo(meta!.id, ctx);
     } else if (t.closest('[data-del]')) {
       const isGym = meta!.source === 'gymcam';
-      const title = isGym ? 'Delete Gym Cam clip?' : (meta!.linkOnly ? 'Unlink this video?' : 'Delete this video?');
+      const title = isGym ? (meta!.guest ? 'Delete Guest Clip?' : 'Delete Gym Cam clip?') : (meta!.linkOnly ? 'Unlink this video?' : 'Delete this video?');
       const msg = isGym
-        ? 'Removes this clip from the set, OptiPlex, and Google Drive (your 14-day raw tape stays intact).'
+        ? (meta!.guest
+          ? 'Removes this guest clip from this session, OptiPlex, and Google Drive (your 14-day raw tape stays intact).'
+          : 'Removes this clip from the set, OptiPlex, and Google Drive (your 14-day raw tape stays intact).')
         : (meta!.linkOnly ? 'Removes this link from the set (keeps the file on your phone & Drive).' : 'It is removed from this phone.');
       const okLbl = (meta!.linkOnly && !isGym) ? 'Unlink' : 'Delete';
       if (await confirmSheet(title, msg, okLbl, true)) {
@@ -2843,7 +2847,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         await lifts.deleteVideo(id);
         await resetTimerIfIdle(lifts.sessions.get(meta!.sessionId));
         sh.close();
-        toast(isGym ? 'Clip deleted from set, OptiPlex & Drive' : (meta!.linkOnly ? 'Video unlinked' : 'Video deleted'));
+        toast(isGym ? (meta!.guest ? 'Guest clip deleted from session, OptiPlex & Drive' : 'Clip deleted from set, OptiPlex & Drive') : (meta!.linkOnly ? 'Video unlinked' : 'Video deleted'));
       }
     }
   });

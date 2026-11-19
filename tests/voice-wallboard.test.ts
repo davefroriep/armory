@@ -3,6 +3,7 @@ import { parentHash } from '../src/nav';
 import { LIBRARY_BY_ID } from '../src/lifts/library';
 import { PHASE1_ROUTINES } from '../src/lifts/seed';
 import { defaultQueueState } from '../src/domain/plan';
+import { DEFAULTS } from '../src/store/settings';
 import { KG_PER_LB } from '../src/lifts/settings';
 import {
   advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
@@ -815,5 +816,17 @@ describe('wallboard snapshot & routing', () => {
     expect(defaultReadbackForIntent({ kind: 'wb_replay', slow: true })).toBe('Replaying slow motion on TV');
     expect(defaultReadbackForIntent({ kind: 'wb_close_replay' })).toBe('Closing video');
     expect(defaultReadbackForIntent({ kind: 'cam_guest', camera: 'Smith Cam' })).toBe('Guest camera Smith');
+
+    expect(DEFAULTS.gymCamBuddyMode).toBe(false);
+    expect(parseVoiceTranscript('Armory buddy mode on')).toEqual({ kind: 'buddy_mode', on: true });
+    expect(parseVoiceTranscript('Armory enable buddy mode')).toEqual({ kind: 'buddy_mode', on: true });
+    expect(parseVoiceTranscript('Armory lifting with a buddy')).toEqual({ kind: 'buddy_mode', on: true });
+    expect(parseVoiceTranscript('Armory buddy mode off')).toEqual({ kind: 'buddy_mode', on: false });
+    expect(parseVoiceTranscript('Armory solo mode')).toEqual({ kind: 'buddy_mode', on: false });
+    expect(parseVoiceTranscript('Armory buddy mode')).toEqual({ kind: 'buddy_mode' });
+    expect(parseVoiceTranscript('Armory toggle buddy mode')).toEqual({ kind: 'buddy_mode' });
+    expect(defaultReadbackForIntent({ kind: 'buddy_mode', on: true })).toBe('Buddy mode on');
+    expect(defaultReadbackForIntent({ kind: 'buddy_mode', on: false })).toBe('Buddy mode off');
+    expect(defaultReadbackForIntent({ kind: 'buddy_mode' })).toBe('Buddy mode toggled');
   });
 });

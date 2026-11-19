@@ -103,6 +103,7 @@ class ActiveWorkout {
     const s: LiftSession = {
       id: uid(), name: o.name, routineId: o.routineId, eventId: o.eventId,
       ...(o.planSlot ? { planSlot: o.planSlot } : {}),
+      ...(getSettings().gymCamBuddyMode ? { buddyMode: true } : {}),
       startMs: Date.now(), endMs: null,
       status: 'active', started: false, exs: o.exs, rpe: null, bwKg: getSettings().weightKg,
     };

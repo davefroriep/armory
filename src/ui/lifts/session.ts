@@ -19,7 +19,7 @@ import { shortCamLabel } from '../../lifts/tape';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
 import { voice } from '../../lifts/voice';
 import { allowNextRoute } from '../../main';
-import { getSettings } from '../../store/settings';
+import { getSettings, settingsChanged, updateSettings } from '../../store/settings';
 import { setWallboardHoldState } from '../../wallboard/state';
 import { wallboard } from '../../wallboard/sync';
 import { wireChips } from '../chrome';
@@ -66,6 +66,12 @@ function build(root: HTMLElement, id?: string): () => void {
       : computePRs([...lifts.finished().filter((x) => x.id !== s.id), { ...s, status: 'done' as const, startMs: Date.now() + 1 }], exOf);
   };
   const save = (): void => { if (dead || finishing || (!edit && !lifts.sessions.has(s.id))) return; dirty = true; lifts.saveSession(s); };
+  const setBuddyMode = (next: boolean): void => {
+    s.buddyMode = next;
+    save();
+    if (getSettings().gymCamBuddyMode !== next) updateSettings({ gymCamBuddyMode: next });
+    paintCamPill();
+  };
   const find = (uid: string): SessionEx => s.exs.find((e) => e.uid === uid)!;
 
   // ---------- render ----------
@@ -370,6 +376,15 @@ function build(root: HTMLElement, id?: string): () => void {
   };
   const offVoice = edit ? () => {} : voice.changed.on(syncVisibleCards);
   const offCam = edit ? () => {} : gymCam.changed.on(() => { if (!dead) syncVisibleCards(); });
+  const offAppSet = edit ? () => {} : settingsChanged.on((cur) => {
+    if (dead) return;
+    const want = !!cur.gymCamBuddyMode;
+    if (!!s.buddyMode !== want) {
+      s.buddyMode = want;
+      save();
+    }
+    paintCamPill();
+  });
   if (!edit) {
     voice.setLiftScreenMounted(true);
     voice.holdStarter = (exUid, setId, seconds) => {
@@ -1018,7 +1033,7 @@ function build(root: HTMLElement, id?: string): () => void {
             ? `<div class="fl">RECORD GUEST / BUDDY CLIP (NO LOG ENTRY)</div>
                <div class="vp-foot-row" style="margin:6px 0 10px">
                  ${cams.map((c) => `<button class="btn sm" type="button" data-gstart="${esc(c)}">● ${esc(shortCamLabel(c))}</button>`).join('')}
-                 <button class="btn sm" type="button" data-gstart="">● Auto</button>
+                 ${s.buddyMode ? '' : '<button class="btn sm" type="button" data-gstart="">● Auto</button>'}
                </div>`
             : '';
         const guestList = guestVids.length
@@ -1048,16 +1063,15 @@ function build(root: HTMLElement, id?: string): () => void {
         const el = ev.target as HTMLElement;
         if (el.closest('[data-cok]')) { sh.close(); return; }
         if (el.closest('[data-buddy]')) {
-          s.buddyMode = !s.buddyMode;
-          save();
-          paintCamPill();
+          setBuddyMode(!s.buddyMode);
           renderCamSheet();
           return;
         }
         const gStart = el.closest<HTMLElement>('[data-gstart]');
         if (gStart) {
           active.ensureStarted(s, true);
-          gymCam.armGuest(s, gStart.dataset.gstart || undefined);
+          const effCam = gStart.dataset.gstart || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+          gymCam.armGuest(s, effCam);
           paintCamPill();
           sh.close();
           toast('Guest clip recording — tap ● GUEST REC or say “Armory guest record” to save');
@@ -1203,7 +1217,7 @@ function build(root: HTMLElement, id?: string): () => void {
           return;
         }
         if (gymCam.online && !set.done) {
-          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel, camForEx(se));
+          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel, camForEx(se), !!s.buddyMode);
           if (dead || choice.kind === 'cancel') return;
           if (choice.kind === 'cam') {
             active.ensureStarted(s, true);
@@ -1212,7 +1226,9 @@ function build(root: HTMLElement, id?: string): () => void {
               se.camPref = choice.camera;
               save();
             }
-            const effCam = choice.camera || camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+            const effCam = choice.explicitAuto && !s.buddyMode
+              ? undefined
+              : (choice.camera || camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined));
             gymCam.armSet(s, se, set, effCam);
             buzz(25);
             syncVisibleCards();
@@ -1253,6 +1269,11 @@ function build(root: HTMLElement, id?: string): () => void {
     void setKeepScreenOn(true);
     document.addEventListener('visibilitychange', onVisKeepAwake);
     voice.finishTrigger = () => { void finish(); };
+    voice.buddyHandler = (on) => {
+      const next = on ?? !s.buddyMode;
+      setBuddyMode(next);
+      return next ? 'Buddy mode on' : 'Buddy mode off';
+    };
     voice.camHandler = async (mode, camera) => {
       if (mode === 'guest') {
         if (gymCam.guestArmed) {
@@ -1266,9 +1287,10 @@ function build(root: HTMLElement, id?: string): () => void {
         }
         if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
         active.ensureStarted(s, true);
-        gymCam.armGuest(s, camera);
+        const effCam = camera || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+        gymCam.armGuest(s, effCam);
         if (!dead) paintCamPill();
-        const camLbl = camera ? shortCamLabel(camera) : 'Auto';
+        const camLbl = effCam ? shortCamLabel(effCam) : 'Auto';
         return `Guest recording ${camLbl}`;
       }
       if (mode === 'arm') {
@@ -1380,10 +1402,11 @@ function build(root: HTMLElement, id?: string): () => void {
     stopHold();
     document.removeEventListener('visibilitychange', onVisKeepAwake);
     window.visualViewport?.removeEventListener('resize', onVvResize);
-    offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice(); offCam();
+    offTick(); offRest(); offChips(); offCfg(); offStore(); offVoice(); offCam(); offAppSet();
     if (!edit) {
       voice.holdStarter = null;
       voice.finishTrigger = null;
+      voice.buddyHandler = null;
       voice.camHandler = null;
       voice.replayHandler = null;
       voice.setLiftScreenMounted(false);

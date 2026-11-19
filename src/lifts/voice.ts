@@ -66,6 +66,7 @@ const BASE_BIAS = [
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
   'camera', 'record set', 'record rack', 'record smith', 'rack camera', 'smith camera', 'clip that', 'save clip', 'clip rack', 'clip smith',
   'replay', 'replay slow', 'play set', 'close video', 'guest record', 'guest rack', 'guest smith',
+  'buddy mode', 'buddy mode on', 'buddy mode off', 'solo mode',
 ];
 
 class VoiceController {
@@ -80,6 +81,7 @@ class VoiceController {
   finishTrigger: (() => void) | null = null;
   camHandler: ((mode: 'arm' | 'clip_last' | 'guest', camera?: string) => Promise<string | null> | string | null) | null = null;
   replayHandler: ((req: { exQuery?: string; setNum?: number; slow?: boolean; close?: boolean }) => Promise<string | null> | string | null) | null = null;
+  buddyHandler: ((on?: boolean) => string | null) | null = null;
 
   readonly changed = new Emitter<void>();
   readonly toasted = new Emitter<{ msg: string; kind?: 'pr' }>();
@@ -510,6 +512,23 @@ class VoiceController {
         false,
         fallbackSpeech,
       );
+    }
+    if (intent.kind === 'buddy_mode') {
+      if (this.buddyHandler) {
+        const msg = this.buddyHandler(intent.on) || fallbackSpeech || 'Buddy mode updated';
+        buzz(20);
+        return this.notice(msg, 'info', true, msg);
+      }
+      const next = intent.on ?? !getSettings().gymCamBuddyMode;
+      updateSettings({ gymCamBuddyMode: next });
+      const act = active.session;
+      if (act) {
+        act.buddyMode = next;
+        lifts.saveSession(act, true);
+      }
+      buzz(20);
+      const speech = next ? 'Buddy mode on' : 'Buddy mode off';
+      return this.notice(speech, 'info', true, speech);
     }
 
     const cur = resolveTargetSet(s.exs, this.cursor);

@@ -18,6 +18,7 @@ export type VoiceIntent =
   | { kind: 'cam_arm'; camera?: string }
   | { kind: 'cam_clip_last'; camera?: string }
   | { kind: 'cam_guest'; camera?: string }
+  | { kind: 'buddy_mode'; on?: boolean }
   | { kind: 'wb_replay'; exQuery?: string; setNum?: number; slow?: boolean }
   | { kind: 'wb_close_replay' };
 
@@ -88,9 +89,9 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
     examples: ['skip rest', 'end rest', 'more rest', 'add 30 seconds', 'minus 15 seconds', 'start hold 45'],
   },
   {
-    title: 'Gym Camera DVR & Guest Clips',
+    title: 'Gym Camera DVR, Buddy & Guest Clips',
     slot: 'cam_arm',
-    examples: ['record', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith', 'guest record', 'guest smith'],
+    examples: ['record', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith', 'guest record', 'guest smith', 'buddy mode on', 'buddy mode off', 'buddy mode'],
   },
   {
     title: 'Wallboard TV Video Replay',
@@ -388,6 +389,16 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): Voi
     return { kind: 'wb_replay', exQuery: repLastEx[1].trim(), ...(slow ? { slow: true } : {}) };
   }
 
+  if (/^(?:(?:turn\s+on|enable|start|activate)\s+buddy(?:\s+mode)?|buddy(?:\s+mode)?\s+on|lifting\s+with\s+(?:a\s+)?buddy)$/.test(tail)) {
+    return { kind: 'buddy_mode', on: true };
+  }
+  if (/^(?:(?:turn\s+off|disable|stop|exit|end)\s+buddy(?:\s+mode)?|buddy(?:\s+mode)?\s+off|solo(?:\s+mode)?(?:\s+on)?|lifting\s+solo|lifting\s+alone)$/.test(tail)) {
+    return { kind: 'buddy_mode', on: false };
+  }
+  if (/^(?:toggle\s+)?buddy(?:\s+mode)?$/.test(tail)) {
+    return { kind: 'buddy_mode' };
+  }
+
   const mapCamTok = (tok?: string): string | undefined =>
     tok === 'rack' ? 'Rack Cam' : tok === 'smith' ? 'Smith Cam' : undefined;
   const camGuestA = tail.match(
@@ -566,6 +577,8 @@ export function defaultReadbackForIntent(intent: VoiceIntent): string | null {
       return 'Clipping last set';
     case 'cam_guest':
       return intent.camera ? `Guest camera ${intent.camera.replace(/ cam$/i, '')}` : 'Guest camera toggled';
+    case 'buddy_mode':
+      return intent.on === true ? 'Buddy mode on' : intent.on === false ? 'Buddy mode off' : 'Buddy mode toggled';
     case 'wb_replay':
       return intent.slow ? 'Replaying slow motion on TV' : 'Replaying on TV';
     case 'wb_close_replay':
