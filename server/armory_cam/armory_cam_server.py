@@ -30,6 +30,7 @@ import threading
 import time
 from typing import Any, Callable
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -82,6 +83,26 @@ try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { t
 
 DEFAULT_DRIVE_BACKUP_BASE = Path(r"J:\My Drive\Backups\ArmoryFit Backup")
 DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+CALIBRATION_MILESTONES = (5, 15, 50)
+DEFAULT_NTFY_TOPIC = "FroriepAntigravity"
+
+
+def send_ntfy_alert(topic: str, title: str, message: str, tags: str = "movie_camera,bell") -> bool:
+    """Send a push notification via ntfy.sh (best-effort, non-blocking failure)."""
+    clean = topic.strip()
+    if not clean:
+        return False
+    req = urllib.request.Request(
+        f"https://ntfy.sh/{urllib.parse.quote(clean)}",
+        data=message.encode("utf-8"),
+        headers={"Title": title, "Tags": tags, "Priority": "default"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=6.0) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
 
 
 def default_root_dir() -> Path:
@@ -1227,6 +1248,7 @@ class ArmoryCamService:
         root_dir: Path | None = None,
         adb_controller: FireTvAdbController | None = None,
         drive_backup_dir: str | Path | None = None,
+        ntfy_topic: str | None = None,
     ) -> None:
         self.root = (root_dir or default_root_dir()).resolve()
         self.ring_root = self.root / "ring"
@@ -1236,6 +1258,7 @@ class ArmoryCamService:
         self.logs_root = self.root / "logs"
         self.config_path = self.root / "config.json"
         self.clips_index_path = self.clips_root / "index.jsonl"
+        self.cal_state_path = self.root / "calibration_state.json"
         for d in (self.root, self.ring_root, self.tapes_root, self.clips_root, self.thumbs_root, self.logs_root):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -1257,6 +1280,12 @@ class ArmoryCamService:
             self.drive_backup_dir = default_drive_backup_dir()
         else:
             self.drive_backup_dir = ""
+        if ntfy_topic is not None:
+            self.ntfy_topic = ntfy_topic.strip()
+        elif root_dir is None:
+            self.ntfy_topic = DEFAULT_NTFY_TOPIC
+        else:
+            self.ntfy_topic = ""
         self.cameras: list[CameraConfig] = []
 
         self.active_session_id: str | None = None
@@ -2461,6 +2490,7 @@ class ArmoryCamService:
             }
             with self.clips_index_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({k: v for k, v in meta.items() if k != "thumb"}) + "\n")
+            self.check_calibration_milestones()
             return meta
         finally:
             concat_path.unlink(missing_ok=True)
@@ -2563,6 +2593,141 @@ class ArmoryCamService:
                 break
         return out
 
+    def delete_clip(self, lan_url: str = "", file_name: str = "") -> dict[str, Any]:
+        """Delete a saved MP4 from local `clips_root`, Google Drive mirror, and `index.jsonl` (preserves raw tapes)."""
+        base_resolved = self.clips_root.resolve()
+        rel_path = ""
+        raw_url = str(lan_url or "").strip()
+        if "/clips/" in raw_url:
+            rel_path = raw_url.split("/clips/", 1)[1].split("?", 1)[0].strip("/")
+        parts = [p for p in rel_path.split("/") if p] if rel_path else []
+        target_name = Path(parts[-1]).name if parts else Path(str(file_name or "").strip()).name
+        candidates: list[Path] = []
+        if len(parts) >= 2 and target_name:
+            candidates.append(self.clips_root / parts[-2] / target_name)
+        elif target_name:
+            candidates.extend(self.clips_root.glob(f"*/{target_name}"))
+
+        local_deleted = False
+        drive_deleted = False
+        with self.lock:
+            backup_dir = self.drive_backup_dir.strip()
+            for cand in candidates:
+                try:
+                    resolved = cand.resolve()
+                    rel = resolved.relative_to(base_resolved)
+                except Exception:
+                    continue
+                if resolved.is_file():
+                    try:
+                        resolved.unlink()
+                        local_deleted = True
+                    except OSError:
+                        pass
+                if backup_dir and len(rel.parts) >= 2:
+                    d_file = Path(backup_dir) / rel.parts[-2] / rel.parts[-1]
+                    if d_file.is_file():
+                        try:
+                            d_file.unlink()
+                            drive_deleted = True
+                        except OSError:
+                            pass
+            if backup_dir and target_name and not drive_deleted and len(parts) >= 2:
+                d_file = Path(backup_dir) / parts[-2] / target_name
+                if d_file.is_file():
+                    try:
+                        d_file.unlink()
+                        drive_deleted = True
+                    except OSError:
+                        pass
+            if self.clips_index_path.exists() and (target_name or raw_url):
+                kept: list[str] = []
+                for line in self.clips_index_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        kept.append(line)
+                        continue
+                    fname = str(obj.get("fileName") or "")
+                    lurl = str(obj.get("lanUrl") or "")
+                    if (target_name and fname == target_name) or (
+                        target_name and lurl.endswith(f"/{target_name}")
+                    ):
+                        continue
+                    kept.append(line)
+                tmp = self.clips_index_path.with_suffix(".jsonl.tmp")
+                tmp.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
+                tmp.replace(self.clips_index_path)
+
+        return {
+            "ok": True,
+            "fileName": target_name,
+            "localDeleted": local_deleted,
+            "driveDeleted": drive_deleted,
+        }
+
+    def calibration_status(self) -> dict[str, Any]:
+        """Return unique clean clip count and notified pose-calibration milestones."""
+        with self.lock:
+            clip_count = (
+                len({p.name for p in self.clips_root.glob("*/*.mp4") if p.is_file()})
+                if self.clips_root.exists()
+                else 0
+            )
+            notified: list[int] = []
+            if self.cal_state_path.is_file():
+                try:
+                    raw = json.loads(self.cal_state_path.read_text(encoding="utf-8"))
+                    notified = [int(x) for x in raw.get("notified", []) if isinstance(x, (int, float))]
+                except Exception:
+                    notified = []
+        next_m = next((m for m in CALIBRATION_MILESTONES if clip_count < m), None)
+        return {
+            "clipCount": clip_count,
+            "milestones": list(CALIBRATION_MILESTONES),
+            "notified": sorted(set(notified)),
+            "nextMilestone": next_m,
+        }
+
+    def check_calibration_milestones(self) -> list[int]:
+        """Persist newly reached calibration clip milestones (5 / 15 / 50) and fire ntfy alert once per tier."""
+        with self.lock:
+            st = self.calibration_status()
+            count = int(st["clipCount"])
+            notified = list(st["notified"])
+            crossed = [m for m in CALIBRATION_MILESTONES if count >= m and m not in notified]
+            if not crossed:
+                return []
+            merged = sorted(set(notified + crossed))
+            tmp = self.cal_state_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps({"notified": merged, "clipCount": count, "updatedAtMs": int(time.time() * 1000)}),
+                encoding="utf-8",
+            )
+            tmp.replace(self.cal_state_path)
+            topic = self.ntfy_topic
+
+        if topic:
+            top = max(crossed)
+            if top == 5:
+                title = "Armory Fit: 5 Clean Clips Ready"
+                msg = f"You now have {count} clean Gym Cam clips saved. Tell Antigravity 'calibrate pose trimming' anytime for the early unrack-to-rack pass."
+            elif top == 15:
+                title = "Armory Fit: 15 Clips Collected"
+                msg = f"{count} clean clips across multiple lifts are ready for multi-exercise pose-trim tuning in Antigravity."
+            else:
+                title = "Armory Fit: 50 Clips Collected"
+                msg = f"{count} clean clips saved! Ready for full unrack-to-rack calibration lock-in in Antigravity."
+            threading.Thread(
+                target=send_ntfy_alert,
+                args=(topic, title, msg),
+                name="ntfy-cal-milestone",
+                daemon=True,
+            ).start()
+        return crossed
+
     def disk_stats(self) -> dict[str, Any]:
         usage = shutil.disk_usage(self.root)
         return {
@@ -2602,6 +2767,7 @@ class ArmoryCamService:
                 "recording": self.recording,
                 "paused": self.paused,
                 "disk": self.disk_stats(),
+                "calibration": self.calibration_status(),
                 "cameras": cams,
                 "wallboard": wb_status,
             }
@@ -2736,7 +2902,10 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 
   <div class="card" style="margin-top:14px">
-    <h2>Recent Saved Clips</h2>
+    <h2>
+      <span>Recent Saved Clips</span>
+      <span id="calBadge" class="pill">0 / 5 clips for pose calibration</span>
+    </h2>
     <div id="clipList" style="color:var(--mut)">No clips saved yet.</div>
   </div>
 </div>
@@ -3192,6 +3361,16 @@ async function pollStatus() {
       else if (wb.lastAction) parts.push(`Last: ${wb.lastAction}`);
       $('wbMsg').innerHTML = parts.join(' · ');
     }
+    if (st.calibration) {
+      const cal = st.calibration;
+      const calEl = $('calBadge');
+      if (calEl) {
+        calEl.textContent = cal.nextMilestone
+          ? `${cal.clipCount} / ${cal.nextMilestone} clips for pose calibration`
+          : `${cal.clipCount} clips · 50+ full calibration ready`;
+        calEl.className = 'pill ' + (cal.clipCount >= 5 ? 'ok' : '');
+      }
+    }
   } catch {}
 }
 
@@ -3202,6 +3381,8 @@ async function pollClips() {
       $('clipList').innerHTML = `<table><thead><tr><th>Clip</th><th>Camera</th><th>Duration</th><th>Size</th><th>Drive</th></tr></thead><tbody>` +
         clips.clips.map(x => `<tr><td><a href="${x.lanUrl}" target="_blank">${x.fileName}</a></td><td>${x.camera}</td><td>${x.durationSec}s</td><td>${(x.bytes/1048576).toFixed(1)} MB</td><td>${x.driveUrl ? `<a href="${x.driveUrl}" target="_blank">Drive ↗</a>` : 'Syncing…'}</td></tr>`).join('') +
         `</tbody></table>`;
+    } else {
+      $('clipList').textContent = 'No clips saved yet.';
     }
   } catch {}
 }
@@ -3521,6 +3702,15 @@ def create_app(service: ArmoryCamService) -> Flask:
         except (TypeError, ValueError):
             limit = 30
         return jsonify({"clips": service.recent_clips(limit)})
+
+    @app.post("/api/clip/delete")
+    def api_clip_delete() -> Response:
+        body = request.get_json(silent=True) or {}
+        res = service.delete_clip(
+            lan_url=str(body.get("lanUrl") or ""),
+            file_name=str(body.get("fileName") or ""),
+        )
+        return jsonify(res)
 
     @app.get("/api/snapshot")
     def api_snapshot() -> Response:

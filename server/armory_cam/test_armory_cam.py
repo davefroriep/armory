@@ -589,6 +589,63 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_delete_clip_cleans_local_drive_and_calibration_milestones(self) -> None:
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_del_"))
+        try:
+            root = tmp / "camroot"
+            drive_dir = tmp / "drive_clips"
+            svc = ac.ArmoryCamService(root_dir=root, drive_backup_dir=drive_dir, ntfy_topic="TestTopic")
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            day = "2026-11-19"
+            (svc.clips_root / day).mkdir(parents=True, exist_ok=True)
+            (drive_dir / day).mkdir(parents=True, exist_ok=True)
+            entries = []
+            for idx in range(5):
+                fname = f"Squat_{idx}_abc12{idx}.mp4"
+                (svc.clips_root / day / fname).write_bytes(b"mp4-bytes")
+                (drive_dir / day / fname).write_bytes(b"mp4-bytes")
+                entries.append(json.dumps({"fileName": fname, "lanUrl": f"/clips/{day}/{fname}", "camera": "Rack Cam", "durationSec": 20, "bytes": 9}))
+            svc.clips_index_path.write_text("\n".join(entries) + "\n", encoding="utf-8")
+
+            # Milestone 5 fires once via ntfy and persists to calibration_state.json
+            with mock.patch.object(ac, "send_ntfy_alert", return_value=True) as m_ntfy:
+                crossed = svc.check_calibration_milestones()
+                self.assertEqual(crossed, [5])
+                # Wait briefly for daemon thread dispatch
+                import time as _time
+                _time.sleep(0.15)
+                self.assertEqual(m_ntfy.call_count, 1)
+
+                # Adding a 6th clip does not re-fire milestone 5
+                (svc.clips_root / day / "Bench_6_xyz999.mp4").write_bytes(b"mp4-bytes")
+                self.assertEqual(svc.check_calibration_milestones(), [])
+
+            st = client.get("/api/status").get_json()
+            self.assertEqual(st["calibration"]["clipCount"], 6)
+            self.assertEqual(st["calibration"]["notified"], [5])
+            self.assertEqual(st["calibration"]["nextMilestone"], 15)
+
+            # Deleting clip removes local MP4, Google Drive MP4, and index.jsonl row
+            del_res = client.post(
+                "/api/clip/delete",
+                json={"lanUrl": f"http://192.168.1.152:8766/clips/{day}/Squat_0_abc120.mp4", "fileName": "Squat_0_abc120.mp4"},
+            )
+            self.assertEqual(del_res.status_code, 200)
+            body = del_res.get_json()
+            self.assertTrue(body["ok"])
+            self.assertTrue(body["localDeleted"])
+            self.assertTrue(body["driveDeleted"])
+            self.assertFalse((svc.clips_root / day / "Squat_0_abc120.mp4").exists())
+            self.assertFalse((drive_dir / day / "Squat_0_abc120.mp4").exists())
+            remaining_names = [c["fileName"] for c in client.get("/api/clips").get_json()["clips"]]
+            self.assertNotIn("Squat_0_abc120.mp4", remaining_names)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -603,7 +603,19 @@ class GymCamController {
     }
     await lifts.saveVideoMeta(next);
     this.changed.emit();
+    if (meta.fileName && res.fileName && res.fileName !== meta.fileName) {
+      void this.deleteClip(meta);
+    }
     return next;
+  }
+
+  async deleteClip(meta: Pick<VideoMeta, 'lanUrl' | 'fileName' | 'source'>): Promise<boolean> {
+    if (!this.online || meta.source !== 'gymcam' || (!meta.lanUrl && !meta.fileName)) return false;
+    const res = await this.postJson<{ ok?: boolean }>('/api/clip/delete', {
+      lanUrl: meta.lanUrl ?? '',
+      fileName: meta.fileName ?? '',
+    }, 8000);
+    return !!res?.ok;
   }
 
   async switchClipCamera(meta: VideoMeta, nextCamera: string): Promise<VideoMeta | null> {
@@ -632,6 +644,9 @@ class GymCamController {
     };
     await lifts.saveVideoMeta(next);
     this.changed.emit();
+    if (meta.fileName && res.fileName && res.fileName !== meta.fileName) {
+      void this.deleteClip(meta);
+    }
     return next;
   }
 }

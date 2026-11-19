@@ -1345,10 +1345,13 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const unlink = el.closest<HTMLElement>('[data-unlink]');
     if (unlink) {
-      await lifts.deleteVideo(unlink.dataset.unlink!);
+      const vidId = unlink.dataset.unlink!;
+      const oldMeta = lifts.videos.get(vidId);
+      await lifts.deleteVideo(vidId);
+      if (oldMeta?.source === 'gymcam') void gymCam.deleteClip(oldMeta);
       await resetTimerIfIdle(t.session);
       redrawLinked();
-      toast('Video unlinked');
+      toast(oldMeta?.source === 'gymcam' ? 'Clip deleted from set, OptiPlex & Drive' : 'Video unlinked');
       return;
     }
 
@@ -2463,13 +2466,19 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       toast('Video link updated');
       void playVideo(meta!.id, ctx);
     } else if (t.closest('[data-del]')) {
-      const msg = meta!.linkOnly ? 'Removes this link from the set (keeps the file on your phone & Drive).' : 'It is removed from this phone.';
-      if (await confirmSheet(meta!.linkOnly ? 'Unlink this video?' : 'Delete this video?', msg, meta!.linkOnly ? 'Unlink' : 'Delete', true)) {
+      const isGym = meta!.source === 'gymcam';
+      const title = isGym ? 'Delete Gym Cam clip?' : (meta!.linkOnly ? 'Unlink this video?' : 'Delete this video?');
+      const msg = isGym
+        ? 'Removes this clip from the set, OptiPlex, and Google Drive (your 14-day raw tape stays intact).'
+        : (meta!.linkOnly ? 'Removes this link from the set (keeps the file on your phone & Drive).' : 'It is removed from this phone.');
+      const okLbl = (meta!.linkOnly && !isGym) ? 'Unlink' : 'Delete';
+      if (await confirmSheet(title, msg, okLbl, true)) {
         sessionFiles.delete(id);
+        if (isGym) void gymCam.deleteClip(meta!);
         await lifts.deleteVideo(id);
         await resetTimerIfIdle(lifts.sessions.get(meta!.sessionId));
         sh.close();
-        toast(meta!.linkOnly ? 'Video unlinked' : 'Video deleted');
+        toast(isGym ? 'Clip deleted from set, OptiPlex & Drive' : (meta!.linkOnly ? 'Video unlinked' : 'Video deleted'));
       }
     }
   });
