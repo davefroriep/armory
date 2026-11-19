@@ -12,7 +12,7 @@ import { buildExercise } from '../src/lifts/logic';
 import { hasWakeWord, parseVoiceTranscript } from '../src/lifts/voiceParser';
 import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
-import { buildWallboardSnapshot } from '../src/wallboard/snapshot';
+import { buildWallboardSnapshot, isWallboardWorkoutActive } from '../src/wallboard/snapshot';
 import type { Exercise, LiftSession, LiftSet, SessionEx } from '../src/lifts/types';
 
 const exOf = (id: string): Exercise =>
@@ -609,5 +609,65 @@ describe('wallboard snapshot & routing', () => {
     expect(roadmap[3].isPrescribedLoad).toBe(false);
     expect(roadmap[3].subText).toBe('3 × 8–10 · RPE 7.5');
     expect(JSON.stringify(snap)).not.toContain('RIR');
+  });
+
+  it('detects active workout transitions cleanly for OptiPlex relay and supports dual-mount WALLBOARD_HTML paths', () => {
+    expect(WALLBOARD_HTML).toContain("wbUrl('/state')");
+    expect(WALLBOARD_HTML).toContain("wbUrl('/events')");
+    expect(WALLBOARD_HTML).toContain("location.pathname.endsWith('/wallboard')");
+
+    const standby = buildWallboardSnapshot({
+      now: 1_000,
+      settings: { hrMax: 180, recoveryHrPct: 72, voiceEnabled: false, voiceWakeWord: 'armory', queue: defaultQueueState() },
+      unit: 'lb',
+      hr: { bpm: 0, fresh: false, recentPoints: [] },
+      voice: { listening: false, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: undefined,
+      elapsedSec: 0,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(isWallboardWorkoutActive(standby)).toBe(false);
+
+    const previewLift = buildWallboardSnapshot({
+      now: 1_000,
+      settings: { hrMax: 180, recoveryHrPct: 72, voiceEnabled: false, voiceWakeWord: 'armory', queue: defaultQueueState() },
+      unit: 'lb',
+      hr: { bpm: 0, fresh: false, recentPoints: [] },
+      voice: { listening: false, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: { id: 'p1', name: 'Upper 1', routineId: null, eventId: null, startMs: 1_000, endMs: null, status: 'active', started: false, exs: mkUpper1(), rpe: null, bwKg: 88.5 },
+      elapsedSec: 0,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(isWallboardWorkoutActive(previewLift)).toBe(false);
+
+    const activeLift = { ...previewLift, lift: { ...previewLift.lift!, started: true, paused: false } };
+    expect(isWallboardWorkoutActive(activeLift)).toBe(true);
+
+    const pausedLift = { ...previewLift, lift: { ...previewLift.lift!, started: true, paused: true } };
+    expect(isWallboardWorkoutActive(pausedLift)).toBe(false);
+
+    const activeCardio = {
+      ...standby,
+      mode: 'cardio' as const,
+      cardio: {
+        title: 'AirBike Z2', phase: 'STEADY', phaseTone: 'work' as const, repText: '1/1',
+        countdownText: '25:00', targetText: '129 W', watts: 129, targetWatts: 129,
+        rpm: 50, targetRpm: 50, elapsedSec: 30, kcal: 5, z5Sec: 0, paused: false,
+      },
+    };
+    expect(isWallboardWorkoutActive(activeCardio)).toBe(true);
+    expect(isWallboardWorkoutActive({ ...activeCardio, cardio: { ...activeCardio.cardio, paused: true } })).toBe(false);
   });
 });

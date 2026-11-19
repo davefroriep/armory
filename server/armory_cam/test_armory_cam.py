@@ -195,6 +195,145 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_wallboard_relay_html_state_config_and_adb_lifecycle(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_wb_test_"))
+        cmds: list[list[str]] = []
+        dev_state = {"state": "device"}
+
+        def fake_runner(cmd: list[str], timeout: float) -> tuple[int, str, str]:
+            cmds.append(cmd[1:])
+            args = cmd[1:]
+            if args[:1] == ["connect"]:
+                return 0, f"connected to {args[1]}", ""
+            if args[:1] == ["devices"]:
+                return 0, f"List of devices attached\n192.168.1.99:5555\t{dev_state['state']}\n", ""
+            if args[-2:] == ["getprop", "ro.product.model"]:
+                return 0, "AFTR\n", ""
+            return 0, "Status: ok\n", ""
+
+        try:
+            adb = ac.FireTvAdbController(adb_bin="adb.exe", runner=fake_runner, settle_sec=0.0)
+            svc = ac.ArmoryCamService(root_dir=tmp, adb_controller=adb)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # 1. GET /wallboard extracts live WALLBOARD_HTML with dual-mount base-path helpers
+            wb_page = client.get("/wallboard")
+            self.assertEqual(wb_page.status_code, 200)
+            html = wb_page.get_data(as_text=True)
+            self.assertIn("Armory Fit · Gym Wallboard", html)
+            self.assertIn("wbUrl('/state')", html)
+            self.assertIn("wbUrl('/events')", html)
+
+            # 2. GET /wallboard/state returns valid standby JSON before workout starts
+            st0 = client.get("/wallboard/state").get_json()
+            self.assertEqual(st0["mode"], "standby")
+
+            # 3. POST /api/config persists wallboard settings without clobbering cameras
+            cfg_res = client.post(
+                "/api/config",
+                json={
+                    "wallboard": {
+                        "fireTvHost": "192.168.1.99",
+                        "adbPort": 5555,
+                        "displayClient": "silk",
+                        "wallboardUrl": "http://192.168.1.152:8766/wallboard",
+                        "wakeOnStart": True,
+                        "sleepOnStop": True,
+                        "idleSleepSec": 600,
+                    }
+                },
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            saved_cfg = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(saved_cfg["cameras"]), 2)
+            self.assertEqual(saved_cfg["wallboard"]["fireTvHost"], "192.168.1.99")
+
+            # 4. ADB probe handles authorized, unauthorized, and offline states
+            probe_ok = client.post("/api/wallboard/adb/test", json={}).get_json()
+            self.assertTrue(probe_ok["ok"])
+            self.assertEqual(probe_ok["state"], "ready")
+            self.assertEqual(probe_ok["model"], "AFTR")
+
+            dev_state["state"] = "unauthorized"
+            probe_unauth = client.post("/api/wallboard/adb/test", json={}).get_json()
+            self.assertFalse(probe_unauth["ok"])
+            self.assertEqual(probe_unauth["state"], "unauthorized")
+            self.assertIn("Always allow", probe_unauth["message"])
+
+            dev_state["state"] = "offline"
+            probe_off = client.post("/api/wallboard/adb/test", json={}).get_json()
+            self.assertFalse(probe_off["ok"])
+            self.assertEqual(probe_off["state"], "offline")
+
+            # 5. Active state push wakes TV with KEYCODE_WAKEUP, disables screensaver, and opens Silk
+            dev_state["state"] = "device"
+            cmds.clear()
+            snap_lift = {
+                "ts": 1_763_500_000_000,
+                "mode": "lift",
+                "lift": {"title": "Upper 1", "started": True, "paused": False, "setsDone": 1, "setsTotal": 10},
+            }
+            self.assertEqual(
+                client.post(
+                    "/api/wallboard/state",
+                    json={"state": snap_lift, "workoutActive": True, "sourceUrl": "http://192.168.1.50:8765"},
+                ).status_code,
+                200,
+            )
+            import time as _time
+            for _ in range(40):
+                if adb.tv_awake_requested:
+                    break
+                _time.sleep(0.02)
+            self.assertTrue(adb.tv_awake_requested)
+            flat = [" ".join(c) for c in cmds]
+            self.assertTrue(any("KEYCODE_WAKEUP" in x for x in flat))
+            self.assertTrue(any("screensaver_enabled 0" in x for x in flat))
+            self.assertTrue(any("com.amazon.cloud9/.BrowserActivity" in x for x in flat))
+            self.assertEqual(client.get("/wallboard/state").get_json()["lift"]["title"], "Upper 1")
+
+            # 6. Delayed sleep schedules timer, and active push cancels it; immediate sleep executes KEYCODE_SLEEP
+            slp_sched = client.post(
+                "/api/wallboard/sleep",
+                json={"reason": "workout_finished", "delaySec": 30},
+            ).get_json()
+            self.assertEqual(slp_sched["scheduledDelaySec"], 30)
+            self.assertIsNotNone(adb.pending_sleep_at_ms)
+
+            self.assertEqual(
+                client.post("/api/wallboard/state", json={"state": snap_lift, "workoutActive": True}).status_code,
+                200,
+            )
+            self.assertIsNone(adb.pending_sleep_at_ms)
+
+            cmds.clear()
+            slp_now = client.post(
+                "/api/wallboard/sleep",
+                json={"reason": "manual", "delaySec": 0, "sync": True},
+            ).get_json()
+            self.assertTrue(slp_now["adb"]["ok"])
+            flat2 = [" ".join(c) for c in cmds]
+            self.assertTrue(any("screensaver_enabled 1" in x for x in flat2))
+            self.assertTrue(any("KEYCODE_SLEEP" in x for x in flat2))
+            self.assertFalse(adb.tv_awake_requested)
+
+            # 7. Idle watchdog triggers KEYCODE_SLEEP after idleSleepSec elapses
+            adb.tv_awake_requested = True
+            cmds.clear()
+            now_ms = int(_time.time() * 1000)
+            res_idle = adb.check_timers(
+                svc.wallboard_cfg,
+                last_active_push_ms=now_ms - 700_000,
+                workout_active=True,
+                now_ms=now_ms,
+            )
+            self.assertIsNotNone(res_idle)
+            self.assertTrue(any("KEYCODE_SLEEP" in " ".join(c) for c in cmds))
+            self.assertFalse(adb.tv_awake_requested)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,4 @@
-import { getSettings, settingsChanged } from '../store/settings';
+import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { isNative } from '../native/service';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../wallboard/page';
 import { wallboard } from '../wallboard/sync';
@@ -14,7 +14,16 @@ export function wallboardPreviewScreen(root: HTMLElement): () => void {
   <main class="page">
     <section class="card">
       <div class="line">
-        <span>Smart TV Wallboard<small>Local Wi-Fi live dashboard (1 Hz HR, rest timer &amp; superset progression)</small></span>
+        <span>Auto-Wake 32&quot; TV on Workout<small>OptiPlex relay + ADB wake &amp; Silk launch when a workout starts</small></span>
+        <button class="switch ${st.wallboardRelayEnabled ? 'on' : ''}" id="wbRelayTog" role="switch" aria-checked="${st.wallboardRelayEnabled}"><i></i></button>
+      </div>
+      <div class="hint" id="wbRelayLine"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn sm ok" type="button" id="wbWakeBtn">Wake TV</button>
+        <button class="btn sm" type="button" id="wbSleepBtn">Sleep TV</button>
+      </div>
+      <div class="line" style="margin-top:12px">
+        <span>Pixel Direct Wallboard<small>Optional local Wi-Fi server hosted directly on this Pixel</small></span>
         <button class="switch ${st.wallboardEnabled ? 'on' : ''}" id="wbTog" role="switch" aria-checked="${st.wallboardEnabled}"><i></i></button>
       </div>
       <div class="hint" id="wbUrlLine"></div>
@@ -22,7 +31,7 @@ export function wallboardPreviewScreen(root: HTMLElement): () => void {
         <button class="btn sm primary" type="button" id="wbCopy">Copy TV URL</button>
         <button class="btn sm" type="button" id="wbRefresh">Refresh IP</button>
       </div>
-      <p class="hint" style="margin-top:10px">Open Amazon Silk, Chrome, or Edge on your gym TV/monitor connected to the same Wi-Fi and browse to the address above.</p>
+      <p class="hint" style="margin-top:10px">Point Amazon Silk on the 32&quot; Fire TV (or OptiPlex ADB config on <code>${esc(wallboard.relayUrl().replace(/\/wallboard$/, ''))}</code>) to the permanent OptiPlex URL above.</p>
     </section>
 
     <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 2px 8px">
@@ -140,6 +149,13 @@ export function wallboardPreviewScreen(root: HTMLElement): () => void {
     if (dead) return;
     const cfg = getSettings();
     const s = wallboard.status;
+    const relayTog = $<HTMLElement>('#wbRelayTog', root);
+    relayTog.classList.toggle('on', cfg.wallboardRelayEnabled);
+    relayTog.setAttribute('aria-checked', String(cfg.wallboardRelayEnabled));
+    $('#wbRelayLine', root).innerHTML = cfg.wallboardRelayEnabled
+      ? `<b>Permanent Fire TV URL:</b> <code>${esc(wallboard.relayUrl())}</code>${wallboard.relayOnline ? ' · <span style="color:#86efac">OptiPlex Online</span>' : ''}`
+      : 'OptiPlex Auto-Wake relay off';
+
     const tog = $<HTMLElement>('#wbTog', root);
     tog.classList.toggle('on', cfg.wallboardEnabled);
     tog.setAttribute('aria-checked', String(cfg.wallboardEnabled));
@@ -149,16 +165,28 @@ export function wallboardPreviewScreen(root: HTMLElement): () => void {
     } else if (s.running) {
       urlLine.innerHTML = `<b>● LIVE:</b> <code>${esc(s.url)}</code> · ${s.clients} display${s.clients === 1 ? '' : 's'} connected`;
     } else {
-      urlLine.textContent = s.error ? `Error: ${s.error}` : 'Wallboard server off';
+      urlLine.textContent = s.error ? `Error: ${s.error}` : 'Pixel direct server off';
     }
     pushToFrame();
   };
 
+  $('#wbRelayTog', root).addEventListener('click', () => {
+    updateSettings({ wallboardRelayEnabled: !getSettings().wallboardRelayEnabled });
+    paint();
+  });
+  $('#wbWakeBtn', root).addEventListener('click', () => {
+    toast('Waking 32" Fire TV via OptiPlex…');
+    void wallboard.wakeRelayTv().then((r) => { toast(r.message); paint(); });
+  });
+  $('#wbSleepBtn', root).addEventListener('click', () => {
+    toast('Sending sleep command to Fire TV…');
+    void wallboard.sleepRelayTv().then((r) => { toast(r.message); paint(); });
+  });
   $('#wbTog', root).addEventListener('click', () => {
     void wallboard.setEnabled(!getSettings().wallboardEnabled).then(paint);
   });
   $('#wbCopy', root).addEventListener('click', () => {
-    const url = wallboard.status.url;
+    const url = getSettings().wallboardRelayEnabled ? wallboard.relayUrl() : wallboard.status.url;
     void navigator.clipboard?.writeText(url).then(() => toast(`Copied ${url}`)).catch(() => toast(url));
   });
   $('#wbRefresh', root).addEventListener('click', () => {

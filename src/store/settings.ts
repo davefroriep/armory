@@ -53,6 +53,8 @@ export interface Settings {
   /** Local Wi-Fi HTTP/SSE server hosting the Smart TV wallboard. */
   wallboardEnabled: boolean;
   wallboardPort: number;
+  /** Push live wallboard to OptiPlex & auto-wake 32" Fire TV via ADB on workout start. */
+  wallboardRelayEnabled: boolean;
   /** Foreground-only hands-free voice command listener ("armory ..."). */
   voiceEnabled: boolean;
   voiceWakeWord: string;
@@ -98,6 +100,7 @@ export const DEFAULTS: Settings = {
   restDay: 0,
   wallboardEnabled: false,
   wallboardPort: 8765,
+  wallboardRelayEnabled: true,
   voiceEnabled: false,
   voiceWakeWord: 'armory',
   gymCamEnabled: true,

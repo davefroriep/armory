@@ -670,3 +670,10 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     },
   };
 }
+
+/** True whenever an active (non-paused) strength or cardio workout is underway. */
+export function isWallboardWorkoutActive(st: WallboardState): boolean {
+  if (st.mode === 'cardio' && !!st.cardio && !st.cardio.paused) return true;
+  if (st.mode === 'lift' && !!st.lift?.started && !st.lift.paused) return true;
+  return false;
+}

@@ -418,10 +418,13 @@ window.addEventListener('message', (ev) => {
   if (ev.data && ev.data.type === 'armory:wallboard-state') render(ev.data.state);
 });
 
+const WB_BASE = location.pathname.endsWith('/wallboard') || location.pathname.endsWith('/wallboard/') ? '/wallboard' : '';
+const wbUrl = (p) => WB_BASE + p;
+
 async function pollOnce() {
   if (location.protocol === 'about:' || location.protocol === 'blob:') return;
   try {
-    const r = await fetch('/state?t=' + Date.now(), { cache:'no-store' });
+    const r = await fetch(wbUrl('/state') + '?t=' + Date.now(), { cache:'no-store' });
     if (r.ok) {
       const txt = await r.text();
       if (txt !== lastJson) { lastJson = txt; render(JSON.parse(txt)); }
@@ -434,7 +437,7 @@ if (location.protocol !== 'about:' && location.protocol !== 'blob:') {
   let pollTimer = null;
   const connect = () => {
     try {
-      const es = new EventSource('/events');
+      const es = new EventSource(wbUrl('/events'));
       es.onmessage = (e) => {
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         if (e.data && e.data !== lastJson) {
@@ -473,7 +476,7 @@ if (SR && location.protocol.startsWith('http')) {
       for (let i = e.resultIndex; i < e.results.length; i++) {
         if (e.results[i].isFinal) {
           const transcript = e.results[i][0].transcript;
-          fetch('/api/voice', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ transcript }) }).catch(() => {});
+          fetch(WB_BASE ? '/wallboard/voice' : '/api/voice', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ transcript }) }).catch(() => {});
         }
       }
     };

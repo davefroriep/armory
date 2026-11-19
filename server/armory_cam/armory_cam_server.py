@@ -13,17 +13,21 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 from datetime import datetime
+import glob
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
+import urllib.error
+import urllib.request
 import uuid
 
 import cv2
@@ -35,9 +39,38 @@ DEFAULT_PORT = 8766
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_PRE_ROLL_SEC = 120
 DEFAULT_MOTION_THRESHOLD = 2.2
+DEFAULT_ADB_PORT = 5555
+DEFAULT_IDLE_SLEEP_SEC = 600
 MIN_CROP_SPAN = 0.15
 RING_KEEP_MIN_SEC = 300
 SEG_NAME_RE = re.compile(r"^seg_(\d{8})_(\d{6})\.ts$")
+
+FALLBACK_WALLBOARD_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Armory Fit · Gym Wallboard</title>
+<style>html,body{height:100%;margin:0;background:#070b12;color:#f2f6fc;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;text-align:center}
+.box{padding:32px;border:1px solid #1e2b42;border-radius:18px;background:#0f1724;max-width:680px}.mut{color:#8fa2bf;margin-top:8px;font-size:18px}
+h1{margin:0;font-size:40px;letter-spacing:.08em}#st{font-size:28px;margin-top:16px;color:#38bdf8;font-weight:700}</style></head>
+<body><div class="box"><h1>ARMORY FIT · WALLBOARD</h1><div id="st">Standby · Waiting for workout on Pixel</div>
+<div class="mut" id="sub">Connect Armory Fit on Wi-Fi to start streaming live sets, rest timer &amp; HR.</div></div>
+<script>
+const paint = (d) => {
+  const st = document.getElementById('st'), sub = document.getElementById('sub');
+  if (!d) return;
+  if (d.mode === 'lift' && d.lift) {
+    st.textContent = d.lift.title + ' · ' + d.lift.setsDone + '/' + d.lift.setsTotal + ' sets';
+    sub.textContent = d.hr && d.hr.fresh ? ('HR ' + d.hr.bpm + ' BPM') : 'Strength active';
+  } else if (d.mode === 'cardio' && d.cardio) {
+    st.textContent = d.cardio.title + ' · ' + d.cardio.phase;
+    sub.textContent = Math.round(d.cardio.watts || 0) + ' W · ' + (d.cardio.countdownText || '');
+  } else {
+    st.textContent = (d.standby && d.standby.timeLabel) ? ('Standby · ' + d.standby.timeLabel) : 'Standby';
+    sub.textContent = 'Start a workout on your Pixel to launch live telemetry.';
+  }
+};
+fetch('/wallboard/state?t=' + Date.now()).then(r => r.json()).then(paint).catch(() => {});
+try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { try { paint(JSON.parse(e.data)); } catch {} }; } catch {}
+</script></body></html>"""
 
 
 def default_root_dir() -> Path:
@@ -62,6 +95,75 @@ def resolve_tool_bin(tool_name: str, env_key: str) -> str:
             return str(c)
     found = shutil.which(tool_name)
     return found or exe
+
+
+def resolve_adb_bin() -> str | None:
+    """Resolve `adb` binary from env, PATH, WinGet PlatformTools, or Android SDK."""
+    env_val = os.environ.get("ARMORY_ADB", "").strip()
+    if env_val and Path(env_val).exists():
+        return env_val
+    found = shutil.which("adb")
+    if found:
+        return found
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    candidates: list[Path] = []
+    if local_app:
+        candidates.append(Path(local_app) / "Microsoft" / "WinGet" / "Links" / "adb.exe")
+        winget_glob = glob.glob(
+            str(Path(local_app) / "Microsoft" / "WinGet" / "Packages" / "Google.PlatformTools*" / "platform-tools" / "adb.exe")
+        )
+        candidates.extend(Path(p) for p in winget_glob)
+        candidates.append(Path(local_app) / "Android" / "Sdk" / "platform-tools" / "adb.exe")
+    candidates.append(Path(r"C:\Users\davef\Tools\platform-tools\adb.exe"))
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def detect_lan_ip() -> str:
+    """Best-effort LAN IPv4 lookup for building the static OptiPlex wallboard URL."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.168.1.1", 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "192.168.1.152"
+
+
+def extract_wallboard_html_from_ts(ts_path: Path) -> str | None:
+    """Extract literal `WALLBOARD_HTML` string from `src/wallboard/page.ts` if present."""
+    if not ts_path.is_file():
+        return None
+    try:
+        raw = ts_path.read_text(encoding="utf-8")
+        marker = "export const WALLBOARD_HTML = `"
+        start = raw.find(marker)
+        if start < 0:
+            return None
+        start += len(marker)
+        end = raw.rfind("`;")
+        if end <= start:
+            return None
+        html = raw[start:end]
+        return html if "<!doctype html" in html[:200].lower() else None
+    except Exception:
+        return None
+
+
+def _subprocess_no_window_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
 
 
 def parse_segment_start_ms(file_name: str) -> int | None:
@@ -480,10 +582,523 @@ class LiveStreamHub:
         return None
 
 
+@dataclass
+class WallboardConfig:
+    enabled: bool = True
+    fire_tv_host: str = ""
+    adb_port: int = DEFAULT_ADB_PORT
+    display_client: str = "silk"
+    custom_component: str = ""
+    wallboard_url: str = ""
+    wake_on_start: bool = True
+    sleep_on_stop: bool = True
+    idle_sleep_sec: int = DEFAULT_IDLE_SLEEP_SEC
+    suppress_screensaver: bool = True
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> "WallboardConfig":
+        if not isinstance(raw, dict):
+            return cls()
+        client = str(raw.get("displayClient", "silk")).strip().lower()
+        if client not in ("silk", "fully", "custom"):
+            client = "silk"
+        try:
+            adb_port = max(1, min(65535, int(raw.get("adbPort", DEFAULT_ADB_PORT))))
+        except (TypeError, ValueError):
+            adb_port = DEFAULT_ADB_PORT
+        try:
+            idle_sec = max(60, min(7200, int(raw.get("idleSleepSec", DEFAULT_IDLE_SLEEP_SEC))))
+        except (TypeError, ValueError):
+            idle_sec = DEFAULT_IDLE_SLEEP_SEC
+        return cls(
+            enabled=bool(raw.get("enabled", True)),
+            fire_tv_host=str(raw.get("fireTvHost", "")).strip(),
+            adb_port=adb_port,
+            display_client=client,
+            custom_component=str(raw.get("customComponent", "")).strip(),
+            wallboard_url=str(raw.get("wallboardUrl", "")).strip(),
+            wake_on_start=bool(raw.get("wakeOnStart", True)),
+            sleep_on_stop=bool(raw.get("sleepOnStop", True)),
+            idle_sleep_sec=idle_sec,
+            suppress_screensaver=bool(raw.get("suppressScreensaver", True)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "fireTvHost": self.fire_tv_host,
+            "adbPort": self.adb_port,
+            "displayClient": self.display_client,
+            "customComponent": self.custom_component,
+            "wallboardUrl": self.wallboard_url,
+            "wakeOnStart": self.wake_on_start,
+            "sleepOnStop": self.sleep_on_stop,
+            "idleSleepSec": self.idle_sleep_sec,
+            "suppressScreensaver": self.suppress_screensaver,
+        }
+
+
+class FireTvAdbController:
+    """Manages ADB-over-Wi-Fi wake, Silk/kiosk launch, screensaver suppression, and auto-sleep."""
+
+    def __init__(
+        self,
+        adb_bin: str | None = None,
+        runner: Callable[[list[str], float], tuple[int, str, str]] | None = None,
+        settle_sec: float = 0.35,
+    ) -> None:
+        self.adb_bin = adb_bin if adb_bin is not None else resolve_adb_bin()
+        self._runner = runner or self._default_runner
+        self.settle_sec = max(0.0, float(settle_sec))
+        self.lock = threading.RLock()
+        self.adb_state = "unconfigured"
+        self.last_model = ""
+        self.last_action = ""
+        self.last_error = ""
+        self.last_wake_ms = 0
+        self.tv_awake_requested = False
+        self.pending_sleep_at_ms: int | None = None
+        self.pending_sleep_reason = ""
+
+    @staticmethod
+    def _default_runner(cmd: list[str], timeout: float) -> tuple[int, str, str]:
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                **_subprocess_no_window_kwargs(),
+            )
+            return res.returncode, res.stdout or "", res.stderr or ""
+        except subprocess.TimeoutExpired:
+            return 124, "", f"ADB command timed out after {timeout:.0f}s"
+        except Exception as exc:
+            return 1, "", str(exc)
+
+    def _run(self, args: list[str], timeout: float = 6.0) -> tuple[int, str, str]:
+        if not self.adb_bin:
+            return 127, "", "adb.exe not found on OptiPlex"
+        return self._runner([self.adb_bin, *args], timeout)
+
+    @staticmethod
+    def serial(cfg: WallboardConfig) -> str:
+        host = cfg.fire_tv_host.strip()
+        if not host:
+            return ""
+        if ":" in host:
+            return host
+        return f"{host}:{cfg.adb_port}"
+
+    def _connect_and_status(self, serial: str) -> tuple[str, str]:
+        rc_c, out_c, err_c = self._run(["connect", serial], timeout=6.0)
+        rc_d, out_d, err_d = self._run(["devices"], timeout=5.0)
+        combined_c = f"{out_c} {err_c}".strip()
+        for line in out_d.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[0] == serial:
+                st = parts[1].lower()
+                if st in ("device", "unauthorized"):
+                    return st, combined_c
+                return "offline", f"{line.strip()} ({combined_c})".strip()
+        if "failed to authenticate" in combined_c.lower() or "unauthorized" in combined_c.lower():
+            return "unauthorized", combined_c
+        detail = combined_c or err_d.strip() or out_d.strip() or f"rc={rc_c}/{rc_d}"
+        return "offline", detail
+
+    def connect_and_probe(self, cfg: WallboardConfig) -> dict[str, Any]:
+        with self.lock:
+            ser = self.serial(cfg)
+            if not ser:
+                self.adb_state = "unconfigured"
+                self.last_error = ""
+                return {
+                    "ok": False,
+                    "configured": False,
+                    "state": "unconfigured",
+                    "serial": "",
+                    "model": "",
+                    "message": 'Enter the 32" Fire TV IP address first.',
+                }
+            st, detail = self._connect_and_status(ser)
+            if st == "device":
+                rc_m, out_m, _ = self._run(["-s", ser, "shell", "getprop", "ro.product.model"], timeout=4.0)
+                model = out_m.strip().splitlines()[0] if rc_m == 0 and out_m.strip() else ""
+                self.adb_state = "ready"
+                if model:
+                    self.last_model = model
+                self.last_error = ""
+                self.last_action = f"probe ({ser})"
+                return {
+                    "ok": True,
+                    "configured": True,
+                    "state": "ready",
+                    "serial": ser,
+                    "model": self.last_model,
+                    "message": f"Connected ({self.last_model or ser})",
+                }
+            if st == "unauthorized":
+                self.adb_state = "unauthorized"
+                msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
+                self.last_error = msg
+                return {
+                    "ok": False,
+                    "configured": True,
+                    "state": "unauthorized",
+                    "serial": ser,
+                    "model": "",
+                    "message": msg,
+                }
+            self.adb_state = "offline"
+            msg = f"Fire TV unreachable at {ser}: {detail}"
+            self.last_error = msg
+            return {
+                "ok": False,
+                "configured": True,
+                "state": "offline",
+                "serial": ser,
+                "model": "",
+                "message": msg,
+            }
+
+    @staticmethod
+    def _launch_cmd(cfg: WallboardConfig, wallboard_url: str, ser: str) -> list[str]:
+        if cfg.display_client == "fully":
+            return [
+                "-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                "-d", wallboard_url, "-n", "de.ozerov.fully/.MainActivity",
+            ]
+        if cfg.display_client == "custom":
+            if cfg.custom_component.strip():
+                return [
+                    "-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                    "-d", wallboard_url, "-n", cfg.custom_component.strip(),
+                ]
+            return ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", wallboard_url]
+        return [
+            "-s", ser, "shell", "am", "start", "-W", "-a", "android.intent.action.VIEW",
+            "-d", wallboard_url, "-n", "com.amazon.cloud9/.BrowserActivity",
+        ]
+
+    def wake_and_launch(self, cfg: WallboardConfig, wallboard_url: str, force: bool = False) -> dict[str, Any]:
+        with self.lock:
+            self.pending_sleep_at_ms = None
+            self.pending_sleep_reason = ""
+            ser = self.serial(cfg)
+            if not cfg.enabled or not ser:
+                self.adb_state = "disabled" if not cfg.enabled else "unconfigured"
+                self.last_error = ""
+                return {
+                    "ok": False,
+                    "configured": bool(ser),
+                    "state": self.adb_state,
+                    "serial": ser,
+                    "model": self.last_model,
+                    "message": "Fire TV IP not configured yet" if not ser else "Wallboard ADB disabled",
+                }
+            now_ms = int(time.time() * 1000)
+            if self.tv_awake_requested and not force and (now_ms - self.last_wake_ms) < 20_000:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "configured": True,
+                    "state": self.adb_state,
+                    "serial": ser,
+                    "model": self.last_model,
+                    "message": "Fire TV wake already active",
+                }
+            st, detail = self._connect_and_status(ser)
+            if st == "unauthorized":
+                self.adb_state = "unauthorized"
+                msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
+                self.last_error = msg
+                return {"ok": False, "configured": True, "state": "unauthorized", "serial": ser, "message": msg}
+            if st != "device":
+                self.adb_state = "offline"
+                msg = f"Fire TV unreachable at {ser}: {detail}"
+                self.last_error = msg
+                return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
+
+            rc_w, out_w, err_w = self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_WAKEUP"], timeout=5.0)
+            if rc_w != 0:
+                self.adb_state = "offline"
+                msg = f"Wake keyevent failed: {(err_w or out_w).strip()}"
+                self.last_error = msg
+                return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
+
+            if self.settle_sec > 0:
+                time.sleep(self.settle_sec)
+
+            if cfg.suppress_screensaver:
+                self._run(["-s", ser, "shell", "settings", "put", "secure", "screensaver_enabled", "0"], timeout=4.0)
+                self._run(["-s", ser, "shell", "settings", "put", "secure", "sleep_timeout", "0"], timeout=4.0)
+
+            rc_l, out_l, err_l = self._run(self._launch_cmd(cfg, wallboard_url, ser), timeout=8.0)
+            if cfg.display_client == "silk" and (rc_l != 0 or "Error" in f"{out_l}\n{err_l}"):
+                rc_l, out_l, err_l = self._run(
+                    ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", wallboard_url, "-p", "com.amazon.cloud9"],
+                    timeout=8.0,
+                )
+
+            if rc_l != 0:
+                self.adb_state = "ready"
+                msg = f"Awoke TV but browser launch failed: {(err_l or out_l).strip()}"
+                self.last_error = msg
+                return {"ok": False, "configured": True, "state": "ready", "serial": ser, "message": msg}
+
+            self.tv_awake_requested = True
+            self.last_wake_ms = int(time.time() * 1000)
+            self.adb_state = "awake"
+            self.last_action = f"wake -> {cfg.display_client}"
+            self.last_error = ""
+            return {
+                "ok": True,
+                "configured": True,
+                "state": "awake",
+                "serial": ser,
+                "model": self.last_model,
+                "message": f"Awoke {self.last_model or ser} & opened {cfg.display_client}",
+            }
+
+    def schedule_sleep(self, cfg: WallboardConfig, delay_sec: float = 0.0, reason: str = "") -> dict[str, Any]:
+        if delay_sec <= 0:
+            return self.sleep_now(cfg, reason=reason)
+        with self.lock:
+            self.pending_sleep_at_ms = int(time.time() * 1000) + int(delay_sec * 1000)
+            self.pending_sleep_reason = reason or "workout_end"
+            return {
+                "ok": True,
+                "scheduledDelaySec": delay_sec,
+                "reason": self.pending_sleep_reason,
+                "message": f"Sleep scheduled in {int(delay_sec)}s",
+            }
+
+    def sleep_now(self, cfg: WallboardConfig, reason: str = "") -> dict[str, Any]:
+        with self.lock:
+            self.pending_sleep_at_ms = None
+            self.pending_sleep_reason = ""
+            self.tv_awake_requested = False
+            ser = self.serial(cfg)
+            if not ser:
+                self.adb_state = "unconfigured"
+                self.last_action = f"sleep skipped ({reason or 'unconfigured'})"
+                return {
+                    "ok": False,
+                    "configured": False,
+                    "state": "unconfigured",
+                    "serial": "",
+                    "message": "Fire TV IP not configured yet",
+                }
+            st, detail = self._connect_and_status(ser)
+            if st != "device":
+                self.adb_state = st
+                msg = f"Sleep failed ({st}): {detail}"
+                self.last_error = msg
+                return {"ok": False, "configured": True, "state": st, "serial": ser, "message": msg}
+            if cfg.suppress_screensaver:
+                self._run(["-s", ser, "shell", "settings", "put", "secure", "screensaver_enabled", "1"], timeout=4.0)
+                self._run(["-s", ser, "shell", "settings", "put", "secure", "sleep_timeout", "1200000"], timeout=4.0)
+            self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_SLEEP"], timeout=5.0)
+            self.adb_state = "asleep"
+            self.last_action = f"sleep ({reason or 'manual'})"
+            self.last_error = ""
+            return {
+                "ok": True,
+                "configured": True,
+                "state": "asleep",
+                "serial": ser,
+                "model": self.last_model,
+                "message": f"Slept {self.last_model or ser}",
+            }
+
+    def check_timers(
+        self,
+        cfg: WallboardConfig,
+        last_active_push_ms: int,
+        workout_active: bool,
+        now_ms: int | None = None,
+    ) -> dict[str, Any] | None:
+        cur_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+        reason_to_sleep: str | None = None
+        with self.lock:
+            if self.pending_sleep_at_ms is not None and cur_ms >= self.pending_sleep_at_ms:
+                if cfg.sleep_on_stop:
+                    reason_to_sleep = self.pending_sleep_reason or "workout_end"
+                else:
+                    self.pending_sleep_at_ms = None
+                    self.pending_sleep_reason = ""
+            elif (
+                self.tv_awake_requested
+                and cfg.idle_sleep_sec > 0
+                and last_active_push_ms > 0
+                and (cur_ms - last_active_push_ms) >= cfg.idle_sleep_sec * 1000
+            ):
+                reason_to_sleep = "idle_timeout"
+        if reason_to_sleep:
+            return self.sleep_now(cfg, reason=reason_to_sleep)
+        return None
+
+    def status_dict(self, cfg: WallboardConfig) -> dict[str, Any]:
+        with self.lock:
+            now_ms = int(time.time() * 1000)
+            pending_sec = (
+                max(0, int((self.pending_sleep_at_ms - now_ms) / 1000))
+                if self.pending_sleep_at_ms is not None
+                else 0
+            )
+            return {
+                "adbBinFound": bool(self.adb_bin),
+                "adbBin": self.adb_bin or "",
+                "adbState": self.adb_state,
+                "fireTvHost": cfg.fire_tv_host,
+                "adbPort": cfg.adb_port,
+                "fireTvModel": self.last_model,
+                "tvAwake": self.tv_awake_requested,
+                "lastAction": self.last_action,
+                "lastError": self.last_error,
+                "pendingSleepSec": pending_sec,
+            }
+
+
+class WallboardRelay:
+    """Thread-safe OptiPlex mirror of Pixel's live Wallboard state with SSE fan-out."""
+
+    def __init__(self, root_dir: Path) -> None:
+        self.root_dir = root_dir
+        self.cache_html_path = root_dir / "wallboard_cache.html"
+        self.repo_page_ts_path = Path(__file__).resolve().parents[2] / "src" / "wallboard" / "page.ts"
+        self.cond = threading.Condition()
+        self.seq = 0
+        self.latest_json = ""
+        self.mode = "standby"
+        self.workout_active = False
+        self.last_push_ms = 0
+        self.last_active_push_ms = 0
+        self.source_url = ""
+        self.sse_clients = 0
+
+    def get_html(self) -> str:
+        repo_html: str | None = None
+        repo_mtime = 0.0
+        if self.repo_page_ts_path.is_file():
+            repo_html = extract_wallboard_html_from_ts(self.repo_page_ts_path)
+            if repo_html:
+                repo_mtime = self.repo_page_ts_path.stat().st_mtime
+
+        cache_html: str | None = None
+        cache_mtime = 0.0
+        if self.cache_html_path.is_file():
+            try:
+                txt = self.cache_html_path.read_text(encoding="utf-8")
+                if "<!doctype html" in txt[:200].lower():
+                    cache_html = txt
+                    cache_mtime = self.cache_html_path.stat().st_mtime
+            except Exception:
+                pass
+
+        if repo_html and cache_html:
+            return repo_html if repo_mtime >= cache_mtime else cache_html
+        if repo_html:
+            return repo_html
+        if cache_html:
+            return cache_html
+        return FALLBACK_WALLBOARD_HTML
+
+    def save_uploaded_html(self, html: str) -> bool:
+        if not isinstance(html, str) or "<!doctype html" not in html[:200].lower():
+            return False
+        tmp = self.cache_html_path.with_suffix(".html.tmp")
+        tmp.write_text(html, encoding="utf-8")
+        tmp.replace(self.cache_html_path)
+        return True
+
+    @staticmethod
+    def standby_state_dict(now_ms: int | None = None) -> dict[str, Any]:
+        ts = now_ms if now_ms is not None else int(time.time() * 1000)
+        dt = datetime.fromtimestamp(ts / 1000.0)
+        hour12 = dt.strftime("%I").lstrip("0") or "12"
+        return {
+            "ts": ts,
+            "mode": "standby",
+            "hr": {
+                "bpm": 0,
+                "fresh": False,
+                "zone": 0,
+                "pctMax": 0,
+                "readyLimitBpm": 130,
+                "drop60": 0,
+                "readiness": "idle",
+            },
+            "voice": {
+                "enabled": False,
+                "listening": False,
+                "armed": False,
+                "wakeWord": "armory",
+                "banner": None,
+            },
+            "standby": {
+                "dateLabel": dt.strftime("%a, %b ") + str(dt.day),
+                "timeLabel": f"{hour12}:{dt.strftime('%M %p')}",
+                "weekLabel": "OptiPlex Wallboard Relay · Standby",
+                "todayItems": [],
+            },
+        }
+
+    def current_state_json(self, stale_ms: int = 900_000) -> str:
+        with self.cond:
+            now_ms = int(time.time() * 1000)
+            if self.latest_json and self.last_push_ms > 0 and (now_ms - self.last_push_ms) <= stale_ms:
+                return self.latest_json
+        return json.dumps(self.standby_state_dict(), separators=(",", ":"))
+
+    def update_state(
+        self,
+        state_obj: dict[str, Any] | None,
+        workout_active: bool,
+        source_url: str = "",
+    ) -> None:
+        now_ms = int(time.time() * 1000)
+        payload = state_obj if isinstance(state_obj, dict) else self.standby_state_dict(now_ms)
+        compact = json.dumps(payload, separators=(",", ":")).replace("\r", " ").replace("\n", " ")
+        with self.cond:
+            self.latest_json = compact
+            self.workout_active = bool(workout_active)
+            self.mode = str(payload.get("mode") or ("lift" if workout_active else "standby"))
+            self.last_push_ms = now_ms
+            if workout_active:
+                self.last_active_push_ms = now_ms
+            if source_url and source_url.strip():
+                self.source_url = source_url.strip().rstrip("/")
+            self.seq += 1
+            self.cond.notify_all()
+
+    def mark_active_wake(self, state_obj: dict[str, Any] | None = None, source_url: str = "") -> None:
+        now_ms = int(time.time() * 1000)
+        if isinstance(state_obj, dict):
+            self.update_state(state_obj, workout_active=True, source_url=source_url)
+            return
+        with self.cond:
+            self.workout_active = True
+            self.last_push_ms = now_ms
+            self.last_active_push_ms = now_ms
+            if source_url and source_url.strip():
+                self.source_url = source_url.strip().rstrip("/")
+
+    def status_dict(self) -> dict[str, Any]:
+        with self.cond:
+            return {
+                "clients": self.sse_clients,
+                "mode": self.mode,
+                "workoutActive": self.workout_active,
+                "lastPushMs": self.last_push_ms,
+                "lastActivePushMs": self.last_active_push_ms,
+            }
+
+
 class ArmoryCamService:
     """Core DVR manager: config persistence, FFmpeg RTSP ring capture, motion indexing & clip cutting."""
 
-    def __init__(self, root_dir: Path | None = None) -> None:
+    def __init__(self, root_dir: Path | None = None, adb_controller: FireTvAdbController | None = None) -> None:
         self.root = (root_dir or default_root_dir()).resolve()
         self.ring_root = self.root / "ring"
         self.tapes_root = self.root / "tapes"
@@ -498,6 +1113,9 @@ class ArmoryCamService:
         self.ffprobe = resolve_tool_bin("ffprobe", "ARMORY_CAM_FFPROBE")
         self.log = logging.getLogger("armory-cam")
         self.live_hub = LiveStreamHub()
+        self.wallboard_cfg = WallboardConfig()
+        self.wallboard = WallboardRelay(self.root)
+        self.adb = adb_controller or FireTvAdbController()
 
         self.lock = threading.RLock()
         self.port = DEFAULT_PORT
@@ -531,6 +1149,7 @@ class ArmoryCamService:
         ]
         if not self.config_path.exists():
             self.cameras = default_cams
+            self.wallboard_cfg = WallboardConfig()
             self.save_config()
             return
         try:
@@ -538,6 +1157,7 @@ class ArmoryCamService:
             self.port = int(raw.get("port", DEFAULT_PORT))
             self.retention_days = max(1, int(raw.get("retentionDays", DEFAULT_RETENTION_DAYS)))
             self.pre_roll_sec = max(30, int(raw.get("preRollSec", DEFAULT_PRE_ROLL_SEC)))
+            self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
             loaded: list[CameraConfig] = []
             for item in raw.get("cameras", []):
                 name = str(item.get("name", "")).strip()
@@ -567,10 +1187,47 @@ class ArmoryCamService:
             "retentionDays": self.retention_days,
             "preRollSec": self.pre_roll_sec,
             "cameras": [c.to_dict() for c in self.cameras],
+            "wallboard": self.wallboard_cfg.to_dict(),
         }
         tmp = self.config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.config_path)
+
+    def effective_wallboard_url(self) -> str:
+        with self.lock:
+            explicit = self.wallboard_cfg.wallboard_url.strip()
+            port = self.port
+        if explicit:
+            return explicit
+        return f"http://{detect_lan_ip()}:{port}/wallboard"
+
+    def trigger_adb_wake_async(self, force: bool = False) -> None:
+        with self.lock:
+            cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
+            url = self.effective_wallboard_url()
+
+        def _worker() -> None:
+            try:
+                res = self.adb.wake_and_launch(cfg, url, force=force)
+                if not res.get("skipped"):
+                    self.log.info("Wallboard ADB wake: %s", res.get("message", res))
+            except Exception as exc:
+                self.adb.last_error = str(exc)
+
+        threading.Thread(target=_worker, name="wallboard-adb-wake", daemon=True).start()
+
+    def trigger_adb_sleep_async(self, reason: str = "", delay_sec: float = 0.0) -> None:
+        with self.lock:
+            cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
+
+        def _worker() -> None:
+            try:
+                res = self.adb.schedule_sleep(cfg, delay_sec=delay_sec, reason=reason)
+                self.log.info("Wallboard ADB sleep: %s", res.get("message", res))
+            except Exception as exc:
+                self.adb.last_error = str(exc)
+
+        threading.Thread(target=_worker, name="wallboard-adb-sleep", daemon=True).start()
 
     def update_config(self, raw: dict[str, Any]) -> None:
         with self.lock:
@@ -579,6 +1236,9 @@ class ArmoryCamService:
                 self.retention_days = max(1, min(90, int(raw["retentionDays"])))
             if "preRollSec" in raw:
                 self.pre_roll_sec = max(30, min(600, int(raw["preRollSec"])))
+            if isinstance(raw.get("wallboard"), dict):
+                merged = {**self.wallboard_cfg.to_dict(), **raw["wallboard"]}
+                self.wallboard_cfg = WallboardConfig.from_dict(merged)
             if isinstance(raw.get("cameras"), list):
                 next_cams: list[CameraConfig] = []
                 for idx, item in enumerate(raw["cameras"]):
@@ -826,8 +1486,13 @@ class ArmoryCamService:
             now = time.time()
             with self.lock:
                 cams = list(self.cameras)
+                wb_cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
             for cam in cams:
                 self._ingest_closed_segments(cam, now)
+            with self.wallboard.cond:
+                last_active_ms = self.wallboard.last_active_push_ms
+                workout_active = self.wallboard.workout_active
+            self.adb.check_timers(wb_cfg, last_active_ms, workout_active)
             if now - last_prune > 60.0:
                 last_prune = now
                 self._prune_storage(now)
@@ -1328,6 +1993,17 @@ class ArmoryCamService:
                 }
                 for c in self.cameras
             ]
+            wb_cfg = self.wallboard_cfg
+            wb_status = {
+                **self.adb.status_dict(wb_cfg),
+                **self.wallboard.status_dict(),
+                "wallboardUrl": self.effective_wallboard_url(),
+                "wakeOnStart": wb_cfg.wake_on_start,
+                "sleepOnStop": wb_cfg.sleep_on_stop,
+                "idleSleepSec": wb_cfg.idle_sleep_sec,
+                "displayClient": wb_cfg.display_client,
+                "enabled": wb_cfg.enabled,
+            }
             return {
                 "service": "armory-cam",
                 "serverEpochMs": int(time.time() * 1000),
@@ -1335,6 +2011,7 @@ class ArmoryCamService:
                 "paused": self.paused,
                 "disk": self.disk_stats(),
                 "cameras": cams,
+                "wallboard": wb_status,
             }
 
 
@@ -1407,6 +2084,45 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="ctrl-row" style="margin-top:10px">
       <button class="btn" id="saveBtn" type="button">Save Camera Config &amp; Apply</button>
       <span id="saveMsg" style="color:var(--mut);font-size:12px"></span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>
+      <span>32&quot; Fire TV Wallboard &amp; ADB Auto-Wake</span>
+      <span style="display:flex;align-items:center;gap:8px">
+        <a href="/wallboard" target="_blank" style="font-size:12px;font-weight:700">Open Wallboard ↗</a>
+        <span id="wbBadge" class="pill">UNCONFIGURED</span>
+      </span>
+    </h2>
+    <div id="wbMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Permanent URL: <code>/wallboard</code></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+      <div><label>Fire TV IP / Hostname</label><input id="wbHost" type="text" placeholder="192.168.1.xxx"></div>
+      <div><label>ADB Port</label><input id="wbPort" type="number" min="1" max="65535" value="5555"></div>
+      <div>
+        <label>Display Client</label>
+        <select id="wbClient">
+          <option value="silk">Amazon Silk</option>
+          <option value="fully">Fully Kiosk Browser</option>
+          <option value="custom">Custom App / URL Intent</option>
+        </select>
+      </div>
+      <div><label>Idle Auto-Sleep (minutes)</label><input id="wbIdleMin" type="number" min="1" max="120" value="10"></div>
+      <div>
+        <label>Wake on Workout Start</label>
+        <select id="wbWake"><option value="1">Yes (Auto-Wake)</option><option value="0">No</option></select>
+      </div>
+      <div>
+        <label>Sleep When Workout Ends</label>
+        <select id="wbSleep"><option value="1">Yes (30s delay)</option><option value="0">No</option></select>
+      </div>
+    </div>
+    <div class="ctrl-row" style="margin-top:10px">
+      <button class="btn" id="wbSaveBtn" type="button">Save Wallboard</button>
+      <button class="btn sec" id="wbPairBtn" type="button">Connect / Pair ADB</button>
+      <button class="btn ok" id="wbWakeBtn" type="button">Test Wake &amp; Launch</button>
+      <button class="btn sec" id="wbSleepBtn" type="button">Sleep TV Now</button>
+      <span id="wbOut" style="color:var(--mut);font-size:12px"></span>
     </div>
   </div>
 
@@ -1671,15 +2387,27 @@ async function saveConfig() {
     motionThreshold: Number($(`thresh-${idx}`).value) || 2.2,
     enabled: $(`en-${idx}`).value === '1',
   }));
+  const wallboard = {
+    ...(cfg.wallboard || {}),
+    fireTvHost: $('wbHost').value.trim(),
+    adbPort: Number($('wbPort').value) || 5555,
+    displayClient: $('wbClient').value || 'silk',
+    idleSleepSec: clamp(Math.round((Number($('wbIdleMin').value) || 10) * 60), 60, 7200),
+    wakeOnStart: $('wbWake').value === '1',
+    sleepOnStop: $('wbSleep').value === '1',
+  };
   const body = {
     retentionDays: Number($('retDays').value) || 14,
     preRollSec: Number($('preRoll').value) || 120,
     cameras,
+    wallboard,
   };
   const prevUrls = cfg.cameras.map(c => c.rtspUrl);
   const res = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(r => r.json());
   $('saveMsg').textContent = res.ok ? 'Saved & applied live!' : 'Save failed';
+  $('wbOut').textContent = res.ok ? 'Saved!' : 'Save failed';
   cfg.cameras = cameras;
+  cfg.wallboard = wallboard;
   cameras.forEach((c, idx) => {
     if (c.rtspUrl !== prevUrls[idx]) $(`stream-${idx}`).src = streamUrlFor(idx);
   });
@@ -1706,6 +2434,23 @@ async function pollStatus() {
         mEl.classList.toggle('hot', c.latestEnergy >= c.motionThreshold);
       }
     });
+    if (st.wallboard) {
+      const wb = st.wallboard;
+      const wbBadge = $('wbBadge');
+      const stTxt = (wb.adbState || 'unconfigured').toUpperCase();
+      wbBadge.textContent = wb.workoutActive ? `LIVE · ${(wb.mode || 'WORKOUT').toUpperCase()}` : stTxt;
+      wbBadge.className = 'pill ' + ((wb.adbState === 'awake' || wb.adbState === 'ready' || wb.workoutActive) ? 'ok' : 'live');
+      const parts = [
+        `URL: <code>${wb.wallboardUrl}</code>`,
+        `SSE Displays: <b>${wb.clients}</b>`,
+        `Mode: <b>${wb.mode || 'standby'}</b>`,
+        wb.adbBinFound ? (wb.fireTvModel ? `TV: <b>${wb.fireTvModel}</b>` : (wb.fireTvHost ? `TV: <code>${wb.fireTvHost}</code>` : 'TV IP not set yet')) : 'adb.exe missing',
+      ];
+      if (wb.pendingSleepSec > 0) parts.push(`Sleep in ${wb.pendingSleepSec}s`);
+      if (wb.lastError) parts.push(`<span style="color:var(--amber)">${wb.lastError}</span>`);
+      else if (wb.lastAction) parts.push(`Last: ${wb.lastAction}`);
+      $('wbMsg').innerHTML = parts.join(' · ');
+    }
   } catch {}
 }
 
@@ -1724,6 +2469,13 @@ async function init() {
   cfg = await fetch('/api/config').then(r => r.json());
   $('retDays').value = cfg.retentionDays;
   $('preRoll').value = cfg.preRollSec;
+  const wb = cfg.wallboard || {};
+  $('wbHost').value = wb.fireTvHost || '';
+  $('wbPort').value = wb.adbPort || 5555;
+  $('wbClient').value = wb.displayClient || 'silk';
+  $('wbIdleMin').value = Math.max(1, Math.round((wb.idleSleepSec || 600) / 60));
+  $('wbWake').value = wb.wakeOnStart === false ? '0' : '1';
+  $('wbSleep').value = wb.sleepOnStop === false ? '0' : '1';
   renderCameras();
   await Promise.all([pollStatus(), pollClips()]);
   setInterval(pollStatus, 1000);
@@ -1732,6 +2484,25 @@ async function init() {
 
 $('saveBtn').onclick = saveConfig;
 $('saveAllTop').onclick = saveConfig;
+$('wbSaveBtn').onclick = saveConfig;
+$('wbPairBtn').onclick = async () => {
+  await saveConfig();
+  $('wbOut').textContent = 'Connecting ADB…';
+  const r = await fetch('/api/wallboard/adb/test', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+  $('wbOut').textContent = r.message || r.state || 'Done';
+};
+$('wbWakeBtn').onclick = async () => {
+  await saveConfig();
+  $('wbOut').textContent = 'Waking TV & launching…';
+  const r = await fetch('/api/wallboard/wake', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ force: true, sync: true }) }).then(x => x.json());
+  $('wbOut').textContent = (r.adb && r.adb.message) || 'Sent wake';
+};
+$('wbSleepBtn').onclick = async () => {
+  await saveConfig();
+  $('wbOut').textContent = 'Sleeping TV…';
+  const r = await fetch('/api/wallboard/sleep', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ reason: 'manual', delaySec: 0, sync: true }) }).then(x => x.json());
+  $('wbOut').textContent = (r.adb && r.adb.message) || 'Sent sleep';
+};
 init();
 </script>
 </body>
@@ -1826,6 +2597,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "retentionDays": service.retention_days,
                 "preRollSec": service.pre_roll_sec,
                 "cameras": cams,
+                "wallboard": service.wallboard_cfg.to_dict(),
                 "disk": service.disk_stats(),
             }
         return jsonify(payload)
@@ -1835,6 +2607,164 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         service.update_config(body)
         return jsonify({"ok": True})
+
+    @app.get("/wallboard")
+    @app.get("/wallboard/")
+    def wallboard_page() -> Response:
+        resp = Response(service.wallboard.get_html(), mimetype="text/html; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/wallboard/state")
+    def wallboard_state() -> Response:
+        resp = Response(service.wallboard.current_state_json(), mimetype="application/json")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/wallboard/events")
+    def wallboard_events() -> Response:
+        def generate():
+            with service.wallboard.cond:
+                service.wallboard.sse_clients += 1
+                last_seq = service.wallboard.seq
+            try:
+                initial = service.wallboard.current_state_json()
+                yield f"data: {initial}\n\n".encode("utf-8")
+                while not service._stop_event.is_set():
+                    payload = None
+                    with service.wallboard.cond:
+                        if service.wallboard.seq == last_seq:
+                            service.wallboard.cond.wait(timeout=15.0)
+                        if service.wallboard.seq != last_seq:
+                            last_seq = service.wallboard.seq
+                            payload = service.wallboard.latest_json or service.wallboard.current_state_json()
+                    if payload:
+                        yield f"data: {payload}\n\n".encode("utf-8")
+                    else:
+                        yield b": ping\n\n"
+            finally:
+                with service.wallboard.cond:
+                    service.wallboard.sse_clients = max(0, service.wallboard.sse_clients - 1)
+
+        resp = Response(generate(), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
+    @app.post("/wallboard/voice")
+    def wallboard_voice() -> Response:
+        body = request.get_json(silent=True) or {}
+        transcript = str(body.get("transcript") or "").strip()
+        if not transcript:
+            return jsonify({"ok": False, "error": "Empty transcript"}), 400
+        with service.wallboard.cond:
+            target_base = service.wallboard.source_url
+        if not target_base:
+            return jsonify({"ok": False, "error": "No active Pixel wallboard source URL"}), 503
+        req = urllib.request.Request(
+            f"{target_base}/api/voice",
+            data=json.dumps({"transcript": transcript}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                raw = resp.read()
+                return Response(raw or b'{"ok":true}', status=resp.status, mimetype="application/json")
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 502
+
+    @app.post("/api/wallboard/html")
+    def api_wallboard_html() -> Response:
+        body = request.get_json(silent=True) or {}
+        html = body.get("html")
+        if not isinstance(html, str) or not service.wallboard.save_uploaded_html(html):
+            return jsonify({"ok": False, "error": "Invalid HTML"}), 400
+        return jsonify({"ok": True})
+
+    @app.post("/api/wallboard/state")
+    def api_wallboard_state() -> Response:
+        body = request.get_json(silent=True) or {}
+        state_obj = body.get("state") if isinstance(body.get("state"), dict) else None
+        workout_active = bool(body.get("workoutActive", False))
+        source_url = str(body.get("sourceUrl") or "")
+        service.wallboard.update_state(state_obj, workout_active=workout_active, source_url=source_url)
+        with service.lock:
+            cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
+        if workout_active:
+            with service.adb.lock:
+                service.adb.pending_sleep_at_ms = None
+                service.adb.pending_sleep_reason = ""
+                should_wake = (
+                    cfg.enabled
+                    and cfg.wake_on_start
+                    and bool(service.adb.serial(cfg))
+                    and not service.adb.tv_awake_requested
+                )
+            if should_wake:
+                service.trigger_adb_wake_async(force=False)
+        return jsonify({"ok": True})
+
+    @app.post("/api/wallboard/wake")
+    def api_wallboard_wake() -> Response:
+        body = request.get_json(silent=True) or {}
+        state_obj = body.get("state") if isinstance(body.get("state"), dict) else None
+        source_url = str(body.get("sourceUrl") or "")
+        force = bool(body.get("force", False))
+        sync_flag = bool(body.get("sync", False))
+        service.wallboard.mark_active_wake(state_obj=state_obj, source_url=source_url)
+        with service.lock:
+            cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
+            url = service.effective_wallboard_url()
+        if not (cfg.enabled and cfg.wake_on_start) and not force:
+            adb_res: dict[str, Any] = {"ok": False, "skipped": True, "message": "Wake on workout start disabled"}
+        elif sync_flag:
+            adb_res = service.adb.wake_and_launch(cfg, url, force=force)
+        else:
+            service.trigger_adb_wake_async(force=force)
+            adb_res = {"queued": True, "state": service.adb.adb_state, "message": "Wake queued on OptiPlex"}
+        return jsonify(
+            {
+                "ok": True,
+                "wallboardUrl": url,
+                "fireTvHost": cfg.fire_tv_host,
+                "adb": adb_res,
+            }
+        )
+
+    @app.post("/api/wallboard/sleep")
+    def api_wallboard_sleep() -> Response:
+        body = request.get_json(silent=True) or {}
+        state_obj = body.get("state") if isinstance(body.get("state"), dict) else None
+        reason = str(body.get("reason") or "workout_finished")
+        delay_sec = max(0.0, float(body.get("delaySec", 0) or 0))
+        sync_flag = bool(body.get("sync", False))
+        service.wallboard.update_state(state_obj, workout_active=False)
+        with service.lock:
+            cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
+        if reason != "manual" and not cfg.sleep_on_stop:
+            return jsonify(
+                {
+                    "ok": True,
+                    "scheduledDelaySec": 0,
+                    "adb": {"ok": False, "skipped": True, "message": "Auto-sleep disabled"},
+                }
+            )
+        if delay_sec == 0 and sync_flag:
+            adb_res = service.adb.sleep_now(cfg, reason=reason)
+        elif delay_sec > 0:
+            adb_res = service.adb.schedule_sleep(cfg, delay_sec=delay_sec, reason=reason)
+        else:
+            service.trigger_adb_sleep_async(reason=reason, delay_sec=0.0)
+            adb_res = {"queued": True, "state": service.adb.adb_state, "message": "Sleep queued on OptiPlex"}
+        return jsonify({"ok": True, "scheduledDelaySec": delay_sec, "adb": adb_res})
+
+    @app.post("/api/wallboard/adb/test")
+    def api_wallboard_adb_test() -> Response:
+        with service.lock:
+            cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
+        res = service.adb.connect_and_probe(cfg)
+        return jsonify(res)
 
     @app.get("/api/clips")
     def api_clips() -> Response:

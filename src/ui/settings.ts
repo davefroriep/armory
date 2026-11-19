@@ -49,7 +49,8 @@ export function settingsScreen(root: HTMLElement): () => void {
 
     <h2 class="sec">GYM DISPLAY &amp; VOICE</h2>
     <section class="card">
-      <div class="line"><span>Smart TV Wallboard<small>Streams live 1 Hz HR, rest timer &amp; superset progression over Wi-Fi</small></span><button class="switch ${s.wallboardEnabled ? 'on' : ''}" id="wbTog" role="switch" aria-checked="${s.wallboardEnabled}"><i></i></button></div>
+      <div class="line"><span>Auto-Wake 32&quot; TV on Workout<small>Streams wallboard via OptiPlex &amp; wakes Fire TV over ADB when a workout starts</small></span>${tog('wallboardRelayEnabled', s.wallboardRelayEnabled)}</div>
+      <div class="line"><span>Smart TV Wallboard (Pixel Direct)<small>Optional local HTTP/SSE server hosted directly on this Pixel</small></span><button class="switch ${s.wallboardEnabled ? 'on' : ''}" id="wbTog" role="switch" aria-checked="${s.wallboardEnabled}"><i></i></button></div>
       <div class="hint" id="wbInfo"></div>
       <div class="row">
         <button class="btn sm" id="wbCopy">Copy TV URL</button>
@@ -149,10 +150,18 @@ export function settingsScreen(root: HTMLElement): () => void {
     const wbTog = $<HTMLElement>('#wbTog', root);
     wbTog.classList.toggle('on', cur.wallboardEnabled);
     wbTog.setAttribute('aria-checked', String(cur.wallboardEnabled));
+    const relayTog = root.querySelector<HTMLElement>('[data-tog="wallboardRelayEnabled"]');
+    if (relayTog) {
+      relayTog.classList.toggle('on', cur.wallboardRelayEnabled);
+      relayTog.setAttribute('aria-checked', String(cur.wallboardRelayEnabled));
+    }
     const wbSt = wallboard.status;
-    $('#wbInfo', root).innerHTML = wbSt.running
-      ? `<b>● LIVE:</b> <code>${esc(wbSt.url)}</code> · ${wbSt.clients} display${wbSt.clients === 1 ? '' : 's'} connected`
-      : wbSt.error ? `✗ ${esc(wbSt.error)}` : `Off · will serve on port ${cur.wallboardPort}`;
+    const localTxt = wbSt.running
+      ? `<b>● Pixel LIVE:</b> <code>${esc(wbSt.url)}</code> · ${wbSt.clients} display${wbSt.clients === 1 ? '' : 's'}`
+      : wbSt.error ? `✗ ${esc(wbSt.error)}` : `Pixel server off (port ${cur.wallboardPort})`;
+    $('#wbInfo', root).innerHTML = cur.wallboardRelayEnabled
+      ? `<b>TV URL (OptiPlex):</b> <code>${esc(wallboard.relayUrl())}</code> · ${localTxt}`
+      : localTxt;
 
     const vxTog = $<HTMLElement>('#vxTog', root);
     vxTog.classList.toggle('on', cur.voiceEnabled);
@@ -184,7 +193,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'wallboardRelayEnabled';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
@@ -213,7 +222,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     if (t.closest('#test')) void test();
     if (t.closest('#wbTog')) void wallboard.setEnabled(!getSettings().wallboardEnabled).then(paintFtpBox);
     if (t.closest('#wbCopy')) {
-      const u = wallboard.status.url;
+      const u = getSettings().wallboardRelayEnabled ? wallboard.relayUrl() : wallboard.status.url;
       void navigator.clipboard?.writeText(u).then(() => toast(`Copied ${u}`)).catch(() => toast(u));
     }
     if (t.closest('#vxTog')) void voice.setEnabled(!getSettings().voiceEnabled).then(paintFtpBox);
