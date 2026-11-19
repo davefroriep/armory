@@ -87,3 +87,25 @@ export function fmtRelativeToCheck(targetMs: number, checkedMs: number): string 
   const span = m > 0 ? (s ? `${m}m ${s}s` : `${m}m`) : `${abs}s`;
   return dSec > 0 ? `${span} before ✓` : `${span} after ✓`;
 }
+
+/** Binary-searches sorted tape frames by `tsMs` and returns index closest to `targetMs` (tie-breaks lower). */
+export function findNearestFrameIndex(frames: readonly { tsMs: number }[], targetMs: number): number {
+  const n = frames.length;
+  if (n === 0) return -1;
+  if (n === 1) return 0;
+  if (targetMs <= frames[0].tsMs) return 0;
+  if (targetMs >= frames[n - 1].tsMs) return n - 1;
+  let lo = 0;
+  let hi = n - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].tsMs < targetMs) lo = mid + 1;
+    else hi = mid;
+  }
+  if (lo > 0) {
+    const dPrev = Math.abs(targetMs - frames[lo - 1].tsMs);
+    const dCur = Math.abs(frames[lo].tsMs - targetMs);
+    if (dPrev <= dCur) return lo - 1;
+  }
+  return lo;
+}

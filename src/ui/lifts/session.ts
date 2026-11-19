@@ -15,6 +15,7 @@ import { lifts } from '../../lifts/store';
 import { gymCam } from '../../lifts/gymCam';
 import { resyncSession } from '../../lifts/intervals';
 import { setText } from '../../lifts/summary';
+import { shortCamLabel } from '../../lifts/tape';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
 import { voice } from '../../lifts/voice';
 import { allowNextRoute } from '../../main';
@@ -25,7 +26,7 @@ import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
-import { openSetVideoSheet, playVideo } from './video';
+import { openSetVideoSheet, pickRecordCameraSheet, playVideo } from './video';
 
 const KIND_LABEL: Record<SetKind, string> = { n: 'Normal', w: 'Warm-up', d: 'Drop set', f: 'To failure' };
 const KIND_CHAR: Record<SetKind, string> = { n: '', w: 'W', d: 'D', f: 'F' };
@@ -132,6 +133,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const wShow = set.w != null ? fmtKg(set.w) : '';
     const hasVid = !!set.vids?.length;
     const isRec = !edit && gymCam.isArmed(set.id);
+    const isSaving = !edit && gymCam.isSaving(set.id);
     const rpeTag = set.rpe != null ? `<u class="srpe">@${set.rpe}</u>` : '';
     const isTime = ex.type === 'time';
     const holdActive = hold?.setId === set.id;
@@ -144,7 +146,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '–' : 'BW'}" aria-label="Weight">
       <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${isTime ? 'sec' : '–'}" aria-label="${isTime ? 'Seconds' : 'Reps'}">
       ${holdBtn}
-      <button class="svid${isRec ? ' rec' : hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${isRec ? 'Stop camera recording' : hasVid ? 'Play clip' : 'Arm camera or link video'}">${LI.video}</button>
+      <button class="svid${isRec ? ' rec' : isSaving ? ' saving' : hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${isSaving ? 'Saving clip…' : isRec ? 'Stop camera recording' : hasVid ? 'Play clip' : 'Arm camera or link video'}">${LI.video}</button>
       <button class="schk${set.done ? ' on' : ''}" type="button" data-act="done" aria-label="Log set"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7.5"/></svg></button>
     </div>`;
   };
@@ -213,9 +215,16 @@ function build(root: HTMLElement, id?: string): () => void {
       holder.innerHTML = '';
       return;
     }
-    const armed = !!gymCam.armed;
-    const cls = armed ? ' rec' : gymCam.recording && !gymCam.paused ? '' : ' off';
-    const txt = armed ? '● REC' : gymCam.recording && !gymCam.paused ? '● CAM' : '○ CAM';
+    const saving = !!gymCam.savingSetId;
+    const armed = gymCam.armed;
+    const cls = saving || armed ? ' rec' : gymCam.recording && !gymCam.paused ? '' : ' off';
+    const txt = saving
+      ? '● SAVING…'
+      : armed
+        ? `● REC ${shortCamLabel(armed.camera)}`
+        : gymCam.recording && !gymCam.paused
+          ? '● CAM'
+          : '○ CAM';
     holder.innerHTML = `<button class="cam-pill${cls}" type="button" data-act="camstatus">${txt}</button>`;
   };
 
@@ -294,6 +303,7 @@ function build(root: HTMLElement, id?: string): () => void {
       const svid = row.querySelector('.svid');
       svid?.classList.toggle('on', !!set.vids?.length);
       svid?.classList.toggle('rec', !edit && gymCam.isArmed(set.id));
+      svid?.classList.toggle('saving', !edit && gymCam.isSaving(set.id));
       const star = row.querySelector('.prstar');
       const pr = set.done && hits.has(set.id);
       if (pr && !star) row.querySelector('.snum')!.insertAdjacentHTML('beforeend', '<i class="prstar">★</i>');
@@ -496,14 +506,20 @@ function build(root: HTMLElement, id?: string): () => void {
         buzz(25);
       }
     };
-    const maybeCamOnLog = (hadPr: boolean, wasArmed: boolean): void => {
-      if (edit || !gymCam.online) return;
+    const maybeCamOnLog = (hadPr: boolean, wasArmed: boolean, armedCam?: string): void => {
+      if (edit) return;
       if (wasArmed) {
+        const camLbl = armedCam ? shortCamLabel(armedCam) : 'Gym Cam';
+        toast(`Saving ${camLbl} clip…`);
         void gymCam.stopAndSaveArmed(s, se, set).then((meta) => {
-          if (!dead && meta) { toast(`Clip saved · ${ex.name}`); save(); syncVisibleCards(); }
+          if (dead) return;
+          toast(meta ? `${camLbl} clip saved · ${ex.name}` : 'Could not save clip from Gym Cam');
+          save();
+          syncVisibleCards();
         });
         return;
       }
+      if (!gymCam.online) return;
       if (!hadPr && hits.has(set.id) && getSettings().gymCamAutoPr && !set.vids?.length) {
         void gymCam.autoClipPr(s, se, set).then((meta) => {
           if (!dead && meta) { toast('★ PR auto-clipped from Gym Cam'); save(); syncVisibleCards(); }
@@ -514,9 +530,10 @@ function build(root: HTMLElement, id?: string): () => void {
       if (!canLog(set, ex)) return shakeIncomplete();
       const hadPr = hits.has(set.id);
       const wasArmed = !edit && gymCam.isArmed(set.id);
+      const armedCam = wasArmed ? gymCam.armed?.camera : undefined;
       recomputePRs();
       commitBuzz(hadPr);
-      maybeCamOnLog(hadPr, wasArmed);
+      maybeCamOnLog(hadPr, wasArmed, armedCam);
       syncCard(card);
       save();
       focused?.blur();
@@ -524,6 +541,7 @@ function build(root: HTMLElement, id?: string): () => void {
       return;
     }
     const wasArmed = !edit && gymCam.isArmed(set.id);
+    const armedCam = wasArmed ? gymCam.armed?.camera : undefined;
     const r = toggleDone(se, i, ex);
     if (r === null) return shakeIncomplete();
     if (r && !was) {
@@ -538,7 +556,7 @@ function build(root: HTMLElement, id?: string): () => void {
         paintClock();
       }
       commitBuzz(false);
-      maybeCamOnLog(false, wasArmed);
+      maybeCamOnLog(false, wasArmed, armedCam);
     } else {
       recomputePRs();
       if (!r && was && !edit) {
@@ -1052,23 +1070,33 @@ function build(root: HTMLElement, id?: string): () => void {
         return;
       }
       if (!edit) {
-        active.ensureStarted(s, true);
-        paintClock();
+        if (gymCam.isSaving(set.id)) {
+          toast('Saving clip from Gym Cam…');
+          return;
+        }
         if (gymCam.isArmed(set.id)) {
+          const camLbl = gymCam.armed?.camera ? shortCamLabel(gymCam.armed.camera) : 'Gym Cam';
+          toast(`Saving ${camLbl} clip…`);
           const meta = await gymCam.stopAndSaveArmed(s, se, set);
           if (!dead) {
-            toast(meta ? 'Clip saved & linked' : 'Could not save clip from Gym Cam');
+            toast(meta ? `${camLbl} clip saved & linked` : 'Could not save clip from Gym Cam');
             save();
             syncVisibleCards();
           }
           return;
         }
         if (gymCam.online && !set.done) {
-          gymCam.armSet(s, se, set);
-          buzz(25);
-          syncVisibleCards();
-          toast(`Recording ${exOf(se.exId).name} ${setLabel} — tap ✓ or camera to stop`);
-          return;
+          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel);
+          if (dead || choice.kind === 'cancel') return;
+          if (choice.kind === 'cam') {
+            active.ensureStarted(s, true);
+            paintClock();
+            gymCam.armSet(s, se, set, choice.camera);
+            buzz(25);
+            syncVisibleCards();
+            toast(`Recording ${shortCamLabel(choice.camera)} · ${setLabel} — tap ✓ or red camera to stop`);
+            return;
+          }
         }
       }
       await openSetVideoSheet({ session: s, se, set }, setLabel);

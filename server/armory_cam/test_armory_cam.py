@@ -164,13 +164,17 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertGreater(clip_data["bytes"], 1000)
             self.assertTrue(clip_data["thumb"].startswith("data:image/jpeg;base64,"))
 
-            # Verify 50% crop on 320x240 input yielded exact 160x120 FastStart MP4
+            # Verify 50% crop on 320x240 input yielded exact 160x120 FastStart MP4 with zero B-frames (fast scrub)
             out_file = svc.clips_root / clip_data["lanUrl"].removeprefix("/clips/")
             probe_out = subprocess.check_output(
-                [svc.ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(out_file)],
+                [
+                    svc.ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height,has_b_frames",
+                    "-of", "csv=p=0:s=x", str(out_file),
+                ],
                 text=True,
             ).strip()
-            self.assertEqual(probe_out, "160x120")
+            self.assertEqual(probe_out, "160x120x0")
 
             status = client.get("/api/status").get_json()
             self.assertEqual(status["service"], "armory-cam")
@@ -429,6 +433,39 @@ class ArmoryCamTests(unittest.TestCase):
             fr_res = client.get(f"/api/tape/frame?sessionId=sess-tape&camera=Rack%20Cam&tsMs={t0_ms + 30500}&w=480")
             self.assertEqual(fr_res.status_code, 200)
             self.assertTrue(fr_res.data.startswith(b"\xff\xd8"))
+
+            # Batch /api/tape/pack builds and reuses crop-keyed cached JPEGs under thumbs/
+            import base64 as _b64
+            pack_res = client.get(
+                f"/api/tape/pack?sessionId=sess-tape&camera=Rack%20Cam&startMs={t0_ms}&endMs={t0_ms + 44000}&count=8"
+            )
+            self.assertEqual(pack_res.status_code, 200)
+            pack = pack_res.get_json()
+            self.assertTrue(pack["ok"])
+            self.assertEqual(pack["camera"], "Rack Cam")
+            self.assertEqual(len(pack["frames"]), 8)
+            for item in pack["frames"]:
+                self.assertGreaterEqual(item["tsMs"], t0_ms)
+                raw_jpg = _b64.b64decode(item["jpg"])
+                self.assertTrue(raw_jpg.startswith(b"\xff\xd8"))
+
+            rack_thumb_dirs = [d.name for d in (svc.thumbs_root / "rack_cam").iterdir() if d.is_dir()]
+            self.assertEqual(len(rack_thumb_dirs), 1)
+            cached_jpgs = list((svc.thumbs_root / "rack_cam" / rack_thumb_dirs[0]).glob("*.jpg"))
+            self.assertGreaterEqual(len(cached_jpgs), 8)
+            self.assertLessEqual(len(cached_jpgs), 9)
+
+            # Updating crop creates a fresh cropKey cache folder (never serves stale thumbs)
+            client.post("/api/config", json={
+                "cameras": [
+                    {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "crop": [0.1, 0.1, 0.9, 0.9]},
+                    {"name": "Smith Cam", "slug": "smith_cam", "rtspUrl": "", "enabled": True},
+                ]
+            })
+            pack_res2 = client.get(f"/api/tape/pack?sessionId=sess-tape&camera=Rack%20Cam&count=4")
+            self.assertEqual(pack_res2.status_code, 200)
+            rack_thumb_dirs2 = sorted(d.name for d in (svc.thumbs_root / "rack_cam").iterdir() if d.is_dir())
+            self.assertEqual(len(rack_thumb_dirs2), 2)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

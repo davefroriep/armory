@@ -1,5 +1,5 @@
 import { active } from '../../lifts/active';
-import { gymCam, type GymCamBurst, type GymCamTimeline } from '../../lifts/gymCam';
+import { gymCam, type GymCamBurst, type GymCamTapeFrame, type GymCamTimeline } from '../../lifts/gymCam';
 import { driveUrlFor } from '../../lifts/logic';
 import {
   extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink, sortDeviceVideosNewestFirst,
@@ -8,7 +8,7 @@ import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
 import {
-  applyClipMarker, computeScrubWindow, fmtRelativeToCheck, pickNearestBurstIndex, shortCamLabel,
+  applyClipMarker, computeScrubWindow, findNearestFrameIndex, fmtRelativeToCheck, pickNearestBurstIndex, shortCamLabel,
 } from '../../lifts/tape';
 import {
   createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
@@ -34,6 +34,17 @@ export interface VideoTarget {
 
 const VIDEO_EXT = /\.(mp4|mov|webm|mkv|m4v|3gp)$/i;
 const sessionFiles = new Map<string, Blob>();
+const MAX_LOCAL_CACHE_BYTES = 64 * 1024 * 1024;
+const MAX_SESSION_BLOBS = 6;
+const cacheSessionBlob = (id: string, blob: Blob): void => {
+  if (sessionFiles.has(id)) sessionFiles.delete(id);
+  sessionFiles.set(id, blob);
+  while (sessionFiles.size > MAX_SESSION_BLOBS) {
+    const oldest = sessionFiles.keys().next().value;
+    if (oldest !== undefined) sessionFiles.delete(oldest);
+    else break;
+  }
+};
 const isMobileWeb = (): boolean => !isNative() && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
@@ -328,6 +339,48 @@ export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
 /** Legacy alias for callers. */
 export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDcimVideo(t);
 
+/** Quick 1-tap chooser asking "Rack or Smith?" before arming Gym Cam on an unchecked set. */
+export function pickRecordCameraSheet(
+  exName: string,
+  setLabel: string,
+): Promise<{ kind: 'cam'; camera: string } | { kind: 'link' } | { kind: 'cancel' }> {
+  const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+  return new Promise((resolve) => {
+    let out: { kind: 'cam'; camera: string } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
+    const sh = openSheet(
+      `<h3 class="sh-title">${esc(exName)} · ${esc(setLabel)}</h3>
+       <div class="fl">WHICH CAMERA TO RECORD?</div>
+       <div class="vcam-pick">
+         ${cams.map((c) => `
+           <button class="vcam-btn" type="button" data-rcam="${esc(c)}">
+             <b>${esc(shortCamLabel(c))}</b>
+             <small>Auto-stops when you tap ✓</small>
+           </button>`).join('')}
+       </div>
+       <button class="btn big" type="button" data-rlink>Link Existing Tape / Phone Video…</button>
+       <button class="btn big" type="button" data-rcancel>Cancel</button>`,
+      { onClose: () => resolve(out) },
+    );
+    sh.body.addEventListener('click', (e) => {
+      const el = e.target as HTMLElement;
+      const camBtn = el.closest<HTMLElement>('[data-rcam]');
+      if (camBtn) {
+        out = { kind: 'cam', camera: camBtn.dataset.rcam! };
+        sh.close();
+        return;
+      }
+      if (el.closest('[data-rlink]')) {
+        out = { kind: 'link' };
+        sh.close();
+        return;
+      }
+      if (el.closest('[data-rcancel]')) {
+        sh.close();
+      }
+    });
+  });
+}
+
 /**
  * Per-row video sheet: explicit Rack/Smith Gym-Cam linking (30s+ bursts + live tape scrubber),
  * linked clips, Record Video & Select Video.
@@ -357,9 +410,14 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       </div>`).join('')}`;
   };
 
-  const gymArmHtml = () => (camAvail && t.session.status === 'active' && !t.set.done
-    ? `<button class="aitem on" type="button" data-vact="gymarm"><b>Record on Gym Cam</b><small>Arms this set and auto-stops when you tap ✓</small></button>`
-    : '');
+  const camList = (): string[] => (gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam']);
+
+  const gymArmHtml = () => {
+    if (!camAvail || t.session.status !== 'active' || t.set.done) return '';
+    return camList().map((c) =>
+      `<button class="aitem on" type="button" data-varmcam="${esc(c)}"><b>Record on ${esc(shortCamLabel(c))}</b><small>Arms this set and auto-stops when you tap ✓</small></button>`
+    ).join('');
+  };
 
   const actionsHtml = () => native
     ? `<div class="alist">
@@ -379,8 +437,6 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
            <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video</b></label>
          </div>`;
 
-  const camList = (): string[] => (gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam']);
-
   let selectedCam: string | null = null;
   let viewMode: 'bursts' | 'scrub' = 'bursts';
   let loadingCam = false;
@@ -393,25 +449,34 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   let timeline: GymCamTimeline | null = null;
   let minMs = 0;
   let maxMs = 0;
+  let winCenterMs = 0;
   let cursorMs = 0;
   let inMs = 0;
   let outMs = 0;
   let zoomMin: number | null = 15;
   let dragScrub = false;
 
-  const frameCache = new Map<string, string>();
-  let frameAbort: AbortController | null = null;
-  let frameTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastFrameBucketKey = '';
+  let packFrames: GymCamTapeFrame[] = [];
+  let packKey = '';
+  let packLoading = false;
+  let packAbort: AbortController | null = null;
+  let lastPackIdx = -1;
   let activeFrameUrl = '';
   let scrubDirty = false;
 
+  const clearPack = (): void => {
+    packAbort?.abort();
+    packAbort = null;
+    packLoading = false;
+    packKey = '';
+    lastPackIdx = -1;
+    activeFrameUrl = '';
+    for (const f of packFrames) URL.revokeObjectURL(f.url);
+    packFrames = [];
+  };
+
   const cleanupResources = (): void => {
-    frameAbort?.abort();
-    frameAbort = null;
-    if (frameTimer) { clearTimeout(frameTimer); frameTimer = null; }
-    for (const u of frameCache.values()) URL.revokeObjectURL(u);
-    frameCache.clear();
+    clearPack();
   };
 
   const sh = openSheet(
@@ -432,60 +497,57 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   const redrawLinked = (): void => { sh.body.querySelector('#vlinked')!.innerHTML = linkedRows(); };
   const redrawActions = (): void => { sh.body.querySelector('#vactions')!.innerHTML = actionsHtml(); };
 
-  const requestScrubFrame = (immediate: boolean): void => {
-    if (!selectedCam || !minMs || !maxMs) return;
-    const bucketMs = Math.round(clamp(cursorMs, minMs, maxMs) / 2000) * 2000;
-    const key = `${selectedCam}|${bucketMs}`;
-    if (key === lastFrameBucketKey && activeFrameUrl) return;
+  const currentWindow = (): { winStart: number; winEnd: number } =>
+    computeScrubWindow(minMs, maxMs, winCenterMs || cursorMs, zoomMin);
 
-    const hit = frameCache.get(key);
-    if (hit) {
-      lastFrameBucketKey = key;
-      activeFrameUrl = hit;
-      const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
-      if (img) { img.src = hit; img.hidden = false; }
-      const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
+  const paintScrubFrameLocal = (): void => {
+    const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
+    const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
+    const idx = findNearestFrameIndex(packFrames, cursorMs);
+    if (idx >= 0) {
+      const url = packFrames[idx].url;
+      activeFrameUrl = url;
+      if (img && (lastPackIdx !== idx || img.getAttribute('src') !== url || img.hidden)) {
+        lastPackIdx = idx;
+        img.src = url;
+        img.hidden = false;
+      }
       if (spin) spin.hidden = true;
       return;
     }
+    if (img && !activeFrameUrl) img.hidden = true;
+    if (spin) {
+      spin.hidden = false;
+      spin.textContent = packLoading ? 'Loading local tape frames…' : 'No frames in window';
+    }
+  };
 
-    if (frameTimer) { clearTimeout(frameTimer); frameTimer = null; }
-    const run = (): void => {
-      frameAbort?.abort();
-      const ctrl = new AbortController();
-      frameAbort = ctrl;
-      const camReq = selectedCam!;
-      const reqKey = `${camReq}|${bucketMs}`;
-      void gymCam.fetchTapeFrameBlobUrl(sid, camReq, bucketMs, ctrl.signal, 480).then((url) => {
-        if (ctrl.signal.aborted || !sh.el.isConnected) {
-          if (url) URL.revokeObjectURL(url);
-          return;
-        }
-        if (!url) {
-          const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
-          if (spin && !activeFrameUrl) spin.textContent = 'Frame unavailable';
-          return;
-        }
-        frameCache.set(reqKey, url);
-        if (frameCache.size > 100) {
-          const firstKey = frameCache.keys().next().value;
-          if (firstKey && firstKey !== reqKey) {
-            URL.revokeObjectURL(frameCache.get(firstKey)!);
-            frameCache.delete(firstKey);
-          }
-        }
-        if (camReq !== selectedCam) return;
-        lastFrameBucketKey = reqKey;
-        activeFrameUrl = url;
-        const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
-        if (img) { img.src = url; img.hidden = false; }
-        const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
-        if (spin) spin.hidden = true;
-      });
-    };
-
-    if (immediate) run();
-    else frameTimer = setTimeout(run, 85);
+  const ensurePackForCurrentWindow = (): void => {
+    if (!selectedCam || !minMs || !maxMs) return;
+    const { winStart, winEnd } = currentWindow();
+    const key = `${selectedCam}|${winStart}|${winEnd}`;
+    if (packKey === key && (packFrames.length || packLoading)) {
+      paintScrubFrameLocal();
+      return;
+    }
+    packAbort?.abort();
+    const ctrl = new AbortController();
+    packAbort = ctrl;
+    packKey = key;
+    packLoading = true;
+    paintScrubFrameLocal();
+    const camReq = selectedCam;
+    void gymCam.fetchTapePack(sid, camReq, winStart, winEnd, 80, ctrl.signal).then((frames) => {
+      if (ctrl.signal.aborted || !sh.el.isConnected || camReq !== selectedCam || packKey !== key) {
+        for (const f of frames) URL.revokeObjectURL(f.url);
+        return;
+      }
+      for (const oldF of packFrames) URL.revokeObjectURL(oldF.url);
+      packFrames = frames;
+      packLoading = false;
+      lastPackIdx = -1;
+      paintScrubFrameLocal();
+    });
   };
 
   const paintScrubOverlaysOnly = (): void => {
@@ -496,7 +558,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     }
     const head = sh.body.querySelector<HTMLElement>('#vscrubHead');
     if (head && maxMs > minMs) {
-      const { winStart, winEnd } = computeScrubWindow(minMs, maxMs, cursorMs, zoomMin);
+      const { winStart, winEnd } = currentWindow();
       const pct = clamp(((cursorMs - winStart) / Math.max(1, winEnd - winStart)) * 100, 0, 100);
       head.style.left = `${pct.toFixed(2)}%`;
     }
@@ -568,7 +630,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       return;
     }
 
-    const { winStart, winEnd } = computeScrubWindow(minMs, maxMs, cursorMs, zoomMin);
+    const { winStart, winEnd } = currentWindow();
     const span = Math.max(1, winEnd - winStart);
     const curPct = clamp(((cursorMs - winStart) / span) * 100, 0, 100);
     const inPct = clamp(((inMs - winStart) / span) * 100, 0, 100);
@@ -590,14 +652,18 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     const rel = t.set.at != null ? ` · ${fmtRelativeToCheck(cursorMs, checkedMs)}` : '';
     const clipSec = Math.max(1, Math.round((outMs - inMs) / 1000));
     const totalMin = (maxMs - minMs) / 60_000;
+    const initIdx = findNearestFrameIndex(packFrames, cursorMs);
+    const initUrl = initIdx >= 0 ? packFrames[initIdx].url : '';
+    lastPackIdx = initIdx;
+    if (initUrl) activeFrameUrl = initUrl;
 
     box.innerHTML = `
       ${headHtml}
       ${autoScrubHint ? `<div class="hint" style="margin:2px 0 6px">${esc(autoScrubHint)}</div>` : ''}
       <div class="vburst-card vscrub-card">
         <div class="vscrub-stage">
-          <img class="vscrub-img" id="vscrubImg" alt="${esc(shortCamLabel(selectedCam))} frame" ${activeFrameUrl ? `src="${activeFrameUrl}"` : 'hidden'}>
-          <div class="vscrub-spin" id="vscrubSpin" ${activeFrameUrl ? 'hidden' : ''}>Loading frame…</div>
+          <img class="vscrub-img" id="vscrubImg" alt="${esc(shortCamLabel(selectedCam))} frame" ${initUrl ? `src="${initUrl}"` : 'hidden'}>
+          <div class="vscrub-spin" id="vscrubSpin" ${initUrl ? 'hidden' : ''}>Loading local tape frames…</div>
           <div class="vscrub-ov l">${esc(shortCamLabel(selectedCam))}</div>
           <div class="vscrub-ov r" id="vscrubTime">${fmtEpochClock(cursorMs)}${esc(rel)}</div>
         </div>
@@ -636,7 +702,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
         <button class="btn primary big" type="button" data-ssave>Save Clip (${clipSec}s) to ${esc(setLabel)}</button>
       </div>`;
 
-    requestScrubFrame(true);
+    ensurePackForCurrentWindow();
   };
 
   const selectCamera = async (camName: string): Promise<void> => {
@@ -644,8 +710,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     selectedCam = camName;
     loadingCam = true;
     autoScrubHint = '';
-    activeFrameUrl = '';
-    lastFrameBucketKey = '';
+    clearPack();
     scrubDirty = false;
     bursts = [];
     timeline = null;
@@ -681,7 +746,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
         autoScrubHint = `No 30s+ bursts on ${shortCamLabel(camName)} — scrub tape directly`;
       }
     }
+    winCenterMs = cursorMs;
     loadingCam = false;
+    if (minMs && maxMs) ensurePackForCurrentWindow();
     renderGymCam();
   };
 
@@ -696,16 +763,16 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     });
   }
 
-  // Timeline drag scrubbing (smooth overlay & frame updates without full DOM thrashing)
-  const applyRailPointer = (clientX: number, immediateFrame: boolean): void => {
+  // Timeline drag scrubbing (60 fps local RAM frame lookup — zero network traffic on drag)
+  const applyRailPointer = (clientX: number): void => {
     const rail = sh.body.querySelector<HTMLElement>('#vscrubRail');
     if (!rail || !minMs || !maxMs) return;
     const rect = rail.getBoundingClientRect();
     const pct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
-    const { winStart, winEnd } = computeScrubWindow(minMs, maxMs, cursorMs, zoomMin);
+    const { winStart, winEnd } = currentWindow();
     cursorMs = clamp(Math.round(winStart + pct * (winEnd - winStart)), minMs, maxMs);
     paintScrubOverlaysOnly();
-    requestScrubFrame(immediateFrame);
+    paintScrubFrameLocal();
   };
 
   sh.body.addEventListener('pointerdown', (e) => {
@@ -715,17 +782,15 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     e.preventDefault();
     dragScrub = true;
     rail.setPointerCapture(e.pointerId);
-    applyRailPointer(e.clientX, true);
+    applyRailPointer(e.clientX);
   });
   sh.body.addEventListener('pointermove', (e) => {
     if (!dragScrub) return;
-    applyRailPointer(e.clientX, false);
+    applyRailPointer(e.clientX);
   });
   const endScrubDrag = (): void => {
     if (!dragScrub) return;
     dragScrub = false;
-    requestScrubFrame(true);
-    renderGymCam();
   };
   sh.body.addEventListener('pointerup', endScrubDrag);
   sh.body.addEventListener('pointercancel', endScrubDrag);
@@ -780,6 +845,8 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
           outMs = clamp(b.endMs, inMs + 3000, maxMs);
           cursorMs = Math.round((inMs + outMs) / 2);
         }
+        const { winStart, winEnd } = currentWindow();
+        if (!winCenterMs || cursorMs < winStart || cursorMs > winEnd) winCenterMs = cursorMs;
       }
       renderGymCam();
       return;
@@ -792,8 +859,6 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
       outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
       cursorMs = Math.round((inMs + outMs) / 2);
-      activeFrameUrl = '';
-      lastFrameBucketKey = '';
       renderGymCam();
       return;
     }
@@ -803,8 +868,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
       outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
       cursorMs = Math.round((inMs + outMs) / 2);
-      activeFrameUrl = '';
-      lastFrameBucketKey = '';
+      winCenterMs = cursorMs;
       scrubDirty = true;
       viewMode = 'scrub';
       renderGymCam();
@@ -815,6 +879,8 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     if (szoom) {
       const raw = szoom.dataset.szoom!;
       zoomMin = raw === 'all' ? null : Number(raw);
+      winCenterMs = cursorMs;
+      lastPackIdx = -1;
       renderGymCam();
       return;
     }
@@ -823,7 +889,15 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     if (sjmp && minMs && maxMs) {
       const v = sjmp.dataset.sjmp!;
       cursorMs = v === 'chk' ? clamp(checkedMs, minMs, maxMs) : clamp(cursorMs + Number(v), minMs, maxMs);
-      renderGymCam();
+      const { winStart, winEnd } = currentWindow();
+      if (cursorMs >= winStart && cursorMs <= winEnd) {
+        paintScrubOverlaysOnly();
+        paintScrubFrameLocal();
+      } else {
+        winCenterMs = cursorMs;
+        lastPackIdx = -1;
+        renderGymCam();
+      }
       return;
     }
 
@@ -869,6 +943,15 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
         ssave.textContent = `Save Clip (${dur}s) to ${setLabel}`;
         toast('Could not save clip from Gym Cam');
       }
+      return;
+    }
+
+    const warmCam = el.closest<HTMLElement>('[data-varmcam]')?.dataset.varmcam;
+    if (warmCam) {
+      startTimerForVideo(t.session);
+      gymCam.armSet(t.session, t.se, t.set, warmCam);
+      sh.close();
+      toast(`Recording ${shortCamLabel(warmCam)} · ${setLabel} — tap ✓ or red camera to stop`);
       return;
     }
 
@@ -1057,22 +1140,19 @@ export function recordVideo(t: VideoTarget): Promise<VideoMeta | null> {
 export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLabel?: string }): Promise<void> {
   let meta = lifts.videos.get(id);
   if (!meta) return;
-  const blob = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
+  let blob: Blob | null = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
   if (!blob && !meta.linkOnly && !meta.fileName && !meta.uri && !meta.driveQuery && !meta.lanUrl) {
     toast('Video file is missing');
     return;
   }
 
-  const objectUrl = blob ? URL.createObjectURL(blob) : '';
-  let playUrl = objectUrl || '';
-  if (!playUrl && meta.lanUrl) {
-    playUrl = isNative()
-      ? ((await getPlayableNativeVideoUrl(meta.lanUrl, meta.mime)) ?? meta.lanUrl)
-      : meta.lanUrl;
-  }
+  let activeObjectUrl = blob ? URL.createObjectURL(blob) : '';
+  let playUrl = activeObjectUrl || '';
   if (!playUrl && isNative() && meta.uri?.startsWith('content://')) {
     playUrl = (await getPlayableNativeVideoUrl(meta.uri, meta.mime)) ?? '';
   }
+  const needsLanLoad = !playUrl && !!meta.lanUrl;
+  const canHaveDeck = !!(playUrl || meta.lanUrl);
 
   const s = lifts.sessions.get(meta.sessionId);
   const set = s?.exs.flatMap((e) => e.sets).find((x) => x.id === meta!.setId);
@@ -1088,9 +1168,10 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   let shareOpen = false;
   let uiTicker: ReturnType<typeof setInterval> | null = null;
   let closed = false;
+  const dlCtrl = new AbortController();
 
   const posterHtml = meta.thumb
-    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${meta.source === 'gymcam' ? 'Gym Cam · Google Drive' : 'DCIM Backup · Google Drive'}</span></div>`
+    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Loading local clip…' : (meta.source === 'gymcam' ? 'Gym Cam · Google Drive' : 'DCIM Backup · Google Drive')}</span></div>`
     : `<div class="pv-poster" id="vpPoster" hidden><span class="pv-badge">Google Drive Backup</span></div>`;
 
   const tapeAvail = (): boolean => meta!.source === 'gymcam' && gymCam.online && meta!.clipStartMs != null;
@@ -1099,17 +1180,18 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     `<div class="vp-head">
        <div class="vp-title"><h3 class="sh-title">${esc(ex.name)}</h3><p class="sh-text">${esc(subTxt)}</p></div>
        <div class="vp-pills">
-         ${playUrl ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
+         ${canHaveDeck ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
          <button class="vp-pill" type="button" data-vp="share">Share ↗</button>
        </div>
      </div>
      <div class="vp-stage">
-       ${playUrl ? `<video class="pv" id="vpVid" src="${esc(playUrl)}" playsinline muted autoplay loop preload="metadata"></video>` : ''}
+       ${canHaveDeck ? `<video class="pv" id="vpVid"${playUrl ? ` src="${esc(playUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video>` : ''}
        ${posterHtml}
+       <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Downloading clip to phone RAM for 60 fps scrubbing…</p>
        <p class="hint" id="vpLanErr" hidden style="text-align:center">OptiPlex LAN stream unavailable away from home — open via Google Drive below.</p>
      </div>
-     ${playUrl ? `
-     <div class="vp-deck" id="vpDeck">
+     ${canHaveDeck ? `
+     <div class="vp-deck" id="vpDeck"${playUrl ? '' : ' hidden'}>
        <div class="vp-readout">
          <span><span class="vp-time" id="vpTime">0:00.00 / 0:00.00</span> · <span class="vp-frame" id="vpFrame">f 0</span></span>
          <button class="vp-focus" type="button" id="vpFocus" data-vfocus-cycle>Full clip</button>
@@ -1161,7 +1243,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
        ${driveUrl ? `<a class="btn big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>Open in Google Drive ↗</a>` : ''}
      </div>
      ${meta.fileName ? `<div class="vfile"><small>LINKED FILE${meta.driveQuery ? ' · TIMESTAMP MATCHED' : ''}</small><b>${esc(meta.fileName)}</b></div>` : ''}
-     ${!playUrl && driveUrl ? `<a class="btn primary big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>Open in Google Drive ↗</a>` : ''}
+     ${driveUrl ? `<a class="btn primary big" id="vpDriveFallback"${canHaveDeck ? ' hidden' : ''} href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>Open in Google Drive ↗</a>` : ''}
      ${hasLocalUri && !playUrl ? '<button class="btn big" type="button" data-vlocal>▶ Play from phone DCIM</button>' : ''}
      ${ctx?.target ? '<button class="btn big" type="button" data-vmanage>+ Add / Manage Clips</button>' : ''}
      <div class="vp-foot-row">
@@ -1172,14 +1254,57 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     {
       onClose: () => {
         closed = true;
+        dlCtrl.abort();
         if (uiTicker) clearInterval(uiTicker);
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        if (activeObjectUrl) URL.revokeObjectURL(activeObjectUrl);
       },
     },
   );
 
   const vid = sh.body.querySelector<HTMLVideoElement>('#vpVid');
   const q = <T extends HTMLElement>(sel: string): T | null => sh.body.querySelector<T>(sel);
+
+  let pendingSeekSec: number | null = null;
+  const seekVid = (sec: number): void => {
+    if (!vid) return;
+    const target = st.dur > 0 ? clamp(sec, 0, st.dur) : Math.max(0, sec);
+    if (!vid.seeking) {
+      pendingSeekSec = null;
+      vid.currentTime = target;
+    } else {
+      pendingSeekSec = target;
+    }
+  };
+
+  const resolveLanPlayable = async (lanUrl: string, bytesHint = 0): Promise<string> => {
+    if ((!bytesHint || bytesHint <= MAX_LOCAL_CACHE_BYTES) && typeof fetch !== 'undefined') {
+      const tCtrl = new AbortController();
+      const onParentAbort = () => tCtrl.abort();
+      dlCtrl.signal.addEventListener('abort', onParentAbort, { once: true });
+      const timer = setTimeout(() => tCtrl.abort(), 12_000);
+      try {
+        const res = await fetch(lanUrl, { signal: tCtrl.signal, cache: 'no-store' });
+        if (res.ok) {
+          const dlBlob = await res.blob();
+          if (!closed && dlBlob.size > 0 && dlBlob.size <= MAX_LOCAL_CACHE_BYTES) {
+            cacheSessionBlob(id, dlBlob);
+            blob = dlBlob;
+            const prevUrl = activeObjectUrl;
+            activeObjectUrl = URL.createObjectURL(dlBlob);
+            if (prevUrl) URL.revokeObjectURL(prevUrl);
+            return activeObjectUrl;
+          }
+        }
+      } catch {
+        // Fallback below if LAN download fails
+      } finally {
+        clearTimeout(timer);
+        dlCtrl.signal.removeEventListener('abort', onParentAbort);
+      }
+    }
+    if (closed) return '';
+    return isNative() ? ((await getPlayableNativeVideoUrl(lanUrl, meta!.mime)) ?? lanUrl) : lanUrl;
+  };
 
   const syncUi = (): void => {
     if (closed) return;
@@ -1275,10 +1400,16 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   };
 
   if (vid) {
+    vid.addEventListener('seeked', () => {
+      if (closed || pendingSeekSec == null) return;
+      const next = pendingSeekSec;
+      pendingSeekSec = null;
+      vid.currentTime = next;
+    });
     vid.onloadedmetadata = () => {
       if (Number.isFinite(vid.duration) && vid.duration > 0) {
         st = createTrimState(vid.duration, meta!.trimStartSec, meta!.trimEndSec);
-        if (st.start > 0.015 && vid.currentTime < st.start) vid.currentTime = st.start;
+        if (st.start > 0.015 && vid.currentTime < st.start) seekVid(st.start);
       }
       vid.playbackRate = speed;
       syncUi();
@@ -1287,15 +1418,19 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       const deck = q('#vpDeck');
       const poster = q('#vpPoster');
       const err = q('#vpLanErr');
+      const loadMsg = q('#vpLoadMsg');
+      const drv = q('#vpDriveFallback');
       vid.hidden = true;
+      if (loadMsg) loadMsg.hidden = true;
       if (deck) deck.hidden = true;
       if (poster) poster.hidden = false;
       if (err) err.hidden = false;
+      if (drv) drv.hidden = false;
     };
     vid.onclick = () => {
       if (vid.paused) {
         st = resolvePlayStart(st);
-        vid.currentTime = st.playhead;
+        seekVid(st.playhead);
         void vid.play().catch(() => {});
       } else {
         vid.pause();
@@ -1317,7 +1452,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       syncUi();
     }, 45);
 
-    // Bracketed Start / End grab rails + seek track (zero-jump handle offset)
+    // Bracketed Start / End grab rails + seek track (zero-jump handle offset & coalesced seek)
     const railEl = q('#vpSeek');
     const trackEl = q('#vpTrack');
     const inH = q('#vpInH');
@@ -1348,7 +1483,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         dragGrabOffsetPx = 0;
         st = dragTrimHandle(st, 'playhead', timeAtPtr(e.clientX));
       }
-      vid.currentTime = st.playhead;
+      seekVid(st.playhead);
       syncUi();
     };
 
@@ -1358,7 +1493,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     railEl?.addEventListener('pointermove', (e) => {
       if (!dragMode || !railEl.hasPointerCapture(e.pointerId)) return;
       st = dragTrimHandle(st, dragMode, timeAtPtr(e.clientX - dragGrabOffsetPx));
-      vid.currentTime = st.playhead;
+      seekVid(st.playhead);
       syncUi();
     });
     const endSeekDrag = (): void => { dragMode = null; dragGrabOffsetPx = 0; };
@@ -1382,12 +1517,37 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (!jogEl.hasPointerCapture(e.pointerId) || st.dur <= 0) return;
       const secPerPx = 2.5 / Math.max(220, jogEl.clientWidth);
       st = jogTrimDelta(jogBase, (e.clientX - jogStartX) * secPerPx);
-      vid.currentTime = st.playhead;
+      seekVid(st.playhead);
       syncUi();
     });
     const endJog = (): void => { jogEl?.classList.remove('drag'); };
     jogEl?.addEventListener('pointerup', endJog);
     jogEl?.addEventListener('pointercancel', endJog);
+
+    if (needsLanLoad && meta.lanUrl) {
+      void resolveLanPlayable(meta.lanUrl, meta.bytes).then((nextUrl) => {
+        if (closed) return;
+        const poster = q('#vpPoster');
+        const loadMsg = q('#vpLoadMsg');
+        const deck = q('#vpDeck');
+        const err = q('#vpLanErr');
+        const drv = q('#vpDriveFallback');
+        if (loadMsg) loadMsg.hidden = true;
+        if (!nextUrl) {
+          if (poster) poster.hidden = false;
+          if (err) err.hidden = false;
+          if (drv) drv.hidden = false;
+          return;
+        }
+        vid.hidden = false;
+        if (poster) poster.hidden = true;
+        if (deck) deck.hidden = false;
+        vid.src = nextUrl;
+        vid.load();
+        void vid.play().catch(() => {});
+        syncUi();
+      });
+    }
   }
 
   const persistTrim = async (): Promise<void> => {
@@ -1464,7 +1624,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       const nextFocus: TrimFocus = st.focus === 'playhead' ? 'in' : st.focus === 'in' ? 'out' : 'playhead';
       const jump = nextFocus === 'in' ? st.start : nextFocus === 'out' ? st.end : st.playhead;
       st = { ...st, focus: nextFocus, playhead: jump };
-      vid.currentTime = st.playhead;
+      seekVid(st.playhead);
       syncUi();
       return;
     }
@@ -1479,7 +1639,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     if (t.closest('[data-vplay]') && vid) {
       if (vid.paused) {
         st = resolvePlayStart(st);
-        vid.currentTime = st.playhead;
+        seekVid(st.playhead);
         void vid.play().catch(() => {});
       } else {
         vid.pause();
@@ -1491,7 +1651,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     if (step && vid) {
       vid.pause();
       st = stepTrimFrames(st, Number(step.dataset.vstep), FRAME_FPS);
-      vid.currentTime = st.playhead;
+      seekVid(st.playhead);
       syncUi();
       return;
     }
@@ -1501,7 +1661,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (vtrim === 'reset') {
         vid.pause();
         st = { ...createTrimState(st.dur), savedStart: 0, savedEnd: st.dur };
-        vid.currentTime = st.playhead;
+        seekVid(st.playhead);
         await persistTrim();
         toast('Trim reset');
       } else if (vtrim === 'save') {
@@ -1523,12 +1683,15 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (btn) btn.disabled = false;
       if (updated?.lanUrl) {
         meta = updated;
+        sessionFiles.delete(id);
         st = createTrimState(updated.durationSec ?? st.dur, updated.trimStartSec, updated.trimEndSec);
-        const nextPlayUrl = isNative()
-          ? ((await getPlayableNativeVideoUrl(updated.lanUrl, updated.mime)) ?? updated.lanUrl)
-          : updated.lanUrl;
-        vid.src = nextPlayUrl;
-        vid.load();
+        pendingSeekSec = null;
+        const nextPlayUrl = await resolveLanPlayable(updated.lanUrl, updated.bytes);
+        if (!closed && nextPlayUrl) {
+          vid.src = nextPlayUrl;
+          vid.load();
+          void vid.play().catch(() => {});
+        }
         toast('Extended clip from 2-Week Tape');
       } else {
         toast('Tape window unavailable on OptiPlex');

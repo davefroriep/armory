@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   applyClipMarker,
   computeScrubWindow,
+  findNearestFrameIndex,
   fmtRelativeToCheck,
   pickNearestBurstIndex,
   shortCamLabel,
@@ -82,5 +83,24 @@ describe('tape linking & scrubbing helpers', () => {
     expect(fmtRelativeToCheck(100_000, 145_000)).toBe('45s before ✓');
     expect(fmtRelativeToCheck(100_000, 200_000)).toBe('1m 40s before ✓');
     expect(fmtRelativeToCheck(180_000, 120_000)).toBe('1m after ✓');
+  });
+
+  it('binary-searches local tape frames for synchronous 60 fps scrubbing', () => {
+    expect(findNearestFrameIndex([], 1000)).toBe(-1);
+    expect(findNearestFrameIndex([{ tsMs: 5000 }], 9999)).toBe(0);
+
+    const frames = [
+      { tsMs: 100_000 },
+      { tsMs: 102_000 },
+      { tsMs: 104_000 },
+      { tsMs: 108_000 },
+    ];
+    expect(findNearestFrameIndex(frames, 90_000)).toBe(0);
+    expect(findNearestFrameIndex(frames, 120_000)).toBe(3);
+    expect(findNearestFrameIndex(frames, 104_000)).toBe(2);
+    expect(findNearestFrameIndex(frames, 102_900)).toBe(1);
+    expect(findNearestFrameIndex(frames, 103_000)).toBe(1); // midpoint ties to lower index
+    expect(findNearestFrameIndex(frames, 103_200)).toBe(2);
+    expect(findNearestFrameIndex(frames, 106_500)).toBe(3);
   });
 });

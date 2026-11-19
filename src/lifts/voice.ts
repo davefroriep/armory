@@ -10,6 +10,7 @@ import {
   advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
   jumpToExerciseCursor, resolveTargetSet, stepExerciseCursor, type CursorRef,
 } from './cursor';
+import { gymCam } from './gymCam';
 import { canLog, editReps, editWeight, labels, toggleDone } from './logic';
 import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
@@ -590,6 +591,7 @@ class VoiceController {
     if (!canLog(set, ex)) {
       return this.notice(`Need weight & reps for ${cur.label} ${ex.name} (e.g. "Armory 135 for 10")`, 'warn');
     }
+    const wasArmed = gymCam.isArmed(set.id);
     const logged = toggleDone(se, cur.setIdx, ex);
     if (!logged) {
       return this.notice(`Could not log ${ex.name}`, 'warn');
@@ -602,6 +604,9 @@ class VoiceController {
     active.afterSetLogged(s, cur.exIdx);
     this.cursor = advanceCursorAfterLog(s.exs, { exIdx: cur.exIdx, setIdx: cur.setIdx });
     lifts.saveSession(s, true);
+    if (wasArmed) {
+      void gymCam.stopAndSaveArmed(s, se, set);
+    }
     buzz([35, 30, 50]);
 
     const valTxt = ex.type === 'time'

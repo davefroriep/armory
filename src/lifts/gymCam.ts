@@ -23,6 +23,11 @@ export interface GymCamTimeline {
   bursts30: { startMs: number; endMs: number; durationSec: number }[];
 }
 
+export interface GymCamTapeFrame {
+  tsMs: number;
+  url: string;
+}
+
 export interface GymCamProbeInfo {
   online: boolean;
   recording: boolean;
@@ -55,7 +60,9 @@ class GymCamController {
   paused = false;
   cameras: string[] = [];
   clockOffsetMs = 0;
-  armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number } | null = null;
+  armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera: string } | null = null;
+  savingSetId: string | null = null;
+  private probeMisses = 0;
 
   readonly changed = new Emitter<void>();
 
@@ -71,6 +78,10 @@ class GymCamController {
     return this.armed?.setId === setId;
   }
 
+  isSaving(setId: string): boolean {
+    return this.savingSetId === setId;
+  }
+
   cancelArm(): void {
     if (!this.armed) return;
     this.armed = null;
@@ -82,9 +93,10 @@ class GymCamController {
     return `${this.baseUrl()}/api/snapshot${q}`;
   }
 
-  async probe(timeoutMs = 800): Promise<GymCamProbeInfo> {
+  async probe(timeoutMs = 2500): Promise<GymCamProbeInfo> {
     if (!getSettings().gymCamEnabled || typeof fetch === 'undefined' || typeof AbortController === 'undefined') {
       const was = this.online || this.recording;
+      this.probeMisses = 0;
       this.online = false;
       this.recording = false;
       this.paused = false;
@@ -108,6 +120,7 @@ class GymCamController {
         cameras?: string[];
       };
       if (data?.service !== 'armory-cam') throw new Error('Not armory-cam');
+      this.probeMisses = 0;
       this.clockOffsetMs = typeof data.serverEpochMs === 'number' ? data.serverEpochMs - Date.now() : 0;
       this.online = true;
       this.recording = !!data.recording;
@@ -116,13 +129,16 @@ class GymCamController {
       this.changed.emit();
       return { online: true, recording: this.recording, paused: this.paused, cameras: this.cameras, latencyMs };
     } catch {
-      const was = this.online || this.recording;
-      this.online = false;
-      this.recording = false;
-      this.paused = false;
-      this.cameras = [];
-      if (was) this.changed.emit();
-      return { online: false, recording: false, paused: false, cameras: [], latencyMs: 0 };
+      this.probeMisses += 1;
+      if (!this.online || this.probeMisses >= 2) {
+        const was = this.online || this.recording;
+        this.online = false;
+        this.recording = false;
+        this.paused = false;
+        this.cameras = [];
+        if (was) this.changed.emit();
+      }
+      return { online: this.online, recording: this.recording, paused: this.paused, cameras: this.cameras, latencyMs: 0 };
     } finally {
       clearTimeout(timer);
     }
@@ -192,9 +208,10 @@ class GymCamController {
     this.changed.emit();
   }
 
-  armSet(s: LiftSession, se: SessionEx, set: LiftSet): boolean {
+  armSet(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string): boolean {
     if (!this.online) return false;
-    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs() };
+    const cam = (camera && camera.trim()) || this.cameras[0] || 'Rack Cam';
+    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs(), camera: cam };
     this.changed.emit();
     return true;
   }
@@ -233,22 +250,38 @@ class GymCamController {
   }
 
   async stopAndSaveArmed(s: LiftSession, se: SessionEx, set: LiftSet): Promise<VideoMeta | null> {
-    if (!this.armed || this.armed.setId !== set.id) return null;
-    const startMs = this.armed.startEpochMs;
-    const endMs = this.serverNowMs() + 2000;
+    if (!this.armed || this.armed.setId !== set.id || this.savingSetId === set.id) return null;
+    const { startEpochMs: startMs, camera } = this.armed;
+    const endMs = Math.max(startMs + 3000, this.serverNowMs() + 2000);
     this.armed = null;
+    this.savingSetId = set.id;
     this.changed.emit();
-    if (!this.online) return null;
-    const exName = lifts.exOrStub(se.exId).name;
-    const res = await this.postJson<ClipApiResponse>('/api/clip', {
-      sessionId: s.camSessionId ?? s.id,
-      exId: se.exId,
-      exName,
-      setId: set.id,
-      startMs,
-      endMs,
-    }, 15_000);
-    return res?.lanUrl ? this.persistClipFromServer({ session: s, se, set }, res) : null;
+    try {
+      const exName = lifts.exOrStub(se.exId).name;
+      const body = {
+        sessionId: s.camSessionId ?? s.id,
+        exId: se.exId,
+        exName,
+        setId: set.id,
+        startMs,
+        endMs,
+        camera,
+      };
+      let res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+      if (!res) {
+        await new Promise((r) => setTimeout(r, 1200));
+        res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+      }
+      if (res?.lanUrl) {
+        this.online = true;
+        this.probeMisses = 0;
+        return await this.persistClipFromServer({ session: s, se, set }, res);
+      }
+      return null;
+    } finally {
+      if (this.savingSetId === set.id) this.savingSetId = null;
+      this.changed.emit();
+    }
   }
 
   /**
@@ -273,7 +306,7 @@ class GymCamController {
       setId: set.id,
       setAtMs: atMs + this.clockOffsetMs,
       ...(prevLocalAt > 0 ? { prevSetAtMs: prevLocalAt + this.clockOffsetMs } : {}),
-    }, 15_000);
+    }, 45_000);
     return res?.lanUrl ? this.persistClipFromServer({ session: s, se, set }, res) : null;
   }
 
@@ -284,7 +317,7 @@ class GymCamController {
   ): Promise<GymCamBurst[]> {
     if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return [];
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 3500);
+    const timer = setTimeout(() => ctrl.abort(), 4500);
     try {
       const q = new URLSearchParams({ sessionId });
       if (aroundMs != null) q.set('aroundMs', String(Math.round(aroundMs)));
@@ -304,7 +337,7 @@ class GymCamController {
   async getTapeTimeline(sessionId: string, camera: string): Promise<GymCamTimeline | null> {
     if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 3000);
+    const timer = setTimeout(() => ctrl.abort(), 3500);
     try {
       const q = new URLSearchParams({ sessionId, camera });
       const res = await fetch(`${this.baseUrl()}/api/tape/timeline?${q.toString()}`, { signal: ctrl.signal, cache: 'no-store' });
@@ -317,12 +350,50 @@ class GymCamController {
     }
   }
 
+  async fetchTapePack(
+    sessionId: string,
+    camera: string,
+    startMs?: number,
+    endMs?: number,
+    count = 80,
+    signal?: AbortSignal,
+  ): Promise<GymCamTapeFrame[]> {
+    if (!this.online || typeof fetch === 'undefined') return [];
+    try {
+      const q = new URLSearchParams({
+        sessionId,
+        camera,
+        count: String(count),
+        w: '280',
+      });
+      if (startMs != null) q.set('startMs', String(Math.round(startMs)));
+      if (endMs != null) q.set('endMs', String(Math.round(endMs)));
+      const res = await fetch(`${this.baseUrl()}/api/tape/pack?${q.toString()}`, { signal, cache: 'no-store' });
+      if (!res.ok) return [];
+      const data = (await res.json()) as { frames?: { tsMs?: number; jpg?: string }[] };
+      const rawFrames = Array.isArray(data?.frames) ? data.frames : [];
+      const out: GymCamTapeFrame[] = [];
+      for (const item of rawFrames) {
+        if (typeof item?.tsMs !== 'number' || typeof item?.jpg !== 'string' || !item.jpg) continue;
+        const bin = atob(item.jpg);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+        out.push({ tsMs: item.tsMs, url: URL.createObjectURL(blob) });
+      }
+      out.sort((a, b) => a.tsMs - b.tsMs);
+      return out;
+    } catch {
+      return [];
+    }
+  }
+
   async fetchTapeFrameBlobUrl(
     sessionId: string,
     camera: string,
     tsMs: number,
     signal?: AbortSignal,
-    width = 480,
+    width = 280,
   ): Promise<string | null> {
     if (!this.online || typeof fetch === 'undefined') return null;
     try {
@@ -371,7 +442,7 @@ class GymCamController {
       startMs: Math.round(startMs),
       endMs: Math.round(endMs),
       camera,
-    }, 15_000);
+    }, 45_000);
     return res?.lanUrl ? this.persistClipFromServer(target, res) : null;
   }
 
@@ -388,7 +459,7 @@ class GymCamController {
       startMs: nextStartMs,
       endMs: nextEndMs,
       ...(meta.camera ? { camera: meta.camera } : {}),
-    }, 15_000);
+    }, 45_000);
     if (!res?.lanUrl) return null;
     const next: VideoMeta = {
       ...meta,

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import base64
 import bisect
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 import glob
@@ -42,6 +44,8 @@ DEFAULT_PRE_ROLL_SEC = 120
 DEFAULT_MOTION_THRESHOLD = 2.2
 DEFAULT_ADB_PORT = 5555
 DEFAULT_IDLE_SLEEP_SEC = 600
+DEFAULT_SCRUB_THUMB_W = 280
+DEFAULT_SCRUB_THUMB_Q = 58
 MIN_CROP_SPAN = 0.15
 RING_KEEP_MIN_SEC = 300
 SEG_NAME_RE = re.compile(r"^seg_(\d{8})_(\d{6})\.ts$")
@@ -1125,10 +1129,11 @@ class ArmoryCamService:
         self.ring_root = self.root / "ring"
         self.tapes_root = self.root / "tapes"
         self.clips_root = self.root / "clips"
+        self.thumbs_root = self.root / "thumbs"
         self.logs_root = self.root / "logs"
         self.config_path = self.root / "config.json"
         self.clips_index_path = self.clips_root / "index.jsonl"
-        for d in (self.root, self.ring_root, self.tapes_root, self.clips_root, self.logs_root):
+        for d in (self.root, self.ring_root, self.tapes_root, self.clips_root, self.thumbs_root, self.logs_root):
             d.mkdir(parents=True, exist_ok=True)
 
         self.ffmpeg = resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
@@ -1154,6 +1159,8 @@ class ArmoryCamService:
         self.seen_files: set[str] = set()
         self.latest_energy: dict[str, float] = {}
         self.cam_connected: dict[str, bool] = {}
+        self._thumb_lock = threading.Lock()
+        self._thumb_mem: OrderedDict[str, bytes] = OrderedDict()
 
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._proc_urls: dict[str, str] = {}
@@ -1539,6 +1546,10 @@ class ArmoryCamService:
             if start_ms is None:
                 start_ms = int(st.st_mtime * 1000) - 2000
             dur_ms, energy = analyze_ts_segment(p, roi=cam.effective_roi(), rotate=cam.rotate)
+            try:
+                self._get_or_create_seg_thumb(cam, p, max_w=DEFAULT_SCRUB_THUMB_W)
+            except Exception:
+                pass
             info = SegmentInfo(
                 path=p,
                 start_ms=start_ms,
@@ -1610,6 +1621,21 @@ class ArmoryCamService:
                     shutil.rmtree(sdir, ignore_errors=True)
             except OSError:
                 pass
+
+        if self.thumbs_root.exists():
+            for jpg_p in self.thumbs_root.rglob("*.jpg"):
+                try:
+                    if jpg_p.stat().st_mtime < tape_cutoff:
+                        jpg_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for dir_p in sorted(self.thumbs_root.rglob("*"), reverse=True):
+                if dir_p.is_dir():
+                    try:
+                        if not any(dir_p.iterdir()):
+                            dir_p.rmdir()
+                    except OSError:
+                        pass
 
     def start_session(self, session_id: str, name: str = "") -> None:
         clean_id = safe_slug(session_id, f"sess_{int(time.time())}")
@@ -1832,6 +1858,92 @@ class ArmoryCamService:
             "bursts30": bursts30,
         }
 
+    @staticmethod
+    def _crop_cache_key(cam: CameraConfig) -> str:
+        x0, y0, x1, y1 = cam.crop
+        return (
+            f"r{cam.rotate}_{int(round(x0 * 1000))}_{int(round(y0 * 1000))}_"
+            f"{int(round(x1 * 1000))}_{int(round(y1 * 1000))}"
+        )
+
+    def _render_segment_thumb_jpeg(
+        self,
+        seg_path: Path,
+        cam: CameraConfig | None,
+        max_w: int = DEFAULT_SCRUB_THUMB_W,
+        quality: int = DEFAULT_SCRUB_THUMB_Q,
+    ) -> bytes | None:
+        cap = cv2.VideoCapture(str(seg_path))
+        if not cap.isOpened():
+            return None
+        try:
+            # Read sequentially from the opening IDR keyframe (never call POS_MSEC/POS_FRAMES on MPEG-TS).
+            frm = None
+            for _ in range(5):
+                ok0, f0 = cap.read()
+                if ok0 and f0 is not None:
+                    frm = f0
+                    break
+            if frm is None:
+                return None
+            if cam:
+                frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
+            h, w = frm.shape[:2]
+            tw = max(180, min(720, int(max_w)))
+            if w > tw:
+                th = max(1, int(round(h * (tw / max(1, w)))))
+                frm = cv2.resize(frm, (tw, th), interpolation=cv2.INTER_AREA)
+            ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+            return buf.tobytes() if ok_jpg else None
+        finally:
+            cap.release()
+
+    def _put_mem_thumb(self, mem_key: str, jpg: bytes) -> None:
+        with self._thumb_lock:
+            self._thumb_mem[mem_key] = jpg
+            self._thumb_mem.move_to_end(mem_key)
+            while len(self._thumb_mem) > 1200:
+                self._thumb_mem.popitem(last=False)
+
+    def _get_or_create_seg_thumb(
+        self,
+        cam: CameraConfig | None,
+        seg_path: Path,
+        max_w: int = DEFAULT_SCRUB_THUMB_W,
+        quality: int = DEFAULT_SCRUB_THUMB_Q,
+    ) -> bytes | None:
+        tw = max(180, min(720, int(max_w)))
+        if cam is None or tw != DEFAULT_SCRUB_THUMB_W:
+            return self._render_segment_thumb_jpeg(seg_path, cam, max_w=tw, quality=quality)
+        ck = self._crop_cache_key(cam)
+        mem_key = f"{cam.slug}/{ck}/{seg_path.stem}"
+        with self._thumb_lock:
+            hit = self._thumb_mem.get(mem_key)
+            if hit is not None:
+                self._thumb_mem.move_to_end(mem_key)
+                return hit
+        cache_dir = self.thumbs_root / cam.slug / ck
+        cache_path = cache_dir / f"{seg_path.stem}.jpg"
+        try:
+            if cache_path.is_file() and cache_path.stat().st_size > 100:
+                jpg = cache_path.read_bytes()
+                self._put_mem_thumb(mem_key, jpg)
+                return jpg
+        except OSError:
+            pass
+        jpg = self._render_segment_thumb_jpeg(seg_path, cam, max_w=DEFAULT_SCRUB_THUMB_W, quality=quality)
+        if not jpg:
+            return None
+        self._put_mem_thumb(mem_key, jpg)
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_dir / f"{seg_path.stem}.{threading.get_ident()}.tmp"
+            tmp_path.write_bytes(jpg)
+            tmp_path.replace(cache_path)
+        except OSError:
+            pass
+        return jpg
+
     def get_tape_frame_jpeg(
         self,
         camera_name: str,
@@ -1854,6 +1966,11 @@ class ArmoryCamService:
         if not cands:
             cands.append(segs[0])
         best = min(cands, key=lambda s: abs(((s.start_ms + s.end_ms) // 2) - ts_ms))
+
+        if cam and int(max_w) <= DEFAULT_SCRUB_THUMB_W:
+            cached = self._get_or_create_seg_thumb(cam, best.path, max_w=DEFAULT_SCRUB_THUMB_W)
+            if cached:
+                return cached
 
         cap = cv2.VideoCapture(str(best.path))
         if not cap.isOpened():
@@ -1886,7 +2003,7 @@ class ArmoryCamService:
             if cam:
                 frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
             h, w = frm.shape[:2]
-            tw = max(200, min(720, int(max_w)))
+            tw = max(180, min(720, int(max_w)))
             if w > tw:
                 th = max(1, int(round(h * (tw / max(1, w)))))
                 frm = cv2.resize(frm, (tw, th), interpolation=cv2.INTER_AREA)
@@ -1894,6 +2011,82 @@ class ArmoryCamService:
             return buf.tobytes() if ok_jpg else None
         finally:
             cap.release()
+
+    def tape_frame_pack(
+        self,
+        camera_name: str,
+        session_id: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        count: int = 80,
+        max_w: int = DEFAULT_SCRUB_THUMB_W,
+    ) -> dict[str, Any]:
+        cam = self._find_camera(camera_name)
+        canon = cam.name if cam else (camera_name or "Rack Cam")
+        segs = self._list_camera_segments(canon, session_id)
+        if not segs:
+            return {
+                "ok": True,
+                "camera": canon,
+                "minMs": 0,
+                "maxMs": 0,
+                "winStartMs": 0,
+                "winEndMs": 0,
+                "frames": [],
+            }
+
+        min_ms = int(segs[0].start_ms)
+        max_ms = max(min_ms + 2000, max(int(s.end_ms) for s in segs))
+        filtered = segs
+        if start_ms is not None or end_ms is not None:
+            w0 = int(start_ms) if start_ms is not None else min_ms
+            w1 = int(end_ms) if end_ms is not None else max_ms
+            sub = [s for s in segs if s.end_ms >= w0 - 2500 and s.start_ms <= w1 + 2500]
+            if sub:
+                filtered = sub
+
+        n = max(1, min(180, int(count)))
+        if len(filtered) <= n:
+            picked = filtered
+        elif n == 1:
+            picked = [filtered[len(filtered) // 2]]
+        else:
+            seen_idx: set[int] = set()
+            picked = []
+            last = len(filtered) - 1
+            for i in range(n):
+                idx = int(round((i * last) / (n - 1)))
+                if idx not in seen_idx:
+                    seen_idx.add(idx)
+                    picked.append(filtered[idx])
+
+        tw = max(180, min(720, int(max_w)))
+        if len(picked) > 4:
+            def _load_one(s: SegmentInfo) -> bytes | None:
+                return self._get_or_create_seg_thumb(cam, s.path, max_w=tw)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                jpgs = list(pool.map(_load_one, picked))
+        else:
+            jpgs = [self._get_or_create_seg_thumb(cam, seg.path, max_w=tw) for seg in picked]
+
+        frames: list[dict[str, Any]] = []
+        for seg, jpg in zip(picked, jpgs):
+            if jpg:
+                frames.append(
+                    {
+                        "tsMs": (int(seg.start_ms) + int(seg.end_ms)) // 2,
+                        "jpg": base64.b64encode(jpg).decode("ascii"),
+                    }
+                )
+        return {
+            "ok": True,
+            "camera": canon,
+            "minMs": min_ms,
+            "maxMs": max_ms,
+            "winStartMs": int(picked[0].start_ms),
+            "winEndMs": int(picked[-1].end_ms),
+            "frames": frames,
+        }
 
     def bursts_for_session(
         self,
@@ -1927,10 +2120,16 @@ class ArmoryCamService:
 
         for b in bursts:
             mid_ms = (int(b["startMs"]) + int(b["endMs"])) // 2
-            b["thumb"] = self._thumb_near_ms(str(b["camera"]), session_id, mid_ms, max_w=420)
+            b["thumb"] = self._thumb_near_ms(str(b["camera"]), session_id, mid_ms, max_w=DEFAULT_SCRUB_THUMB_W)
         return bursts
 
-    def _thumb_near_ms(self, camera_name: str, session_id: str, target_ms: int, max_w: int = 420) -> str:
+    def _thumb_near_ms(
+        self,
+        camera_name: str,
+        session_id: str,
+        target_ms: int,
+        max_w: int = DEFAULT_SCRUB_THUMB_W,
+    ) -> str:
         jpg = self.get_tape_frame_jpeg(camera_name, session_id, target_ms, max_w=max_w)
         if not jpg:
             return ""
@@ -2075,9 +2274,17 @@ class ArmoryCamService:
                 "-c:v",
                 "libx264",
                 "-preset",
-                "veryfast",
+                "superfast",
+                "-g",
+                "15",
+                "-keyint_min",
+                "15",
+                "-sc_threshold",
+                "0",
+                "-bf",
+                "0",
                 "-crf",
-                "22",
+                "25",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
@@ -3067,6 +3274,31 @@ def create_app(service: ArmoryCamService) -> Flask:
         buckets_raw = request.args.get("buckets")
         buckets = int(buckets_raw) if buckets_raw else 80
         return jsonify(service.tape_timeline(cam, sid, buckets=buckets))
+
+    @app.get("/api/tape/pack")
+    def api_tape_pack() -> Response:
+        sid = request.args.get("sessionId", "")
+        cam = request.args.get("camera", "Rack Cam")
+        s_raw = request.args.get("startMs")
+        e_raw = request.args.get("endMs")
+        c_raw = request.args.get("count")
+        w_raw = request.args.get("w")
+        start_ms = int(float(s_raw)) if s_raw is not None and s_raw != "" else None
+        end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else None
+        count = int(c_raw) if c_raw else 80
+        max_w = int(w_raw) if w_raw else DEFAULT_SCRUB_THUMB_W
+        resp = jsonify(
+            service.tape_frame_pack(
+                cam,
+                sid,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                count=count,
+                max_w=max_w,
+            )
+        )
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     @app.get("/api/tape/frame")
     def api_tape_frame() -> Response:
