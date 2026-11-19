@@ -2550,11 +2550,16 @@ def create_app(service: ArmoryCamService) -> Flask:
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
         resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
+        resp.headers["Access-Control-Allow-Private-Network"] = "true"
         return resp
 
     @app.route("/<path:dummy>", methods=["OPTIONS"])
     @app.route("/", methods=["OPTIONS"])
     def handle_options(dummy: str = "") -> Response:
+        return Response(status=204)
+
+    @app.get("/favicon.ico")
+    def favicon() -> Response:
         return Response(status=204)
 
     @app.get("/")
