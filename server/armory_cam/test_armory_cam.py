@@ -60,14 +60,25 @@ class ArmoryCamTests(unittest.TestCase):
         fs, fe, fcam = ac.select_pr_window([], set_at_ms=base + 200_000, prev_set_at_ms=base + 100_000)
         self.assertEqual((fs, fe, fcam), (base + 165_000, base + 202_000, None))
 
-    def test_flask_api_synthetic_clip_and_http_206_byte_range(self) -> None:
+    def test_crop_rotate_normalization_and_vf_builder(self) -> None:
+        self.assertEqual(ac.normalize_crop([0.25, 0.25, 0.75, 0.75]), (0.25, 0.25, 0.75, 0.75))
+        self.assertEqual(ac.normalize_crop([0.9, 0.9, 0.92, 0.92]), (0.85, 0.85, 1.0, 1.0))
+        self.assertEqual(ac.normalize_rotate(90), 90)
+        self.assertEqual(ac.normalize_rotate(45), 0)
+        self.assertIsNone(ac.build_ffmpeg_vf((0.0, 0.0, 1.0, 1.0), 0))
+        vf = ac.build_ffmpeg_vf((0.25, 0.25, 0.75, 0.75), 90)
+        self.assertIsNotNone(vf)
+        self.assertIn("transpose=1", vf)
+        self.assertIn("crop=", vf)
+
+    def test_flask_api_synthetic_clip_crop_and_http_206_byte_range(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="armory_cam_test_"))
         try:
             svc = ac.ArmoryCamService(root_dir=tmp)
             app = ac.create_app(svc)
             client = app.test_client()
 
-            # 1. Verify /api/ping + /api/config round-trip
+            # 1. Verify /api/ping + /api/config round-trip with crop & rotate
             ping = client.get("/api/ping").get_json()
             self.assertEqual(ping["service"], "armory-cam")
             self.assertEqual(ping["cameras"], ["Rack Cam", "Smith Cam"])
@@ -78,13 +89,23 @@ class ArmoryCamTests(unittest.TestCase):
                 json={
                     "retentionDays": 21,
                     "cameras": [
-                        {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.0},
+                        {
+                            "name": "Rack Cam",
+                            "slug": "rack_cam",
+                            "rtspUrl": "",
+                            "enabled": True,
+                            "motionThreshold": 2.0,
+                            "crop": [0.25, 0.25, 0.75, 0.75],
+                            "rotate": 0,
+                        },
                         {"name": "Smith Cam", "slug": "smith_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.0},
                     ],
                 },
             )
             self.assertEqual(cfg_res.status_code, 200)
-            self.assertEqual(json.loads((tmp / "config.json").read_text(encoding="utf-8"))["retentionDays"], 21)
+            saved_cfg = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved_cfg["retentionDays"], 21)
+            self.assertEqual(saved_cfg["cameras"][0]["crop"], [0.25, 0.25, 0.75, 0.75])
 
             # 2. Start session and synthesize real 2s MPEG-TS segments in Rack Cam ring
             self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-1", "name": "Lower 1"}).status_code, 200)
@@ -142,6 +163,18 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertTrue(clip_data["lanUrl"].startswith("/clips/"))
             self.assertGreater(clip_data["bytes"], 1000)
             self.assertTrue(clip_data["thumb"].startswith("data:image/jpeg;base64,"))
+
+            # Verify 50% crop on 320x240 input yielded exact 160x120 FastStart MP4
+            out_file = svc.clips_root / clip_data["lanUrl"].removeprefix("/clips/")
+            probe_out = subprocess.check_output(
+                [svc.ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(out_file)],
+                text=True,
+            ).strip()
+            self.assertEqual(probe_out, "160x120")
+
+            status = client.get("/api/status").get_json()
+            self.assertEqual(status["service"], "armory-cam")
+            self.assertEqual(len(status["cameras"]), 2)
 
             r206 = client.get(clip_data["lanUrl"], headers={"Range": "bytes=0-1023"})
             self.assertEqual(r206.status_code, 206)
