@@ -3205,7 +3205,6 @@ DASHBOARD_HTML = """<!doctype html>
   .pill{font-size:11px;padding:3px 10px;border-radius:999px;background:#1d2836;color:var(--mut);font-weight:800;letter-spacing:.04em}
   .pill.ok{background:rgba(34,197,94,.18);color:#86efac}
   .pill.live{background:rgba(30,155,255,.18);color:#7cc4ff}
-  .pill.virt{background:rgba(245,158,11,.18);color:#fcd34d}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin-top:14px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
   .card h2{margin:0 0 10px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
@@ -4361,11 +4360,11 @@ function renderCameras() {
     const parent = isVirt ? physBySlug.get(c.sourceSlug) : null;
     const headLeft = isVirt
       ? `<input type="text" class="cam-name-inp" id="name-${idx}" value="${esc(c.name)}" aria-label="View name">` +
-        `<span class="pill virt">VIRTUAL · from ${esc(parent ? parent.name : c.sourceSlug)}</span>`
+        `<span class="pill">via ${esc(parent ? parent.name : c.sourceSlug)}</span>`
       : `<span>${esc(c.name)}</span>`;
     const headRight = isVirt
       ? `<span class="pill live" id="camState-${idx}">CONNECTING</span>` +
-        `<button class="btn red sm" type="button" data-delview="${idx}" title="Remove virtual view">Remove</button>`
+        `<button class="btn red sm" type="button" data-delview="${idx}" title="Remove view">Remove</button>`
       : `<button class="btn sec sm" type="button" data-addview="${idx}" title="Add another crop/mask view from this camera">+ Add View</button>` +
         `<span class="pill live" id="camState-${idx}">CONNECTING</span>`;
     const srcSelect = isVirt ? `
@@ -4490,7 +4489,7 @@ $('camGrid').addEventListener('click', async (e) => {
     if (!parent) return;
     const countOnParent = cfg.cameras.filter(x => sourceSlugOf(x) === parent.slug).length;
     const defName = `${parent.name.replace(/\\s+cam$/i, '')} View ${countOnParent + 1}`;
-    const rawName = window.prompt(`New virtual view name (shares ${parent.name} 1080p feed):`, defName);
+    const rawName = window.prompt(`New view name (from ${parent.name}):`, defName);
     if (!rawName || !rawName.trim()) return;
     const name = rawName.trim();
     const slug = makeUniqueSlug(name);
@@ -4509,14 +4508,14 @@ $('camGrid').addEventListener('click', async (e) => {
     });
     renderCameras();
     await saveConfig(null);
-    showToast(`✓ Added virtual view "${name}"`, 'ok');
+    showToast(`✓ Added view "${name}"`, 'ok');
     return;
   }
   if (b.dataset.delview !== undefined) {
     const idx = Number(b.dataset.delview);
     const c = cfg.cameras[idx];
     if (!c || !c.sourceSlug) return;
-    if (!window.confirm(`Remove virtual view "${c.name}"? Raw camera tape is unaffected.`)) return;
+    if (!window.confirm(`Remove view "${c.name}"? Raw camera tape is unaffected.`)) return;
     if (mmState.open) closeMaskModal();
     cfg.cameras.splice(idx, 1);
     renderCameras();
