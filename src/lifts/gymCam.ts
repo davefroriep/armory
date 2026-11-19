@@ -13,6 +13,16 @@ export interface GymCamBurst {
   note?: string;
 }
 
+export interface GymCamTimeline {
+  ok: boolean;
+  camera: string;
+  minMs: number;
+  maxMs: number;
+  segmentCount: number;
+  activity: { tMs: number; e: number }[];
+  bursts30: { startMs: number; endMs: number; durationSec: number }[];
+}
+
 export interface GymCamProbeInfo {
   online: boolean;
   recording: boolean;
@@ -267,13 +277,19 @@ class GymCamController {
     return res?.lanUrl ? this.persistClipFromServer({ session: s, se, set }, res) : null;
   }
 
-  async listBursts(sessionId: string, aroundMs?: number): Promise<GymCamBurst[]> {
+  async listBursts(
+    sessionId: string,
+    aroundMs?: number,
+    opts?: { camera?: string; minDurSec?: number },
+  ): Promise<GymCamBurst[]> {
     if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return [];
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 2500);
+    const timer = setTimeout(() => ctrl.abort(), 3500);
     try {
       const q = new URLSearchParams({ sessionId });
       if (aroundMs != null) q.set('aroundMs', String(Math.round(aroundMs)));
+      if (opts?.camera) q.set('camera', opts.camera);
+      if (opts?.minDurSec != null) q.set('minDurSec', String(opts.minDurSec));
       const res = await fetch(`${this.baseUrl()}/api/bursts?${q.toString()}`, { signal: ctrl.signal, cache: 'no-store' });
       if (!res.ok) return [];
       const data = (await res.json()) as { bursts?: GymCamBurst[] };
@@ -285,6 +301,46 @@ class GymCamController {
     }
   }
 
+  async getTapeTimeline(sessionId: string, camera: string): Promise<GymCamTimeline | null> {
+    if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3000);
+    try {
+      const q = new URLSearchParams({ sessionId, camera });
+      const res = await fetch(`${this.baseUrl()}/api/tape/timeline?${q.toString()}`, { signal: ctrl.signal, cache: 'no-store' });
+      if (!res.ok) return null;
+      return (await res.json()) as GymCamTimeline;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async fetchTapeFrameBlobUrl(
+    sessionId: string,
+    camera: string,
+    tsMs: number,
+    signal?: AbortSignal,
+    width = 480,
+  ): Promise<string | null> {
+    if (!this.online || typeof fetch === 'undefined') return null;
+    try {
+      const q = new URLSearchParams({
+        sessionId,
+        camera,
+        tsMs: String(Math.round(tsMs)),
+        w: String(width),
+      });
+      const res = await fetch(`${this.baseUrl()}/api/tape/frame?${q.toString()}`, { signal });
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      return URL.createObjectURL(blob);
+    } catch {
+      return null;
+    }
+  }
+
   async saveBurstClip(
     target: GymCamTarget,
     burst: GymCamBurst,
@@ -292,15 +348,29 @@ class GymCamController {
     endDeltaSec = 0,
     cameraOverride?: string,
   ): Promise<VideoMeta | null> {
+    return this.saveWindowClip(
+      target,
+      cameraOverride || burst.camera,
+      burst.startMs + startDeltaSec * 1000,
+      burst.endMs + endDeltaSec * 1000,
+    );
+  }
+
+  async saveWindowClip(
+    target: GymCamTarget,
+    camera: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<VideoMeta | null> {
     if (!this.online) return null;
     const res = await this.postJson<ClipApiResponse>('/api/clip', {
       sessionId: target.session.camSessionId ?? target.session.id,
       exId: target.se.exId,
       exName: lifts.exOrStub(target.se.exId).name,
       setId: target.set.id,
-      startMs: burst.startMs + startDeltaSec * 1000,
-      endMs: burst.endMs + endDeltaSec * 1000,
-      camera: cameraOverride || burst.camera,
+      startMs: Math.round(startMs),
+      endMs: Math.round(endMs),
+      camera,
     }, 15_000);
     return res?.lanUrl ? this.persistClipFromServer(target, res) : null;
   }

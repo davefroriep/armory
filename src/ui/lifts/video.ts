@@ -1,5 +1,5 @@
 import { active } from '../../lifts/active';
-import { gymCam, type GymCamBurst } from '../../lifts/gymCam';
+import { gymCam, type GymCamBurst, type GymCamTimeline } from '../../lifts/gymCam';
 import { driveUrlFor } from '../../lifts/logic';
 import {
   extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink, sortDeviceVideosNewestFirst,
@@ -7,6 +7,9 @@ import {
 import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
+import {
+  applyClipMarker, computeScrubWindow, fmtRelativeToCheck, pickNearestBurstIndex, shortCamLabel,
+} from '../../lifts/tape';
 import {
   createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
   jogTrimDelta, resolvePlayStart, roundMs, stepTrimFrames, type TrimFocus, type TrimState,
@@ -17,6 +20,7 @@ import {
   exportNativeVideo, getPlayableNativeVideoUrl, isNative, listNativeDeviceVideos,
   openNativeVideoUri, pickNativeDcimVideo, recordNativeVideo, type DeviceVideoEntry,
 } from '../../native/service';
+import { getSettings } from '../../store/settings';
 import { esc } from '../dom';
 import { confirmSheet, openSheet, promptSheet, toast } from './kit';
 
@@ -325,13 +329,18 @@ export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
 export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDcimVideo(t);
 
 /**
- * Per-row video sheet: Gym-Cam Smart Burst Snap (when online), linked clips, Record Video & Select Video.
+ * Per-row video sheet: explicit Rack/Smith Gym-Cam linking (30s+ bursts + live tape scrubber),
+ * linked clips, Record Video & Select Video.
  */
 export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promise<void> {
   const ex = lifts.exOrStub(t.se.exId);
   const native = isNative();
   const mobile = isMobileWeb();
-  const camOnline = gymCam.online && t.session.status === 'active';
+  const tapeAgeOk = Date.now() - (t.session.endMs ?? t.session.startMs) < 14 * 86_400_000;
+  let camAvail = gymCam.online && tapeAgeOk;
+  const sid = t.session.camSessionId ?? t.session.id;
+  const checkedMs = (t.set.at ?? Date.now()) + gymCam.clockOffsetMs;
+
   let resolveClosed: () => void = () => {};
   const closed = new Promise<void>((res) => { resolveClosed = res; });
 
@@ -348,106 +357,378 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       </div>`).join('')}`;
   };
 
-  const gymArmHtml = camOnline && !t.set.done
+  const gymArmHtml = () => (camAvail && t.session.status === 'active' && !t.set.done
     ? `<button class="aitem on" type="button" data-vact="gymarm"><b>Record on Gym Cam</b><small>Arms this set and auto-stops when you tap ✓</small></button>`
-    : '';
+    : '');
 
-  const actionsHtml = native
+  const actionsHtml = () => native
     ? `<div class="alist">
-         ${gymArmHtml}
+         ${gymArmHtml()}
          <button class="aitem" type="button" data-vact="cam"><b>Record Video</b><small>Phone camera</small></button>
          <button class="aitem" type="button" data-vact="pick"><b>Select Video</b><small>Newest phone videos</small></button>
        </div>`
     : mobile
       ? `<div class="alist">
-           ${gymArmHtml}
+           ${gymArmHtml()}
            <label class="aitem" data-vact="cam"><input type="file" accept="video/*" capture="environment" data-vinp="cam" hidden><b>Record Video</b></label>
            <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video</b></label>
          </div>`
       : `<div class="alist">
-           ${gymArmHtml}
+           ${gymArmHtml()}
            <button class="aitem" type="button" data-vact="cam"><b>Record Video</b></button>
            <label class="aitem" data-vact="pick"><input type="file" accept="video/*" data-vinp="pick" hidden><b>Select Video</b></label>
          </div>`;
 
+  const camList = (): string[] => (gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam']);
+
+  let selectedCam: string | null = null;
+  let viewMode: 'bursts' | 'scrub' = 'bursts';
+  let loadingCam = false;
+  let loadGen = 0;
+  let autoScrubHint = '';
+
+  let bursts: GymCamBurst[] = [];
+  let burstIdx = 0;
+
+  let timeline: GymCamTimeline | null = null;
+  let minMs = 0;
+  let maxMs = 0;
+  let cursorMs = 0;
+  let inMs = 0;
+  let outMs = 0;
+  let zoomMin: number | null = 15;
+  let dragScrub = false;
+
+  const frameCache = new Map<string, string>();
+  let frameAbort: AbortController | null = null;
+  let frameTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastFrameBucketKey = '';
+  let activeFrameUrl = '';
+  let scrubDirty = false;
+
+  const cleanupResources = (): void => {
+    frameAbort?.abort();
+    frameAbort = null;
+    if (frameTimer) { clearTimeout(frameTimer); frameTimer = null; }
+    for (const u of frameCache.values()) URL.revokeObjectURL(u);
+    frameCache.clear();
+  };
+
   const sh = openSheet(
     `<h3 class="sh-title">${esc(ex.name)} · ${esc(setLabel)}</h3>
      <div id="vlinked">${linkedRows()}</div>
-     <div id="vburst"${camOnline ? '' : ' hidden'}></div>
-     ${actionsHtml}
+     <div id="vgymcam"></div>
+     <div id="vactions">${actionsHtml()}</div>
      <button class="btn big" type="button" data-vok>Done</button>`,
-    { onClose: resolveClosed },
+    {
+      full: camAvail,
+      onClose: () => {
+        cleanupResources();
+        resolveClosed();
+      },
+    },
   );
-  const redraw = (): void => { sh.body.querySelector('#vlinked')!.innerHTML = linkedRows(); };
 
-  // Sheet A: Smart Burst Snap when OptiPlex Gym Cam is on LAN
-  let bursts: GymCamBurst[] = [];
-  let burstIdx = 0;
-  let burstStartDelta = 0;
-  let burstEndDelta = 0;
-  let burstCamOverride = '';
-  let fineOpen = false;
+  const redrawLinked = (): void => { sh.body.querySelector('#vlinked')!.innerHTML = linkedRows(); };
+  const redrawActions = (): void => { sh.body.querySelector('#vactions')!.innerHTML = actionsHtml(); };
 
-  const drawBursts = (): void => {
-    const box = sh.body.querySelector<HTMLElement>('#vburst');
+  const requestScrubFrame = (immediate: boolean): void => {
+    if (!selectedCam || !minMs || !maxMs) return;
+    const bucketMs = Math.round(clamp(cursorMs, minMs, maxMs) / 2000) * 2000;
+    const key = `${selectedCam}|${bucketMs}`;
+    if (key === lastFrameBucketKey && activeFrameUrl) return;
+
+    const hit = frameCache.get(key);
+    if (hit) {
+      lastFrameBucketKey = key;
+      activeFrameUrl = hit;
+      const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
+      if (img) { img.src = hit; img.hidden = false; }
+      const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
+      if (spin) spin.hidden = true;
+      return;
+    }
+
+    if (frameTimer) { clearTimeout(frameTimer); frameTimer = null; }
+    const run = (): void => {
+      frameAbort?.abort();
+      const ctrl = new AbortController();
+      frameAbort = ctrl;
+      const camReq = selectedCam!;
+      const reqKey = `${camReq}|${bucketMs}`;
+      void gymCam.fetchTapeFrameBlobUrl(sid, camReq, bucketMs, ctrl.signal, 480).then((url) => {
+        if (ctrl.signal.aborted || !sh.el.isConnected) {
+          if (url) URL.revokeObjectURL(url);
+          return;
+        }
+        if (!url) {
+          const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
+          if (spin && !activeFrameUrl) spin.textContent = 'Frame unavailable';
+          return;
+        }
+        frameCache.set(reqKey, url);
+        if (frameCache.size > 100) {
+          const firstKey = frameCache.keys().next().value;
+          if (firstKey && firstKey !== reqKey) {
+            URL.revokeObjectURL(frameCache.get(firstKey)!);
+            frameCache.delete(firstKey);
+          }
+        }
+        if (camReq !== selectedCam) return;
+        lastFrameBucketKey = reqKey;
+        activeFrameUrl = url;
+        const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
+        if (img) { img.src = url; img.hidden = false; }
+        const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
+        if (spin) spin.hidden = true;
+      });
+    };
+
+    if (immediate) run();
+    else frameTimer = setTimeout(run, 85);
+  };
+
+  const paintScrubOverlaysOnly = (): void => {
+    const timePill = sh.body.querySelector<HTMLElement>('#vscrubTime');
+    if (timePill) {
+      const rel = t.set.at != null ? ` · ${fmtRelativeToCheck(cursorMs, checkedMs)}` : '';
+      timePill.textContent = `${fmtEpochClock(cursorMs)}${rel}`;
+    }
+    const head = sh.body.querySelector<HTMLElement>('#vscrubHead');
+    if (head && maxMs > minMs) {
+      const { winStart, winEnd } = computeScrubWindow(minMs, maxMs, cursorMs, zoomMin);
+      const pct = clamp(((cursorMs - winStart) / Math.max(1, winEnd - winStart)) * 100, 0, 100);
+      head.style.left = `${pct.toFixed(2)}%`;
+    }
+  };
+
+  const renderGymCam = (): void => {
+    const box = sh.body.querySelector<HTMLElement>('#vgymcam');
     if (!box) return;
-    if (!bursts.length) {
+    if (!camAvail) {
       box.hidden = true;
+      box.innerHTML = '';
       return;
     }
     box.hidden = false;
-    const b = bursts[burstIdx];
-    const camName = burstCamOverride || b.camera || 'Rack Cam';
-    const altCam = camName === 'Rack Cam' ? 'Smith Cam' : 'Rack Cam';
-    const effStart = b.startMs + burstStartDelta * 1000;
-    const effEnd = Math.max(effStart + 3000, b.endMs + burstEndDelta * 1000);
-    const effSec = Math.round((effEnd - effStart) / 1000);
-    box.innerHTML = `
-      <div class="fl">GYM CAM · MOTION BURST</div>
-      <div class="vburst-card">
-        <div class="vburst-top">
-          <div class="vburst-th" style="${b.thumb ? `background-image:url(${b.thumb})` : ''}"></div>
-          <div class="vburst-meta">
-            <div><b>${esc(camName)}</b> <small>${effSec}s</small></div>
-            <small>${fmtEpochClock(effStart)} – ${fmtEpochClock(effEnd)}</small>
-            ${b.note ? `<small>${esc(b.note)}</small>` : ''}
-          </div>
+    const cams = camList();
+
+    if (!selectedCam) {
+      box.innerHTML = `
+        <div class="fl">GYM CAM · RACK OR SMITH?</div>
+        <div class="vcam-pick">
+          ${cams.map((c) => `
+            <button class="vcam-btn" type="button" data-pickcam="${esc(c)}">
+              <b>${esc(shortCamLabel(c))}</b>
+              <small>30s+ sets · Scrub tape</small>
+            </button>`).join('')}
+        </div>`;
+      return;
+    }
+
+    const headHtml = `
+      <div class="vcam-head">
+        <div class="vcam-pills">
+          ${cams.map((c) => `<button class="vcam-pill${c === selectedCam ? ' on' : ''}" type="button" data-pickcam="${esc(c)}">${esc(shortCamLabel(c))}</button>`).join('')}
         </div>
-        ${bursts.length > 1 ? `<div class="vburst-nav">
-          <button class="btn sm" type="button" data-bnav="-1">◀ Prev Burst</button>
-          <button class="btn sm" type="button" data-bnav="1">Next Burst ▶</button>
-        </div>` : ''}
-        <button class="btn primary big" type="button" data-bsave>Save Clip to ${esc(setLabel)}</button>
-        <button class="vburst-tog" type="button" data-btog>${fineOpen ? 'Hide fine-tune ▴' : 'Fine-tune ±5s or switch camera ▾'}</button>
-        ${fineOpen ? `<div class="vburst-fine">
-          <div class="vburst-nudge">
-            <div><span>Start</span><button class="btn sm" type="button" data-bnudge="s:-5">−5s</button><button class="btn sm" type="button" data-bnudge="s:5">+5s</button></div>
-            <div><span>End</span><button class="btn sm" type="button" data-bnudge="e:-5">−5s</button><button class="btn sm" type="button" data-bnudge="e:5">+5s</button></div>
-          </div>
-          <button class="btn sm" type="button" data-bcam="${esc(altCam)}">Switch to ${esc(altCam)}</button>
-        </div>` : ''}
+        <div class="vcam-tabs">
+          <button class="vcam-tab${viewMode === 'bursts' ? ' on' : ''}" type="button" data-vmode="bursts">Bursts (30s+)${!loadingCam && bursts.length ? ` · ${bursts.length}` : ''}</button>
+          <button class="vcam-tab${viewMode === 'scrub' ? ' on' : ''}" type="button" data-vmode="scrub">Scrub Tape</button>
+        </div>
       </div>`;
+
+    if (loadingCam) {
+      box.innerHTML = `${headHtml}<div class="vburst-card"><div class="hint" style="padding:18px 4px;text-align:center">Loading ${esc(shortCamLabel(selectedCam))} tape &amp; 30s+ bursts…</div></div>`;
+      return;
+    }
+
+    if (viewMode === 'bursts' && bursts.length) {
+      const b = bursts[clamp(burstIdx, 0, bursts.length - 1)];
+      const rel = t.set.at != null ? fmtRelativeToCheck(b.endMs, checkedMs) : '';
+      box.innerHTML = `
+        ${headHtml}
+        <div class="vburst-card">
+          ${b.thumb ? `<img class="vburst-img" src="${b.thumb}" alt="${esc(shortCamLabel(selectedCam))} burst preview">` : `<div class="vburst-img empty"><span>No preview thumbnail</span></div>`}
+          <div class="vburst-bar">
+            <div><b>Burst ${burstIdx + 1} of ${bursts.length} · ${b.durationSec}s</b>${rel ? `<span class="vburst-rel">${esc(rel)}</span>` : ''}</div>
+            <small>${fmtEpochClock(b.startMs)} – ${fmtEpochClock(b.endMs)}</small>
+          </div>
+          ${bursts.length > 1 ? `<div class="vburst-nav">
+            <button class="btn sm" type="button" data-bnav="-1" ${burstIdx <= 0 ? 'disabled' : ''}>◀ Older</button>
+            <button class="btn sm" type="button" data-bnav="1" ${burstIdx >= bursts.length - 1 ? 'disabled' : ''}>Newer ▶</button>
+          </div>` : ''}
+          <button class="btn primary big" type="button" data-bsave>Save Clip (${b.durationSec}s) to ${esc(setLabel)}</button>
+          <button class="btn sm" type="button" data-bscrub>Scrub / Adjust Window ▸</button>
+        </div>`;
+      return;
+    }
+
+    if (!minMs || !maxMs || (timeline?.segmentCount ?? 0) === 0) {
+      box.innerHTML = `${headHtml}<div class="vburst-card"><div class="hint" style="padding:16px 4px;text-align:center">No recorded segments on ${esc(shortCamLabel(selectedCam))} for this session yet.</div></div>`;
+      return;
+    }
+
+    const { winStart, winEnd } = computeScrubWindow(minMs, maxMs, cursorMs, zoomMin);
+    const span = Math.max(1, winEnd - winStart);
+    const curPct = clamp(((cursorMs - winStart) / span) * 100, 0, 100);
+    const inPct = clamp(((inMs - winStart) / span) * 100, 0, 100);
+    const outPct = clamp(((outMs - winStart) / span) * 100, 0, 100);
+    const winLeft = Math.min(inPct, outPct);
+    const winWidth = Math.max(inMs < winEnd && outMs > winStart ? 1 : 0, Math.abs(outPct - inPct));
+    const chkInView = checkedMs >= winStart && checkedMs <= winEnd;
+    const chkPct = clamp(((checkedMs - winStart) / span) * 100, 0, 100);
+
+    const visActivity = (timeline?.activity ?? []).filter((pt) => pt.tMs >= winStart && pt.tMs <= winEnd);
+    const maxEnergy = Math.max(4, ...visActivity.map((pt) => pt.e));
+    const barsHtml = visActivity.map((pt) => {
+      const leftPct = clamp(((pt.tMs - winStart) / span) * 100, 0, 100);
+      const hPct = pt.e > 0.3 ? clamp((pt.e / maxEnergy) * 100, 10, 100) : 6;
+      const hot = pt.e >= 2.2 ? ' hot' : '';
+      return `<i class="vscrub-bar${hot}" style="left:${leftPct.toFixed(2)}%;height:${hPct.toFixed(0)}%"></i>`;
+    }).join('');
+
+    const rel = t.set.at != null ? ` · ${fmtRelativeToCheck(cursorMs, checkedMs)}` : '';
+    const clipSec = Math.max(1, Math.round((outMs - inMs) / 1000));
+    const totalMin = (maxMs - minMs) / 60_000;
+
+    box.innerHTML = `
+      ${headHtml}
+      ${autoScrubHint ? `<div class="hint" style="margin:2px 0 6px">${esc(autoScrubHint)}</div>` : ''}
+      <div class="vburst-card vscrub-card">
+        <div class="vscrub-stage">
+          <img class="vscrub-img" id="vscrubImg" alt="${esc(shortCamLabel(selectedCam))} frame" ${activeFrameUrl ? `src="${activeFrameUrl}"` : 'hidden'}>
+          <div class="vscrub-spin" id="vscrubSpin" ${activeFrameUrl ? 'hidden' : ''}>Loading frame…</div>
+          <div class="vscrub-ov l">${esc(shortCamLabel(selectedCam))}</div>
+          <div class="vscrub-ov r" id="vscrubTime">${fmtEpochClock(cursorMs)}${esc(rel)}</div>
+        </div>
+
+        <div class="vscrub-zrow">
+          <div class="vscrub-zpills">
+            ${totalMin > 5 ? `<button class="vscrub-z${zoomMin === 5 ? ' on' : ''}" type="button" data-szoom="5">5m</button>` : ''}
+            ${totalMin > 15 ? `<button class="vscrub-z${zoomMin === 15 ? ' on' : ''}" type="button" data-szoom="15">15m</button>` : ''}
+            <button class="vscrub-z${zoomMin == null ? ' on' : ''}" type="button" data-szoom="all">All</button>
+          </div>
+          <button class="vscrub-z" type="button" data-sjmp="chk">Jump to ✓</button>
+        </div>
+
+        <div class="vscrub-rail" id="vscrubRail" data-srail>
+          <div class="vscrub-bars">${barsHtml}</div>
+          ${winWidth > 0 ? `<div class="vscrub-win" style="left:${winLeft.toFixed(2)}%;width:${winWidth.toFixed(2)}%"></div>` : ''}
+          ${chkInView ? `<div class="vscrub-chk" style="left:${chkPct.toFixed(2)}%"><span>✓</span></div>` : ''}
+          <div class="vscrub-head" id="vscrubHead" style="left:${curPct.toFixed(2)}%"></div>
+        </div>
+
+        <div class="vscrub-jumps">
+          <button class="btn sm" type="button" data-sjmp="-60000">−1m</button>
+          <button class="btn sm" type="button" data-sjmp="-15000">−15s</button>
+          <button class="btn sm" type="button" data-sjmp="-5000">−5s</button>
+          <button class="btn sm" type="button" data-sjmp="5000">+5s</button>
+          <button class="btn sm" type="button" data-sjmp="15000">+15s</button>
+          <button class="btn sm" type="button" data-sjmp="60000">+1m</button>
+        </div>
+
+        <div class="vscrub-marks">
+          <button class="btn sm" type="button" data-smark="in"><b>Set Start (IN)</b><small>${fmtEpochClock(inMs)}</small></button>
+          <button class="btn sm" type="button" data-smark="out"><b>Set End (OUT)</b><small>${fmtEpochClock(outMs)}</small></button>
+        </div>
+
+        <div class="vscrub-sum">Clip: <b>${fmtEpochClock(inMs)} → ${fmtEpochClock(outMs)}</b> · <b>${clipSec}s</b></div>
+        <button class="btn primary big" type="button" data-ssave>Save Clip (${clipSec}s) to ${esc(setLabel)}</button>
+      </div>`;
+
+    requestScrubFrame(true);
   };
 
-  if (camOnline) {
-    const box = sh.body.querySelector<HTMLElement>('#vburst')!;
-    box.innerHTML = '<div class="hint">Checking OptiPlex Session Tape…</div>';
-    void gymCam.listBursts(t.session.camSessionId ?? t.session.id, t.set.at).then((list) => {
-      if (!sh.el.isConnected) return;
-      bursts = list;
-      if (bursts.length) {
-        const ref = (t.set.at ?? Date.now()) + gymCam.clockOffsetMs;
-        let bestIdx = bursts.length - 1;
-        let bestDiff = Infinity;
-        bursts.forEach((b, idx) => {
-          const d = Math.abs(b.endMs - ref);
-          if (d < bestDiff) { bestDiff = d; bestIdx = idx; }
-        });
-        burstIdx = bestIdx;
+  const selectCamera = async (camName: string): Promise<void> => {
+    const gen = ++loadGen;
+    selectedCam = camName;
+    loadingCam = true;
+    autoScrubHint = '';
+    activeFrameUrl = '';
+    lastFrameBucketKey = '';
+    scrubDirty = false;
+    bursts = [];
+    timeline = null;
+    sh.body.classList.add('full');
+    renderGymCam();
+
+    const [bList, tl] = await Promise.all([
+      gymCam.listBursts(sid, checkedMs, { camera: camName, minDurSec: 30 }),
+      gymCam.getTapeTimeline(sid, camName),
+    ]);
+    if (gen !== loadGen || !sh.el.isConnected) return;
+
+    bursts = bList;
+    timeline = tl;
+    minMs = tl?.minMs ?? 0;
+    maxMs = tl?.maxMs ?? 0;
+    const totalMin = minMs && maxMs ? (maxMs - minMs) / 60_000 : 0;
+    zoomMin = totalMin > 15 ? 15 : null;
+
+    if (bursts.length) {
+      burstIdx = pickNearestBurstIndex(bursts, checkedMs);
+      viewMode = 'bursts';
+      const b = bursts[Math.max(0, burstIdx)];
+      inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
+      outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
+      cursorMs = Math.round((inMs + outMs) / 2);
+    } else {
+      viewMode = 'scrub';
+      if (minMs && maxMs) {
+        outMs = clamp(checkedMs + 3000, Math.min(maxMs, minMs + 3000), maxMs);
+        inMs = clamp(outMs - 45_000, minMs, Math.max(minMs, outMs - 3000));
+        cursorMs = clamp(checkedMs - 20_000, minMs, maxMs);
+        autoScrubHint = `No 30s+ bursts on ${shortCamLabel(camName)} — scrub tape directly`;
       }
-      drawBursts();
+    }
+    loadingCam = false;
+    renderGymCam();
+  };
+
+  renderGymCam();
+  if (!camAvail && tapeAgeOk && getSettings().gymCamEnabled) {
+    void gymCam.probe(500).then((r) => {
+      if (!sh.el.isConnected || !r.online) return;
+      camAvail = true;
+      sh.body.classList.add('full');
+      renderGymCam();
+      redrawActions();
     });
   }
+
+  // Timeline drag scrubbing (smooth overlay & frame updates without full DOM thrashing)
+  const applyRailPointer = (clientX: number, immediateFrame: boolean): void => {
+    const rail = sh.body.querySelector<HTMLElement>('#vscrubRail');
+    if (!rail || !minMs || !maxMs) return;
+    const rect = rail.getBoundingClientRect();
+    const pct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    const { winStart, winEnd } = computeScrubWindow(minMs, maxMs, cursorMs, zoomMin);
+    cursorMs = clamp(Math.round(winStart + pct * (winEnd - winStart)), minMs, maxMs);
+    paintScrubOverlaysOnly();
+    requestScrubFrame(immediateFrame);
+  };
+
+  sh.body.addEventListener('pointerdown', (e) => {
+    const el = e.target as HTMLElement;
+    const rail = el.closest<HTMLElement>('[data-srail]');
+    if (!rail) return;
+    e.preventDefault();
+    dragScrub = true;
+    rail.setPointerCapture(e.pointerId);
+    applyRailPointer(e.clientX, true);
+  });
+  sh.body.addEventListener('pointermove', (e) => {
+    if (!dragScrub) return;
+    applyRailPointer(e.clientX, false);
+  });
+  const endScrubDrag = (): void => {
+    if (!dragScrub) return;
+    dragScrub = false;
+    requestScrubFrame(true);
+    renderGymCam();
+  };
+  sh.body.addEventListener('pointerup', endScrubDrag);
+  sh.body.addEventListener('pointercancel', endScrubDrag);
 
   sh.body.querySelectorAll<HTMLInputElement>('[data-vinp]').forEach((inp) => {
     const kind = inp.dataset.vinp as 'cam' | 'pick';
@@ -470,55 +751,122 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   sh.body.addEventListener('click', async (e) => {
     const el = e.target as HTMLElement;
     if (el instanceof HTMLInputElement) return;
+
     const play = el.closest<HTMLElement>('[data-play]');
-    if (play) { await playVideo(play.dataset.play!, { target: t, setLabel }); redraw(); return; }
+    if (play) { await playVideo(play.dataset.play!, { target: t, setLabel }); redrawLinked(); return; }
+
     const unlink = el.closest<HTMLElement>('[data-unlink]');
     if (unlink) {
       await lifts.deleteVideo(unlink.dataset.unlink!);
       await resetTimerIfIdle(t.session);
-      redraw();
+      redrawLinked();
       toast('Video unlinked');
       return;
     }
+
+    const pickCam = el.closest<HTMLElement>('[data-pickcam]');
+    if (pickCam) {
+      void selectCamera(pickCam.dataset.pickcam!);
+      return;
+    }
+
+    const vmode = el.closest<HTMLElement>('[data-vmode]');
+    if (vmode) {
+      viewMode = vmode.dataset.vmode as 'bursts' | 'scrub';
+      if (viewMode === 'scrub' && minMs && maxMs && !scrubDirty) {
+        const b = bursts[burstIdx];
+        if (b) {
+          inMs = clamp(b.startMs, minMs, maxMs);
+          outMs = clamp(b.endMs, inMs + 3000, maxMs);
+          cursorMs = Math.round((inMs + outMs) / 2);
+        }
+      }
+      renderGymCam();
+      return;
+    }
+
     const bnav = el.closest<HTMLElement>('[data-bnav]');
     if (bnav && bursts.length) {
-      burstIdx = (burstIdx + Number(bnav.dataset.bnav) + bursts.length) % bursts.length;
-      burstStartDelta = 0;
-      burstEndDelta = 0;
-      burstCamOverride = '';
-      drawBursts();
+      burstIdx = clamp(burstIdx + Number(bnav.dataset.bnav), 0, bursts.length - 1);
+      const b = bursts[burstIdx];
+      inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
+      outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
+      cursorMs = Math.round((inMs + outMs) / 2);
+      activeFrameUrl = '';
+      lastFrameBucketKey = '';
+      renderGymCam();
       return;
     }
-    if (el.closest('[data-btog]')) {
-      fineOpen = !fineOpen;
-      drawBursts();
+
+    if (el.closest('[data-bscrub]') && bursts[burstIdx]) {
+      const b = bursts[burstIdx];
+      inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
+      outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
+      cursorMs = Math.round((inMs + outMs) / 2);
+      activeFrameUrl = '';
+      lastFrameBucketKey = '';
+      scrubDirty = true;
+      viewMode = 'scrub';
+      renderGymCam();
       return;
     }
-    const bnudge = el.closest<HTMLElement>('[data-bnudge]');
-    if (bnudge) {
-      const [side, deltaStr] = bnudge.dataset.bnudge!.split(':');
-      if (side === 's') burstStartDelta += Number(deltaStr);
-      else burstEndDelta += Number(deltaStr);
-      drawBursts();
+
+    const szoom = el.closest<HTMLElement>('[data-szoom]');
+    if (szoom) {
+      const raw = szoom.dataset.szoom!;
+      zoomMin = raw === 'all' ? null : Number(raw);
+      renderGymCam();
       return;
     }
-    const bcam = el.closest<HTMLElement>('[data-bcam]');
-    if (bcam) {
-      burstCamOverride = bcam.dataset.bcam!;
-      drawBursts();
+
+    const sjmp = el.closest<HTMLElement>('[data-sjmp]');
+    if (sjmp && minMs && maxMs) {
+      const v = sjmp.dataset.sjmp!;
+      cursorMs = v === 'chk' ? clamp(checkedMs, minMs, maxMs) : clamp(cursorMs + Number(v), minMs, maxMs);
+      renderGymCam();
       return;
     }
+
+    const smark = el.closest<HTMLElement>('[data-smark]');
+    if (smark && minMs && maxMs) {
+      scrubDirty = true;
+      const side = smark.dataset.smark as 'in' | 'out';
+      const next = applyClipMarker(inMs, outMs, cursorMs, side, minMs, maxMs);
+      inMs = next.inMs;
+      outMs = next.outMs;
+      renderGymCam();
+      return;
+    }
+
     const bsave = el.closest<HTMLButtonElement>('[data-bsave]');
-    if (bsave && bursts[burstIdx]) {
+    if (bsave && bursts[burstIdx] && selectedCam) {
+      const b = bursts[burstIdx];
       bsave.disabled = true;
       bsave.textContent = 'Saving…';
-      const meta = await gymCam.saveBurstClip(t, bursts[burstIdx], burstStartDelta, burstEndDelta, burstCamOverride || undefined);
+      const meta = await gymCam.saveWindowClip(t, selectedCam, b.startMs, b.endMs);
       if (meta) {
         toast('Clip saved & linked');
         sh.close();
       } else {
         bsave.disabled = false;
-        bsave.textContent = `Save Clip to ${setLabel}`;
+        bsave.textContent = `Save Clip (${b.durationSec}s) to ${setLabel}`;
+        toast('Could not save clip from Gym Cam');
+      }
+      return;
+    }
+
+    const ssave = el.closest<HTMLButtonElement>('[data-ssave]');
+    if (ssave && selectedCam && minMs && maxMs) {
+      const dur = Math.max(1, Math.round((outMs - inMs) / 1000));
+      ssave.disabled = true;
+      ssave.textContent = 'Saving…';
+      const meta = await gymCam.saveWindowClip(t, selectedCam, inMs, outMs);
+      if (meta) {
+        toast('Clip saved & linked');
+        sh.close();
+      } else {
+        ssave.disabled = false;
+        ssave.textContent = `Save Clip (${dur}s) to ${setLabel}`;
         toast('Could not save clip from Gym Cam');
       }
       return;

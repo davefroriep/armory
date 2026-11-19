@@ -11,6 +11,7 @@ outside the git workspace so RTSP credentials are never committed.
 from __future__ import annotations
 
 import base64
+import bisect
 from dataclasses import dataclass, field
 from datetime import datetime
 import glob
@@ -380,12 +381,28 @@ def cluster_motion_bursts(
     merge_gap_ms: int = 4000,
     pad_before_ms: int = 3000,
     pad_after_ms: int = 2000,
+    camera: str | None = None,
+    resolve_overlap: bool = True,
+    min_raw_dur_ms: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Group active motion samples into padded bursts and resolve Rack-vs-Smith collisions."""
+    """Group active motion samples into padded bursts, optionally isolated to one camera and min duration."""
+    cam_q = camera.strip().lower() if camera and camera.strip() else None
+    eff_merge_ms = max(merge_gap_ms, 6000) if min_dur_ms >= 30_000 else merge_gap_ms
+    eff_min_raw = (
+        min_raw_dur_ms
+        if min_raw_dur_ms is not None
+        else (max(4000, min_dur_ms - 10_000) if min_dur_ms >= 30_000 else min_dur_ms)
+    )
+
     by_cam: dict[str, list[dict[str, Any]]] = {}
     for s in samples:
+        if cam_q is not None:
+            s_cam = str(s.get("camera", "")).strip().lower()
+            s_slug = str(s.get("slug", "")).strip().lower()
+            if s_cam != cam_q and s_slug != cam_q:
+                continue
         if float(s.get("energy", 0.0)) >= threshold:
-            by_cam.setdefault(str(s.get("camera", "Rack Cam")), []).append(s)
+            by_cam.setdefault(str(s.get("camera", camera or "Rack Cam")), []).append(s)
 
     cam_bursts: list[dict[str, Any]] = []
     for cam, items in by_cam.items():
@@ -396,7 +413,7 @@ def cluster_motion_bursts(
                 groups.append([it])
                 continue
             prev_end = int(groups[-1][-1]["endMs"])
-            if int(it["startMs"]) - prev_end <= merge_gap_ms:
+            if int(it["startMs"]) - prev_end <= eff_merge_ms:
                 groups[-1].append(it)
             else:
                 groups.append([it])
@@ -404,13 +421,15 @@ def cluster_motion_bursts(
         for grp in groups:
             raw_start = int(grp[0]["startMs"])
             raw_end = int(grp[-1]["endMs"])
-            if raw_end - raw_start < min_dur_ms:
+            if raw_end - raw_start < eff_min_raw:
+                continue
+            b_start = max(0, raw_start - pad_before_ms)
+            b_end = raw_end + pad_after_ms
+            if b_end - b_start < min_dur_ms:
                 continue
             energies = [float(x["energy"]) for x in grp]
             mean_e = sum(energies) / max(1, len(energies))
             peak_e = max(energies)
-            b_start = max(0, raw_start - pad_before_ms)
-            b_end = raw_end + pad_after_ms
             cam_bursts.append(
                 {
                     "id": f"{safe_slug(cam)}_{b_start}",
@@ -422,9 +441,12 @@ def cluster_motion_bursts(
                     "durationSec": max(1, int(round((b_end - b_start) / 1000.0))),
                     "peakEnergy": round(peak_e, 2),
                     "meanEnergy": round(mean_e, 2),
-                    "note": f"Auto-picked {cam} (motion {peak_e:.1f})" if len(by_cam) > 1 else f"Motion peak {peak_e:.1f}",
+                    "note": f"Motion peak {peak_e:.1f}" if cam_q or len(by_cam) <= 1 else f"Auto-picked {cam} (motion {peak_e:.1f})",
                 }
             )
+
+    if not resolve_overlap or cam_q is not None:
+        return sorted(cam_bursts, key=lambda b: int(b["startMs"]))
 
     cam_bursts.sort(key=lambda b: (int(b["startMs"]), -float(b["meanEnergy"])))
     merged: list[dict[str, Any]] = []
@@ -1717,40 +1739,202 @@ class ArmoryCamService:
                 return c
         return self.cameras[0] if self.cameras else None
 
-    def bursts_for_session(self, session_id: str, around_ms: int | None = None) -> list[dict[str, Any]]:
+    def _list_camera_segments(self, camera_name: str, session_id: str) -> list[SegmentInfo]:
+        cam = self._find_camera(camera_name)
+        slug = cam.slug if cam else safe_slug(camera_name.lower(), "rack_cam")
+        canon_name = cam.name if cam else camera_name
+        clean_id = safe_slug(session_id, "session") if session_id else ""
+        by_name: dict[str, SegmentInfo] = {}
+
+        if clean_id:
+            tape_cam_dir = self.tapes_root / clean_id / slug
+            if tape_cam_dir.exists():
+                for p in sorted(tape_cam_dir.glob("seg_*.ts")):
+                    s_ms = parse_segment_start_ms(p.name)
+                    if s_ms is None:
+                        try:
+                            s_ms = int(p.stat().st_mtime * 1000) - 2000
+                        except OSError:
+                            continue
+                    by_name[p.name] = SegmentInfo(
+                        path=p,
+                        start_ms=s_ms,
+                        end_ms=s_ms + 2000,
+                        energy=0.0,
+                        camera=canon_name,
+                    )
+
+        with self.lock:
+            for info in self.ring_segments.get(slug, []):
+                if info.path.exists() and info.path.name not in by_name:
+                    by_name[info.path.name] = info
+
+        return sorted(by_name.values(), key=lambda s: s.start_ms)
+
+    def tape_timeline(self, camera_name: str, session_id: str, buckets: int = 80) -> dict[str, Any]:
+        cam = self._find_camera(camera_name)
+        canon = cam.name if cam else (camera_name or "Rack Cam")
+        segs = self._list_camera_segments(canon, session_id)
+        if not segs:
+            return {
+                "ok": True,
+                "camera": canon,
+                "minMs": 0,
+                "maxMs": 0,
+                "segmentCount": 0,
+                "activity": [],
+                "bursts30": [],
+            }
+
+        min_ms = int(segs[0].start_ms)
+        max_ms = max(min_ms + 2000, max(int(s.end_ms) for s in segs))
+        span = max(1, max_ms - min_ms)
+        n_buckets = max(10, min(200, int(buckets)))
+        bucket_max = [0.0] * n_buckets
+
+        cam_samples: list[dict[str, Any]] = []
+        cam_l = canon.lower()
+        slug_l = cam.slug.lower() if cam else ""
+        for s in self.session_samples(session_id):
+            sc = str(s.get("camera", "")).strip().lower()
+            ss = str(s.get("slug", "")).strip().lower()
+            if sc != cam_l and (not slug_l or ss != slug_l):
+                continue
+            cam_samples.append(s)
+            mid = (int(s["startMs"]) + int(s["endMs"])) // 2
+            bi = min(n_buckets - 1, max(0, int(((mid - min_ms) / span) * n_buckets)))
+            e = float(s.get("energy", 0.0))
+            if e > bucket_max[bi]:
+                bucket_max[bi] = e
+
+        activity = [
+            {"tMs": int(min_ms + ((i + 0.5) / n_buckets) * span), "e": round(bucket_max[i], 2)}
+            for i in range(n_buckets)
+        ]
+        thresh = cam.motion_threshold if cam else DEFAULT_MOTION_THRESHOLD
+        bursts30 = [
+            {"startMs": b["startMs"], "endMs": b["endMs"], "durationSec": b["durationSec"]}
+            for b in cluster_motion_bursts(
+                cam_samples,
+                threshold=thresh,
+                min_dur_ms=30_000,
+                camera=canon,
+                resolve_overlap=False,
+            )
+        ]
+        return {
+            "ok": True,
+            "camera": canon,
+            "minMs": min_ms,
+            "maxMs": max_ms,
+            "segmentCount": len(segs),
+            "activity": activity,
+            "bursts30": bursts30,
+        }
+
+    def get_tape_frame_jpeg(
+        self,
+        camera_name: str,
+        session_id: str,
+        ts_ms: int,
+        max_w: int = 480,
+    ) -> bytes | None:
+        cam = self._find_camera(camera_name)
+        segs = self._list_camera_segments(camera_name, session_id)
+        if not segs:
+            return None
+
+        starts = [s.start_ms for s in segs]
+        idx = bisect.bisect_right(starts, ts_ms) - 1
+        cands: list[SegmentInfo] = []
+        if idx >= 0:
+            cands.append(segs[idx])
+        if idx + 1 < len(segs):
+            cands.append(segs[idx + 1])
+        if not cands:
+            cands.append(segs[0])
+        best = min(cands, key=lambda s: abs(((s.start_ms + s.end_ms) // 2) - ts_ms))
+
+        cap = cv2.VideoCapture(str(best.path))
+        if not cap.isOpened():
+            return None
+        try:
+            # Read sequentially from the opening IDR keyframe (never call POS_MSEC/POS_FRAMES on MPEG-TS).
+            first_frm = None
+            for _ in range(5):
+                ok0, f0 = cap.read()
+                if ok0 and f0 is not None:
+                    first_frm = f0
+                    break
+            if first_frm is None:
+                return None
+
+            frm = first_frm
+            offset_ms = ts_ms - best.start_ms
+            if 600 <= offset_ms <= 1900:
+                grabs = min(20, max(1, int(offset_ms // 80)))
+                ok_g = True
+                for _ in range(grabs):
+                    if not cap.grab():
+                        ok_g = False
+                        break
+                if ok_g:
+                    ok_r, f_later = cap.retrieve()
+                    if ok_r and f_later is not None:
+                        frm = f_later
+
+            if cam:
+                frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
+            h, w = frm.shape[:2]
+            tw = max(200, min(720, int(max_w)))
+            if w > tw:
+                th = max(1, int(round(h * (tw / max(1, w)))))
+                frm = cv2.resize(frm, (tw, th), interpolation=cv2.INTER_AREA)
+            ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
+            return buf.tobytes() if ok_jpg else None
+        finally:
+            cap.release()
+
+    def bursts_for_session(
+        self,
+        session_id: str,
+        around_ms: int | None = None,
+        camera: str | None = None,
+        min_dur_sec: float | None = None,
+    ) -> list[dict[str, Any]]:
         samples = self.session_samples(session_id)
-        min_thresh = min((c.motion_threshold for c in self.cameras), default=DEFAULT_MOTION_THRESHOLD)
-        bursts = cluster_motion_bursts(samples, threshold=min_thresh)
+        cam_cfg = self._find_camera(camera) if camera and camera.strip() else None
+        thresh = (
+            cam_cfg.motion_threshold
+            if cam_cfg
+            else min((c.motion_threshold for c in self.cameras), default=DEFAULT_MOTION_THRESHOLD)
+        )
+        min_dur_ms = int(round(max(1.0, min_dur_sec) * 1000)) if min_dur_sec is not None else 4000
+        bursts = cluster_motion_bursts(
+            samples,
+            threshold=thresh,
+            min_dur_ms=min_dur_ms,
+            camera=(cam_cfg.name if cam_cfg else None),
+            resolve_overlap=(cam_cfg is None),
+        )
+        limit = 20
         if around_ms is not None:
             bursts.sort(key=lambda b: abs(int(b["endMs"]) - around_ms))
-            bursts = bursts[:12]
+            bursts = bursts[:limit]
             bursts.sort(key=lambda b: int(b["startMs"]))
         else:
-            bursts = bursts[-12:]
+            bursts = bursts[-limit:]
 
         for b in bursts:
             mid_ms = (int(b["startMs"]) + int(b["endMs"])) // 2
-            b["thumb"] = self._thumb_near_ms(str(b["camera"]), session_id, mid_ms)
+            b["thumb"] = self._thumb_near_ms(str(b["camera"]), session_id, mid_ms, max_w=420)
         return bursts
 
-    def _thumb_near_ms(self, camera_name: str, session_id: str, target_ms: int) -> str:
-        cam = self._find_camera(camera_name)
-        segs = self.find_segments(camera_name, session_id, target_ms - 3000, target_ms + 3000)
-        if not segs:
+    def _thumb_near_ms(self, camera_name: str, session_id: str, target_ms: int, max_w: int = 420) -> str:
+        jpg = self.get_tape_frame_jpeg(camera_name, session_id, target_ms, max_w=max_w)
+        if not jpg:
             return ""
-        best = min(segs, key=lambda s: abs(((s.start_ms + s.end_ms) // 2) - target_ms))
-        cap = cv2.VideoCapture(str(best.path))
-        if not cap.isOpened():
-            return ""
-        try:
-            ok, frm = cap.read()
-            if not ok or frm is None:
-                return ""
-            if cam:
-                frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
-            return encode_thumb_data_url(frm)
-        finally:
-            cap.release()
+        return "data:image/jpeg;base64," + base64.b64encode(jpg).decode("ascii")
 
     def get_snapshot_jpeg(self, camera_name: str | None = None, raw: bool = False) -> bytes | None:
         cam = self._find_camera(camera_name)
@@ -2870,8 +3054,34 @@ def create_app(service: ArmoryCamService) -> Flask:
         sid = request.args.get("sessionId", "")
         around_raw = request.args.get("aroundMs")
         around_ms = int(float(around_raw)) if around_raw is not None else None
-        bursts = service.bursts_for_session(sid, around_ms=around_ms)
+        cam = request.args.get("camera")
+        min_dur_raw = request.args.get("minDurSec")
+        min_dur_sec = float(min_dur_raw) if min_dur_raw is not None else None
+        bursts = service.bursts_for_session(sid, around_ms=around_ms, camera=cam, min_dur_sec=min_dur_sec)
         return jsonify({"bursts": bursts})
+
+    @app.get("/api/tape/timeline")
+    def api_tape_timeline() -> Response:
+        sid = request.args.get("sessionId", "")
+        cam = request.args.get("camera", "Rack Cam")
+        buckets_raw = request.args.get("buckets")
+        buckets = int(buckets_raw) if buckets_raw else 80
+        return jsonify(service.tape_timeline(cam, sid, buckets=buckets))
+
+    @app.get("/api/tape/frame")
+    def api_tape_frame() -> Response:
+        sid = request.args.get("sessionId", "")
+        cam = request.args.get("camera", "Rack Cam")
+        ts_raw = request.args.get("tsMs")
+        ts_ms = int(float(ts_raw)) if ts_raw is not None else int(time.time() * 1000)
+        w_raw = request.args.get("w")
+        max_w = int(w_raw) if w_raw else 480
+        jpg = service.get_tape_frame_jpeg(cam, sid, ts_ms, max_w=max_w)
+        if not jpg:
+            return Response(status=404)
+        resp = Response(jpg, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "public, max-age=300"
+        return resp
 
     @app.post("/api/clip")
     def api_clip() -> Response:

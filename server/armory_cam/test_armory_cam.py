@@ -334,6 +334,104 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_per_camera_30s_burst_filtering_and_tape_timeline_frame_endpoints(self) -> None:
+        base = 1_763_500_000_000
+        # 1. Build synthetic 2s samples with an 11s Rack blip (skipped at 30s+) and a 34s Rack set
+        # while Smith Cam has louder overlapping buddy motion (preserved when camera="Rack Cam").
+        samples = []
+        # 11s Rack blip (5 x 2s = 10s raw, +5s = 15s < 30s)
+        for i in range(5):
+            samples.append({"camera": "Rack Cam", "slug": "rack_cam", "startMs": base + i * 2000, "endMs": base + (i + 1) * 2000, "energy": 8.0})
+        # 34s Rack set (17 x 2s = 34s raw, +5s = 39s >= 30s) at +60s..+94s
+        for i in range(17):
+            s0 = base + 60_000 + i * 2000
+            samples.append({"camera": "Rack Cam", "slug": "rack_cam", "startMs": s0, "endMs": s0 + 2000, "energy": 6.5})
+            samples.append({"camera": "Smith Cam", "slug": "smith_cam", "startMs": s0, "endMs": s0 + 2000, "energy": 14.0})
+
+        rack_30 = ac.cluster_motion_bursts(samples, threshold=2.2, min_dur_ms=30_000, camera="Rack Cam")
+        self.assertEqual(len(rack_30), 1)
+        self.assertEqual(rack_30[0]["camera"], "Rack Cam")
+        self.assertGreaterEqual(rack_30[0]["durationSec"], 30)
+
+        # 2. HTTP /api/bursts?camera=Rack%20Cam&minDurSec=30 + /api/tape/timeline + /api/tape/frame
+        tmp = Path(tempfile.mkdtemp(prefix="armory_tape_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            client.post("/api/config", json={
+                "cameras": [
+                    {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "crop": [0.25, 0.25, 0.75, 0.75]},
+                    {"name": "Smith Cam", "slug": "smith_cam", "rtspUrl": "", "enabled": True},
+                ]
+            })
+            client.post("/api/session/start", json={"sessionId": "sess-tape", "name": "Buddy Lift"})
+
+            ff = shutil.which("ffmpeg") or svc.ffmpeg
+            t0_dt = datetime(2026, 11, 18, 20, 10, 0)
+            t0_ms = int(t0_dt.timestamp() * 1000)
+            rack_dir = svc.tapes_root / "sess-tape" / "rack_cam"
+            rack_dir.mkdir(parents=True, exist_ok=True)
+            m_lines = []
+
+            # 22 x 2s segments = 44s on Rack Cam: first 5 idle/short blip, then pause, then 14-seg (28s+pad=33s) set
+            for i in range(22):
+                seg_dt = datetime.fromtimestamp((t0_ms + i * 2000) / 1000.0)
+                seg_name = f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                seg_path = rack_dir / seg_name
+                if i in (0, 7, 15, 21):
+                    subprocess.run(
+                        [
+                            ff, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", "color=c=green:s=320x240:r=20:d=2",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                        ],
+                        check=True,
+                    )
+                else:
+                    shutil.copy2(rack_dir / f"seg_{datetime.fromtimestamp(t0_ms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts", seg_path)
+                # 8..20 (13*2=26s raw + 5s pad = 31s) is 30s+; 1..4 (4*2=8s) is blip
+                e = 9.0 if (1 <= i <= 4 or 8 <= i <= 20) else 0.4
+                m_lines.append(json.dumps({
+                    "camera": "Rack Cam",
+                    "slug": "rack_cam",
+                    "file": seg_name,
+                    "startMs": t0_ms + i * 2000,
+                    "endMs": t0_ms + (i + 1) * 2000,
+                    "energy": e,
+                }))
+                m_lines.append(json.dumps({
+                    "camera": "Smith Cam",
+                    "slug": "smith_cam",
+                    "file": seg_name,
+                    "startMs": t0_ms + i * 2000,
+                    "endMs": t0_ms + (i + 1) * 2000,
+                    "energy": 18.0 if 8 <= i <= 20 else 0.3,
+                }))
+            (svc.tapes_root / "sess-tape" / "motion.jsonl").write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+            b_res = client.get(f"/api/bursts?sessionId=sess-tape&camera=Rack%20Cam&minDurSec=30&aroundMs={t0_ms + 42000}")
+            self.assertEqual(b_res.status_code, 200)
+            bursts = b_res.get_json()["bursts"]
+            self.assertEqual(len(bursts), 1)
+            self.assertEqual(bursts[0]["camera"], "Rack Cam")
+            self.assertGreaterEqual(bursts[0]["durationSec"], 30)
+            self.assertTrue(bursts[0]["thumb"].startswith("data:image/jpeg;base64,"))
+
+            tl_res = client.get("/api/tape/timeline?sessionId=sess-tape&camera=Rack%20Cam&buckets=20")
+            self.assertEqual(tl_res.status_code, 200)
+            tl = tl_res.get_json()
+            self.assertEqual(tl["segmentCount"], 22)
+            self.assertEqual(tl["minMs"], t0_ms)
+            self.assertEqual(len(tl["activity"]), 20)
+            self.assertEqual(len(tl["bursts30"]), 1)
+
+            fr_res = client.get(f"/api/tape/frame?sessionId=sess-tape&camera=Rack%20Cam&tsMs={t0_ms + 30500}&w=480")
+            self.assertEqual(fr_res.status_code, 200)
+            self.assertTrue(fr_res.data.startswith(b"\xff\xd8"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
