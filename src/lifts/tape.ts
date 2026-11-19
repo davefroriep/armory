@@ -133,3 +133,26 @@ export function findNearestFrameIndex(frames: readonly { tsMs: number }[], targe
   }
   return lo;
 }
+
+/** Computes percentage progress, elapsed seconds, and total seconds inside a burst `[startMs, endMs]`. */
+export function burstScrubPosition(
+  startMs: number,
+  endMs: number,
+  cursorMs: number,
+): { pct: number; elapsedSec: number; totalSec: number } {
+  const lo = Math.min(startMs, endMs);
+  const hi = Math.max(lo + 1000, endMs);
+  const clamped = Math.max(lo, Math.min(hi, cursorMs));
+  return {
+    pct: ((clamped - lo) / (hi - lo)) * 100,
+    elapsedSec: Math.max(0, Math.round((clamped - lo) / 1000)),
+    totalSec: Math.max(1, Math.round((hi - lo) / 1000)),
+  };
+}
+
+/** Returns the next frame index (wrapping at the end) for inline burst fast-preview playback. */
+export function nextBurstPlayIndex(frames: readonly { tsMs: number }[], currentCursorMs: number): number {
+  if (!frames.length) return -1;
+  const cur = findNearestFrameIndex(frames, currentCursorMs);
+  return (cur + 1) % frames.length;
+}

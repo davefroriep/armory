@@ -383,6 +383,14 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .vburst-bar small { color: var(--mut); font-size: .76rem; font-variant-numeric: tabular-nums; }
 .vburst-rel { font-size: .72rem; font-weight: 800; padding: 2px 8px; border-radius: 999px; background: rgba(34, 211, 238, .15); color: #67e8f9; border: 1px solid rgba(34, 211, 238, .35); }
 .vburst-nav { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.vburst-stage { touch-action: pan-y; cursor: ew-resize; }
+.vburst-loading { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); padding: 3px 10px; border-radius: 999px; background: rgba(7, 11, 18, .82); border: 1px solid rgba(255, 255, 255, .14); font-size: .7rem; font-weight: 700; color: #93c5fd; pointer-events: none; white-space: nowrap; }
+.vburst-scrub-row { display: flex; align-items: center; gap: 8px; }
+.vburst-play { flex: none; width: 38px; height: 38px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); color: #e2e8f0; font-size: .92rem; font-weight: 800; display: grid; place-items: center; }
+.vburst-play.on { background: var(--blue); border-color: var(--blue); color: #00131f; }
+.vburst-play:disabled { opacity: .4; pointer-events: none; }
+.vburst-rail { flex: 1; height: 40px; }
+.vburst-fill { position: absolute; inset: 0 auto 0 0; background: rgba(30, 155, 255, .2); pointer-events: none; }
 .vscrub-stage { position: relative; width: 100%; height: 42dvh; min-height: 240px; max-height: 360px; border-radius: 10px; background: #000; border: 1px solid var(--line); overflow: hidden; display: flex; align-items: center; justify-content: center; }
 .vscrub-img { max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; display: block; }
 .vscrub-spin { position: absolute; font-size: .8rem; color: var(--mut); font-weight: 700; }
@@ -549,8 +557,17 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 /* In-app newest-first native video picker */
 .vpick-sub { font-size: .78rem; color: var(--mut); margin-top: -6px; }
 .vpick-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.vpick-card { display: flex; flex-direction: column; gap: 6px; padding: 6px; border-radius: 14px; background: var(--card2); border: 1px solid var(--line); text-align: left; overflow: hidden; }
+.vpick-card { display: flex; flex-direction: column; gap: 6px; padding: 6px; border-radius: 14px; background: var(--card2); border: 1.5px solid var(--line); text-align: left; overflow: hidden; }
 .vpick-card:active { opacity: .82; }
+.vpick-card.sel { border-color: var(--blue); background: #132940; box-shadow: 0 0 0 1px rgba(30, 155, 255, .45); }
+.vpick-preview { padding: 10px; border-radius: 14px; background: var(--card2); border: 1px solid rgba(30, 155, 255, .5); display: flex; flex-direction: column; gap: 8px; }
+.vpick-phead { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.vpick-phead span { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.vpick-phead b { font-size: .88rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vpick-phead small { font-size: .72rem; color: var(--mut); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.vpick-pclose { width: 30px; height: 30px; border-radius: 9px; background: var(--card); color: var(--mut); font-weight: 900; display: grid; place-items: center; flex: none; }
+.vpick-vid { width: 100%; max-height: 38dvh; min-height: 180px; border-radius: 10px; background: #000; object-fit: contain; display: block; }
+.vpick-ptime { font-size: .72rem; font-weight: 800; color: var(--mut); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .vpick-th { position: relative; width: 100%; aspect-ratio: 16 / 10; border-radius: 10px; background: #141a22 center / cover no-repeat; display: block; overflow: hidden; }
 .vpick-dur { position: absolute; right: 6px; bottom: 6px; padding: 2px 6px; border-radius: 6px; background: rgba(0, 0, 0, .78); color: #f8fafc; font-style: normal; font-size: .7rem; font-weight: 800; font-variant-numeric: tabular-nums; }
 .vpick-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 0 2px 2px; }

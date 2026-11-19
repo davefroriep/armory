@@ -8,7 +8,8 @@ import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
 import {
-  applyClipMarker, computeClipZoomWindow, computeScrubWindow, findNearestFrameIndex, fmtRelativeToCheck, pickNearestBurstIndex, shortCamLabel,
+  applyClipMarker, burstScrubPosition, computeClipZoomWindow, computeScrubWindow,
+  findNearestFrameIndex, fmtRelativeToCheck, nextBurstPlayIndex, pickNearestBurstIndex, shortCamLabel,
 } from '../../lifts/tape';
 import {
   computeTrimViewport, createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
@@ -230,55 +231,252 @@ async function openNativeVideoPickerSheet(t: VideoTarget): Promise<VideoMeta | n
     let loadingMore = false;
     let entries: DeviceVideoEntry[] = sortDeviceVideosNewestFirst(initial.videos);
     let hasMore = !!initial.hasMore;
+    let selectedIdx = -1;
+    let previewGen = 0;
+    let previewLoading = false;
+    let previewUrl = '';
+    let previewErr = '';
+    let dragPickRail = false;
 
-    const renderBody = (): string => {
-      const cards = entries.length
-        ? `<div class="vpick-grid">${entries.map((v, idx) => `<button class="vpick-card" type="button" data-vidx="${idx}">
-            <span class="vpick-th" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}">
-              ${v.durationSec ? `<em class="vpick-dur">${esc(fmtVideoDuration(v.durationSec))}</em>` : ''}
-            </span>
-            <span class="vpick-meta">
-              <b>${esc(fmtVideoTimestamp(v.fileMs))}</b>
-              <small>${esc([v.bucket, v.bytes ? `${(v.bytes / 1048576).toFixed(1)} MB` : ''].filter(Boolean).join(' · ') || v.fileName)}</small>
-            </span>
-          </button>`).join('')}</div>`
-        : '<p class="sh-text" style="text-align:center;padding:18px 0">No device videos found.</p>';
+    const sh = openSheet(
+      `<h3 class="sh-title">Select Video</h3>
+       <div class="vpick-sub">Tap a clip to scrub &amp; preview · Newest first</div>
+       <div class="vpick-preview" id="vpickPreview" hidden></div>
+       <div id="vpickList"></div>
+       <div class="vpick-foot" id="vpickFoot"></div>`,
+      {
+        full: true,
+        onClose: () => {
+          releasePreviewVideo();
+          if (!done && !deferResolve) {
+            done = true;
+            resolve(resolved);
+          }
+        },
+      },
+    );
 
-      return `<h3 class="sh-title">Select Video</h3>
-        <div class="vpick-sub">Newest first · Videos only</div>
-        ${cards}
-        <div class="vpick-foot">
-          ${hasMore ? `<button class="btn" type="button" data-vmore ${loadingMore ? 'disabled' : ''}>${loadingMore ? 'Loading…' : 'Show older videos'}</button>` : ''}
+    const releasePreviewVideo = (): void => {
+      dragPickRail = false;
+      const vid = sh.body.querySelector<HTMLVideoElement>('#vpickVid');
+      if (vid) {
+        vid.pause();
+        vid.removeAttribute('src');
+        vid.load();
+      }
+    };
+
+    const syncCardSel = (): void => {
+      sh.body.querySelectorAll<HTMLElement>('[data-vidx]').forEach((card) => {
+        card.classList.toggle('sel', Number(card.dataset.vidx) === selectedIdx);
+      });
+    };
+
+    const syncPickScrub = (): void => {
+      const vid = sh.body.querySelector<HTMLVideoElement>('#vpickVid');
+      const fill = sh.body.querySelector<HTMLElement>('#vpickFill');
+      const head = sh.body.querySelector<HTMLElement>('#vpickHead');
+      const timeEl = sh.body.querySelector<HTMLElement>('#vpickTime');
+      const playBtn = sh.body.querySelector<HTMLButtonElement>('[data-pplay]');
+      const entry = entries[selectedIdx];
+      const fallbackDur = entry?.durationSec ?? 0;
+      const dur = vid && Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : fallbackDur;
+      const cur = vid && Number.isFinite(vid.currentTime) ? vid.currentTime : 0;
+      const pct = dur > 0 ? clamp((cur / dur) * 100, 0, 100) : 0;
+      if (fill) fill.style.width = `${pct.toFixed(2)}%`;
+      if (head) head.style.left = `${pct.toFixed(2)}%`;
+      if (timeEl) timeEl.textContent = `${fmtVideoDuration(cur)} / ${fmtVideoDuration(dur)}`;
+      if (playBtn) {
+        const playing = !!vid && !vid.paused && !vid.ended;
+        playBtn.classList.toggle('on', playing);
+        playBtn.textContent = playing ? '⏸' : '▶';
+      }
+    };
+
+    const renderList = (): void => {
+      const listEl = sh.body.querySelector<HTMLElement>('#vpickList');
+      const footEl = sh.body.querySelector<HTMLElement>('#vpickFoot');
+      if (listEl) {
+        listEl.innerHTML = entries.length
+          ? `<div class="vpick-grid">${entries.map((v, idx) => `<button class="vpick-card${idx === selectedIdx ? ' sel' : ''}" type="button" data-vidx="${idx}">
+              <span class="vpick-th" style="${v.thumb ? `background-image:url(${v.thumb})` : ''}">
+                ${v.durationSec ? `<em class="vpick-dur">${esc(fmtVideoDuration(v.durationSec))}</em>` : ''}
+              </span>
+              <span class="vpick-meta">
+                <b>${esc(fmtVideoTimestamp(v.fileMs))}</b>
+                <small>${esc([v.bucket, v.bytes ? `${(v.bytes / 1048576).toFixed(1)} MB` : ''].filter(Boolean).join(' · ') || v.fileName)}</small>
+              </span>
+            </button>`).join('')}</div>`
+          : '<p class="sh-text" style="text-align:center;padding:18px 0">No device videos found.</p>';
+      }
+      if (footEl) {
+        footEl.innerHTML = `${hasMore ? `<button class="btn" type="button" data-vmore ${loadingMore ? 'disabled' : ''}>${loadingMore ? 'Loading…' : 'Show older videos'}</button>` : ''}
           <button class="btn" type="button" data-vsaf>Browse system files…</button>
-          <button class="btn" type="button" data-vcancel>Cancel</button>
-        </div>`;
+          <button class="btn" type="button" data-vcancel>Cancel</button>`;
+      }
+    };
+
+    const renderPreview = (): void => {
+      const box = sh.body.querySelector<HTMLElement>('#vpickPreview');
+      if (!box) return;
+      const entry = entries[selectedIdx];
+      if (!entry) {
+        releasePreviewVideo();
+        box.hidden = true;
+        box.innerHTML = '';
+        return;
+      }
+      releasePreviewVideo();
+      box.hidden = false;
+      const metaLine = [
+        entry.bucket,
+        entry.bytes ? `${(entry.bytes / 1048576).toFixed(1)} MB` : '',
+        entry.durationSec ? fmtVideoDuration(entry.durationSec) : '',
+      ].filter(Boolean).join(' · ') || entry.fileName;
+      box.innerHTML = `
+        <div class="vpick-phead">
+          <span><b>${esc(fmtVideoTimestamp(entry.fileMs))}</b><small>${esc(metaLine)}</small></span>
+          <button class="vpick-pclose" type="button" data-pclose aria-label="Close preview">✕</button>
+        </div>
+        <video class="vpick-vid" id="vpickVid" playsinline muted preload="auto"${entry.thumb ? ` poster="${esc(entry.thumb)}"` : ''}${previewUrl ? ` src="${esc(previewUrl)}"` : ''}></video>
+        ${previewLoading ? '<div class="hint" style="text-align:center">Loading clip preview…</div>' : previewErr ? `<div class="hint" style="text-align:center">${esc(previewErr)}</div>` : ''}
+        <div class="vburst-scrub-row">
+          <button class="vburst-play" type="button" data-pplay aria-label="Play or pause preview" ${previewUrl ? '' : 'disabled'}>▶</button>
+          <div class="vscrub-rail vburst-rail" id="vpickRail" data-prail>
+            <div class="vburst-fill" id="vpickFill" style="width:0%"></div>
+            <div class="vscrub-head" id="vpickHead" style="left:0%"></div>
+          </div>
+          <span class="vpick-ptime" id="vpickTime">0:00 / ${fmtVideoDuration(entry.durationSec || 0)}</span>
+        </div>
+        <button class="btn primary big" type="button" data-puse>Link This Clip</button>`;
+
+      const vid = box.querySelector<HTMLVideoElement>('#vpickVid');
+      if (vid) {
+        const onSync = () => syncPickScrub();
+        vid.addEventListener('loadedmetadata', onSync);
+        vid.addEventListener('timeupdate', onSync);
+        vid.addEventListener('play', onSync);
+        vid.addEventListener('pause', onSync);
+        vid.addEventListener('ended', onSync);
+      }
+      syncPickScrub();
+    };
+
+    const selectPreviewClip = async (idx: number): Promise<void> => {
+      const entry = entries[idx];
+      if (!entry) return;
+      const gen = ++previewGen;
+      selectedIdx = idx;
+      previewLoading = true;
+      previewUrl = '';
+      previewErr = '';
+      syncCardSel();
+      renderPreview();
+      sh.body.scrollTo({ top: 0, behavior: 'smooth' });
+
+      const url = await getPlayableNativeVideoUrl(entry.uri, entry.mime);
+      if (gen !== previewGen || done || selectedIdx !== idx) return;
+      previewLoading = false;
+      if (url) {
+        previewUrl = url;
+        previewErr = '';
+      } else {
+        previewUrl = '';
+        previewErr = 'Inline preview unavailable — tap Link This Clip to attach it.';
+      }
+      renderPreview();
+    };
+
+    const applyPickRailPointer = (clientX: number): void => {
+      const rail = sh.body.querySelector<HTMLElement>('#vpickRail');
+      const vid = sh.body.querySelector<HTMLVideoElement>('#vpickVid');
+      const entry = entries[selectedIdx];
+      if (!rail || !entry) return;
+      const rect = rail.getBoundingClientRect();
+      const pct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+      const fill = sh.body.querySelector<HTMLElement>('#vpickFill');
+      const head = sh.body.querySelector<HTMLElement>('#vpickHead');
+      const timeEl = sh.body.querySelector<HTMLElement>('#vpickTime');
+      if (fill) fill.style.width = `${(pct * 100).toFixed(2)}%`;
+      if (head) head.style.left = `${(pct * 100).toFixed(2)}%`;
+      if (vid && Number.isFinite(vid.duration) && vid.duration > 0) {
+        const nextSec = pct * vid.duration;
+        vid.currentTime = nextSec;
+        if (timeEl) timeEl.textContent = `${fmtVideoDuration(nextSec)} / ${fmtVideoDuration(vid.duration)}`;
+      }
     };
 
     const finish = (meta: VideoMeta | null): void => {
       if (done) return;
       done = true;
       resolved = meta;
+      releasePreviewVideo();
       sh.close();
       resolve(resolved);
     };
 
-    const sh = openSheet(renderBody(), {
-      full: true,
-      onClose: () => {
-        if (!done && !deferResolve) {
-          done = true;
-          resolve(resolved);
-        }
-      },
+    renderList();
+
+    sh.body.addEventListener('pointerdown', (e) => {
+      const rail = (e.target as HTMLElement).closest<HTMLElement>('[data-prail]');
+      if (!rail) return;
+      const vid = sh.body.querySelector<HTMLVideoElement>('#vpickVid');
+      if (vid && Number.isFinite(vid.duration) && vid.duration > 0) {
+        vid.pause();
+      }
+      e.preventDefault();
+      dragPickRail = true;
+      rail.setPointerCapture(e.pointerId);
+      applyPickRailPointer(e.clientX);
     });
+    sh.body.addEventListener('pointermove', (e) => {
+      if (!dragPickRail) return;
+      applyPickRailPointer(e.clientX);
+    });
+    const endPickDrag = (): void => {
+      dragPickRail = false;
+    };
+    sh.body.addEventListener('pointerup', endPickDrag);
+    sh.body.addEventListener('pointercancel', endPickDrag);
 
     sh.body.addEventListener('click', async (e) => {
       const el = e.target as HTMLElement;
       const card = el.closest<HTMLElement>('[data-vidx]');
       if (card) {
-        const entry = entries[Number(card.dataset.vidx)];
+        const idx = Number(card.dataset.vidx);
+        if (idx === selectedIdx && !previewLoading) return;
+        void selectPreviewClip(idx);
+        return;
+      }
+      if (el.closest('[data-pclose]')) {
+        ++previewGen;
+        selectedIdx = -1;
+        previewLoading = false;
+        previewUrl = '';
+        previewErr = '';
+        syncCardSel();
+        renderPreview();
+        return;
+      }
+      if (el.closest('[data-pplay]') || el.id === 'vpickVid') {
+        const vid = sh.body.querySelector<HTMLVideoElement>('#vpickVid');
+        if (!vid || !previewUrl) return;
+        if (vid.paused || vid.ended) {
+          if (vid.ended) vid.currentTime = 0;
+          await vid.play().catch(() => {});
+        } else {
+          vid.pause();
+        }
+        syncPickScrub();
+        return;
+      }
+      const useBtn = el.closest<HTMLButtonElement>('[data-puse]');
+      if (useBtn) {
+        const entry = entries[selectedIdx];
         if (!entry) return;
-        card.setAttribute('disabled', 'disabled');
+        useBtn.disabled = true;
+        useBtn.textContent = 'Linking…';
+        releasePreviewVideo();
         const meta = await storeLinkClip(t, {
           fileName: entry.fileName,
           bytes: entry.bytes,
@@ -294,18 +492,21 @@ async function openNativeVideoPickerSheet(t: VideoTarget): Promise<VideoMeta | n
       }
       if (el.closest('[data-vmore]') && !loadingMore) {
         loadingMore = true;
-        sh.body.innerHTML = renderBody();
+        renderList();
         const next = await listNativeDeviceVideos(200);
         loadingMore = false;
         if (next?.granted) {
+          const curUri = entries[selectedIdx]?.uri;
           entries = sortDeviceVideosNewestFirst(next.videos);
           hasMore = !!next.hasMore;
+          selectedIdx = curUri ? entries.findIndex((x) => x.uri === curUri) : -1;
         }
-        if (!done) sh.body.innerHTML = renderBody();
+        if (!done) renderList();
         return;
       }
       if (el.closest('[data-vsaf]')) {
         deferResolve = true;
+        releasePreviewVideo();
         sh.close();
         const meta = await pickDcimFromSaf(t);
         finish(meta);
@@ -469,6 +670,18 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   let activeFrameUrl = '';
   let scrubDirty = false;
 
+  let burstCursorMs = 0;
+  const burstPackCache = new Map<string, GymCamTapeFrame[]>();
+  let burstPackKey = '';
+  let burstPackLoading = false;
+  let burstPackAbort: AbortController | null = null;
+  let burstPrefetchAbort: AbortController | null = null;
+  let lastBurstPackIdx = -1;
+  let dragBurstScrub = false;
+  let burstStageDrag: { pointerId: number; startX: number; startY: number; startCursorMs: number; active: boolean } | null = null;
+  let burstPlayTimer: ReturnType<typeof setInterval> | null = null;
+  let wantBurstAutoPlay = false;
+
   const clearPack = (): void => {
     packAbort?.abort();
     packAbort = null;
@@ -480,11 +693,45 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     packFrames = [];
   };
 
-  const cleanupResources = (): void => {
-    clearPack();
+  const burstKeyFor = (cam: string, b: GymCamBurst): string => `${cam}|${b.startMs}|${b.endMs}`;
+  const currentBurst = (): GymCamBurst | null => (bursts.length ? bursts[clamp(burstIdx, 0, bursts.length - 1)] : null);
+
+  let sh: ReturnType<typeof openSheet>;
+
+  const stopBurstPlay = (): void => {
+    if (burstPlayTimer != null) {
+      clearInterval(burstPlayTimer);
+      burstPlayTimer = null;
+    }
+    wantBurstAutoPlay = false;
+    const btn = sh?.body.querySelector<HTMLButtonElement>('[data-bplay]');
+    if (btn) {
+      btn.classList.remove('on');
+      btn.textContent = '▶';
+    }
   };
 
-  const sh = openSheet(
+  const clearBurstPacks = (): void => {
+    stopBurstPlay();
+    burstPackAbort?.abort();
+    burstPackAbort = null;
+    burstPrefetchAbort?.abort();
+    burstPrefetchAbort = null;
+    for (const frames of burstPackCache.values()) {
+      for (const f of frames) URL.revokeObjectURL(f.url);
+    }
+    burstPackCache.clear();
+    burstPackKey = '';
+    burstPackLoading = false;
+    lastBurstPackIdx = -1;
+  };
+
+  const cleanupResources = (): void => {
+    clearPack();
+    clearBurstPacks();
+  };
+
+  sh = openSheet(
     `<h3 class="sh-title">${esc(ex.name)} · ${esc(setLabel)}</h3>
      <div id="vlinked">${linkedRows()}</div>
      <div id="vgymcam"></div>
@@ -513,6 +760,158 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     zoomMode = 'clip';
     winCenterMs = Math.round((customWin.winStart + customWin.winEnd) / 2);
     lastPackIdx = -1;
+  };
+
+  const paintBurstFrameLocal = (): void => {
+    const b = currentBurst();
+    if (!b || !selectedCam) return;
+    const pos = burstScrubPosition(b.startMs, b.endMs, burstCursorMs);
+    const timeEl = sh.body.querySelector<HTMLElement>('#vburstTime');
+    if (timeEl) {
+      timeEl.textContent = `${fmtVideoDuration(pos.elapsedSec)} / ${fmtVideoDuration(pos.totalSec)} · ${fmtEpochClock(burstCursorMs)}`;
+    }
+    const headEl = sh.body.querySelector<HTMLElement>('#vburstHead');
+    if (headEl) headEl.style.left = `${pos.pct.toFixed(2)}%`;
+    const fillEl = sh.body.querySelector<HTMLElement>('#vburstFill');
+    if (fillEl) fillEl.style.width = `${pos.pct.toFixed(2)}%`;
+
+    const frames = burstPackCache.get(burstKeyFor(selectedCam, b));
+    const img = sh.body.querySelector<HTMLImageElement>('#vburstImg');
+    const spin = sh.body.querySelector<HTMLElement>('#vburstSpin');
+    if (frames?.length) {
+      const idx = findNearestFrameIndex(frames, burstCursorMs);
+      if (idx >= 0) {
+        const url = frames[idx].url;
+        if (img && (lastBurstPackIdx !== idx || img.getAttribute('src') !== url || img.hidden)) {
+          lastBurstPackIdx = idx;
+          img.src = url;
+          img.hidden = false;
+        }
+        if (spin) spin.hidden = true;
+        return;
+      }
+    }
+    if (img && b.thumb) {
+      if (img.getAttribute('src') !== b.thumb || img.hidden) {
+        img.src = b.thumb;
+        img.hidden = false;
+      }
+    } else if (img) {
+      img.hidden = true;
+    }
+    if (spin) {
+      spin.hidden = !burstPackLoading;
+      if (burstPackLoading) spin.textContent = 'Loading scrub frames…';
+    }
+  };
+
+  const startBurstPlayLoop = (b: GymCamBurst, frames: GymCamTapeFrame[]): void => {
+    if (burstPlayTimer != null) clearInterval(burstPlayTimer);
+    const btn = sh.body.querySelector<HTMLButtonElement>('[data-bplay]');
+    if (btn) {
+      btn.classList.add('on');
+      btn.textContent = '⏸';
+    }
+    burstPlayTimer = setInterval(() => {
+      const activeB = currentBurst();
+      if (!sh.el.isConnected || viewMode !== 'bursts' || !activeB || !selectedCam || burstKeyFor(selectedCam, activeB) !== burstKeyFor(selectedCam, b)) {
+        stopBurstPlay();
+        return;
+      }
+      const nextIdx = nextBurstPlayIndex(frames, burstCursorMs);
+      if (nextIdx < 0) {
+        stopBurstPlay();
+        return;
+      }
+      burstCursorMs = clamp(frames[nextIdx].tsMs, activeB.startMs, activeB.endMs);
+      paintBurstFrameLocal();
+    }, 180);
+  };
+
+  const prefetchBurstNeighbor = (camReq: string, idx: number): void => {
+    if (idx < 0 || idx >= bursts.length) return;
+    const nb = bursts[idx];
+    const nKey = burstKeyFor(camReq, nb);
+    if (burstPackCache.has(nKey)) return;
+    burstPrefetchAbort?.abort();
+    const ctrl = new AbortController();
+    burstPrefetchAbort = ctrl;
+    void gymCam.fetchTapePack(sid, camReq, nb.startMs, nb.endMs, 60, ctrl.signal).then((frames) => {
+      if (ctrl.signal.aborted || !sh.el.isConnected || camReq !== selectedCam || burstPackCache.has(nKey)) {
+        for (const f of frames) URL.revokeObjectURL(f.url);
+        return;
+      }
+      burstPackCache.set(nKey, frames);
+    });
+  };
+
+  const ensureBurstPack = (b: GymCamBurst): void => {
+    if (!selectedCam) return;
+    const key = burstKeyFor(selectedCam, b);
+    const hit = burstPackCache.get(key);
+    if (hit) {
+      burstPackKey = key;
+      burstPackLoading = false;
+      paintBurstFrameLocal();
+      if (wantBurstAutoPlay && !burstPlayTimer && hit.length) {
+        wantBurstAutoPlay = false;
+        startBurstPlayLoop(b, hit);
+      }
+      prefetchBurstNeighbor(selectedCam, burstIdx - 1);
+      return;
+    }
+    if (burstPackKey === key && burstPackLoading) {
+      paintBurstFrameLocal();
+      return;
+    }
+    burstPackAbort?.abort();
+    const ctrl = new AbortController();
+    burstPackAbort = ctrl;
+    burstPackKey = key;
+    burstPackLoading = true;
+    paintBurstFrameLocal();
+    const camReq = selectedCam;
+    void gymCam.fetchTapePack(sid, camReq, b.startMs, b.endMs, 60, ctrl.signal).then((frames) => {
+      if (ctrl.signal.aborted || !sh.el.isConnected || camReq !== selectedCam) {
+        for (const f of frames) URL.revokeObjectURL(f.url);
+        return;
+      }
+      const prev = burstPackCache.get(key);
+      if (prev) for (const oldF of prev) URL.revokeObjectURL(oldF.url);
+      burstPackCache.set(key, frames);
+      if (burstPackKey === key) burstPackLoading = false;
+      lastBurstPackIdx = -1;
+      if (viewMode === 'bursts' && currentBurst() && burstKeyFor(camReq, currentBurst()!) === key) {
+        paintBurstFrameLocal();
+        if (wantBurstAutoPlay) {
+          wantBurstAutoPlay = false;
+          if (frames.length) startBurstPlayLoop(b, frames);
+          else stopBurstPlay();
+        }
+        prefetchBurstNeighbor(camReq, burstIdx - 1);
+      }
+    });
+  };
+
+  const toggleBurstPlay = (): void => {
+    if (burstPlayTimer != null || wantBurstAutoPlay) {
+      stopBurstPlay();
+      return;
+    }
+    const b = currentBurst();
+    if (!b || !selectedCam) return;
+    const frames = burstPackCache.get(burstKeyFor(selectedCam, b));
+    if (frames?.length) {
+      startBurstPlayLoop(b, frames);
+      return;
+    }
+    wantBurstAutoPlay = true;
+    const btn = sh.body.querySelector<HTMLButtonElement>('[data-bplay]');
+    if (btn) {
+      btn.classList.add('on');
+      btn.textContent = '⏸';
+    }
+    ensureBurstPack(b);
   };
 
   const paintScrubFrameLocal = (): void => {
@@ -621,11 +1020,42 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     if (viewMode === 'bursts' && bursts.length) {
       const b = bursts[clamp(burstIdx, 0, bursts.length - 1)];
+      const curPos = clamp(burstCursorMs || Math.round((b.startMs + b.endMs) / 2), b.startMs, b.endMs);
+      burstCursorMs = curPos;
+      const pos = burstScrubPosition(b.startMs, b.endMs, curPos);
+      const bKey = burstKeyFor(selectedCam, b);
+      const cachedFrames = burstPackCache.get(bKey);
+      const initBurstIdx = cachedFrames?.length ? findNearestFrameIndex(cachedFrames, curPos) : -1;
+      const initBurstUrl = initBurstIdx >= 0 ? cachedFrames![initBurstIdx].url : (b.thumb || '');
+      lastBurstPackIdx = initBurstIdx;
+      const bSpan = Math.max(1, b.endMs - b.startMs);
+      const bAct = (timeline?.activity ?? []).filter((pt) => pt.tMs >= b.startMs && pt.tMs <= b.endMs);
+      const bMaxE = Math.max(4, ...bAct.map((pt) => pt.e));
+      const bBarsHtml = bAct.map((pt) => {
+        const leftPct = clamp(((pt.tMs - b.startMs) / bSpan) * 100, 0, 100);
+        const hPct = pt.e > 0.3 ? clamp((pt.e / bMaxE) * 100, 10, 100) : 6;
+        const hot = pt.e >= 2.2 ? ' hot' : '';
+        return `<i class="vscrub-bar${hot}" style="left:${leftPct.toFixed(2)}%;height:${hPct.toFixed(0)}%"></i>`;
+      }).join('');
       const rel = t.set.at != null ? fmtRelativeToCheck(b.endMs, checkedMs) : '';
       box.innerHTML = `
         ${headHtml}
         <div class="vburst-card">
-          ${b.thumb ? `<img class="vburst-img" src="${b.thumb}" alt="${esc(shortCamLabel(selectedCam))} burst preview">` : `<div class="vburst-img empty"><span>No preview thumbnail</span></div>`}
+          <div class="vscrub-stage vburst-stage" id="vburstStage" data-bstage>
+            <img class="vscrub-img" id="vburstImg" alt="${esc(shortCamLabel(selectedCam))} burst preview" ${initBurstUrl ? `src="${initBurstUrl}"` : 'hidden'}>
+            <div class="vburst-loading" id="vburstSpin" ${initBurstIdx >= 0 || !burstPackLoading ? 'hidden' : ''}>Loading scrub frames…</div>
+            <div class="vscrub-ov l">${esc(shortCamLabel(selectedCam))} · ${burstIdx + 1}/${bursts.length}</div>
+            <div class="vscrub-ov r" id="vburstTime">${fmtVideoDuration(pos.elapsedSec)} / ${fmtVideoDuration(pos.totalSec)} · ${fmtEpochClock(curPos)}</div>
+          </div>
+          <div class="vburst-scrub-row">
+            <button class="vburst-play${burstPlayTimer || wantBurstAutoPlay ? ' on' : ''}" type="button" data-bplay aria-label="Play or pause burst preview">${burstPlayTimer || wantBurstAutoPlay ? '⏸' : '▶'}</button>
+            <div class="vscrub-rail vburst-rail" id="vburstRail" data-brail>
+              <div class="vburst-fill" id="vburstFill" style="width:${pos.pct.toFixed(2)}%"></div>
+              <div class="vscrub-bars">${bBarsHtml}</div>
+              <div class="vscrub-head" id="vburstHead" style="left:${pos.pct.toFixed(2)}%"></div>
+            </div>
+          </div>
+          <div class="vscrub-edges"><span>0:00 (${fmtEpochClock(b.startMs)})</span><span>Drag bar or video to scrub</span><span>${fmtVideoDuration(pos.totalSec)}</span></div>
           <div class="vburst-bar">
             <div><b>Burst ${burstIdx + 1} of ${bursts.length} · ${b.durationSec}s</b>${rel ? `<span class="vburst-rel">${esc(rel)}</span>` : ''}</div>
             <small>${fmtEpochClock(b.startMs)} – ${fmtEpochClock(b.endMs)}</small>
@@ -635,8 +1065,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
             <button class="btn sm" type="button" data-bnav="1" ${burstIdx >= bursts.length - 1 ? 'disabled' : ''}>Newer ▶</button>
           </div>` : ''}
           <button class="btn primary big" type="button" data-bsave>Save Clip (${b.durationSec}s) to ${esc(setLabel)}</button>
-          <button class="btn sm" type="button" data-bscrub>Scrub / Adjust Window ▸</button>
+          <button class="btn sm" type="button" data-bscrub>Adjust IN/OUT Trim ▸</button>
         </div>`;
+      ensureBurstPack(b);
       return;
     }
 
@@ -728,7 +1159,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     loadingCam = true;
     autoScrubHint = '';
     clearPack();
+    clearBurstPacks();
     scrubDirty = false;
+    burstCursorMs = 0;
     bursts = [];
     timeline = null;
     sh.body.classList.add('full');
@@ -756,6 +1189,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       const b = bursts[Math.max(0, burstIdx)];
       inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
       outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
+      burstCursorMs = Math.round((b.startMs + b.endMs) / 2);
       cursorMs = Math.round((inMs + outMs) / 2);
     } else {
       viewMode = 'scrub';
@@ -768,7 +1202,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     }
     winCenterMs = cursorMs;
     loadingCam = false;
-    if (minMs && maxMs) ensurePackForCurrentWindow();
+    if (viewMode === 'scrub' && minMs && maxMs) ensurePackForCurrentWindow();
     renderGymCam();
   };
 
@@ -795,22 +1229,88 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     paintScrubFrameLocal();
   };
 
+  const applyBurstRailPointer = (clientX: number): void => {
+    const rail = sh.body.querySelector<HTMLElement>('#vburstRail');
+    const b = currentBurst();
+    if (!rail || !b) return;
+    const rect = rail.getBoundingClientRect();
+    const pct = clamp((clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    burstCursorMs = clamp(Math.round(b.startMs + pct * (b.endMs - b.startMs)), b.startMs, b.endMs);
+    paintBurstFrameLocal();
+  };
+
   sh.body.addEventListener('pointerdown', (e) => {
     const el = e.target as HTMLElement;
-    const rail = el.closest<HTMLElement>('[data-srail]');
-    if (!rail) return;
-    e.preventDefault();
-    dragScrub = true;
-    rail.setPointerCapture(e.pointerId);
-    applyRailPointer(e.clientX);
+    const sRail = el.closest<HTMLElement>('[data-srail]');
+    if (sRail) {
+      e.preventDefault();
+      dragScrub = true;
+      sRail.setPointerCapture(e.pointerId);
+      applyRailPointer(e.clientX);
+      return;
+    }
+    const bRail = el.closest<HTMLElement>('[data-brail]');
+    if (bRail) {
+      e.preventDefault();
+      stopBurstPlay();
+      dragBurstScrub = true;
+      bRail.setPointerCapture(e.pointerId);
+      applyBurstRailPointer(e.clientX);
+      return;
+    }
+    const bStage = el.closest<HTMLElement>('[data-bstage]');
+    if (bStage) {
+      const b = currentBurst();
+      if (b) {
+        burstStageDrag = {
+          pointerId: e.pointerId,
+          startX: e.clientX,
+          startY: e.clientY,
+          startCursorMs: burstCursorMs || Math.round((b.startMs + b.endMs) / 2),
+          active: false,
+        };
+      }
+    }
   });
   sh.body.addEventListener('pointermove', (e) => {
-    if (!dragScrub) return;
-    applyRailPointer(e.clientX);
+    if (dragScrub) {
+      applyRailPointer(e.clientX);
+      return;
+    }
+    if (dragBurstScrub) {
+      applyBurstRailPointer(e.clientX);
+      return;
+    }
+    if (burstStageDrag && e.pointerId === burstStageDrag.pointerId) {
+      const dx = e.clientX - burstStageDrag.startX;
+      const dy = e.clientY - burstStageDrag.startY;
+      if (!burstStageDrag.active) {
+        if (Math.abs(dy) >= 8 && Math.abs(dy) > Math.abs(dx)) {
+          burstStageDrag = null;
+          return;
+        }
+        if (Math.abs(dx) >= 6 && Math.abs(dx) > Math.abs(dy)) {
+          burstStageDrag.active = true;
+          stopBurstPlay();
+          sh.body.querySelector<HTMLElement>('#vburstStage')?.setPointerCapture(e.pointerId);
+        } else {
+          return;
+        }
+      }
+      e.preventDefault();
+      const stage = sh.body.querySelector<HTMLElement>('#vburstStage');
+      const b = currentBurst();
+      if (!stage || !b) return;
+      const w = Math.max(120, stage.getBoundingClientRect().width);
+      const deltaMs = Math.round((dx / w) * Math.max(1000, b.endMs - b.startMs));
+      burstCursorMs = clamp(burstStageDrag.startCursorMs + deltaMs, b.startMs, b.endMs);
+      paintBurstFrameLocal();
+    }
   });
   const endScrubDrag = (): void => {
-    if (!dragScrub) return;
     dragScrub = false;
+    dragBurstScrub = false;
+    burstStageDrag = null;
   };
   sh.body.addEventListener('pointerup', endScrubDrag);
   sh.body.addEventListener('pointercancel', endScrubDrag);
@@ -857,13 +1357,14 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const vmode = el.closest<HTMLElement>('[data-vmode]');
     if (vmode) {
+      stopBurstPlay();
       viewMode = vmode.dataset.vmode as 'bursts' | 'scrub';
       if (viewMode === 'scrub' && minMs && maxMs && !scrubDirty) {
         const b = bursts[burstIdx];
         if (b) {
           inMs = clamp(b.startMs, minMs, maxMs);
           outMs = clamp(b.endMs, inMs + 3000, maxMs);
-          cursorMs = Math.round((inMs + outMs) / 2);
+          cursorMs = clamp(burstCursorMs || Math.round((inMs + outMs) / 2), inMs, outMs);
         }
         const { winStart, winEnd } = currentWindow();
         if (!winCenterMs || cursorMs < winStart || cursorMs > winEnd) winCenterMs = cursorMs;
@@ -872,22 +1373,31 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       return;
     }
 
+    if (el.closest('[data-bplay]')) {
+      toggleBurstPlay();
+      return;
+    }
+
     const bnav = el.closest<HTMLElement>('[data-bnav]');
     if (bnav && bursts.length) {
+      stopBurstPlay();
       burstIdx = clamp(burstIdx + Number(bnav.dataset.bnav), 0, bursts.length - 1);
       const b = bursts[burstIdx];
       inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
       outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
-      cursorMs = Math.round((inMs + outMs) / 2);
+      burstCursorMs = Math.round((b.startMs + b.endMs) / 2);
+      cursorMs = burstCursorMs;
+      lastBurstPackIdx = -1;
       renderGymCam();
       return;
     }
 
     if (el.closest('[data-bscrub]') && bursts[burstIdx]) {
+      stopBurstPlay();
       const b = bursts[burstIdx];
       inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
       outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
-      cursorMs = Math.round((inMs + outMs) / 2);
+      cursorMs = clamp(burstCursorMs || Math.round((inMs + outMs) / 2), inMs, outMs);
       inMarked = true;
       outMarked = true;
       zoomToClip('both_set');
@@ -954,6 +1464,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const bsave = el.closest<HTMLButtonElement>('[data-bsave]');
     if (bsave && bursts[burstIdx] && selectedCam) {
+      stopBurstPlay();
       const b = bursts[burstIdx];
       bsave.disabled = true;
       bsave.textContent = 'Saving…';

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyClipMarker,
+  burstScrubPosition,
   computeClipZoomWindow,
   computeScrubWindow,
   findNearestFrameIndex,
   fmtRelativeToCheck,
+  nextBurstPlayIndex,
   pickNearestBurstIndex,
   shortCamLabel,
 } from '../src/lifts/tape';
@@ -126,5 +128,20 @@ describe('tape linking & scrubbing helpers', () => {
     const wEdge = computeClipZoomWindow(minMs, maxMs, minMs + 1000, minMs + 25_000, 'both_set');
     expect(wEdge.winStart).toBe(minMs);
     expect(wEdge.winEnd).toBe(minMs + 25_000 + 4000);
+  });
+
+  it('computes normalized burst scrub progress and playback frame stepping', () => {
+    expect(burstScrubPosition(100_000, 140_000, 100_000)).toEqual({ pct: 0, elapsedSec: 0, totalSec: 40 });
+    expect(burstScrubPosition(100_000, 140_000, 120_000)).toEqual({ pct: 50, elapsedSec: 20, totalSec: 40 });
+    expect(burstScrubPosition(100_000, 140_000, 140_000)).toEqual({ pct: 100, elapsedSec: 40, totalSec: 40 });
+    expect(burstScrubPosition(100_000, 140_000, 90_000)).toEqual({ pct: 0, elapsedSec: 0, totalSec: 40 });
+    expect(burstScrubPosition(100_000, 140_000, 180_000)).toEqual({ pct: 100, elapsedSec: 40, totalSec: 40 });
+
+    const frames = [{ tsMs: 100_000 }, { tsMs: 102_000 }, { tsMs: 104_000 }];
+    expect(nextBurstPlayIndex([], 100_000)).toBe(-1);
+    expect(nextBurstPlayIndex([{ tsMs: 100_000 }], 100_000)).toBe(0);
+    expect(nextBurstPlayIndex(frames, 100_000)).toBe(1);
+    expect(nextBurstPlayIndex(frames, 101_900)).toBe(2);
+    expect(nextBurstPlayIndex(frames, 104_000)).toBe(0);
   });
 });
