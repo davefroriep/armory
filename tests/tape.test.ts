@@ -1,14 +1,17 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyClipMarker,
+  buildCoachAngleOptions,
   burstScrubPosition,
   computeClipZoomWindow,
   computeScrubWindow,
   findNearestFrameIndex,
   fmtRelativeToCheck,
+  isTapeWithinRetention,
   nextBurstPlayIndex,
   pickNearestBurstIndex,
   shortCamLabel,
+  tapeDaysRemaining,
 } from '../src/lifts/tape';
 
 describe('tape linking & scrubbing helpers', () => {
@@ -143,5 +146,81 @@ describe('tape linking & scrubbing helpers', () => {
     expect(nextBurstPlayIndex(frames, 100_000)).toBe(1);
     expect(nextBurstPlayIndex(frames, 101_900)).toBe(2);
     expect(nextBurstPlayIndex(frames, 104_000)).toBe(0);
+  });
+
+  it('tracks tape retention boundary and days remaining accurately', () => {
+    const day = 86_400_000;
+    const t0 = 1_763_500_000_000;
+    expect(isTapeWithinRetention(null, 14, t0)).toBe(false);
+    expect(isTapeWithinRetention(0, 14, t0)).toBe(false);
+    expect(tapeDaysRemaining(null, 14, t0)).toBe(0);
+
+    // Fresh clip & day 13.9
+    expect(isTapeWithinRetention(t0, 14, t0 + 1000)).toBe(true);
+    expect(tapeDaysRemaining(t0, 14, t0 + 1000)).toBe(14);
+    expect(isTapeWithinRetention(t0, 14, t0 + 13.9 * day)).toBe(true);
+    expect(tapeDaysRemaining(t0, 14, t0 + 13.9 * day)).toBe(1);
+
+    // Exact 14-day boundary and day 15 -> expired
+    expect(isTapeWithinRetention(t0, 14, t0 + 14 * day)).toBe(false);
+    expect(tapeDaysRemaining(t0, 14, t0 + 14 * day)).toBe(0);
+    expect(isTapeWithinRetention(t0, 14, t0 + 15 * day)).toBe(false);
+    expect(tapeDaysRemaining(t0, 14, t0 + 15 * day)).toBe(0);
+
+    // Custom retention (7d vs 21d)
+    expect(isTapeWithinRetention(t0, 7, t0 + 8 * day)).toBe(false);
+    expect(isTapeWithinRetention(t0, 21, t0 + 18 * day)).toBe(true);
+    expect(tapeDaysRemaining(t0, 21, t0 + 18 * day)).toBe(3);
+  });
+
+  it('builds deduplicated spatial-ordered coach angle options and expires un-saved tape angles cleanly', () => {
+    // 2-cam + 3-cam within retention follows configuredCameras order
+    expect(
+      buildCoachAngleOptions({
+        primaryCamera: 'Smith Cam',
+        tapeCameras: ['Rack Cam', 'Smith Cam', 'Low Knee Cam'],
+        configuredCameras: ['Rack Cam', 'Smith Cam', 'Low Knee Cam'],
+      }),
+    ).toEqual([
+      { camera: 'Rack Cam', label: 'Rack', kind: 'tape' },
+      { camera: 'Smith Cam', label: 'Smith', kind: 'primary' },
+      { camera: 'Low Knee Cam', label: 'Low Knee', kind: 'tape' },
+    ]);
+
+    // Post-14d expiry with no saved sibling leaves only primary (caller hides switcher when length <= 1)
+    expect(
+      buildCoachAngleOptions({
+        primaryCamera: 'Rack Cam',
+        tapeCameras: [],
+        configuredCameras: ['Rack Cam', 'Smith Cam'],
+      }),
+    ).toEqual([{ camera: 'Rack Cam', label: 'Rack', kind: 'primary' }]);
+
+    // Post-14d expiry WITH saved sibling retains permanent sibling angle
+    expect(
+      buildCoachAngleOptions({
+        primaryCamera: 'Rack Cam',
+        savedSiblingCameras: ['Smith Cam'],
+        tapeCameras: [],
+        configuredCameras: ['Rack Cam', 'Smith Cam'],
+      }),
+    ).toEqual([
+      { camera: 'Rack Cam', label: 'Rack', kind: 'primary' },
+      { camera: 'Smith Cam', label: 'Smith', kind: 'saved' },
+    ]);
+
+    // Deduplication: saved sibling that also has live tape keeps kind='saved'
+    expect(
+      buildCoachAngleOptions({
+        primaryCamera: 'Rack Cam',
+        savedSiblingCameras: ['Smith Cam', 'Smith Cam'],
+        tapeCameras: ['Rack Cam', 'Smith Cam', 'Low Knee Cam'],
+        configuredCameras: ['Rack Cam', 'Smith Cam', 'Low Knee Cam'],
+      }),
+    ).toEqual([
+      { camera: 'Rack Cam', label: 'Rack', kind: 'primary' },
+      { camera: 'Smith Cam', label: 'Smith', kind: 'saved' },
+      { camera: 'Low Knee Cam', label: 'Low Knee', kind: 'tape' },
+    ]);
   });
 });

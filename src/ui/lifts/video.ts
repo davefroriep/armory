@@ -1,5 +1,7 @@
 import { active } from '../../lifts/active';
-import { gymCam, type GymCamBurst, type GymCamTapeFrame, type GymCamTimeline } from '../../lifts/gymCam';
+import {
+  gymCam, type GymCamBurst, type GymCamPreviewResult, type GymCamTapeFrame, type GymCamTimeline,
+} from '../../lifts/gymCam';
 import { driveUrlFor } from '../../lifts/logic';
 import {
   extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink, sortDeviceVideosNewestFirst,
@@ -8,8 +10,9 @@ import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
 import {
-  applyClipMarker, burstScrubPosition, computeClipZoomWindow, computeScrubWindow,
-  findNearestFrameIndex, fmtRelativeToCheck, nextBurstPlayIndex, pickNearestBurstIndex, shortCamLabel,
+  applyClipMarker, buildCoachAngleOptions, burstScrubPosition, computeClipZoomWindow, computeScrubWindow,
+  findNearestFrameIndex, fmtRelativeToCheck, isTapeWithinRetention, nextBurstPlayIndex, pickNearestBurstIndex,
+  shortCamLabel, tapeDaysRemaining,
 } from '../../lifts/tape';
 import {
   computeTrimViewport, createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
@@ -595,7 +598,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   const ex = lifts.exOrStub(t.se.exId);
   const native = isNative();
   const mobile = isMobileWeb();
-  const tapeAgeOk = Date.now() - (t.session.endMs ?? t.session.startMs) < 14 * 86_400_000;
+  const tapeAgeOk = isTapeWithinRetention(t.session.endMs ?? t.session.startMs, gymCam.retentionDays);
   let camAvail = gymCam.online && tapeAgeOk;
   const sid = t.session.camSessionId ?? t.session.id;
   const checkedMs = (t.set.at ?? Date.now()) + gymCam.clockOffsetMs;
@@ -1748,22 +1751,25 @@ export function castClipToWallboard(
 export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLabel?: string }): Promise<void> {
   let meta = lifts.videos.get(id);
   if (!meta) return;
-  let blob: Blob | null = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
-  if (!blob && !meta.linkOnly && !meta.fileName && !meta.uri && !meta.driveQuery && !meta.lanUrl) {
+  let primaryBlob: Blob | null = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
+  if (!primaryBlob && !meta.linkOnly && !meta.fileName && !meta.uri && !meta.driveQuery && !meta.lanUrl) {
     toast('Video file is missing');
     return;
   }
 
-  let activeObjectUrl = blob ? URL.createObjectURL(blob) : '';
-  let playUrl = activeObjectUrl || '';
-  if (!playUrl && isNative() && meta.uri?.startsWith('content://')) {
-    playUrl = (await getPlayableNativeVideoUrl(meta.uri, meta.mime)) ?? '';
+  let primaryObjectUrl = primaryBlob ? URL.createObjectURL(primaryBlob) : '';
+  let primaryPlayUrl = primaryObjectUrl || '';
+  if (!primaryPlayUrl && isNative() && meta.uri?.startsWith('content://')) {
+    primaryPlayUrl = (await getPlayableNativeVideoUrl(meta.uri, meta.mime)) ?? '';
   }
-  const needsLanLoad = !playUrl && !!meta.lanUrl;
-  const canHaveDeck = !!(playUrl || meta.lanUrl);
+  const needsLanLoad = !primaryPlayUrl && !!meta.lanUrl;
+  const canHaveDeck = !!(primaryPlayUrl || meta.lanUrl);
 
   const s = lifts.sessions.get(meta.sessionId);
-  const set = s?.exs.flatMap((e) => e.sets).find((x) => x.id === meta!.setId);
+  const se = ctx?.target?.se ?? s?.exs.find((e) => e.sets.some((x) => x.id === meta!.setId));
+  const set = ctx?.target?.set ?? se?.sets.find((x) => x.id === meta!.setId);
+  const resolvedTarget: VideoTarget | undefined =
+    ctx?.target ?? (s && se && set ? { session: s, se, set } : undefined);
   const ex = lifts.exOrStub(meta.exId);
   const clipTitle = meta.guest ? 'Guest Clip' : ex.name;
   const driveUrl = driveUrlFor(meta);
@@ -1783,34 +1789,74 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   let closed = false;
   const dlCtrl = new AbortController();
 
+  let viewCam = meta.camera || '';
+  let viewLanUrl = meta.lanUrl || '';
+  let viewBlob: Blob | null = primaryBlob;
+  let viewFileName = meta.fileName || '';
+  let viewIsPreview = false;
+  let viewSiblingMeta: VideoMeta | null = null;
+  let loadingCam: string | null = null;
+  let switchGen = 0;
+  let restoreAfterLoad: { time: number; paused: boolean } | null = null;
+  let tapeAnglesChecked = false;
+  let tapeAngles: string[] = [];
+  let lastAnglesSig = '';
+  const angleCache = new Map<string, { playUrl: string; objectUrl: string; blob: Blob | null; lanUrl: string; fileName: string }>();
+
+  const clearAngleCache = (): void => {
+    for (const entry of angleCache.values()) {
+      if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
+    }
+    angleCache.clear();
+  };
+
   const refreshRailView = (wantZoom: boolean): void => {
     railView = computeTrimViewport(st, wantZoom);
     railZoomed = railView.zoomed;
   };
 
   const posterHtml = meta.thumb
-    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Connecting to OptiPlex…' : (meta.source === 'gymcam' ? 'Gym Cam · Google Drive Backup' : 'DCIM Backup · Google Drive')}</span></div>`
+    ? `<div class="pv-poster" id="vpPoster"${primaryPlayUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Connecting to OptiPlex…' : (meta.source === 'gymcam' ? 'Gym Cam · Google Drive Backup' : 'DCIM Backup · Google Drive')}</span></div>`
     : `<div class="pv-poster" id="vpPoster" hidden><span class="pv-badge">Google Drive Backup</span></div>`;
 
-  const tapeAvail = (): boolean => meta!.source === 'gymcam' && gymCam.online && meta!.clipStartMs != null;
+  const clipRefMs = (): number | null => meta!.clipEndMs ?? meta!.clipStartMs ?? null;
+  const withinRetention = (): boolean => isTapeWithinRetention(clipRefMs(), gymCam.retentionDays);
+  const tapeAvail = (): boolean =>
+    meta!.source === 'gymcam' &&
+    gymCam.online &&
+    meta!.clipStartMs != null &&
+    withinRetention() &&
+    (!tapeAnglesChecked || tapeAngles.length > 0);
+
+  const getSavedSiblings = (): Map<string, VideoMeta> => {
+    const out = new Map<string, VideoMeta>();
+    for (const vidId of set?.vids ?? []) {
+      if (vidId === meta!.id) continue;
+      const v = lifts.videos.get(vidId);
+      if (v && v.source === 'gymcam' && v.camera && v.camera !== meta!.camera && v.lanUrl) {
+        if (!out.has(v.camera)) out.set(v.camera, v);
+      }
+    }
+    return out;
+  };
 
   const sh = openSheet(
     `<div class="vp-head">
        <div class="vp-title"><h3 class="sh-title">${esc(clipTitle)}</h3><p class="sh-text" id="vpSub">${esc(subTxt)}</p></div>
        <div class="vp-pills">
          ${canHaveDeck ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
-         ${meta.lanUrl && gymCam.online ? '<button class="vp-pill" type="button" data-vp="tv">📺 TV</button>' : ''}
+         ${meta.source === 'gymcam' ? `<button class="vp-pill" type="button" id="vpTvBtn" data-vp="tv"${meta.lanUrl && gymCam.online ? '' : ' hidden'}>📺 TV</button>` : ''}
          <button class="vp-pill" type="button" data-vp="share">Share ↗</button>
        </div>
      </div>
      <div class="vp-stage">
-       ${canHaveDeck ? `<video class="pv" id="vpVid"${playUrl ? ` src="${esc(playUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video>` : ''}
+       ${canHaveDeck ? `<video class="pv" id="vpVid"${primaryPlayUrl ? ` src="${esc(primaryPlayUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video>` : ''}
        ${posterHtml}
        <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Loading from OptiPlex on Gym Wi-Fi…</p>
        <p class="hint" id="vpLanErr" hidden style="text-align:center">Away from Gym Wi-Fi — stream this clip from Google Drive below.</p>
      </div>
      ${canHaveDeck ? `
-     <div class="vp-deck" id="vpDeck"${playUrl ? '' : ' hidden'}>
+     <div class="vp-deck" id="vpDeck"${primaryPlayUrl ? '' : ' hidden'}>
        <div class="vp-readout">
          <span><span class="vp-time" id="vpTime">0:00.00 / 0:00.00</span> · <span class="vp-frame" id="vpFrame">f 0</span></span>
          <span class="vp-rbtns">
@@ -1850,11 +1896,23 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
            <button class="vp-qbtn acc" type="button" id="vpTrimShare" data-vtrim="share" hidden>Trim &amp; Share ↗</button>
          </div>
        </div>
+       <div class="vp-angle-row" id="vpAngleRow" hidden>
+         <div class="vp-angle-top">
+           <small id="vpAngleLbl">Angles</small>
+           <div class="vp-angle-pills" id="vpAnglePills"></div>
+         </div>
+         <div class="vp-angle-acts" id="vpAngleActs" hidden>
+           <span class="vp-angle-note" id="vpAngleNote">Temp preview</span>
+           <div class="vp-angle-btns">
+             <button class="vp-nbtn" type="button" id="vpSwapPrimary" data-vcam-swap>Swap Primary</button>
+             <button class="vp-nbtn pri" type="button" id="vpSaveBoth" data-vcam-saveboth>+ Save Both</button>
+           </div>
+         </div>
+       </div>
        <div class="vp-tape-row" id="vpTapeRow"${tapeAvail() ? '' : ' hidden'}>
-         <small>2-Wk Tape</small>
+         <small id="vpTapeLbl">2-Wk Tape</small>
          <button class="vp-nbtn" type="button" data-vtape="5:0">−5s Earlier</button>
          <button class="vp-nbtn" type="button" data-vtape="0:5">+5s Later</button>
-         <button class="vp-nbtn" type="button" id="vpCamSwitch" data-vcam-switch hidden></button>
        </div>
      </div>` : ''}
      <div class="vp-drawer" id="vpShareBox" hidden>
@@ -1866,9 +1924,9 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
        <button class="btn big" type="button" data-vexp="save">Save MP4 to Gallery</button>
        ${driveUrl ? `<a class="btn big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>${driveBtnLabel}</a>` : ''}
      </div>
-     ${meta.fileName ? `<div class="vfile"><small>LINKED FILE${meta.driveQuery ? ' · TIMESTAMP MATCHED' : ''}</small><b>${esc(meta.fileName)}</b></div>` : ''}
+     ${meta.fileName ? `<div class="vfile"><small>LINKED FILE${meta.driveQuery ? ' · TIMESTAMP MATCHED' : ''}</small><b id="vpFileName">${esc(meta.fileName)}</b></div>` : ''}
      ${driveUrl ? `<a class="btn primary big" id="vpDriveFallback"${canHaveDeck ? ' hidden' : ''} href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>${driveBtnLabel}</a>` : ''}
-     ${hasLocalUri && !playUrl ? '<button class="btn big" type="button" data-vlocal>▶ Play from phone DCIM</button>' : ''}
+     ${hasLocalUri && !primaryPlayUrl ? '<button class="btn big" type="button" data-vlocal>▶ Play from phone DCIM</button>' : ''}
      ${ctx?.target ? '<button class="btn big" type="button" data-vmanage>+ Add / Manage Clips</button>' : ''}
      <div class="vp-foot-row">
        <button class="btn sm" type="button" data-vedit>Edit filename / URL</button>
@@ -1880,7 +1938,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         closed = true;
         dlCtrl.abort();
         if (uiTicker) clearInterval(uiTicker);
-        if (activeObjectUrl) URL.revokeObjectURL(activeObjectUrl);
+        if (primaryObjectUrl) URL.revokeObjectURL(primaryObjectUrl);
+        clearAngleCache();
       },
     },
   );
@@ -1900,10 +1959,14 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     }
   };
 
-  const resolveLanPlayable = async (lanUrl: string, bytesHint = 0): Promise<string> => {
+  const fetchBlobUrl = async (
+    lanUrl: string,
+    bytesHint = 0,
+  ): Promise<{ playUrl: string; objectUrl: string; blob: Blob | null } | null> => {
     if (bytesHint > MAX_LOCAL_CACHE_BYTES) {
-      if (closed) return '';
-      return isNative() ? ((await getPlayableNativeVideoUrl(lanUrl, meta!.mime)) ?? lanUrl) : lanUrl;
+      if (closed) return null;
+      const directUrl = isNative() ? ((await getPlayableNativeVideoUrl(lanUrl, meta!.mime)) ?? lanUrl) : lanUrl;
+      return { playUrl: directUrl, objectUrl: '', blob: null };
     }
     if (typeof fetch !== 'undefined') {
       const tCtrl = new AbortController();
@@ -1914,27 +1977,194 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         const res = await fetch(lanUrl, { signal: tCtrl.signal, cache: 'no-store' });
         if (res.ok) {
           const dlBlob = await res.blob();
-          if (!closed && dlBlob.size > 0 && dlBlob.size <= MAX_LOCAL_CACHE_BYTES) {
-            cacheSessionBlob(id, dlBlob);
-            blob = dlBlob;
-            const prevUrl = activeObjectUrl;
-            activeObjectUrl = URL.createObjectURL(dlBlob);
-            if (prevUrl) URL.revokeObjectURL(prevUrl);
-            return activeObjectUrl;
+          if (closed) return null;
+          if (dlBlob.size > 0 && dlBlob.size <= MAX_LOCAL_CACHE_BYTES) {
+            const objectUrl = URL.createObjectURL(dlBlob);
+            return { playUrl: objectUrl, objectUrl, blob: dlBlob };
+          }
+          if (dlBlob.size > MAX_LOCAL_CACHE_BYTES) {
+            const directUrl = isNative() ? ((await getPlayableNativeVideoUrl(lanUrl, meta!.mime)) ?? lanUrl) : lanUrl;
+            return { playUrl: directUrl, objectUrl: '', blob: null };
           }
         }
       } catch {
-        // LAN unreachable — return '' below so off-LAN shows Google Drive button immediately
+        // LAN unreachable — return null so off-LAN falls back cleanly
       } finally {
         clearTimeout(timer);
         dlCtrl.signal.removeEventListener('abort', onParentAbort);
       }
     }
-    return '';
+    return null;
+  };
+
+  const resolveLanPlayable = async (lanUrl: string, bytesHint = 0): Promise<string> => {
+    const res = await fetchBlobUrl(lanUrl, bytesHint);
+    if (!res) return '';
+    if (res.blob) {
+      cacheSessionBlob(id, res.blob);
+      primaryBlob = res.blob;
+    }
+    if (res.objectUrl) {
+      if (primaryObjectUrl && primaryObjectUrl !== res.objectUrl) URL.revokeObjectURL(primaryObjectUrl);
+      primaryObjectUrl = res.objectUrl;
+    }
+    primaryPlayUrl = res.playUrl;
+    if (!viewIsPreview && !viewSiblingMeta) {
+      viewBlob = primaryBlob;
+      viewLanUrl = meta!.lanUrl || '';
+      viewFileName = meta!.fileName || '';
+      viewCam = meta!.camera || '';
+    }
+    return res.playUrl;
+  };
+
+  const refreshTapeAngles = async (): Promise<void> => {
+    if (meta!.source !== 'gymcam' || !gymCam.online || meta!.clipStartMs == null || !withinRetention()) {
+      tapeAngles = [];
+      tapeAnglesChecked = false;
+      syncUi();
+      return;
+    }
+    const sid = s?.camSessionId ?? meta!.sessionId;
+    const endMs = meta!.clipEndMs ?? (meta!.clipStartMs + Math.max(5, meta!.durationSec ?? 20) * 1000);
+    const res = await gymCam.getTapeAngles(sid, meta!.clipStartMs, endMs);
+    if (closed) return;
+    if (res !== null) {
+      tapeAngles = res;
+      tapeAnglesChecked = true;
+      syncUi();
+    }
+  };
+
+  const restorePrimaryView = (): void => {
+    if (!vid || !primaryPlayUrl) return;
+    const resumeTime = Number.isFinite(vid.currentTime) ? vid.currentTime : st.playhead;
+    const wasPaused = vid.paused;
+    viewCam = meta!.camera || '';
+    viewLanUrl = meta!.lanUrl || '';
+    viewBlob = primaryBlob;
+    viewFileName = meta!.fileName || '';
+    viewIsPreview = false;
+    viewSiblingMeta = null;
+    loadingCam = null;
+    restoreAfterLoad = { time: resumeTime, paused: wasPaused };
+    vid.autoplay = !wasPaused;
+    vid.src = primaryPlayUrl;
+    vid.load();
+    syncUi();
+  };
+
+  const switchToAngle = async (cam: string): Promise<void> => {
+    if (!vid || !cam || (cam === viewCam && !loadingCam) || closed) return;
+    const resumeTime = Number.isFinite(vid.currentTime) ? vid.currentTime : st.playhead;
+    const wasPaused = vid.paused;
+    const gen = ++switchGen;
+
+    if (cam === (meta!.camera || '')) {
+      if (!primaryPlayUrl) return;
+      viewCam = meta!.camera || '';
+      viewLanUrl = meta!.lanUrl || '';
+      viewBlob = primaryBlob;
+      viewFileName = meta!.fileName || '';
+      viewIsPreview = false;
+      viewSiblingMeta = null;
+      loadingCam = null;
+      restoreAfterLoad = { time: resumeTime, paused: wasPaused };
+      vid.autoplay = !wasPaused;
+      vid.src = primaryPlayUrl;
+      vid.load();
+      syncUi();
+      return;
+    }
+
+    const sib = getSavedSiblings().get(cam);
+    if (sib?.lanUrl) {
+      const cKey = `sib|${sib.id}|${sib.lanUrl}`;
+      let hit = angleCache.get(cKey);
+      if (!hit) {
+        loadingCam = cam;
+        syncUi();
+        const dl = await fetchBlobUrl(sib.lanUrl, sib.bytes);
+        if (closed || gen !== switchGen) {
+          if (dl?.objectUrl) URL.revokeObjectURL(dl.objectUrl);
+          return;
+        }
+        if (!dl) {
+          loadingCam = null;
+          syncUi();
+          toast(`Could not load ${shortCamLabel(cam)} clip`);
+          return;
+        }
+        hit = { ...dl, lanUrl: sib.lanUrl, fileName: sib.fileName || '' };
+        angleCache.set(cKey, hit);
+      }
+      viewCam = cam;
+      viewLanUrl = hit.lanUrl;
+      viewBlob = hit.blob;
+      viewFileName = hit.fileName;
+      viewIsPreview = false;
+      viewSiblingMeta = sib;
+      loadingCam = null;
+      restoreAfterLoad = { time: resumeTime, paused: wasPaused };
+      vid.autoplay = !wasPaused;
+      vid.src = hit.playUrl;
+      vid.load();
+      syncUi();
+      return;
+    }
+
+    if (!tapeAvail() || meta!.clipStartMs == null || meta!.clipEndMs == null) return;
+    const cKey = `prev|${cam}|${meta!.clipStartMs}|${meta!.clipEndMs}`;
+    let hit = angleCache.get(cKey);
+    if (!hit) {
+      loadingCam = cam;
+      syncUi();
+      const prev: GymCamPreviewResult | null = await gymCam.previewClipCamera(meta!, cam);
+      if (closed || gen !== switchGen) return;
+      if (!prev?.lanUrl) {
+        loadingCam = null;
+        syncUi();
+        toast(`No ${shortCamLabel(cam)} tape for this timestamp`);
+        return;
+      }
+      const dl = await fetchBlobUrl(prev.lanUrl, prev.bytes);
+      if (closed || gen !== switchGen) {
+        if (dl?.objectUrl) URL.revokeObjectURL(dl.objectUrl);
+        return;
+      }
+      if (!dl) {
+        loadingCam = null;
+        syncUi();
+        toast(`Could not load ${shortCamLabel(cam)} preview`);
+        return;
+      }
+      hit = { ...dl, lanUrl: prev.lanUrl, fileName: prev.fileName };
+      angleCache.set(cKey, hit);
+    }
+    viewCam = cam;
+    viewLanUrl = hit.lanUrl;
+    viewBlob = hit.blob;
+    viewFileName = hit.fileName;
+    viewIsPreview = true;
+    viewSiblingMeta = null;
+    loadingCam = null;
+    restoreAfterLoad = { time: resumeTime, paused: wasPaused };
+    vid.autoplay = !wasPaused;
+    vid.src = hit.playUrl;
+    vid.load();
+    syncUi();
   };
 
   const syncUi = (): void => {
     if (closed) return;
+    const subEl = q('#vpSub');
+    if (subEl) {
+      const camSub = viewCam ? (viewIsPreview ? `${viewCam} · preview` : viewCam) : '';
+      subEl.textContent = [setTxt, dateTxt, camSub].filter(Boolean).join(' · ');
+    }
+    const tvBtn = q<HTMLButtonElement>('#vpTvBtn');
+    if (tvBtn) tvBtn.hidden = !(gymCam.online && !!(viewLanUrl || meta!.lanUrl));
+
     const sharePill = q('[data-vp="share"]');
     const shareBox = q('#vpShareBox');
     sharePill?.classList.toggle('on', shareOpen);
@@ -2037,16 +2267,55 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     }
     if (shareTrimEl) shareTrimEl.hidden = !trimmed;
 
+    const tapeOk = tapeAvail();
+    const daysLeft = tapeDaysRemaining(clipRefMs(), gymCam.retentionDays);
     const tapeRow = q('#vpTapeRow');
-    if (tapeRow) tapeRow.hidden = !tapeAvail();
-    const camSw = q<HTMLButtonElement>('#vpCamSwitch');
-    if (camSw) {
-      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-      const curIdx = cams.indexOf(meta!.camera || '');
-      const other = cams.length > 1 ? cams[(curIdx + 1) % cams.length] : undefined;
-      camSw.hidden = !(tapeAvail() && other);
-      if (other) camSw.textContent = `⇄ ${shortCamLabel(other)}`;
+    const tapeLbl = q('#vpTapeLbl');
+    if (tapeRow) tapeRow.hidden = !tapeOk;
+    if (tapeLbl) tapeLbl.textContent = `Tape · ${daysLeft}d left`;
+
+    const angleOpts =
+      meta!.source === 'gymcam' && gymCam.online && !!primaryPlayUrl
+        ? buildCoachAngleOptions({
+            primaryCamera: meta!.camera,
+            savedSiblingCameras: [...getSavedSiblings().keys()],
+            tapeCameras: tapeOk ? (tapeAnglesChecked ? tapeAngles : gymCam.cameras) : [],
+            configuredCameras: gymCam.cameras,
+          })
+        : [];
+    const showAngles = angleOpts.length > 1;
+    const angleRow = q('#vpAngleRow');
+    const angleLbl = q('#vpAngleLbl');
+    const anglePills = q('#vpAnglePills');
+    const angleActs = q('#vpAngleActs');
+    const angleNote = q('#vpAngleNote');
+    const saveBothBtn = q<HTMLButtonElement>('#vpSaveBoth');
+    if (angleRow) angleRow.hidden = !showAngles;
+    if (angleLbl) angleLbl.textContent = tapeOk ? `Angles · ${daysLeft}d left` : 'Saved Angles';
+    if (anglePills && showAngles) {
+      const sig = angleOpts
+        .map((o) => `${o.camera}:${o.kind}:${o.camera === viewCam ? 1 : 0}:${o.camera === loadingCam ? 1 : 0}`)
+        .join('|');
+      if (sig !== lastAnglesSig) {
+        lastAnglesSig = sig;
+        anglePills.innerHTML = angleOpts
+          .map((o) => {
+            const active = o.camera === viewCam;
+            const loading = o.camera === loadingCam;
+            const cls = `vp-ang${active ? ' on' : ''}${o.kind === 'saved' ? ' saved' : ''}`;
+            const tag = o.kind === 'saved' ? ' ✓' : '';
+            const txt = loading ? `${o.label}…` : `${o.label}${tag}`;
+            return `<button class="${cls}" type="button" data-vangle="${esc(o.camera)}"${loading ? ' disabled' : ''}>${esc(txt)}</button>`;
+          })
+          .join('');
+      }
+    } else if (anglePills && lastAnglesSig !== '') {
+      lastAnglesSig = '';
+      anglePills.innerHTML = '';
     }
+    if (angleActs) angleActs.hidden = !viewIsPreview;
+    if (angleNote && viewIsPreview) angleNote.textContent = `Temp preview · expires in ${daysLeft}d`;
+    if (saveBothBtn) saveBothBtn.hidden = !resolvedTarget;
   };
 
   if (vid) {
@@ -2057,8 +2326,27 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       vid.currentTime = next;
     });
     vid.onloadedmetadata = () => {
-      if (Number.isFinite(vid.duration) && vid.duration > 0) {
-        st = createTrimState(vid.duration, meta!.trimStartSec, meta!.trimEndSec);
+      const actualDur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
+      if (restoreAfterLoad) {
+        const restore = restoreAfterLoad;
+        restoreAfterLoad = null;
+        if (st.dur <= 0 && actualDur > 0) {
+          st = createTrimState(actualDur, meta!.trimStartSec, meta!.trimEndSec);
+          refreshRailView(isTrimmed(st));
+        }
+        const capDur = actualDur > 0 ? actualDur : st.dur;
+        const maxT = capDur > 0.05 ? capDur - 0.03 : capDur;
+        const target = maxT > 0 ? clamp(restore.time, 0, maxT) : Math.max(0, restore.time);
+        st = { ...st, playhead: target };
+        vid.playbackRate = speed;
+        seekVid(target);
+        if (restore.paused) vid.pause();
+        else void vid.play().catch(() => {});
+        syncUi();
+        return;
+      }
+      if (actualDur > 0) {
+        st = createTrimState(actualDur, meta!.trimStartSec, meta!.trimEndSec);
         refreshRailView(isTrimmed(st));
         if (st.start > 0.015 && vid.currentTime < st.start) seekVid(st.start);
       }
@@ -2066,6 +2354,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       syncUi();
     };
     vid.onerror = () => {
+      if ((viewIsPreview || viewSiblingMeta) && primaryPlayUrl) {
+        const failedCam = viewCam || 'alternate';
+        toast(`Could not load ${shortCamLabel(failedCam)} angle`);
+        restorePrimaryView();
+        return;
+      }
       const deck = q('#vpDeck');
       const poster = q('#vpPoster');
       const err = q('#vpLanErr');
@@ -2213,6 +2507,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
             showDriveOfflineFallback();
             return;
           }
+          void refreshTapeAngles();
         }
         const nextUrl = await resolveLanPlayable(meta!.lanUrl!, meta!.bytes);
         if (closed) return;
@@ -2232,6 +2527,9 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         void vid.play().catch(() => {});
         syncUi();
       })();
+    }
+    if (gymCam.online && meta.source === 'gymcam' && meta.clipStartMs != null && withinRetention()) {
+      void refreshTapeAngles();
     }
   }
 
@@ -2253,14 +2551,17 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     const orig = btn?.textContent ?? '';
     if (btn) { btn.disabled = true; btn.textContent = action === 'save' ? 'Saving…' : 'Preparing…'; }
     try {
-      if (isTrimDirty(st)) await persistTrim();
+      if (!viewIsPreview && isTrimDirty(st)) await persistTrim();
       const startMs = isTrimmed(st) ? Math.round(st.start * 1000) : undefined;
       const endMs = isTrimmed(st) ? Math.round(st.end * 1000) : undefined;
       const title = `${clipTitle}${setTxt ? ` · ${setTxt}` : ''}`;
+      const expFileName = viewFileName || meta!.fileName || `${ex.id}-clip.mp4`;
+      const expBlob = viewBlob;
+      const expLanUrl = viewLanUrl || meta!.lanUrl;
       if (isNative()) {
-        const uri = meta!.uri?.startsWith('content://') ? meta!.uri : undefined;
-        const base64 = !uri && blob ? await blobToBase64(blob) : undefined;
-        const httpUrl = !uri && !base64 && meta!.lanUrl ? meta!.lanUrl : undefined;
+        const uri = !viewIsPreview && !viewSiblingMeta && meta!.uri?.startsWith('content://') ? meta!.uri : undefined;
+        const base64 = !uri && expBlob ? await blobToBase64(expBlob) : undefined;
+        const httpUrl = !uri && !base64 && expLanUrl ? expLanUrl : undefined;
         if (!uri && !httpUrl && !base64) {
           toast('Clip not cached offline yet — connect to Gym Wi-Fi or Google Drive');
           return;
@@ -2269,7 +2570,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
           uri,
           httpUrl,
           base64,
-          fileName: meta!.fileName || `${ex.id}-clip.mp4`,
+          fileName: expFileName,
           title,
           startMs,
           endMs,
@@ -2280,8 +2581,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         } else {
           toast(res.error || 'Export failed');
         }
-      } else if (blob) {
-        await shareImage(blob, meta!.fileName || 'lift-video.mp4', title);
+      } else if (expBlob) {
+        await shareImage(expBlob, expFileName, title);
       } else {
         toast('Install APK on Pixel to trim or share this clip');
       }
@@ -2299,13 +2600,16 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
     const vp = t.closest<HTMLElement>('[data-vp]')?.dataset.vp;
     if (vp === 'tv') {
-      const ok = castClipToWallboard(meta!, {
-        rate: speed < 1 ? speed : 1,
-        exName: clipTitle,
-        setLabel: ctx?.setLabel || setTxt,
-        trimStartSec: isTrimmed(st) ? roundMs(st.start) : meta!.trimStartSec,
-        trimEndSec: isTrimmed(st) ? roundMs(st.end) : meta!.trimEndSec,
-      });
+      const ok = castClipToWallboard(
+        { ...meta!, lanUrl: viewLanUrl || meta!.lanUrl, camera: viewCam || meta!.camera },
+        {
+          rate: speed < 1 ? speed : 1,
+          exName: clipTitle,
+          setLabel: ctx?.setLabel || setTxt,
+          trimStartSec: isTrimmed(st) ? roundMs(st.start) : meta!.trimStartSec,
+          trimEndSec: isTrimmed(st) ? roundMs(st.end) : meta!.trimEndSec,
+        },
+      );
       toast(ok ? 'Playing on Wallboard TV' : 'TV replay requires a Gym Cam clip');
       return;
     }
@@ -2380,30 +2684,78 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       return;
     }
 
-    if (t.closest('[data-vcam-switch]') && vid && meta!.clipStartMs != null && meta!.clipEndMs != null) {
-      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-      const curIdx = cams.indexOf(meta!.camera || '');
-      const other = cams.length > 1 ? cams[(curIdx + 1) % cams.length] : undefined;
-      if (!other) return;
+    const angleBtn = t.closest<HTMLButtonElement>('[data-vangle]');
+    if (angleBtn?.dataset.vangle) {
+      void switchToAngle(angleBtn.dataset.vangle);
+      return;
+    }
+
+    if (t.closest('[data-vcam-saveboth]') && resolvedTarget && viewIsPreview && viewCam) {
       const btn = t.closest<HTMLButtonElement>('button');
-      if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }
-      const updated = await gymCam.switchClipCamera(meta!, other);
-      if (btn) btn.disabled = false;
-      if (updated?.lanUrl) {
-        meta = updated;
-        sessionFiles.delete(id);
-        pendingSeekSec = null;
-        const subEl = q('#vpSub');
-        if (subEl) subEl.textContent = [setTxt, dateTxt, updated.camera].filter(Boolean).join(' · ');
-        const nextPlayUrl = await resolveLanPlayable(updated.lanUrl, updated.bytes);
-        if (!closed && nextPlayUrl) {
-          vid.src = nextPlayUrl;
-          vid.load();
-          void vid.play().catch(() => {});
+      if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+      try {
+        const saved = await gymCam.saveAdditionalAngle(resolvedTarget, meta!, viewCam);
+        if (closed) return;
+        if (saved?.lanUrl) {
+          viewIsPreview = false;
+          viewSiblingMeta = saved;
+          viewLanUrl = saved.lanUrl;
+          viewFileName = saved.fileName || viewFileName;
+          toast(`Saved ${shortCamLabel(viewCam)} angle to set`);
+        } else {
+          toast(`Could not save ${shortCamLabel(viewCam)} angle`);
         }
-        toast(`Switched to ${shortCamLabel(other)}`);
-      } else {
-        toast(`Could not cut ${shortCamLabel(other)} angle`);
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '+ Save Both'; }
+      }
+      syncUi();
+      return;
+    }
+
+    if (t.closest('[data-vcam-swap]') && vid && viewIsPreview && viewCam && meta!.clipStartMs != null && meta!.clipEndMs != null) {
+      const targetCam = viewCam;
+      const oldShort = shortCamLabel(meta!.camera || 'current');
+      const newShort = shortCamLabel(targetCam);
+      const ok = await confirmSheet(
+        `Replace ${oldShort} with ${newShort}?`,
+        'Saves this angle permanently to OptiPlex & Google Drive and removes the old saved clip (14-day raw tape stays intact).',
+        'Swap Primary',
+        false,
+      );
+      if (!ok || closed) return;
+      const resumeTime = Number.isFinite(vid.currentTime) ? vid.currentTime : st.playhead;
+      const wasPaused = vid.paused;
+      const btn = t.closest<HTMLButtonElement>('button');
+      if (btn) { btn.disabled = true; btn.textContent = 'Swapping…'; }
+      try {
+        const updated = await gymCam.switchClipCamera(meta!, targetCam);
+        if (closed) return;
+        if (updated?.lanUrl) {
+          meta = updated;
+          sessionFiles.delete(id);
+          clearAngleCache();
+          viewIsPreview = false;
+          viewSiblingMeta = null;
+          viewCam = updated.camera || targetCam;
+          viewLanUrl = updated.lanUrl;
+          viewFileName = updated.fileName || '';
+          const fileEl = q('#vpFileName');
+          if (fileEl) fileEl.textContent = viewFileName;
+          pendingSeekSec = null;
+          const nextPlayUrl = await resolveLanPlayable(updated.lanUrl, updated.bytes);
+          if (!closed && nextPlayUrl) {
+            restoreAfterLoad = { time: resumeTime, paused: wasPaused };
+            vid.autoplay = !wasPaused;
+            vid.src = nextPlayUrl;
+            vid.load();
+          }
+          toast(`Primary angle switched to ${newShort}`);
+          void refreshTapeAngles();
+        } else {
+          toast(`Could not switch primary to ${newShort}`);
+        }
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Swap Primary'; }
       }
       syncUi();
       return;
@@ -2412,22 +2764,35 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     const vtape = t.closest<HTMLElement>('[data-vtape]');
     if (vtape && vid) {
       const [bStr, aStr] = vtape.dataset.vtape!.split(':');
+      const wasPaused = vid.paused;
       const btn = t.closest<HTMLButtonElement>('button');
       if (btn) btn.disabled = true;
       const updated = await gymCam.extendTapeClip(meta!, Number(bStr), Number(aStr));
       if (btn) btn.disabled = false;
+      if (closed) return;
       if (updated?.lanUrl) {
         meta = updated;
         sessionFiles.delete(id);
+        clearAngleCache();
+        viewIsPreview = false;
+        viewSiblingMeta = null;
+        viewCam = updated.camera || '';
+        viewLanUrl = updated.lanUrl;
+        viewFileName = updated.fileName || '';
+        const fileEl = q('#vpFileName');
+        if (fileEl) fileEl.textContent = viewFileName;
         st = createTrimState(updated.durationSec ?? st.dur, updated.trimStartSec, updated.trimEndSec);
         pendingSeekSec = null;
+        restoreAfterLoad = null;
         const nextPlayUrl = await resolveLanPlayable(updated.lanUrl, updated.bytes);
         if (!closed && nextPlayUrl) {
+          vid.autoplay = !wasPaused;
           vid.src = nextPlayUrl;
           vid.load();
-          void vid.play().catch(() => {});
+          if (!wasPaused) void vid.play().catch(() => {});
         }
         toast('Extended clip from 2-Week Tape');
+        void refreshTapeAngles();
       } else {
         toast('Tape window unavailable on OptiPlex');
       }

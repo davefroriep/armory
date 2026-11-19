@@ -51,6 +51,8 @@ MIN_CROP_SPAN = 0.15
 MIN_EXCL_SPAN = 0.04
 MAX_EXCLUSIONS = 6
 RING_KEEP_MIN_SEC = 300
+PREVIEW_KEEP_SEC = 24 * 3600
+PREVIEW_MAX_FILES = 120
 SEG_NAME_RE = re.compile(r"^seg_(\d{8})_(\d{6})\.ts$")
 
 FALLBACK_WALLBOARD_HTML = """<!doctype html>
@@ -1254,12 +1256,21 @@ class ArmoryCamService:
         self.ring_root = self.root / "ring"
         self.tapes_root = self.root / "tapes"
         self.clips_root = self.root / "clips"
+        self.previews_root = self.root / "previews"
         self.thumbs_root = self.root / "thumbs"
         self.logs_root = self.root / "logs"
         self.config_path = self.root / "config.json"
         self.clips_index_path = self.clips_root / "index.jsonl"
         self.cal_state_path = self.root / "calibration_state.json"
-        for d in (self.root, self.ring_root, self.tapes_root, self.clips_root, self.thumbs_root, self.logs_root):
+        for d in (
+            self.root,
+            self.ring_root,
+            self.tapes_root,
+            self.clips_root,
+            self.previews_root,
+            self.thumbs_root,
+            self.logs_root,
+        ):
             d.mkdir(parents=True, exist_ok=True)
 
         self.ffmpeg = resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
@@ -1299,6 +1310,8 @@ class ArmoryCamService:
         self.cam_connected: dict[str, bool] = {}
         self._thumb_lock = threading.Lock()
         self._thumb_mem: OrderedDict[str, bytes] = OrderedDict()
+        self._preview_locks_guard = threading.Lock()
+        self._preview_locks: dict[str, threading.Lock] = {}
 
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._proc_urls: dict[str, str] = {}
@@ -1798,6 +1811,37 @@ class ArmoryCamService:
                     except OSError:
                         pass
 
+        if self.previews_root.exists():
+            for tmp_p in self.previews_root.glob(".*.mp4"):
+                try:
+                    if tmp_p.stat().st_mtime < now_s - 300:
+                        tmp_p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            prev_cutoff = now_s - PREVIEW_KEEP_SEC
+            kept_previews: list[tuple[float, Path]] = []
+            for p in self.previews_root.glob("*.mp4"):
+                if p.name.startswith("."):
+                    continue
+                try:
+                    mtime = p.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime < prev_cutoff:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                else:
+                    kept_previews.append((mtime, p))
+            if len(kept_previews) > PREVIEW_MAX_FILES:
+                kept_previews.sort(key=lambda item: item[0])
+                for _, stale_p in kept_previews[: len(kept_previews) - PREVIEW_MAX_FILES]:
+                    try:
+                        stale_p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
     def start_session(self, session_id: str, name: str = "") -> None:
         clean_id = safe_slug(session_id, f"sess_{int(time.time())}")
         with self.lock:
@@ -1925,6 +1969,19 @@ class ArmoryCamService:
             if c.name.lower() == q or c.slug.lower() == q:
                 return c
         return self.cameras[0] if self.cameras else None
+
+    def _find_camera_exact(self, name_or_slug: str | None) -> CameraConfig | None:
+        if not name_or_slug:
+            return None
+        q = name_or_slug.strip().lower()
+        if not q:
+            return None
+        with self.lock:
+            cams = list(self.cameras)
+        for c in cams:
+            if c.name.lower() == q or c.slug.lower() == q:
+                return c
+        return None
 
     def _list_camera_segments(self, camera_name: str, session_id: str) -> list[SegmentInfo]:
         cam = self._find_camera(camera_name)
@@ -2365,55 +2422,23 @@ class ArmoryCamService:
                 pass
         return None
 
-    def cut_clip(
+    def _encode_segments_mp4(
         self,
-        session_id: str,
-        ex_name: str,
+        segs: list[SegmentInfo],
+        cam_cfg: CameraConfig | None,
         start_ms: int,
         end_ms: int,
-        camera_override: str | None = None,
-    ) -> dict[str, Any] | None:
-        if end_ms <= start_ms:
-            end_ms = start_ms + 5000
-
-        samples = self.session_samples(session_id)
-        primary_cams = {c.name for c in self.cameras if c.enabled and c.primary}
-        fallback_cam = next((c.name for c in self.cameras if c.enabled and c.primary), self.cameras[0].name if self.cameras else "Rack Cam")
-        chosen_cam = select_camera_for_window(
-            samples,
-            start_ms,
-            end_ms,
-            preferred_camera=camera_override,
-            fallback_camera=fallback_cam,
-            primary_cameras=primary_cams or None,
-        )
-        segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
-        if not segs and not camera_override:
-            for alt in self.cameras:
-                if alt.name != chosen_cam:
-                    alt_segs = self.find_segments(alt.name, session_id, start_ms, end_ms)
-                    if alt_segs:
-                        chosen_cam = alt.name
-                        segs = alt_segs
-                        break
+        out_path: Path,
+    ) -> bool:
         if not segs:
-            return None
-
-        cam_cfg = self._find_camera(chosen_cam)
+            return False
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         vf = build_ffmpeg_vf(cam_cfg.crop, cam_cfg.rotate) if cam_cfg else None
-
         first_start_ms = segs[0].start_ms
         ss_sec = max(0.0, (start_ms - first_start_ms) / 1000.0)
         dur_sec = max(0.5, (end_ms - start_ms) / 1000.0)
-
-        day_str = datetime.fromtimestamp(start_ms / 1000.0).strftime("%Y-%m-%d")
-        time_str = datetime.fromtimestamp(start_ms / 1000.0).strftime("%H%M%S")
-        day_dir = self.clips_root / day_str
-        day_dir.mkdir(parents=True, exist_ok=True)
-        out_name = f"{safe_slug(ex_name or 'lift')}_{time_str}_{uuid.uuid4().hex[:6]}.mp4"
-        out_path = day_dir / out_name
-        concat_path = day_dir / f".concat_{uuid.uuid4().hex[:8]}.txt"
-
+        concat_path = out_path.parent / f".concat_{uuid.uuid4().hex[:8]}.txt"
+        tmp_out = out_path.with_name(f".{out_path.stem}.{uuid.uuid4().hex[:6]}.mp4")
         try:
             lines = []
             for s in segs:
@@ -2460,40 +2485,155 @@ class ArmoryCamService:
                 "96k",
                 "-movflags",
                 "+faststart",
-                str(out_path),
+                str(tmp_out),
             ]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if res.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+            if res.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
                 self.log.warning("FFmpeg clip failed: %s", res.stderr.strip())
-                out_path.unlink(missing_ok=True)
-                return None
-
-            bytes_len = out_path.stat().st_size
-            thumb = extract_video_thumb(out_path)
-            actual_dur = self._probe_duration_sec(out_path) or int(round(dur_sec))
-            drive_info = self.mirror_clip_to_drive(out_path, day_str)
-            rel_url = f"/clips/{day_str}/{out_name}"
-            meta = {
-                "ok": True,
-                "lanUrl": rel_url,
-                "fileName": out_name,
-                "camera": chosen_cam,
-                "thumb": thumb,
-                "durationSec": max(1, actual_dur),
-                "startMs": int(start_ms),
-                "endMs": int(end_ms),
-                "bytes": bytes_len,
-                "exName": ex_name,
-                "createdAtMs": int(time.time() * 1000),
-                **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
-                **({"driveUrl": drive_info["driveUrl"]} if drive_info.get("driveUrl") else {}),
-            }
-            with self.clips_index_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps({k: v for k, v in meta.items() if k != "thumb"}) + "\n")
-            self.check_calibration_milestones()
-            return meta
+                tmp_out.unlink(missing_ok=True)
+                return False
+            tmp_out.replace(out_path)
+            return True
         finally:
             concat_path.unlink(missing_ok=True)
+            tmp_out.unlink(missing_ok=True)
+
+    def tape_angles_for_window(self, session_id: str, start_ms: int, end_ms: int) -> list[str]:
+        norm_end = max(int(start_ms) + 1000, int(end_ms))
+        with self.lock:
+            cams = [c for c in self.cameras if c.enabled]
+        avail: list[str] = []
+        for cam in cams:
+            segs = self.find_segments(cam.name, session_id, int(start_ms), norm_end)
+            if any(s.end_ms > int(start_ms) and s.start_ms < norm_end for s in segs):
+                avail.append(cam.name)
+        return avail
+
+    def cut_preview(
+        self,
+        session_id: str,
+        start_ms: int,
+        end_ms: int,
+        camera_name: str,
+    ) -> dict[str, Any] | None:
+        cam_cfg = self._find_camera_exact(camera_name)
+        if not cam_cfg:
+            return None
+        s_ms = int(start_ms)
+        e_ms = min(s_ms + 180_000, max(s_ms + 1000, int(end_ms)))
+        segs = self.find_segments(cam_cfg.name, session_id, s_ms, e_ms)
+        if not any(s.end_ms > s_ms and s.start_ms < e_ms for s in segs):
+            return None
+
+        ck = self._crop_cache_key(cam_cfg)
+        sid_slug = safe_slug(session_id or "ring", "ring")[:32]
+        fname = f"{sid_slug}_{cam_cfg.slug}_{s_ms}_{e_ms}_{ck}.mp4"
+        out_path = self.previews_root / fname
+
+        with self._preview_locks_guard:
+            p_lock = self._preview_locks.get(fname)
+            if p_lock is None:
+                p_lock = threading.Lock()
+                self._preview_locks[fname] = p_lock
+
+        with p_lock:
+            if out_path.is_file() and out_path.stat().st_size > 1000:
+                try:
+                    os.utime(out_path, None)
+                except OSError:
+                    pass
+                cached = True
+            else:
+                ok = self._encode_segments_mp4(segs, cam_cfg, s_ms, e_ms, out_path)
+                if not ok:
+                    return None
+                cached = False
+
+        actual_dur = self._probe_duration_sec(out_path) or max(1, int(round((e_ms - s_ms) / 1000.0)))
+        return {
+            "ok": True,
+            "ephemeral": True,
+            "cached": cached,
+            "lanUrl": f"/previews/{fname}",
+            "fileName": fname,
+            "camera": cam_cfg.name,
+            "durationSec": max(1, actual_dur),
+            "startMs": s_ms,
+            "endMs": e_ms,
+            "bytes": out_path.stat().st_size,
+        }
+
+    def cut_clip(
+        self,
+        session_id: str,
+        ex_name: str,
+        start_ms: int,
+        end_ms: int,
+        camera_override: str | None = None,
+    ) -> dict[str, Any] | None:
+        if end_ms <= start_ms:
+            end_ms = start_ms + 5000
+
+        samples = self.session_samples(session_id)
+        primary_cams = {c.name for c in self.cameras if c.enabled and c.primary}
+        fallback_cam = next((c.name for c in self.cameras if c.enabled and c.primary), self.cameras[0].name if self.cameras else "Rack Cam")
+        chosen_cam = select_camera_for_window(
+            samples,
+            start_ms,
+            end_ms,
+            preferred_camera=camera_override,
+            fallback_camera=fallback_cam,
+            primary_cameras=primary_cams or None,
+        )
+        segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
+        if not segs and not camera_override:
+            for alt in self.cameras:
+                if alt.name != chosen_cam:
+                    alt_segs = self.find_segments(alt.name, session_id, start_ms, end_ms)
+                    if alt_segs:
+                        chosen_cam = alt.name
+                        segs = alt_segs
+                        break
+        if not segs:
+            return None
+
+        cam_cfg = self._find_camera(chosen_cam)
+        dur_sec = max(0.5, (end_ms - start_ms) / 1000.0)
+
+        day_str = datetime.fromtimestamp(start_ms / 1000.0).strftime("%Y-%m-%d")
+        time_str = datetime.fromtimestamp(start_ms / 1000.0).strftime("%H%M%S")
+        day_dir = self.clips_root / day_str
+        day_dir.mkdir(parents=True, exist_ok=True)
+        out_name = f"{safe_slug(ex_name or 'lift')}_{time_str}_{uuid.uuid4().hex[:6]}.mp4"
+        out_path = day_dir / out_name
+
+        if not self._encode_segments_mp4(segs, cam_cfg, int(start_ms), int(end_ms), out_path):
+            return None
+
+        bytes_len = out_path.stat().st_size
+        thumb = extract_video_thumb(out_path)
+        actual_dur = self._probe_duration_sec(out_path) or int(round(dur_sec))
+        drive_info = self.mirror_clip_to_drive(out_path, day_str)
+        rel_url = f"/clips/{day_str}/{out_name}"
+        meta = {
+            "ok": True,
+            "lanUrl": rel_url,
+            "fileName": out_name,
+            "camera": chosen_cam,
+            "thumb": thumb,
+            "durationSec": max(1, actual_dur),
+            "startMs": int(start_ms),
+            "endMs": int(end_ms),
+            "bytes": bytes_len,
+            "exName": ex_name,
+            "createdAtMs": int(time.time() * 1000),
+            **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
+            **({"driveUrl": drive_info["driveUrl"]} if drive_info.get("driveUrl") else {}),
+        }
+        with self.clips_index_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({k: v for k, v in meta.items() if k != "thumb"}) + "\n")
+        self.check_calibration_milestones()
+        return meta
 
     def mirror_clip_to_drive(self, src_path: Path, day_str: str) -> dict[str, str]:
         """Copy an encoded MP4 into Google Drive backup folder and read Drive file ID if synced."""
@@ -3495,12 +3635,14 @@ def create_app(service: ArmoryCamService) -> Flask:
             cams = [c.name for c in service.cameras if c.enabled]
             rec = service.recording
             paused = service.paused
+            ret_days = service.retention_days
         return jsonify(
             {
                 "service": "armory-cam",
                 "serverEpochMs": int(time.time() * 1000),
                 "recording": rec,
                 "paused": paused,
+                "retentionDays": ret_days,
                 "cameras": cams,
             }
         )
@@ -3861,6 +4003,44 @@ def create_app(service: ArmoryCamService) -> Flask:
         resp.headers["Cache-Control"] = "public, max-age=300"
         return resp
 
+    @app.get("/api/tape/angles")
+    def api_tape_angles() -> Response:
+        sid = request.args.get("sessionId", "")
+        s_raw = request.args.get("startMs")
+        e_raw = request.args.get("endMs")
+        try:
+            if s_raw is None or s_raw == "":
+                raise ValueError("missing startMs")
+            start_ms = int(float(s_raw))
+            end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else start_ms + 5000
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Invalid startMs/endMs"}), 400
+        cams = service.tape_angles_for_window(sid, start_ms, end_ms)
+        with service.lock:
+            ret_days = service.retention_days
+        resp = jsonify({"ok": True, "retentionDays": ret_days, "cameras": cams})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/tape/preview")
+    def api_tape_preview() -> Response:
+        body = request.get_json(silent=True) or {}
+        sid = str(body.get("sessionId") or "")
+        cam = str(body.get("camera") or "").strip()
+        s_raw = body.get("startMs")
+        e_raw = body.get("endMs")
+        try:
+            if not cam or s_raw is None or s_raw == "":
+                raise ValueError("missing camera or startMs")
+            start_ms = int(float(s_raw))
+            end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else start_ms + 5000
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Invalid camera or startMs/endMs"}), 400
+        prev = service.cut_preview(sid, start_ms, end_ms, cam)
+        if not prev:
+            return jsonify({"ok": False, "error": "No alternate camera tape for this timestamp"}), 404
+        return jsonify(prev)
+
     @app.post("/api/clip")
     def api_clip() -> Response:
         body = request.get_json(silent=True) or {}
@@ -3916,9 +4096,8 @@ def create_app(service: ArmoryCamService) -> Flask:
             return jsonify({"ok": False, "error": "No PR video segments found"}), 404
         return jsonify(clip)
 
-    @app.get("/clips/<path:relpath>")
-    def serve_clip(relpath: str) -> Response:
-        base = service.clips_root.resolve()
+    def _serve_mp4_from_root(root: Path, relpath: str) -> Response:
+        base = root.resolve()
         target = (base / relpath).resolve()
         try:
             target.relative_to(base)
@@ -3956,6 +4135,14 @@ def create_app(service: ArmoryCamService) -> Flask:
         if parsed is not None:
             resp.headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         return resp
+
+    @app.get("/clips/<path:relpath>")
+    def serve_clip(relpath: str) -> Response:
+        return _serve_mp4_from_root(service.clips_root, relpath)
+
+    @app.get("/previews/<path:relpath>")
+    def serve_preview(relpath: str) -> Response:
+        return _serve_mp4_from_root(service.previews_root, relpath)
 
     return app
 

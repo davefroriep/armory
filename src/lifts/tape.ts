@@ -156,3 +156,79 @@ export function nextBurstPlayIndex(frames: readonly { tsMs: number }[], currentC
   const cur = findNearestFrameIndex(frames, currentCursorMs);
   return (cur + 1) % frames.length;
 }
+
+const DAY_MS = 86_400_000;
+
+/** Returns true while a Gym-Cam clip/session timestamp is still within OptiPlex tape retention (`retentionDays`). */
+export function isTapeWithinRetention(
+  refMs: number | null | undefined,
+  retentionDays = 14,
+  nowMs = Date.now(),
+): boolean {
+  if (refMs == null || !Number.isFinite(refMs) || refMs <= 0) return false;
+  const days = Math.max(1, Number.isFinite(retentionDays) ? retentionDays : 14);
+  return nowMs - refMs < days * DAY_MS;
+}
+
+/** Whole remaining days (rounded up, min 0) before raw 2-week tape auto-prunes on OptiPlex. */
+export function tapeDaysRemaining(
+  refMs: number | null | undefined,
+  retentionDays = 14,
+  nowMs = Date.now(),
+): number {
+  if (refMs == null || !Number.isFinite(refMs) || refMs <= 0) return 0;
+  const days = Math.max(1, Number.isFinite(retentionDays) ? retentionDays : 14);
+  return Math.max(0, Math.ceil((refMs + days * DAY_MS - nowMs) / DAY_MS));
+}
+
+export interface CoachAngleOption {
+  camera: string;
+  label: string;
+  kind: 'primary' | 'saved' | 'tape';
+}
+
+/** Builds deduplicated, configured-order angle switcher options across primary, saved siblings, and raw tape. */
+export function buildCoachAngleOptions(opts: {
+  primaryCamera?: string;
+  savedSiblingCameras?: readonly string[];
+  tapeCameras?: readonly string[];
+  configuredCameras?: readonly string[];
+}): CoachAngleOption[] {
+  const clean = (s?: string): string => (s ?? '').trim();
+  const primary = clean(opts.primaryCamera);
+  const savedSet = new Set<string>();
+  const availSet = new Set<string>();
+
+  if (primary) availSet.add(primary);
+  for (const raw of opts.savedSiblingCameras ?? []) {
+    const cam = clean(raw);
+    if (cam) {
+      savedSet.add(cam);
+      availSet.add(cam);
+    }
+  }
+  for (const raw of opts.tapeCameras ?? []) {
+    const cam = clean(raw);
+    if (cam) availSet.add(cam);
+  }
+  if (!availSet.size) return [];
+
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  const push = (cam: string): void => {
+    if (!cam || !availSet.has(cam) || seen.has(cam)) return;
+    seen.add(cam);
+    ordered.push(cam);
+  };
+
+  for (const raw of opts.configuredCameras ?? []) push(clean(raw));
+  push(primary);
+  for (const raw of opts.savedSiblingCameras ?? []) push(clean(raw));
+  for (const raw of opts.tapeCameras ?? []) push(clean(raw));
+
+  return ordered.map((camera) => ({
+    camera,
+    label: shortCamLabel(camera),
+    kind: camera === primary ? 'primary' : savedSet.has(camera) ? 'saved' : 'tape',
+  }));
+}

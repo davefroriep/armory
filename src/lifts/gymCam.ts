@@ -32,8 +32,20 @@ export interface GymCamProbeInfo {
   online: boolean;
   recording: boolean;
   paused: boolean;
+  retentionDays: number;
   cameras: string[];
   latencyMs: number;
+}
+
+export interface GymCamPreviewResult {
+  lanUrl: string;
+  fileName: string;
+  camera: string;
+  durationSec: number;
+  startMs: number;
+  endMs: number;
+  bytes: number;
+  cached?: boolean;
 }
 
 export interface GymCamTarget {
@@ -60,6 +72,7 @@ class GymCamController {
   online = false;
   recording = false;
   paused = false;
+  retentionDays = 14;
   cameras: string[] = [];
   clockOffsetMs = 0;
   armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera?: string } | null = null;
@@ -108,7 +121,7 @@ class GymCamController {
       this.paused = false;
       this.cameras = [];
       if (was) this.changed.emit();
-      return { online: false, recording: false, paused: false, cameras: [], latencyMs: 0 };
+      return { online: false, recording: false, paused: false, retentionDays: this.retentionDays, cameras: [], latencyMs: 0 };
     }
 
     const ctrl = new AbortController();
@@ -123,6 +136,7 @@ class GymCamController {
         serverEpochMs?: number;
         recording?: boolean;
         paused?: boolean;
+        retentionDays?: number;
         cameras?: string[];
       };
       if (data?.service !== 'armory-cam') throw new Error('Not armory-cam');
@@ -131,13 +145,23 @@ class GymCamController {
       this.online = true;
       this.recording = !!data.recording;
       this.paused = !!data.paused;
+      if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays) && data.retentionDays >= 1) {
+        this.retentionDays = Math.round(data.retentionDays);
+      }
       this.cameras = Array.isArray(data.cameras) ? data.cameras : [];
       this.changed.emit();
       if (Date.now() - this.lastSyncMs > 60_000) {
         this.lastSyncMs = Date.now();
         void this.syncDriveLinks();
       }
-      return { online: true, recording: this.recording, paused: this.paused, cameras: this.cameras, latencyMs };
+      return {
+        online: true,
+        recording: this.recording,
+        paused: this.paused,
+        retentionDays: this.retentionDays,
+        cameras: this.cameras,
+        latencyMs,
+      };
     } catch {
       this.probeMisses += 1;
       if (!this.online || this.probeMisses >= 2) {
@@ -148,7 +172,14 @@ class GymCamController {
         this.cameras = [];
         if (was) this.changed.emit();
       }
-      return { online: this.online, recording: this.recording, paused: this.paused, cameras: this.cameras, latencyMs: 0 };
+      return {
+        online: this.online,
+        recording: this.recording,
+        paused: this.paused,
+        retentionDays: this.retentionDays,
+        cameras: this.cameras,
+        latencyMs: 0,
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -648,6 +679,73 @@ class GymCamController {
       void this.deleteClip(meta);
     }
     return next;
+  }
+
+  async getTapeAngles(sessionId: string, startMs: number, endMs: number): Promise<string[] | null> {
+    if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3500);
+    try {
+      const q = new URLSearchParams({
+        sessionId,
+        startMs: String(Math.round(startMs)),
+        endMs: String(Math.round(endMs)),
+      });
+      const res = await fetch(`${this.baseUrl()}/api/tape/angles?${q.toString()}`, {
+        signal: ctrl.signal,
+        cache: 'no-store',
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { retentionDays?: number; cameras?: string[] };
+      if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays) && data.retentionDays >= 1) {
+        this.retentionDays = Math.round(data.retentionDays);
+      }
+      return Array.isArray(data.cameras) ? data.cameras : [];
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async previewClipCamera(meta: VideoMeta, nextCamera: string): Promise<GymCamPreviewResult | null> {
+    const cam = nextCamera.trim();
+    if (!this.online || !cam || meta.clipStartMs == null || meta.clipEndMs == null) return null;
+    const s = lifts.sessions.get(meta.sessionId);
+    const res = await this.postJson<ClipApiResponse & { cached?: boolean }>(
+      '/api/tape/preview',
+      {
+        sessionId: s?.camSessionId ?? meta.sessionId,
+        startMs: meta.clipStartMs,
+        endMs: meta.clipEndMs,
+        camera: cam,
+      },
+      45_000,
+    );
+    const lanUrl = this.resolveLanUrl(res?.lanUrl);
+    if (!res?.ok || !lanUrl) return null;
+    return {
+      lanUrl,
+      fileName: res.fileName || '',
+      camera: res.camera || cam,
+      durationSec: res.durationSec ?? meta.durationSec ?? 0,
+      startMs: res.startMs ?? meta.clipStartMs,
+      endMs: res.endMs ?? meta.clipEndMs,
+      bytes: res.bytes ?? 0,
+      ...(res.cached !== undefined ? { cached: res.cached } : {}),
+    };
+  }
+
+  async saveAdditionalAngle(target: GymCamTarget, meta: VideoMeta, nextCamera: string): Promise<VideoMeta | null> {
+    const cam = nextCamera.trim();
+    if (!this.online || !cam || meta.clipStartMs == null || meta.clipEndMs == null) return null;
+    const saved = await this.saveWindowClip(target, cam, meta.clipStartMs, meta.clipEndMs);
+    if (saved && (meta.trimStartSec != null || meta.trimEndSec != null)) {
+      if (meta.trimStartSec != null) saved.trimStartSec = meta.trimStartSec;
+      if (meta.trimEndSec != null) saved.trimEndSec = meta.trimEndSec;
+      await lifts.saveVideoMeta(saved);
+    }
+    return saved;
   }
 }
 

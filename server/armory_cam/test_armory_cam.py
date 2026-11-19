@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -99,6 +101,7 @@ class ArmoryCamTests(unittest.TestCase):
             ping = client.get("/api/ping").get_json()
             self.assertEqual(ping["service"], "armory-cam")
             self.assertEqual(ping["cameras"], ["Rack Cam", "Smith Cam"])
+            self.assertEqual(ping["retentionDays"], 14)
             self.assertFalse(ping["recording"])
 
             dash_html = client.get("/").get_data(as_text=True)
@@ -128,6 +131,7 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(cfg_res.status_code, 200)
             saved_cfg = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_cfg["retentionDays"], 21)
+            self.assertEqual(client.get("/api/ping").get_json()["retentionDays"], 21)
             self.assertEqual(saved_cfg["cameras"][0]["crop"], [0.25, 0.25, 0.75, 0.75])
             self.assertEqual(saved_cfg["cameras"][0]["roi"], [0.3, 0.3, 0.7, 0.7])
             self.assertEqual(saved_cfg["cameras"][0]["exclusions"], [[0.55, 0.1, 0.9, 0.6]])
@@ -643,6 +647,116 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertFalse((drive_dir / day / "Squat_0_abc120.mp4").exists())
             remaining_names = [c["fileName"] for c in client.get("/api/clips").get_json()["clips"]]
             self.assertNotIn("Squat_0_abc120.mp4", remaining_names)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_alternate_angle_preview_endpoints_caching_isolation_and_pruning(self) -> None:
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_prev_"))
+        try:
+            root = tmp / "camroot"
+            drive_dir = tmp / "drive_clips"
+            svc = ac.ArmoryCamService(root_dir=root, drive_backup_dir=drive_dir, ntfy_topic="TestTopic")
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            t0_ms = int(datetime(2026, 11, 19, 10, 0, 0).timestamp() * 1000)
+            for slug, color in (("rack_cam", "blue"), ("smith_cam", "green")):
+                cam_dir = svc.tapes_root / "sess-alt" / slug
+                cam_dir.mkdir(parents=True, exist_ok=True)
+                for i in range(3):
+                    seg_dt = datetime.fromtimestamp((t0_ms + i * 2000) / 1000.0)
+                    seg_name = f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                    seg_path = cam_dir / seg_name
+                    subprocess.run(
+                        [
+                            svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", f"color=c={color}:s=320x240:r=20:d=2",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                        ],
+                        check=True,
+                    )
+
+            ang_res = client.get(f"/api/tape/angles?sessionId=sess-alt&startMs={t0_ms}&endMs={t0_ms + 5000}")
+            self.assertEqual(ang_res.status_code, 200)
+            ang_data = ang_res.get_json()
+            self.assertEqual(ang_data["retentionDays"], 14)
+            self.assertEqual(ang_data["cameras"], ["Rack Cam", "Smith Cam"])
+
+            # Non-overlapping timestamp & non-existent session report empty cameras
+            miss_win = client.get(f"/api/tape/angles?sessionId=sess-alt&startMs={t0_ms + 120_000}&endMs={t0_ms + 130_000}").get_json()
+            self.assertEqual(miss_win["cameras"], [])
+            miss_sess = client.get(f"/api/tape/angles?sessionId=expired-sess&startMs={t0_ms}&endMs={t0_ms + 5000}").get_json()
+            self.assertEqual(miss_sess["cameras"], [])
+
+            with mock.patch.object(ac, "send_ntfy_alert", return_value=True) as m_ntfy:
+                p1 = client.post(
+                    "/api/tape/preview",
+                    json={"sessionId": "sess-alt", "startMs": t0_ms, "endMs": t0_ms + 4000, "camera": "Smith Cam"},
+                )
+                self.assertEqual(p1.status_code, 200)
+                d1 = p1.get_json()
+                self.assertTrue(d1["ok"])
+                self.assertTrue(d1["ephemeral"])
+                self.assertFalse(d1["cached"])
+                self.assertTrue(d1["lanUrl"].startswith("/previews/"))
+                self.assertEqual(d1["camera"], "Smith Cam")
+                self.assertGreater(d1["bytes"], 1000)
+
+                # Byte-range 206 streaming + path traversal block on /previews/
+                r206 = client.get(d1["lanUrl"], headers={"Range": "bytes=0-511"})
+                self.assertEqual(r206.status_code, 206)
+                self.assertEqual(len(r206.data), 512)
+                self.assertEqual(r206.headers["Accept-Ranges"], "bytes")
+                self.assertIn(client.get("/previews/../../config.json").status_code, (403, 404))
+
+                # Zero side effects: no permanent clip, no Drive file, no index row, no calibration bump, no ntfy
+                self.assertEqual(list(svc.clips_root.glob("*/*.mp4")), [])
+                self.assertFalse(drive_dir.exists() and any(drive_dir.rglob("*")))
+                self.assertFalse(svc.clips_index_path.exists() and bool(svc.clips_index_path.read_text(encoding="utf-8").strip()))
+                self.assertEqual(svc.calibration_status()["clipCount"], 0)
+                self.assertEqual(m_ntfy.call_count, 0)
+
+                # Second call hits cached file
+                p2 = client.post(
+                    "/api/tape/preview",
+                    json={"sessionId": "sess-alt", "startMs": t0_ms, "endMs": t0_ms + 4000, "camera": "Smith Cam"},
+                )
+                self.assertEqual(p2.status_code, 200)
+                d2 = p2.get_json()
+                self.assertTrue(d2["cached"])
+                self.assertEqual(d2["fileName"], d1["fileName"])
+
+                # Updating crop creates a fresh preview key
+                client.post(
+                    "/api/config",
+                    json={"cameras": [{"name": "Smith Cam", "slug": "smith_cam", "crop": [0.1, 0.1, 0.9, 0.9]}]},
+                )
+                p3 = client.post(
+                    "/api/tape/preview",
+                    json={"sessionId": "sess-alt", "startMs": t0_ms, "endMs": t0_ms + 4000, "camera": "Smith Cam"},
+                )
+                self.assertEqual(p3.status_code, 200)
+                d3 = p3.get_json()
+                self.assertFalse(d3["cached"])
+                self.assertNotEqual(d3["fileName"], d1["fileName"])
+
+            # Unknown camera returns 404 (must not fall back to Rack Cam)
+            ghost = client.post(
+                "/api/tape/preview",
+                json={"sessionId": "sess-alt", "startMs": t0_ms, "endMs": t0_ms + 4000, "camera": "Ghost Cam"},
+            )
+            self.assertEqual(ghost.status_code, 404)
+
+            # Old ephemeral previews (>24h) are pruned while fresh ones remain
+            old_path = svc.previews_root / d1["fileName"]
+            fresh_path = svc.previews_root / d3["fileName"]
+            stale_ts = time.time() - 25 * 3600
+            os.utime(old_path, (stale_ts, stale_ts))
+            svc._prune_storage(time.time())
+            self.assertFalse(old_path.exists())
+            self.assertTrue(fresh_path.exists())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
