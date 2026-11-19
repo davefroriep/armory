@@ -746,7 +746,7 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    /** Registers a `content://` DCIM video on the loopback HTTP range server so `<video>` plays in-app. */
+    /** Registers a `content://` DCIM video or LAN `http://` clip on the loopback HTTP range server so `<video>` plays in-app. */
     @PluginMethod
     public void getPlayableVideoUrl(PluginCall call) {
         String u = call.getString("uri", "");

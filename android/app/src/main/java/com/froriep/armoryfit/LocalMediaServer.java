@@ -11,10 +11,13 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URI;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -22,8 +25,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Loopback-only HTTP byte-range server for streaming Android `content://` DCIM videos directly
- * inside the WebView `<video>` element with zero file copying and smooth scrubbing.
+ * Loopback-only HTTP byte-range server and proxy for streaming Android `content://` DCIM videos
+ * and LAN `http://` OptiPlex clips inside the WebView `<video>` element without Mixed Content blocks
+ * and with smooth byte-range scrubbing.
  */
 final class LocalMediaServer {
     private static final int MAX_HEADER_BYTES = 16_384;
@@ -167,6 +171,12 @@ final class LocalMediaServer {
                 }
             }
 
+            String scheme = entry.uri.getScheme();
+            if ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme)) {
+                proxyHttp(entry.uri.toString(), entry.mime, method, rangeHdr, out);
+                return;
+            }
+
             try (ParcelFileDescriptor pfd = c.getContentResolver().openFileDescriptor(entry.uri, "r")) {
                 if (pfd == null) {
                     sendEmpty(out, 404, "Not Found", null);
@@ -242,6 +252,63 @@ final class LocalMediaServer {
         } catch (Exception ignored) {
         } finally {
             try { sock.close(); } catch (IOException ignored) {}
+        }
+    }
+
+    private static void proxyHttp(String targetUrl, String fallbackMime, String method, String rangeHdr, OutputStream out) throws IOException {
+        HttpURLConnection conn = null;
+        try {
+            URL url = URI.create(targetUrl).toURL();
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setInstanceFollowRedirects(true);
+            conn.setConnectTimeout(4_000);
+            conn.setReadTimeout(15_000);
+            conn.setRequestMethod(method);
+            if (rangeHdr != null && !rangeHdr.isEmpty()) {
+                conn.setRequestProperty("Range", rangeHdr);
+            }
+            int code = conn.getResponseCode();
+            String msg = conn.getResponseMessage();
+            if (msg == null || msg.isEmpty()) msg = (code == 206 ? "Partial Content" : "OK");
+            String ctype = conn.getContentType();
+            if (ctype == null || ctype.isEmpty()) ctype = fallbackMime;
+            String acceptRanges = conn.getHeaderField("Accept-Ranges");
+            if (acceptRanges == null || acceptRanges.isEmpty()) acceptRanges = "bytes";
+            String contentRange = conn.getHeaderField("Content-Range");
+            long contentLen = conn.getContentLengthLong();
+
+            StringBuilder hdr = new StringBuilder();
+            hdr.append("HTTP/1.1 ").append(code).append(' ').append(msg).append("\r\n");
+            hdr.append("Content-Type: ").append(ctype).append("\r\n");
+            hdr.append("Accept-Ranges: ").append(acceptRanges).append("\r\n");
+            if (contentLen >= 0) {
+                hdr.append("Content-Length: ").append(contentLen).append("\r\n");
+            }
+            if (contentRange != null && !contentRange.isEmpty()) {
+                hdr.append("Content-Range: ").append(contentRange).append("\r\n");
+            }
+            hdr.append("Cache-Control: no-store\r\n");
+            hdr.append("Access-Control-Allow-Origin: *\r\n");
+            hdr.append("Connection: close\r\n\r\n");
+            out.write(hdr.toString().getBytes(StandardCharsets.US_ASCII));
+
+            if ("GET".equals(method)) {
+                InputStream bodyIn = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
+                if (bodyIn != null) {
+                    try (InputStream is = bodyIn) {
+                        byte[] buf = new byte[65_536];
+                        int n;
+                        while ((n = is.read(buf)) >= 0) {
+                            out.write(buf, 0, n);
+                        }
+                    }
+                }
+            }
+            out.flush();
+        } catch (IOException e) {
+            sendEmpty(out, 502, "Bad Gateway", null);
+        } finally {
+            if (conn != null) conn.disconnect();
         }
     }
 

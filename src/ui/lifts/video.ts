@@ -716,7 +716,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   }
 
   const objectUrl = blob ? URL.createObjectURL(blob) : '';
-  let playUrl = objectUrl || meta.lanUrl || '';
+  let playUrl = objectUrl || '';
+  if (!playUrl && meta.lanUrl) {
+    playUrl = isNative()
+      ? ((await getPlayableNativeVideoUrl(meta.lanUrl, meta.mime)) ?? meta.lanUrl)
+      : meta.lanUrl;
+  }
   if (!playUrl && isNative() && meta.uri?.startsWith('content://')) {
     playUrl = (await getPlayableNativeVideoUrl(meta.uri, meta.mime)) ?? '';
   }
@@ -1171,7 +1176,10 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (updated?.lanUrl) {
         meta = updated;
         st = createTrimState(updated.durationSec ?? st.dur, updated.trimStartSec, updated.trimEndSec);
-        vid.src = updated.lanUrl;
+        const nextPlayUrl = isNative()
+          ? ((await getPlayableNativeVideoUrl(updated.lanUrl, updated.mime)) ?? updated.lanUrl)
+          : updated.lanUrl;
+        vid.src = nextPlayUrl;
         vid.load();
         toast('Extended clip from 2-Week Tape');
       } else {

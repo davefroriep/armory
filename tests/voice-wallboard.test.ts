@@ -615,6 +615,8 @@ describe('wallboard snapshot & routing', () => {
     expect(WALLBOARD_HTML).toContain("wbUrl('/state')");
     expect(WALLBOARD_HTML).toContain("wbUrl('/events')");
     expect(WALLBOARD_HTML).toContain("location.pathname.endsWith('/wallboard')");
+    expect(WALLBOARD_HTML).toContain('<div class="top-mid">\' + banner + \'</div>');
+    expect(WALLBOARD_HTML).not.toContain("</div>' + banner + main");
 
     const standby = buildWallboardSnapshot({
       now: 1_000,

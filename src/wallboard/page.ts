@@ -41,19 +41,20 @@ export const WALLBOARD_HTML = `<!doctype html>
   * { box-sizing:border-box; margin:0; padding:0; }
   html,body { height:100%; background:var(--bg); color:var(--txt); font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; overflow:hidden; }
   .wrap { height:100dvh; display:flex; flex-direction:column; gap:clamp(10px,1.4vh,18px); padding:clamp(12px,1.8vh,24px) clamp(14px,2vw,30px); }
-  .top { display:flex; align-items:center; gap:14px; justify-content:space-between; flex-shrink:0; }
-  .brand { display:flex; align-items:center; gap:12px; }
+  .top { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:14px; flex-shrink:0; }
+  .brand { display:flex; align-items:center; gap:12px; flex-shrink:0; }
   .brand b { font-size:clamp(18px,2.2vw,28px); letter-spacing:.12em; color:#fff; }
   .pill { font-size:clamp(11px,1.2vw,15px); font-weight:700; letter-spacing:.08em; padding:6px 12px; border-radius:999px; background:var(--card2); border:1px solid var(--line); color:var(--mut); text-transform:uppercase; }
   .pill.live { color:#86efac; border-color:rgba(34,197,94,.45); background:rgba(34,197,94,.12); }
   .pill.cardio { color:#7dd3fc; border-color:rgba(56,189,248,.45); background:rgba(56,189,248,.12); }
-  .top-r { display:flex; align-items:center; gap:12px; }
+  .top-mid { display:flex; justify-content:center; align-items:center; min-width:0; }
+  .top-r { display:flex; align-items:center; gap:12px; flex-shrink:0; }
   .mic { display:inline-flex; align-items:center; gap:8px; padding:6px 14px; border-radius:999px; border:1px solid var(--line); background:var(--card); font-size:clamp(12px,1.3vw,16px); color:var(--mut); font-weight:600; }
   .mic.on { color:#86efac; border-color:rgba(34,197,94,.5); background:rgba(34,197,94,.12); }
   .mic.armed { color:#67e8f9; border-color:var(--cyan); background:rgba(34,211,238,.2); box-shadow:0 0 20px rgba(34,211,238,.35); }
   .dot { width:9px; height:9px; border-radius:50%; background:currentColor; }
   .clk { font-variant-numeric:tabular-nums; font-size:clamp(18px,2.2vw,28px); font-weight:700; color:var(--mut); }
-  .vtoast { padding:12px 18px; border-radius:14px; font-size:clamp(16px,2.2vw,28px); font-weight:800; letter-spacing:.02em; text-align:center; background:rgba(34,197,94,.18); border:2px solid var(--green); color:#dcfce7; flex-shrink:0; }
+  .vtoast { display:inline-flex; align-items:center; max-width:100%; padding:5px 14px; border-radius:999px; font-size:clamp(12px,1.4vw,17px); font-weight:800; letter-spacing:.02em; line-height:1.15; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; background:rgba(34,197,94,.18); border:1.5px solid var(--green); color:#dcfce7; }
   .vtoast.info { background:rgba(56,189,248,.18); border-color:var(--blue); color:#e0f2fe; }
   .vtoast.warn { background:rgba(245,158,11,.18); border-color:var(--amber); color:#fef3c7; }
   .grid { flex:1; min-height:0; display:grid; grid-template-columns:1.28fr 1fr; gap:clamp(12px,1.6vw,22px); }
@@ -232,7 +233,7 @@ export const WALLBOARD_HTML = `<!doctype html>
 </head>
 <body>
 <div class="wrap" id="app">
-  <div class="top"><div class="brand"><b>ARMORY FIT</b><span class="pill">Connecting…</span></div><div class="clk" id="clk">--:--</div></div>
+  <div class="top"><div class="brand"><b>ARMORY FIT</b><span class="pill">Connecting…</span></div><div class="top-mid"></div><div class="top-r"><div class="clk" id="clk">--:--</div></div></div>
 </div>
 <button class="ptt" id="ptt" hidden type="button">🎤 Voice Relay</button>
 <script>
@@ -411,7 +412,7 @@ function render(st) {
       + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker">TODAY ON THE SCHEDULE</div>' + items + '</section></div></div>';
   }
 
-  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + '</div><div class="top-r">' + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + banner + main;
+  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + '</div><div class="top-mid">' + banner + '</div><div class="top-r">' + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + main;
 }
 
 window.addEventListener('message', (ev) => {
