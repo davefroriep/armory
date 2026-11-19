@@ -749,7 +749,8 @@ describe('wallboard snapshot & routing', () => {
     expect(secondsSinceLastSet({ ...sess, pausedAt: 220_000 }, 999_000)).toBe(10);
     expect(secondsSinceLastSet({ ...sess, endMs: 250_000 }, 300_000)).toBeNull();
 
-    expect(driveUrlFor({ fileName: 'Squat_Set1.mp4', source: 'gymcam' })).toBeNull();
+    expect(driveUrlFor({ fileName: 'Squat_Set1.mp4', source: 'gymcam' })).toBe('https://drive.google.com/drive/search?q=Squat_Set1.mp4');
+    expect(driveUrlFor({ fileName: 'Squat_Set1.mp4', source: 'gymcam', uri: 'https://drive.google.com/file/d/direct123/view' })).toBe('https://drive.google.com/file/d/direct123/view');
 
     const replaySnap: WallboardReplayState = {
       id: 'v1',

@@ -12,7 +12,6 @@ interface BlobRow {
   blob: Blob;
 }
 const BLOB_PREFIX = 'blob:';
-const MAX_OFFLINE_VIDEO_BYTES = 450 * 1024 * 1024;
 
 export interface LiftBackup {
   app: 'armory-lifts';
@@ -41,7 +40,6 @@ class LiftStore {
   private prCache: { v: number; m: Map<string, PRHit> } | null = null;
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   private deletedSessionIds = new Set<string>();
-  private blobSizes = new Map<string, number>();
 
   constructor() {
     this.ready = this.load();
@@ -61,11 +59,13 @@ class LiftStore {
     r.forEach((e) => this.routines.set(e.id, e));
     x.forEach((e) => this.rows.set(e.id, e));
     for (const e of v) {
+      if (!e.id.startsWith(BLOB_PREFIX)) this.videos.set(e.id, e as VideoMeta);
+    }
+    // Reclaim any legacy cached Gym-Cam blobs from Pixel IndexedDB (OptiPlex/Drive hold all MP4s).
+    for (const e of v) {
       if (e.id.startsWith(BLOB_PREFIX)) {
-        const vidId = e.id.slice(BLOB_PREFIX.length);
-        this.blobSizes.set(vidId, (e as BlobRow).blob?.size ?? 0);
-      } else {
-        this.videos.set(e.id, e as VideoMeta);
+        const meta = this.videos.get(e.id.slice(BLOB_PREFIX.length));
+        if (meta?.source === 'gymcam') void idbDelete('lift_videos', e.id);
       }
     }
 
@@ -396,49 +396,11 @@ class LiftStore {
   }
 
   // ---------- videos ----------
-  hasVideoBlob(id: string): boolean {
-    return this.blobSizes.has(id);
-  }
-
-  async saveVideoBlob(id: string, blob: Blob): Promise<void> {
-    await idbPut('lift_videos', { id: BLOB_PREFIX + id, blob } as BlobRow);
-    this.blobSizes.set(id, blob.size);
-    const meta = this.videos.get(id);
-    if (meta && meta.bytes !== blob.size) {
-      const next = { ...meta, bytes: blob.size };
-      this.videos.set(id, next);
-      await idbPut('lift_videos', next);
-    }
-    let total = 0;
-    for (const sz of this.blobSizes.values()) total += sz;
-    if (total > MAX_OFFLINE_VIDEO_BYTES) {
-      // Evict oldest Gym-Cam / server-backed blobs first before touching phone-only clips
-      const candidates = [...this.blobSizes.keys()]
-        .filter((k) => k !== id)
-        .sort((a, b) => {
-          const ma = this.videos.get(a);
-          const mb = this.videos.get(b);
-          const pa = ma?.source === 'gymcam' || ma?.linkOnly ? 0 : 1;
-          const pb = mb?.source === 'gymcam' || mb?.linkOnly ? 0 : 1;
-          if (pa !== pb) return pa - pb;
-          return (ma?.ms ?? 0) - (mb?.ms ?? 0);
-        });
-      for (const oldId of candidates) {
-        if (total <= MAX_OFFLINE_VIDEO_BYTES) break;
-        const oldSz = this.blobSizes.get(oldId) ?? 0;
-        this.blobSizes.delete(oldId);
-        total = Math.max(0, total - oldSz);
-        await idbDelete('lift_videos', BLOB_PREFIX + oldId);
-      }
-    }
-    this.touch();
-  }
-
   async addVideo(meta: VideoMeta, blob?: Blob): Promise<void> {
     this.videos.set(meta.id, meta);
     this.touch();
     await idbPut('lift_videos', meta);
-    if (blob) await this.saveVideoBlob(meta.id, blob);
+    if (blob) await idbPut('lift_videos', { id: BLOB_PREFIX + meta.id, blob } as BlobRow);
   }
 
   async saveVideoMeta(meta: VideoMeta): Promise<void> {
@@ -449,14 +411,12 @@ class LiftStore {
 
   async videoBlob(id: string): Promise<Blob | null> {
     const hit = await idbGet<BlobRow>('lift_videos', BLOB_PREFIX + id);
-    if (hit?.blob) this.blobSizes.set(id, hit.blob.size);
     return hit?.blob ?? null;
   }
 
   async deleteVideo(id: string, unlink = true): Promise<void> {
     const meta = this.videos.get(id);
     this.videos.delete(id);
-    this.blobSizes.delete(id);
     if (unlink && meta) {
       const s = this.sessions.get(meta.sessionId);
       if (s) {

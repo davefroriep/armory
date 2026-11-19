@@ -320,7 +320,6 @@ export function routineFromSession(s: LiftSession, name: string, order: number):
 /** URL that locates a linked clip in Google Drive (direct share URL, timestamp query, or exact filename). */
 export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri' | 'driveQuery' | 'source'>): string | null {
   if (meta.uri && /^https?:\/\//i.test(meta.uri)) return meta.uri;
-  if (meta.source === 'gymcam') return null;
   const q = meta.driveQuery || meta.fileName;
   if (q) return `https://drive.google.com/drive/search?q=${encodeURIComponent(q)}`;
   return null;

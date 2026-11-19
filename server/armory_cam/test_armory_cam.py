@@ -515,6 +515,63 @@ class ArmoryCamTests(unittest.TestCase):
         )
         self.assertGreater(with_lifter, 5.0)
 
+    def test_drive_backup_mirror_and_backfill(self) -> None:
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_drive_"))
+        try:
+            root = tmp / "camroot"
+            drive_dir = tmp / "drive_clips"
+            svc = ac.ArmoryCamService(root_dir=root, drive_backup_dir=drive_dir)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            cfg = client.get("/api/config").get_json()
+            self.assertEqual(cfg["driveBackupDir"], str(drive_dir))
+
+            t0_ms = int(datetime(2026, 11, 18, 20, 0, 0).timestamp() * 1000)
+            rack_dir = svc.tapes_root / "sess-drv" / "rack_cam"
+            rack_dir.mkdir(parents=True, exist_ok=True)
+            seg_path = rack_dir / f"seg_{datetime.fromtimestamp(t0_ms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts"
+            subprocess.run(
+                [
+                    svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=20:d=4",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                ],
+                check=True,
+            )
+            svc.ring_segments["rack_cam"] = [
+                ac.SegmentInfo(path=seg_path, start_ms=t0_ms, end_ms=t0_ms + 4000, energy=12.0, camera="Rack Cam")
+            ]
+
+            with mock.patch.object(ac, "read_google_drive_file_id", return_value="1AbCdEfGhIjKlMnOpQrStUvWxYz"):
+                res = client.post(
+                    "/api/clip",
+                    json={"sessionId": "sess-drv", "exName": "Bench", "startMs": t0_ms, "endMs": t0_ms + 3000, "camera": "Rack Cam"},
+                )
+                self.assertEqual(res.status_code, 200)
+                body = res.get_json()
+                self.assertEqual(body["driveFileId"], "1AbCdEfGhIjKlMnOpQrStUvWxYz")
+                self.assertEqual(body["driveUrl"], "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view")
+                day_str = datetime.fromtimestamp(t0_ms / 1000.0).strftime("%Y-%m-%d")
+                mirrored = drive_dir / day_str / body["fileName"]
+                self.assertTrue(mirrored.is_file())
+
+                # Simulate an existing older clip mirrored only after backfill ran
+                pre_dir = svc.clips_root / "2026-11-17"
+                pre_dir.mkdir(parents=True, exist_ok=True)
+                pre_clip = pre_dir / "Squat_180000_aaaaaa.mp4"
+                pre_clip.write_bytes(b"fake-mp4-data")
+                copied = svc.backfill_drive_clips()
+                self.assertEqual(copied, 1)
+                self.assertTrue((drive_dir / "2026-11-17" / "Squat_180000_aaaaaa.mp4").is_file())
+
+                clips_list = client.get("/api/clips?limit=200").get_json()["clips"]
+                self.assertEqual(clips_list[0]["driveUrl"], "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz/view")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -579,7 +579,8 @@ describe('Phase 1 routine seed', () => {
     expect(driveUrlFor({ fileName: 'PXL_20261116_173012345.mp4' })).toBe('https://drive.google.com/drive/search?q=PXL_20261116_173012345.mp4');
     expect(driveUrlFor({ fileName: 'PXL_20261116_1856xx.mp4', driveQuery: 'PXL 20261116 1856 type:video' })).toBe('https://drive.google.com/drive/search?q=PXL%2020261116%201856%20type%3Avideo');
     expect(driveUrlFor({ fileName: 'clip.mp4', uri: 'https://drive.google.com/file/d/abc/view' })).toBe('https://drive.google.com/file/d/abc/view');
-    expect(driveUrlFor({ fileName: 'OptiPlex_clip.mp4', source: 'gymcam' })).toBeNull();
+    expect(driveUrlFor({ fileName: 'OptiPlex_clip.mp4', source: 'gymcam' })).toBe('https://drive.google.com/drive/search?q=OptiPlex_clip.mp4');
+    expect(driveUrlFor({ fileName: 'OptiPlex_clip.mp4', source: 'gymcam', uri: 'https://drive.google.com/file/d/xyz123/view' })).toBe('https://drive.google.com/file/d/xyz123/view');
     expect(driveUrlFor({})).toBeNull();
   });
 

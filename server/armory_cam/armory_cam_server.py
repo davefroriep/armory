@@ -80,11 +80,44 @@ try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { t
 </script></body></html>"""
 
 
+DEFAULT_DRIVE_BACKUP_BASE = Path(r"J:\My Drive\Backups\ArmoryFit Backup")
+DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
+
+
 def default_root_dir() -> Path:
     env = os.environ.get("ARMORY_CAM_ROOT", "").strip()
     if env:
         return Path(env)
     return Path(r"S:\ArmoryCam")
+
+
+def default_drive_backup_dir() -> str:
+    env = os.environ.get("ARMORY_CAM_DRIVE_DIR", "").strip()
+    if env:
+        return env
+    if DEFAULT_DRIVE_BACKUP_BASE.exists():
+        return str(DEFAULT_DRIVE_BACKUP_BASE / "Clips")
+    return ""
+
+
+def read_google_drive_file_id(path: Path) -> str | None:
+    """Read Windows Google Drive for Desktop `user.drive.id` NTFS stream, returning Drive file ID or None."""
+    if os.name != "nt":
+        return None
+    try:
+        with open(f"{path}:user.drive.id", "r", encoding="utf-8") as fh:
+            fid = fh.read().strip()
+        if fid and DRIVE_ID_RE.match(fid) and not fid.lower().startswith(("local", "tmp")):
+            return fid
+    except OSError:
+        pass
+    return None
+
+
+def google_drive_view_url(file_id: str | None) -> str | None:
+    if not file_id:
+        return None
+    return f"https://drive.google.com/file/d/{file_id}/view"
 
 
 def resolve_tool_bin(tool_name: str, env_key: str) -> str:
@@ -1182,7 +1215,12 @@ class WallboardRelay:
 class ArmoryCamService:
     """Core DVR manager: config persistence, FFmpeg RTSP ring capture, motion indexing & clip cutting."""
 
-    def __init__(self, root_dir: Path | None = None, adb_controller: FireTvAdbController | None = None) -> None:
+    def __init__(
+        self,
+        root_dir: Path | None = None,
+        adb_controller: FireTvAdbController | None = None,
+        drive_backup_dir: str | Path | None = None,
+    ) -> None:
         self.root = (root_dir or default_root_dir()).resolve()
         self.ring_root = self.root / "ring"
         self.tapes_root = self.root / "tapes"
@@ -1206,6 +1244,12 @@ class ArmoryCamService:
         self.port = DEFAULT_PORT
         self.retention_days = DEFAULT_RETENTION_DAYS
         self.pre_roll_sec = DEFAULT_PRE_ROLL_SEC
+        if drive_backup_dir is not None:
+            self.drive_backup_dir = str(drive_backup_dir).strip()
+        elif root_dir is None:
+            self.drive_backup_dir = default_drive_backup_dir()
+        else:
+            self.drive_backup_dir = ""
         self.cameras: list[CameraConfig] = []
 
         self.active_session_id: str | None = None
@@ -1244,6 +1288,8 @@ class ArmoryCamService:
             self.port = int(raw.get("port", DEFAULT_PORT))
             self.retention_days = max(1, int(raw.get("retentionDays", DEFAULT_RETENTION_DAYS)))
             self.pre_roll_sec = max(30, int(raw.get("preRollSec", DEFAULT_PRE_ROLL_SEC)))
+            if "driveBackupDir" in raw:
+                self.drive_backup_dir = str(raw.get("driveBackupDir") or "").strip()
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
             loaded: list[CameraConfig] = []
             for item in raw.get("cameras", []):
@@ -1274,6 +1320,7 @@ class ArmoryCamService:
             "port": self.port,
             "retentionDays": self.retention_days,
             "preRollSec": self.pre_roll_sec,
+            "driveBackupDir": self.drive_backup_dir,
             "cameras": [c.to_dict() for c in self.cameras],
             "wallboard": self.wallboard_cfg.to_dict(),
         }
@@ -1324,6 +1371,11 @@ class ArmoryCamService:
                 self.retention_days = max(1, min(90, int(raw["retentionDays"])))
             if "preRollSec" in raw:
                 self.pre_roll_sec = max(30, min(600, int(raw["preRollSec"])))
+            drive_changed = False
+            if "driveBackupDir" in raw:
+                next_dir = str(raw.get("driveBackupDir") or "").strip()
+                drive_changed = next_dir != self.drive_backup_dir and bool(next_dir)
+                self.drive_backup_dir = next_dir
             if isinstance(raw.get("wallboard"), dict):
                 merged = {**self.wallboard_cfg.to_dict(), **raw["wallboard"]}
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
@@ -1366,6 +1418,8 @@ class ArmoryCamService:
                     self.live_hub.stop_camera(slug)
             if self._started:
                 self._restart_capture_workers()
+                if drive_changed:
+                    threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True).start()
 
     def _rehydrate_ring_index(self) -> None:
         for cam in self.cameras:
@@ -1390,6 +1444,9 @@ class ArmoryCamService:
             poll_t = threading.Thread(target=self._segment_poll_loop, name="armory-cam-poller", daemon=True)
             poll_t.start()
             self._worker_threads.append(poll_t)
+            backfill_t = threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True)
+            backfill_t.start()
+            self._worker_threads.append(backfill_t)
 
     def stop_background(self) -> None:
         self._stop_event.set()
@@ -2369,6 +2426,7 @@ class ArmoryCamService:
             bytes_len = out_path.stat().st_size
             thumb = extract_video_thumb(out_path)
             actual_dur = self._probe_duration_sec(out_path) or int(round(dur_sec))
+            drive_info = self.mirror_clip_to_drive(out_path, day_str)
             rel_url = f"/clips/{day_str}/{out_name}"
             meta = {
                 "ok": True,
@@ -2382,12 +2440,61 @@ class ArmoryCamService:
                 "bytes": bytes_len,
                 "exName": ex_name,
                 "createdAtMs": int(time.time() * 1000),
+                **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
+                **({"driveUrl": drive_info["driveUrl"]} if drive_info.get("driveUrl") else {}),
             }
             with self.clips_index_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({k: v for k, v in meta.items() if k != "thumb"}) + "\n")
             return meta
         finally:
             concat_path.unlink(missing_ok=True)
+
+    def mirror_clip_to_drive(self, src_path: Path, day_str: str) -> dict[str, str]:
+        """Copy an encoded MP4 into Google Drive backup folder and read Drive file ID if synced."""
+        with self.lock:
+            backup_dir = self.drive_backup_dir.strip()
+        if not backup_dir or not src_path.is_file():
+            return {}
+        try:
+            dest_root = Path(backup_dir)
+            anchor = Path(dest_root.anchor) if dest_root.anchor else dest_root
+            if dest_root.anchor and not anchor.exists():
+                return {}
+            dest_dir = dest_root / (day_str or datetime.now().strftime("%Y-%m-%d"))
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / src_path.name
+            src_size = src_path.stat().st_size
+            if not dest.exists() or dest.stat().st_size != src_size:
+                shutil.copy2(src_path, dest)
+            fid = read_google_drive_file_id(dest)
+            url = google_drive_view_url(fid)
+            out: dict[str, str] = {"drivePath": str(dest)}
+            if fid and url:
+                out["driveFileId"] = fid
+                out["driveUrl"] = url
+            return out
+        except Exception as exc:
+            self.log.warning("Google Drive clip mirror failed for %s: %s", src_path.name, exc)
+            return {}
+
+    def backfill_drive_clips(self) -> int:
+        """Mirror any existing OptiPlex clips missing from Google Drive backup folder."""
+        with self.lock:
+            backup_dir = self.drive_backup_dir.strip()
+        if not backup_dir or not self.clips_root.exists():
+            return 0
+        copied = 0
+        for p in sorted(self.clips_root.glob("*/*.mp4")):
+            if self._stop_event.is_set():
+                break
+            dest = Path(backup_dir) / p.parent.name / p.name
+            try:
+                need = not dest.exists() or dest.stat().st_size != p.stat().st_size
+            except OSError:
+                need = True
+            if need and self.mirror_clip_to_drive(p, p.parent.name):
+                copied += 1
+        return copied
 
     def _probe_duration_sec(self, path: Path) -> int:
         try:
@@ -2415,14 +2522,27 @@ class ArmoryCamService:
     def recent_clips(self, limit: int = 20) -> list[dict[str, Any]]:
         if not self.clips_index_path.exists():
             return []
+        with self.lock:
+            backup_dir = self.drive_backup_dir.strip()
         out: list[dict[str, Any]] = []
         for line in reversed(self.clips_index_path.read_text(encoding="utf-8").splitlines()):
             if not line.strip():
                 continue
             try:
-                out.append(json.loads(line))
+                item = json.loads(line)
             except Exception:
                 continue
+            if backup_dir and not item.get("driveUrl"):
+                fname = str(item.get("fileName") or "").strip()
+                parts = [p for p in str(item.get("lanUrl") or "").split("/") if p]
+                day_str = parts[1] if len(parts) >= 3 and parts[0] == "clips" else ""
+                if fname and day_str:
+                    fid = read_google_drive_file_id(Path(backup_dir) / day_str / fname)
+                    url = google_drive_view_url(fid)
+                    if fid and url:
+                        item["driveFileId"] = fid
+                        item["driveUrl"] = url
+            out.append(item)
             if len(out) >= limit:
                 break
         return out
@@ -2547,11 +2667,13 @@ DASHBOARD_HTML = """<!doctype html>
   <div id="camGrid" class="grid"></div>
 
   <div class="card" style="margin-top:14px">
-    <h2>Retention &amp; Buffer</h2>
+    <h2>Retention, Buffer &amp; Google Drive Sync</h2>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <div><label>Full Tape Retention (days)</label><input id="retDays" type="number" min="1" max="90"></div>
       <div><label>Pre-Roll Buffer (seconds)</label><input id="preRoll" type="number" min="30" max="600"></div>
     </div>
+    <label>Google Drive Clip Backup Folder (auto-copied on save)</label>
+    <input id="driveDir" type="text" placeholder="J:\\My Drive\\Backups\\ArmoryFit Backup\\Clips">
     <div class="ctrl-row" style="margin-top:10px">
       <button class="btn" id="saveBtn" type="button">Save Camera Config &amp; Apply</button>
       <span id="saveMsg" style="color:var(--mut);font-size:12px"></span>
@@ -3001,6 +3123,7 @@ async function saveConfig() {
   const body = {
     retentionDays: Number($('retDays').value) || 14,
     preRollSec: Number($('preRoll').value) || 120,
+    driveBackupDir: $('driveDir').value.trim(),
     cameras,
     wallboard,
   };
@@ -3060,8 +3183,8 @@ async function pollClips() {
   try {
     const clips = await fetch('/api/clips').then(r => r.json());
     if (clips.clips && clips.clips.length) {
-      $('clipList').innerHTML = `<table><thead><tr><th>Clip</th><th>Camera</th><th>Duration</th><th>Size</th></tr></thead><tbody>` +
-        clips.clips.map(x => `<tr><td><a href="${x.lanUrl}" target="_blank">${x.fileName}</a></td><td>${x.camera}</td><td>${x.durationSec}s</td><td>${(x.bytes/1048576).toFixed(1)} MB</td></tr>`).join('') +
+      $('clipList').innerHTML = `<table><thead><tr><th>Clip</th><th>Camera</th><th>Duration</th><th>Size</th><th>Drive</th></tr></thead><tbody>` +
+        clips.clips.map(x => `<tr><td><a href="${x.lanUrl}" target="_blank">${x.fileName}</a></td><td>${x.camera}</td><td>${x.durationSec}s</td><td>${(x.bytes/1048576).toFixed(1)} MB</td><td>${x.driveUrl ? `<a href="${x.driveUrl}" target="_blank">Drive ↗</a>` : 'Syncing…'}</td></tr>`).join('') +
         `</tbody></table>`;
     }
   } catch {}
@@ -3071,6 +3194,7 @@ async function init() {
   cfg = await fetch('/api/config').then(r => r.json());
   $('retDays').value = cfg.retentionDays;
   $('preRoll').value = cfg.preRollSec;
+  $('driveDir').value = cfg.driveBackupDir || '';
   const wb = cfg.wallboard || {};
   $('wbHost').value = wb.fireTvHost || '';
   $('wbPort').value = wb.adbPort || 5555;
@@ -3203,6 +3327,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "port": service.port,
                 "retentionDays": service.retention_days,
                 "preRollSec": service.pre_roll_sec,
+                "driveBackupDir": service.drive_backup_dir,
                 "cameras": cams,
                 "wallboard": service.wallboard_cfg.to_dict(),
                 "disk": service.disk_stats(),
@@ -3375,7 +3500,11 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.get("/api/clips")
     def api_clips() -> Response:
-        return jsonify({"clips": service.recent_clips(30)})
+        try:
+            limit = max(1, min(200, int(request.args.get("limit", 30))))
+        except (TypeError, ValueError):
+            limit = 30
+        return jsonify({"clips": service.recent_clips(limit)})
 
     @app.get("/api/snapshot")
     def api_snapshot() -> Response:

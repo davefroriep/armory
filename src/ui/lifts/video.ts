@@ -1744,7 +1744,7 @@ export function castClipToWallboard(
 export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLabel?: string }): Promise<void> {
   let meta = lifts.videos.get(id);
   if (!meta) return;
-  let blob: Blob | null = sessionFiles.get(id) ?? (await lifts.videoBlob(id));
+  let blob: Blob | null = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
   if (!blob && !meta.linkOnly && !meta.fileName && !meta.uri && !meta.driveQuery && !meta.lanUrl) {
     toast('Video file is missing');
     return;
@@ -1763,6 +1763,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   const ex = lifts.exOrStub(meta.exId);
   const clipTitle = meta.guest ? 'Guest Clip' : ex.name;
   const driveUrl = driveUrlFor(meta);
+  const isDirectDrive = !!(meta.uri && /^https?:\/\/drive\.google\.com\/file\/d\//i.test(meta.uri));
+  const driveBtnLabel = isDirectDrive ? '▶ Play in Google Drive ↗' : '▶ Open in Google Drive ↗';
   const hasLocalUri = isNative() && !!meta.uri?.startsWith('content://');
   const setTxt = set ? `${set.w ? `${fmtKg(set.w)} ${liftSettings().unit}` : ex.type === 'bodyweight' ? 'BW' : '–'} × ${set.r ?? 0}` : '';
   const dateTxt = new Date(meta.fileMs ?? meta.ms).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
@@ -1783,8 +1785,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   };
 
   const posterHtml = meta.thumb
-    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Loading clip…' : (meta.source === 'gymcam' ? 'Gym Cam Offline' : 'DCIM Backup · Google Drive')}</span></div>`
-    : `<div class="pv-poster" id="vpPoster" hidden><span class="pv-badge">${meta.source === 'gymcam' ? 'Gym Cam Offline' : 'Google Drive Backup'}</span></div>`;
+    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Connecting to OptiPlex…' : (meta.source === 'gymcam' ? 'Gym Cam · Google Drive Backup' : 'DCIM Backup · Google Drive')}</span></div>`
+    : `<div class="pv-poster" id="vpPoster" hidden><span class="pv-badge">Google Drive Backup</span></div>`;
 
   const tapeAvail = (): boolean => meta!.source === 'gymcam' && gymCam.online && meta!.clipStartMs != null;
 
@@ -1793,15 +1795,15 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
        <div class="vp-title"><h3 class="sh-title">${esc(clipTitle)}</h3><p class="sh-text" id="vpSub">${esc(subTxt)}</p></div>
        <div class="vp-pills">
          ${canHaveDeck ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
-         ${meta.lanUrl ? '<button class="vp-pill" type="button" data-vp="tv">📺 TV</button>' : ''}
+         ${meta.lanUrl && gymCam.online ? '<button class="vp-pill" type="button" data-vp="tv">📺 TV</button>' : ''}
          <button class="vp-pill" type="button" data-vp="share">Share ↗</button>
        </div>
      </div>
      <div class="vp-stage">
        ${canHaveDeck ? `<video class="pv" id="vpVid"${playUrl ? ` src="${esc(playUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video>` : ''}
        ${posterHtml}
-       <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Caching clip locally for offline &amp; 60 fps scrubbing…</p>
-       <p class="hint" id="vpLanErr" hidden style="text-align:center">${meta.source === 'gymcam' ? 'Offline — connect to home Gym Wi-Fi once to cache this clip on your phone.' : 'OptiPlex LAN stream unavailable away from home — open via Google Drive below.'}</p>
+       <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Loading from OptiPlex on Gym Wi-Fi…</p>
+       <p class="hint" id="vpLanErr" hidden style="text-align:center">Away from Gym Wi-Fi — stream this clip from Google Drive below.</p>
      </div>
      ${canHaveDeck ? `
      <div class="vp-deck" id="vpDeck"${playUrl ? '' : ' hidden'}>
@@ -1858,10 +1860,10 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
        </div>
        <button class="btn primary big" type="button" data-vexp="share">Share Video…</button>
        <button class="btn big" type="button" data-vexp="save">Save MP4 to Gallery</button>
-       ${driveUrl ? `<a class="btn big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>Open in Google Drive ↗</a>` : ''}
+       ${driveUrl ? `<a class="btn big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>${driveBtnLabel}</a>` : ''}
      </div>
      ${meta.fileName ? `<div class="vfile"><small>LINKED FILE${meta.driveQuery ? ' · TIMESTAMP MATCHED' : ''}</small><b>${esc(meta.fileName)}</b></div>` : ''}
-     ${driveUrl ? `<a class="btn primary big" id="vpDriveFallback"${canHaveDeck ? ' hidden' : ''} href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>Open in Google Drive ↗</a>` : ''}
+     ${driveUrl ? `<a class="btn primary big" id="vpDriveFallback"${canHaveDeck ? ' hidden' : ''} href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>${driveBtnLabel}</a>` : ''}
      ${hasLocalUri && !playUrl ? '<button class="btn big" type="button" data-vlocal>▶ Play from phone DCIM</button>' : ''}
      ${ctx?.target ? '<button class="btn big" type="button" data-vmanage>+ Add / Manage Clips</button>' : ''}
      <div class="vp-foot-row">
@@ -1895,7 +1897,11 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   };
 
   const resolveLanPlayable = async (lanUrl: string, bytesHint = 0): Promise<string> => {
-    if ((!bytesHint || bytesHint <= MAX_LOCAL_CACHE_BYTES) && typeof fetch !== 'undefined') {
+    if (bytesHint > MAX_LOCAL_CACHE_BYTES) {
+      if (closed) return '';
+      return isNative() ? ((await getPlayableNativeVideoUrl(lanUrl, meta!.mime)) ?? lanUrl) : lanUrl;
+    }
+    if (typeof fetch !== 'undefined') {
       const tCtrl = new AbortController();
       const onParentAbort = () => tCtrl.abort();
       dlCtrl.signal.addEventListener('abort', onParentAbort, { once: true });
@@ -1906,7 +1912,6 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
           const dlBlob = await res.blob();
           if (!closed && dlBlob.size > 0 && dlBlob.size <= MAX_LOCAL_CACHE_BYTES) {
             cacheSessionBlob(id, dlBlob);
-            void lifts.saveVideoBlob(id, dlBlob);
             blob = dlBlob;
             const prevUrl = activeObjectUrl;
             activeObjectUrl = URL.createObjectURL(dlBlob);
@@ -1915,14 +1920,13 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
           }
         }
       } catch {
-        // Fallback below if LAN download fails
+        // LAN unreachable — return '' below so off-LAN shows Google Drive button immediately
       } finally {
         clearTimeout(timer);
         dlCtrl.signal.removeEventListener('abort', onParentAbort);
       }
     }
-    if (closed) return '';
-    return isNative() ? ((await getPlayableNativeVideoUrl(lanUrl, meta!.mime)) ?? lanUrl) : lanUrl;
+    return '';
   };
 
   const syncUi = (): void => {
@@ -2186,20 +2190,35 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     jogEl?.addEventListener('pointercancel', endJog);
 
     if (needsLanLoad && meta.lanUrl) {
-      void resolveLanPlayable(meta.lanUrl, meta.bytes).then((nextUrl) => {
-        if (closed) return;
+      const showDriveOfflineFallback = (): void => {
         const poster = q('#vpPoster');
         const loadMsg = q('#vpLoadMsg');
-        const deck = q('#vpDeck');
         const err = q('#vpLanErr');
         const drv = q('#vpDriveFallback');
         if (loadMsg) loadMsg.hidden = true;
+        if (poster) poster.hidden = false;
+        if (err) err.hidden = false;
+        if (drv) drv.hidden = false;
+      };
+      void (async () => {
+        if (!gymCam.online) {
+          const pr = await gymCam.probe(1500);
+          if (closed) return;
+          if (!pr.online) {
+            showDriveOfflineFallback();
+            return;
+          }
+        }
+        const nextUrl = await resolveLanPlayable(meta!.lanUrl!, meta!.bytes);
+        if (closed) return;
+        const loadMsg = q('#vpLoadMsg');
+        if (loadMsg) loadMsg.hidden = true;
         if (!nextUrl) {
-          if (poster) poster.hidden = false;
-          if (err) err.hidden = false;
-          if (drv) drv.hidden = false;
+          showDriveOfflineFallback();
           return;
         }
+        const poster = q('#vpPoster');
+        const deck = q('#vpDeck');
         vid.hidden = false;
         if (poster) poster.hidden = true;
         if (deck) deck.hidden = false;
@@ -2207,7 +2226,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         vid.load();
         void vid.play().catch(() => {});
         syncUi();
-      });
+      })();
     }
   }
 

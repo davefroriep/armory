@@ -52,6 +52,8 @@ interface ClipApiResponse {
   startMs?: number;
   endMs?: number;
   bytes?: number;
+  driveFileId?: string;
+  driveUrl?: string;
 }
 
 class GymCamController {
@@ -65,8 +67,7 @@ class GymCamController {
   guestArmed: { sessionId: string; startEpochMs: number; camera?: string } | null = null;
   savingGuest = false;
   private probeMisses = 0;
-  private cachingIds = new Set<string>();
-  private syncInFlight = false;
+  private driveSyncInFlight = false;
   private lastSyncMs = 0;
 
   readonly changed = new Emitter<void>();
@@ -134,7 +135,7 @@ class GymCamController {
       this.changed.emit();
       if (Date.now() - this.lastSyncMs > 60_000) {
         this.lastSyncMs = Date.now();
-        void this.syncUncachedClips(25);
+        void this.syncDriveLinks();
       }
       return { online: true, recording: this.recording, paused: this.paused, cameras: this.cameras, latencyMs };
     } catch {
@@ -230,49 +231,44 @@ class GymCamController {
     return /^https?:\/\//i.test(raw) ? raw : `${this.baseUrl()}${raw.startsWith('/') ? '' : '/'}${raw}`;
   }
 
-  /** Download a LAN Gym-Cam MP4 into phone IndexedDB so it plays & exports off home Wi-Fi. */
-  async cacheClipOffline(meta: VideoMeta, force = false): Promise<boolean> {
-    if (!meta.lanUrl || this.cachingIds.has(meta.id) || typeof fetch === 'undefined') return false;
-    if (!force && lifts.hasVideoBlob(meta.id)) return true;
-    const url = this.resolveLanUrl(meta.lanUrl);
-    if (!url) return false;
-    this.cachingIds.add(meta.id);
+  /** Upgrade Gym-Cam VideoMeta rows with direct Google Drive `file/d/.../view` URLs resolved on OptiPlex. */
+  async syncDriveLinks(): Promise<number> {
+    if (!this.online || this.driveSyncInFlight || typeof fetch === 'undefined') return 0;
+    const missing = [...lifts.videos.values()].filter(
+      (v) => v.source === 'gymcam' && !!v.fileName && !/^https?:\/\/drive\.google\.com\/file\/d\//i.test(v.uri ?? ''),
+    );
+    if (!missing.length) return 0;
+    this.driveSyncInFlight = true;
     const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = ctrl ? setTimeout(() => ctrl.abort(), 25_000) : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 5000) : null;
     try {
-      const res = await fetch(url, { ...(ctrl ? { signal: ctrl.signal } : {}), cache: 'no-store' });
-      if (!res.ok) return false;
-      const blob = await res.blob();
-      if (!blob || blob.size <= 0 || blob.size > 64 * 1024 * 1024) return false;
-      await lifts.saveVideoBlob(meta.id, blob);
-      this.changed.emit();
-      return true;
+      const res = await fetch(`${this.baseUrl()}/api/clips?limit=200`, {
+        ...(ctrl ? { signal: ctrl.signal } : {}),
+        cache: 'no-store',
+      });
+      if (!res.ok) return 0;
+      const body = (await res.json()) as { clips?: { fileName?: string; driveUrl?: string }[] };
+      const byFile = new Map<string, string>();
+      for (const c of body.clips ?? []) {
+        if (c.fileName && c.driveUrl && /^https?:\/\//i.test(c.driveUrl)) {
+          byFile.set(c.fileName, c.driveUrl);
+        }
+      }
+      let updated = 0;
+      for (const v of missing) {
+        const url = v.fileName ? byFile.get(v.fileName) : undefined;
+        if (url && url !== v.uri) {
+          await lifts.saveVideoMeta({ ...v, uri: url });
+          updated++;
+        }
+      }
+      if (updated) this.changed.emit();
+      return updated;
     } catch {
-      return false;
+      return 0;
     } finally {
       if (timer) clearTimeout(timer);
-      this.cachingIds.delete(meta.id);
-    }
-  }
-
-  /** Opportunistically cache recent Gym-Cam clips to phone storage while on home Wi-Fi. */
-  async syncUncachedClips(limit = 25): Promise<number> {
-    if (!this.online || this.syncInFlight) return 0;
-    this.syncInFlight = true;
-    let cached = 0;
-    try {
-      const cutoff = Date.now() - 30 * 86_400_000;
-      const todo = [...lifts.videos.values()]
-        .filter((v) => v.source === 'gymcam' && !!v.lanUrl && v.ms >= cutoff && !lifts.hasVideoBlob(v.id))
-        .sort((a, b) => b.ms - a.ms)
-        .slice(0, limit);
-      for (const v of todo) {
-        if (!this.online) break;
-        if (await this.cacheClipOffline(v)) cached++;
-      }
-      return cached;
-    } finally {
-      this.syncInFlight = false;
+      this.driveSyncInFlight = false;
     }
   }
 
@@ -336,10 +332,10 @@ class GymCamController {
         ...(res.durationSec ? { durationSec: res.durationSec } : {}),
         ...(res.startMs != null ? { clipStartMs: res.startMs } : {}),
         ...(res.endMs != null ? { clipEndMs: res.endMs } : {}),
+        ...(res.driveUrl ? { uri: res.driveUrl } : {}),
       };
       await lifts.addVideo(meta);
       this.changed.emit();
-      void this.cacheClipOffline(meta);
       return meta;
     } finally {
       this.savingGuest = false;
@@ -367,12 +363,12 @@ class GymCamController {
       ...(clip.durationSec ? { durationSec: clip.durationSec } : {}),
       ...(clip.startMs != null ? { clipStartMs: clip.startMs } : {}),
       ...(clip.endMs != null ? { clipEndMs: clip.endMs } : {}),
+      ...(clip.driveUrl ? { uri: clip.driveUrl } : {}),
     };
     await lifts.addVideo(meta);
     target.set.vids = [...(target.set.vids ?? []), meta.id];
     lifts.saveSession(target.session, true);
     this.changed.emit();
-    void this.cacheClipOffline(meta);
     return meta;
   }
 
@@ -599,6 +595,7 @@ class GymCamController {
       durationSec: res.durationSec ?? meta.durationSec,
       clipStartMs: res.startMs ?? nextStartMs,
       clipEndMs: res.endMs ?? nextEndMs,
+      ...(res.driveUrl ? { uri: res.driveUrl } : {}),
     };
     if (addBeforeSec !== 0) {
       if (next.trimStartSec != null) next.trimStartSec = Math.max(0, next.trimStartSec + addBeforeSec);
@@ -606,7 +603,6 @@ class GymCamController {
     }
     await lifts.saveVideoMeta(next);
     this.changed.emit();
-    void this.cacheClipOffline(next, true);
     return next;
   }
 
@@ -632,10 +628,10 @@ class GymCamController {
       thumb: res.thumb || meta.thumb,
       bytes: res.bytes ?? meta.bytes,
       durationSec: res.durationSec ?? meta.durationSec,
+      ...(res.driveUrl ? { uri: res.driveUrl } : {}),
     };
     await lifts.saveVideoMeta(next);
     this.changed.emit();
-    void this.cacheClipOffline(next, true);
     return next;
   }
 }
