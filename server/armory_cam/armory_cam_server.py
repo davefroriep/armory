@@ -47,6 +47,8 @@ DEFAULT_IDLE_SLEEP_SEC = 600
 DEFAULT_SCRUB_THUMB_W = 280
 DEFAULT_SCRUB_THUMB_Q = 58
 MIN_CROP_SPAN = 0.15
+MIN_EXCL_SPAN = 0.04
+MAX_EXCLUSIONS = 6
 RING_KEEP_MIN_SEC = 300
 SEG_NAME_RE = re.compile(r"^seg_(\d{8})_(\d{6})\.ts$")
 
@@ -208,6 +210,40 @@ def normalize_crop(raw: Any) -> tuple[float, float, float, float]:
         return (0.0, 0.0, 1.0, 1.0)
 
 
+def normalize_excl_box(raw: Any) -> tuple[float, float, float, float] | None:
+    """Clamp normalized `[x0, y0, x1, y1]` exclusion box with >= MIN_EXCL_SPAN, or None if invalid."""
+    try:
+        vals = [float(v) for v in raw]
+        if len(vals) != 4 or any(not np.isfinite(v) for v in vals):
+            return None
+        x0, y0, x1, y1 = vals
+        if x1 < x0:
+            x0, x1 = x1, x0
+        if y1 < y0:
+            y0, y1 = y1, y0
+        x0 = max(0.0, min(1.0 - MIN_EXCL_SPAN, x0))
+        y0 = max(0.0, min(1.0 - MIN_EXCL_SPAN, y0))
+        x1 = max(x0 + MIN_EXCL_SPAN, min(1.0, x1))
+        y1 = max(y0 + MIN_EXCL_SPAN, min(1.0, y1))
+        return (round(x0, 4), round(y0, 4), round(x1, 4), round(y1, 4))
+    except Exception:
+        return None
+
+
+def normalize_exclusions(raw: Any) -> list[tuple[float, float, float, float]]:
+    """Normalize up to MAX_EXCLUSIONS `[x0, y0, x1, y1]` motion exclusion boxes."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[tuple[float, float, float, float]] = []
+    for item in raw:
+        box = normalize_excl_box(item)
+        if box is not None:
+            out.append(box)
+            if len(out) >= MAX_EXCLUSIONS:
+                break
+    return out
+
+
 def normalize_rotate(raw: Any) -> int:
     try:
         v = int(raw) % 360
@@ -281,27 +317,46 @@ def apply_frame_transform(
 def compute_motion_energy_from_frames(
     frames: list[np.ndarray],
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+    exclusions: list[tuple[float, float, float, float]] | tuple[tuple[float, float, float, float], ...] = (),
 ) -> float:
-    """Compute lightweight motion score (0..100) across sampled BGR frames inside normalized ROI."""
+    """Compute lightweight motion score (0..100) across sampled BGR frames inside normalized ROI minus exclusion boxes."""
     if len(frames) < 2:
         return 0.0
     x0, y0, x1, y1 = normalize_crop(roi)
+    excl_list = normalize_exclusions(list(exclusions)) if exclusions else []
 
     prep: list[np.ndarray] = []
+    include_mask: np.ndarray | None = None
     for frm in frames:
         small = cv2.resize(frm, (160, 90), interpolation=cv2.INTER_AREA)
         h, w = small.shape[:2]
         cx0, cx1 = int(round(x0 * w)), int(round(x1 * w))
         cy0, cy1 = int(round(y0 * h)), int(round(y1 * h))
-        crop = small[max(0, cy0) : max(cy0 + 2, cy1), max(0, cx0) : max(cx0 + 2, cx1)]
+        rx0, ry0 = max(0, cx0), max(0, cy0)
+        rx1, ry1 = min(w, max(rx0 + 2, cx1)), min(h, max(ry0 + 2, cy1))
+        crop = small[ry0:ry1, rx0:rx1]
+        if include_mask is None and excl_list:
+            mask = np.ones((crop.shape[0], crop.shape[1]), dtype=bool)
+            for ex0, ey0, ex1, ey1 in excl_list:
+                mx0 = max(0, min(crop.shape[1], int(round(ex0 * w)) - rx0))
+                my0 = max(0, min(crop.shape[0], int(round(ey0 * h)) - ry0))
+                mx1 = max(0, min(crop.shape[1], int(round(ex1 * w)) - rx0))
+                my1 = max(0, min(crop.shape[0], int(round(ey1 * h)) - ry0))
+                if mx1 > mx0 and my1 > my0:
+                    mask[my0:my1, mx0:mx1] = False
+            include_mask = mask
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         prep.append(cv2.GaussianBlur(gray, (5, 5), 0))
+
+    if include_mask is not None and not np.any(include_mask):
+        return 0.0
 
     best = 0.0
     for i in range(len(prep) - 1):
         diff = cv2.absdiff(prep[i], prep[i + 1])
-        mean_diff = float(np.mean(diff))
-        active_pct = float(np.mean(diff > 14)) * 100.0
+        vals = diff[include_mask] if include_mask is not None else diff
+        mean_diff = float(np.mean(vals))
+        active_pct = float(np.mean(vals > 14)) * 100.0
         score = round(0.6 * mean_diff + 0.25 * active_pct, 3)
         if score > best:
             best = score
@@ -311,6 +366,7 @@ def compute_motion_energy_from_frames(
 def analyze_ts_segment(
     seg_path: Path,
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+    exclusions: list[tuple[float, float, float, float]] | tuple[tuple[float, float, float, float], ...] = (),
     rotate: int = 0,
     fallback_dur_ms: int = 2000,
 ) -> tuple[int, float]:
@@ -342,7 +398,7 @@ def analyze_ts_segment(
         dur_ms = int(round((total / fps) * 1000)) if total >= 2 else fallback_dur_ms
         if dur_ms < 400 or dur_ms > 20_000:
             dur_ms = fallback_dur_ms
-        score = compute_motion_energy_from_frames(frames, roi=roi)
+        score = compute_motion_energy_from_frames(frames, roi=roi, exclusions=exclusions)
         return dur_ms, score
     finally:
         cap.release()
@@ -528,6 +584,7 @@ class CameraConfig:
     enabled: bool = True
     motion_threshold: float = DEFAULT_MOTION_THRESHOLD
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
+    exclusions: list[tuple[float, float, float, float]] = field(default_factory=list)
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     rotate: int = 0
 
@@ -544,6 +601,7 @@ class CameraConfig:
             "enabled": self.enabled,
             "motionThreshold": self.motion_threshold,
             "roi": list(self.roi),
+            "exclusions": [list(b) for b in self.exclusions],
             "crop": list(self.crop),
             "rotate": self.rotate,
         }
@@ -1201,6 +1259,7 @@ class ArmoryCamService:
                         enabled=bool(item.get("enabled", True)),
                         motion_threshold=float(item.get("motionThreshold", DEFAULT_MOTION_THRESHOLD)),
                         roi=normalize_crop(item.get("roi")),
+                        exclusions=normalize_exclusions(item.get("exclusions")),
                         crop=normalize_crop(item.get("crop")),
                         rotate=normalize_rotate(item.get("rotate", 0)),
                     )
@@ -1278,6 +1337,11 @@ class ArmoryCamService:
                     enabled = bool(item["enabled"]) if "enabled" in item else (old.enabled if old else True)
                     thresh = float(item["motionThreshold"]) if "motionThreshold" in item else (old.motion_threshold if old else DEFAULT_MOTION_THRESHOLD)
                     roi = normalize_crop(item["roi"]) if "roi" in item else (old.roi if old else (0.0, 0.0, 1.0, 1.0))
+                    exclusions = (
+                        normalize_exclusions(item["exclusions"])
+                        if "exclusions" in item
+                        else (list(old.exclusions) if old else [])
+                    )
                     crop = normalize_crop(item["crop"]) if "crop" in item else (old.crop if old else (0.0, 0.0, 1.0, 1.0))
                     rotate = normalize_rotate(item["rotate"]) if "rotate" in item else (old.rotate if old else 0)
                     next_cams.append(
@@ -1288,6 +1352,7 @@ class ArmoryCamService:
                             enabled=enabled,
                             motion_threshold=thresh,
                             roi=roi,
+                            exclusions=exclusions,
                             crop=crop,
                             rotate=rotate,
                         )
@@ -1545,7 +1610,7 @@ class ArmoryCamService:
             start_ms = parse_segment_start_ms(p.name)
             if start_ms is None:
                 start_ms = int(st.st_mtime * 1000) - 2000
-            dur_ms, energy = analyze_ts_segment(p, roi=cam.effective_roi(), rotate=cam.rotate)
+            dur_ms, energy = analyze_ts_segment(p, roi=cam.effective_roi(), exclusions=cam.exclusions, rotate=cam.rotate)
             try:
                 self._get_or_create_seg_thumb(cam, p, max_w=DEFAULT_SCRUB_THUMB_W)
             except Exception:
@@ -2413,7 +2478,7 @@ DASHBOARD_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Armory Cam · OptiPlex DVR</title>
 <style>
-  :root{--bg:#0b0f14;--card:#131a22;--line:#233040;--fg:#edf2f7;--mut:#8b9bb0;--blue:#1e9bff;--green:#22c55e;--amber:#f59e0b;}
+  :root{--bg:#0b0f14;--card:#131a22;--line:#233040;--fg:#edf2f7;--mut:#8b9bb0;--blue:#1e9bff;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;}
   *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   .wrap{max-width:1120px;margin:0 auto;padding:18px}
   h1{margin:0 0 6px;font-size:22px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -2435,8 +2500,16 @@ DASHBOARD_HTML = """<!doctype html>
   .roi-box .handle{background:var(--green)}
   .box-tag{position:absolute;left:4px;top:4px;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:900;letter-spacing:.06em;pointer-events:none;background:rgba(6,9,13,.82);color:var(--blue)}
   .roi-box .box-tag{color:#86efac}
-  .crop-box.passive,.roi-box.passive{border-style:dashed;opacity:.55;pointer-events:none;cursor:default}
-  .crop-box.passive .handle,.roi-box.passive .handle{display:none}
+  .crop-box.passive,.roi-box.passive,.excl-box.passive{border-style:dashed;opacity:.55;pointer-events:none;cursor:default}
+  .crop-box.passive .handle,.roi-box.passive .handle,.excl-box.passive .handle,.excl-box.passive .excl-del{display:none}
+  .excl-box{position:absolute;border:2px solid var(--red);background:rgba(239,68,68,.18);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none;z-index:3}
+  .excl-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(252,165,165,.45);pointer-events:none}
+  .excl-box .handle{background:var(--red)}
+  .excl-box .box-tag{color:#fecaca}
+  .excl-del{position:absolute;right:4px;top:4px;width:18px;height:18px;border:0;border-radius:4px;background:rgba(239,68,68,.92);color:#fff;font:900 11px/1 system-ui,sans-serif;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;z-index:4}
+  .btn.red{background:rgba(239,68,68,.18);border:1px solid rgba(239,68,68,.55);color:#fecaca}
+  .btn.red:hover{background:rgba(239,68,68,.28)}
+  .btn:disabled{opacity:.42;cursor:not-allowed}
   .handle{position:absolute;width:22px;height:22px;border-radius:50%;background:var(--blue);border:2px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.7);touch-action:none}
   .handle.nw{left:-11px;top:-11px;cursor:nwse-resize}
   .handle.ne{right:-11px;top:-11px;cursor:nesw-resize}
@@ -2538,6 +2611,8 @@ const editTarget = {};
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const MIN_SPAN = 0.15;
+const MIN_EXCL_SPAN = 0.04;
+const MAX_EXCLUSIONS = 6;
 
 function cropZoomFactor(c) {
   const w = Math.max(MIN_SPAN, c[2] - c[0]);
@@ -2562,8 +2637,12 @@ function setZoomAroundCenter(idx, zoom) {
 function syncCropOverlay(idx) {
   const cam = cfg.cameras[idx];
   const c = cam.crop;
-  const r = cam.roi || [0, 0, 1, 1];
-  const mode = editTarget[idx] || 'crop';
+  const excls = Array.isArray(cam.exclusions) ? cam.exclusions : (cam.exclusions = []);
+  let mode = editTarget[idx] || 'crop';
+  if (mode === 'excl' && !excls.length) {
+    mode = 'crop';
+    editTarget[idx] = 'crop';
+  }
   const rot = cam.rotate || 0;
   const stage = $(`stage-${idx}`);
   const layer = $(`layer-${idx}`);
@@ -2574,19 +2653,39 @@ function syncCropOverlay(idx) {
   layer.hidden = !showEditor;
 
   const isFullCrop = c[0] <= 0.001 && c[1] <= 0.001 && c[2] >= 0.999 && c[3] >= 0.999;
-  const isFullRoi = r[0] <= 0.001 && r[1] <= 0.001 && r[2] >= 0.999 && r[3] >= 0.999;
-  const effRoi = isFullRoi ? c : r;
 
   const boxEl = $(`box-${idx}`);
-  const roiEl = $(`roiBox-${idx}`);
   boxEl.style.cssText = `left:${c[0]*100}%;top:${c[1]*100}%;width:${(c[2]-c[0])*100}%;height:${(c[3]-c[1])*100}%;`;
-  roiEl.style.cssText = `left:${effRoi[0]*100}%;top:${effRoi[1]*100}%;width:${(effRoi[2]-effRoi[0])*100}%;height:${(effRoi[3]-effRoi[1])*100}%;`;
-  roiEl.hidden = (mode === 'crop' && isFullRoi);
-  boxEl.classList.toggle('passive', mode === 'roi');
-  roiEl.classList.toggle('passive', mode !== 'roi');
+  boxEl.classList.toggle('passive', mode === 'excl');
 
-  const act = mode === 'roi' ? effRoi : c;
-  const lPct = act[0] * 100, tPct = act[1] * 100, wPct = (act[2] - act[0]) * 100, hPct = (act[3] - act[1]) * 100;
+  const exclWrap = $(`exclWrap-${idx}`);
+  if (exclWrap) {
+    while (exclWrap.children.length > excls.length) exclWrap.removeChild(exclWrap.lastElementChild);
+    while (exclWrap.children.length < excls.length) {
+      const ei = exclWrap.children.length;
+      const el = document.createElement('div');
+      el.className = 'excl-box';
+      el.innerHTML = `<span class="box-tag">MASK ${ei + 1}</span>` +
+        `<button class="excl-del" type="button" title="Remove mask">×</button>` +
+        `<div class="handle nw" data-handle="nw"></div>` +
+        `<div class="handle ne" data-handle="ne"></div>` +
+        `<div class="handle sw" data-handle="sw"></div>` +
+        `<div class="handle se" data-handle="se"></div>`;
+      exclWrap.appendChild(el);
+    }
+    Array.from(exclWrap.children).forEach((el, ei) => {
+      const b = excls[ei];
+      el.dataset.exclIdx = String(ei);
+      el.classList.toggle('passive', mode !== 'excl');
+      el.style.cssText = `left:${b[0]*100}%;top:${b[1]*100}%;width:${(b[2]-b[0])*100}%;height:${(b[3]-b[1])*100}%;`;
+      const tag = el.querySelector('.box-tag');
+      if (tag) tag.textContent = `MASK ${ei + 1}`;
+      const del = el.querySelector('.excl-del');
+      if (del) del.dataset.excldel = `${idx}:${ei}`;
+    });
+  }
+
+  const lPct = c[0] * 100, tPct = c[1] * 100, wPct = (c[2] - c[0]) * 100, hPct = (c[3] - c[1]) * 100;
   $(`scT-${idx}`).style.cssText = `left:0;top:0;right:0;height:${tPct}%;`;
   $(`scB-${idx}`).style.cssText = `left:0;top:${tPct + hPct}%;right:0;bottom:0;`;
   $(`scL-${idx}`).style.cssText = `left:0;top:${tPct}%;width:${lPct}%;height:${hPct}%;`;
@@ -2599,18 +2698,24 @@ function syncCropOverlay(idx) {
   const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
   const outW = Math.round((c[2] - c[0]) * srcW);
   const outH = Math.round((c[3] - c[1]) * srcH);
-  const roiLabel = isFullRoi ? 'Motion Zone: follows crop' : 'Motion Zone: custom square';
+  const maskLabel = excls.length ? `${excls.length} mirror mask${excls.length === 1 ? '' : 's'} (Red)` : 'No mirror masks';
   $(`cropInfo-${idx}`).textContent = isFullCrop
-    ? `Full frame · ${srcW}×${srcH} · Rotate ${rot}° · ${roiLabel}`
-    : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · Rotate ${rot}° · ${roiLabel}`;
+    ? `Full frame · ${srcW}×${srcH} · Rotate ${rot}° · ${maskLabel}`
+    : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · Rotate ${rot}° · ${maskLabel}`;
   const prevBtn = $(`prevBtn-${idx}`);
   if (prevBtn) prevBtn.classList.toggle('on', !!previewCropped[idx]);
   const rotBtn = $(`rotBtn-${idx}`);
   if (rotBtn) rotBtn.textContent = `Rotate ${rot}°`;
   const mCrop = $(`modeCrop-${idx}`);
-  const mRoi = $(`modeRoi-${idx}`);
+  const mExcl = $(`modeExcl-${idx}`);
+  const addExcl = $(`addExcl-${idx}`);
   if (mCrop) mCrop.classList.toggle('on', mode === 'crop');
-  if (mRoi) mRoi.classList.toggle('on', mode === 'roi');
+  if (mExcl) {
+    mExcl.classList.toggle('on', mode === 'excl');
+    mExcl.disabled = !excls.length;
+    mExcl.textContent = excls.length ? `Edit Masks (${excls.length})` : 'Edit Masks';
+  }
+  if (addExcl) addExcl.disabled = excls.length >= MAX_EXCLUSIONS;
 }
 
 function wireCropDrag(idx) {
@@ -2619,23 +2724,41 @@ function wireCropDrag(idx) {
   let drag = null;
 
   layer.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('.excl-del')) return;
+    const mode = editTarget[idx] || 'crop';
+    const exclEl = e.target.closest('.excl-box:not(.passive)');
     const handleEl = e.target.closest('[data-handle]');
-    const boxEl = e.target.closest('.crop-box:not(.passive), .roi-box:not(.passive)');
-    if (!handleEl && !boxEl) return;
+    const cropEl = e.target.closest('.crop-box:not(.passive)');
+    if (!exclEl && !cropEl) return;
     e.preventDefault();
     const rect = layer.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
-    const mode = editTarget[idx] || 'crop';
-    const key = mode === 'roi' ? 'roi' : 'crop';
     layer.setPointerCapture(e.pointerId);
+    if (mode === 'excl' && exclEl) {
+      const ei = Number(exclEl.dataset.exclIdx);
+      drag = {
+        pid: e.pointerId,
+        dragKey: 'excl',
+        exclIdx: ei,
+        minSpan: MIN_EXCL_SPAN,
+        mode: handleEl ? handleEl.dataset.handle : 'move',
+        sx: e.clientX,
+        sy: e.clientY,
+        rect,
+        orig: [...(cfg.cameras[idx].exclusions[ei] || [0.5, 0.15, 0.85, 0.55])],
+      };
+      return;
+    }
     drag = {
       pid: e.pointerId,
-      dragKey: key,
+      dragKey: 'crop',
+      exclIdx: -1,
+      minSpan: MIN_SPAN,
       mode: handleEl ? handleEl.dataset.handle : 'move',
       sx: e.clientX,
       sy: e.clientY,
       rect,
-      orig: [...(cfg.cameras[idx][key] || [0, 0, 1, 1])],
+      orig: [...(cfg.cameras[idx].crop || [0, 0, 1, 1])],
     };
   });
 
@@ -2645,6 +2768,7 @@ function wireCropDrag(idx) {
     const dy = (e.clientY - drag.sy) / drag.rect.height;
     let [x0, y0, x1, y1] = drag.orig;
     const ow = x1 - x0, oh = y1 - y0;
+    const minS = drag.minSpan || MIN_SPAN;
 
     if (drag.mode === 'move') {
       x0 = clamp(x0 + dx, 0, 1 - ow);
@@ -2652,10 +2776,10 @@ function wireCropDrag(idx) {
       x1 = x0 + ow;
       y1 = y0 + oh;
     } else {
-      if (drag.mode.includes('w')) x0 = clamp(x0 + dx, 0, x1 - MIN_SPAN);
-      if (drag.mode.includes('e')) x1 = clamp(x1 + dx, x0 + MIN_SPAN, 1);
-      if (drag.mode.includes('n')) y0 = clamp(y0 + dy, 0, y1 - MIN_SPAN);
-      if (drag.mode.includes('s')) y1 = clamp(y1 + dy, y0 + MIN_SPAN, 1);
+      if (drag.mode.includes('w')) x0 = clamp(x0 + dx, 0, x1 - minS);
+      if (drag.mode.includes('e')) x1 = clamp(x1 + dx, x0 + minS, 1);
+      if (drag.mode.includes('n')) y0 = clamp(y0 + dy, 0, y1 - minS);
+      if (drag.mode.includes('s')) y1 = clamp(y1 + dy, y0 + minS, 1);
 
       const lock = drag.dragKey === 'crop' ? aspectLock[idx] : null;
       if (lock) {
@@ -2666,7 +2790,7 @@ function wireCropDrag(idx) {
         const targetNormRatio = lock * (srcH / srcW);
         let nw = x1 - x0;
         let nh = nw / targetNormRatio;
-        if (nh < MIN_SPAN) { nh = MIN_SPAN; nw = nh * targetNormRatio; }
+        if (nh < minS) { nh = minS; nw = nh * targetNormRatio; }
         if (drag.mode.includes('n')) {
           y0 = y1 - nh;
           if (y0 < 0) { y0 = 0; nh = y1; nw = nh * targetNormRatio; }
@@ -2674,11 +2798,13 @@ function wireCropDrag(idx) {
           y1 = y0 + nh;
           if (y1 > 1) { y1 = 1; nh = 1 - y0; nw = nh * targetNormRatio; }
         }
-        if (drag.mode.includes('w')) x0 = clamp(x1 - nw, 0, x1 - MIN_SPAN);
-        else x1 = clamp(x0 + nw, x0 + MIN_SPAN, 1);
+        if (drag.mode.includes('w')) x0 = clamp(x1 - nw, 0, x1 - minS);
+        else x1 = clamp(x0 + nw, x0 + minS, 1);
       }
     }
-    cfg.cameras[idx][drag.dragKey] = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
+    const nextBox = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
+    if (drag.dragKey === 'excl') cfg.cameras[idx].exclusions[drag.exclIdx] = nextBox;
+    else cfg.cameras[idx].crop = nextBox;
     syncCropOverlay(idx);
   });
 
@@ -2713,13 +2839,7 @@ function renderCameras() {
             <div class="handle sw" data-handle="sw"></div>
             <div class="handle se" data-handle="se"></div>
           </div>
-          <div class="roi-box" id="roiBox-${idx}" hidden>
-            <span class="box-tag">MOTION ZONE</span>
-            <div class="handle nw" data-handle="nw"></div>
-            <div class="handle ne" data-handle="ne"></div>
-            <div class="handle sw" data-handle="sw"></div>
-            <div class="handle se" data-handle="se"></div>
-          </div>
+          <div id="exclWrap-${idx}"></div>
         </div>
       </div>
       <div class="crop-info">
@@ -2731,10 +2851,11 @@ function renderCameras() {
         <div class="mbar-th" id="mth-${idx}" style="left:${clamp((c.motionThreshold / 20) * 100, 2, 98)}%"></div>
       </div>
       <div class="ctrl-row">
-        <span style="font-size:12px;color:var(--mut)">Edit Box:</span>
+        <span style="font-size:12px;color:var(--mut)">Edit:</span>
         <button class="btn sec sm on" type="button" data-emode="${idx}:crop" id="modeCrop-${idx}">Frame Crop (Blue)</button>
-        <button class="btn sec sm" type="button" data-emode="${idx}:roi" id="modeRoi-${idx}">Motion Zone (Green)</button>
-        <button class="btn sec sm" type="button" data-roireset="${idx}">Reset Zone</button>
+        <button class="btn sec sm" type="button" data-emode="${idx}:excl" id="modeExcl-${idx}" disabled>Edit Masks</button>
+        <button class="btn red sm" type="button" data-addexcl="${idx}" id="addExcl-${idx}">+ Mask Mirror (Red)</button>
+        <button class="btn sec sm" type="button" data-exclclear="${idx}">Clear Masks</button>
       </div>
       <div class="ctrl-row">
         <span style="font-size:12px;color:var(--mut)">Zoom</span>
@@ -2807,35 +2928,51 @@ $('camGrid').addEventListener('click', (e) => {
     if (aspectLock[idx]) setZoomAroundCenter(idx, cropZoomFactor(cfg.cameras[idx].crop));
     return;
   }
+  if (b.dataset.excldel !== undefined) {
+    const [iStr, eStr] = b.dataset.excldel.split(':');
+    const idx = Number(iStr);
+    const ei = Number(eStr);
+    const list = cfg.cameras[idx].exclusions || [];
+    if (ei >= 0 && ei < list.length) list.splice(ei, 1);
+    if (!list.length) editTarget[idx] = 'crop';
+    syncCropOverlay(idx);
+    return;
+  }
+  if (b.dataset.addexcl !== undefined) {
+    const idx = Number(b.dataset.addexcl);
+    if (previewCropped[idx]) {
+      previewCropped[idx] = false;
+      $(`stream-${idx}`).src = streamUrlFor(idx);
+    }
+    const list = (cfg.cameras[idx].exclusions ||= []);
+    if (list.length < MAX_EXCLUSIONS) {
+      const k = list.length;
+      const dx = (k % 3) * 0.07;
+      const dy = Math.floor(k / 3) * 0.08;
+      list.push([+(0.58 - dx).toFixed(4), +(0.12 + dy).toFixed(4), +(0.86 - dx).toFixed(4), +(0.48 + dy).toFixed(4)]);
+    }
+    editTarget[idx] = 'excl';
+    syncCropOverlay(idx);
+    return;
+  }
+  if (b.dataset.exclclear !== undefined) {
+    const idx = Number(b.dataset.exclclear);
+    cfg.cameras[idx].exclusions = [];
+    editTarget[idx] = 'crop';
+    syncCropOverlay(idx);
+    return;
+  }
   if (b.dataset.emode !== undefined) {
     const [iStr, mode] = b.dataset.emode.split(':');
     const idx = Number(iStr);
-    editTarget[idx] = mode;
-    if (mode === 'roi') {
+    if (mode === 'excl') {
+      if (!(cfg.cameras[idx].exclusions || []).length) return;
       if (previewCropped[idx]) {
         previewCropped[idx] = false;
         $(`stream-${idx}`).src = streamUrlFor(idx);
       }
-      const r = cfg.cameras[idx].roi || [0, 0, 1, 1];
-      const isFullRoi = r[0] <= 0.001 && r[1] <= 0.001 && r[2] >= 0.999 && r[3] >= 0.999;
-      if (isFullRoi) {
-        const c = cfg.cameras[idx].crop || [0, 0, 1, 1];
-        const isFullCrop = c[0] <= 0.001 && c[1] <= 0.001 && c[2] >= 0.999 && c[3] >= 0.999;
-        if (isFullCrop) {
-          cfg.cameras[idx].roi = [0.25, 0.2, 0.75, 0.8];
-        } else {
-          const mx = (c[2] - c[0]) * 0.08;
-          const my = (c[3] - c[1]) * 0.08;
-          cfg.cameras[idx].roi = [+(c[0] + mx).toFixed(4), +(c[1] + my).toFixed(4), +(c[2] - mx).toFixed(4), +(c[3] - my).toFixed(4)];
-        }
-      }
     }
-    syncCropOverlay(idx);
-    return;
-  }
-  if (b.dataset.roireset !== undefined) {
-    const idx = Number(b.dataset.roireset);
-    cfg.cameras[idx].roi = [0, 0, 1, 1];
+    editTarget[idx] = mode;
     syncCropOverlay(idx);
     return;
   }

@@ -22,6 +22,8 @@ import {
   openNativeVideoUri, pickNativeDcimVideo, recordNativeVideo, type DeviceVideoEntry,
 } from '../../native/service';
 import { getSettings } from '../../store/settings';
+import { setWallboardReplay } from '../../wallboard/state';
+import { wallboard } from '../../wallboard/sync';
 import { esc } from '../dom';
 import { confirmSheet, openSheet, promptSheet, toast } from './kit';
 
@@ -1351,7 +1353,10 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const pickCam = el.closest<HTMLElement>('[data-pickcam]');
     if (pickCam) {
-      void selectCamera(pickCam.dataset.pickcam!);
+      const picked = pickCam.dataset.pickcam!;
+      t.se.camPref = picked;
+      lifts.saveSession(t.session, true);
+      void selectCamera(picked);
       return;
     }
 
@@ -1500,6 +1505,8 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     const warmCam = el.closest<HTMLElement>('[data-varmcam]')?.dataset.varmcam;
     if (warmCam) {
       startTimerForVideo(t.session);
+      t.se.camPref = warmCam;
+      lifts.saveSession(t.session, true);
       gymCam.armSet(t.session, t.se, t.set, warmCam);
       sh.close();
       toast(`Recording ${shortCamLabel(warmCam)} · ${setLabel} — tap ✓ or red camera to stop`);
@@ -1687,11 +1694,57 @@ export function recordVideo(t: VideoTarget): Promise<VideoMeta | null> {
   });
 }
 
+let wbReplayTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Clear any active form replay overlay on the Gym Wallboard TV. */
+export function closeWallboardReplay(): void {
+  if (wbReplayTimer) { clearTimeout(wbReplayTimer); wbReplayTimer = null; }
+  setWallboardReplay(null);
+  void wallboard.pushNow();
+}
+
+/** Cast a Gym-Cam clip onto the Fire TV Wallboard overlay for 2 auto-looped plays. */
+export function castClipToWallboard(
+  meta: VideoMeta,
+  opts?: { rate?: number; exName?: string; setLabel?: string; trimStartSec?: number; trimEndSec?: number },
+): boolean {
+  const url = gymCam.resolveLanUrl(meta.lanUrl);
+  if (!url) return false;
+  const trimStartSec = Math.max(0, opts?.trimStartSec ?? meta.trimStartSec ?? 0);
+  const trimEndSec = opts?.trimEndSec ?? meta.trimEndSec ?? (meta.durationSec ?? 0);
+  const rate = opts?.rate && opts.rate > 0 ? opts.rate : 1;
+  const rawSpan = trimEndSec > trimStartSec + 0.15 ? trimEndSec - trimStartSec : (meta.durationSec || 20);
+  const durMs = Math.max(12_000, Math.min(180_000, Math.round(((rawSpan * 2) / rate) * 1000) + 4000));
+  const title = opts?.exName || (meta.guest ? 'Guest Clip' : lifts.exOrStub(meta.exId).name);
+  const subtitle = [opts?.setLabel, meta.camera].filter(Boolean).join(' · ');
+  const now = Date.now();
+  setWallboardReplay({
+    id: meta.id,
+    url,
+    title,
+    subtitle,
+    camera: meta.camera || 'Gym Cam',
+    rate,
+    trimStartSec,
+    trimEndSec,
+    startedAtMs: now,
+    expiresAtMs: now + durMs,
+  });
+  void wallboard.pushNow();
+  if (wbReplayTimer) clearTimeout(wbReplayTimer);
+  wbReplayTimer = setTimeout(() => {
+    wbReplayTimer = null;
+    setWallboardReplay(null);
+    void wallboard.pushNow();
+  }, durMs + 250);
+  return true;
+}
+
 /** Play, slow-mo analyze, frame-jog, precision-trim, and export/share a lift clip. */
 export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLabel?: string }): Promise<void> {
   let meta = lifts.videos.get(id);
   if (!meta) return;
-  let blob: Blob | null = sessionFiles.get(id) ?? (meta.linkOnly ? null : await lifts.videoBlob(id));
+  let blob: Blob | null = sessionFiles.get(id) ?? (await lifts.videoBlob(id));
   if (!blob && !meta.linkOnly && !meta.fileName && !meta.uri && !meta.driveQuery && !meta.lanUrl) {
     toast('Video file is missing');
     return;
@@ -1708,6 +1761,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   const s = lifts.sessions.get(meta.sessionId);
   const set = s?.exs.flatMap((e) => e.sets).find((x) => x.id === meta!.setId);
   const ex = lifts.exOrStub(meta.exId);
+  const clipTitle = meta.guest ? 'Guest Clip' : ex.name;
   const driveUrl = driveUrlFor(meta);
   const hasLocalUri = isNative() && !!meta.uri?.startsWith('content://');
   const setTxt = set ? `${set.w ? `${fmtKg(set.w)} ${liftSettings().unit}` : ex.type === 'bodyweight' ? 'BW' : '–'} × ${set.r ?? 0}` : '';
@@ -1729,24 +1783,25 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   };
 
   const posterHtml = meta.thumb
-    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Loading local clip…' : (meta.source === 'gymcam' ? 'Gym Cam · Google Drive' : 'DCIM Backup · Google Drive')}</span></div>`
-    : `<div class="pv-poster" id="vpPoster" hidden><span class="pv-badge">Google Drive Backup</span></div>`;
+    ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Loading clip…' : (meta.source === 'gymcam' ? 'Gym Cam Offline' : 'DCIM Backup · Google Drive')}</span></div>`
+    : `<div class="pv-poster" id="vpPoster" hidden><span class="pv-badge">${meta.source === 'gymcam' ? 'Gym Cam Offline' : 'Google Drive Backup'}</span></div>`;
 
   const tapeAvail = (): boolean => meta!.source === 'gymcam' && gymCam.online && meta!.clipStartMs != null;
 
   const sh = openSheet(
     `<div class="vp-head">
-       <div class="vp-title"><h3 class="sh-title">${esc(ex.name)}</h3><p class="sh-text" id="vpSub">${esc(subTxt)}</p></div>
+       <div class="vp-title"><h3 class="sh-title">${esc(clipTitle)}</h3><p class="sh-text" id="vpSub">${esc(subTxt)}</p></div>
        <div class="vp-pills">
          ${canHaveDeck ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
+         ${meta.lanUrl ? '<button class="vp-pill" type="button" data-vp="tv">📺 TV</button>' : ''}
          <button class="vp-pill" type="button" data-vp="share">Share ↗</button>
        </div>
      </div>
      <div class="vp-stage">
        ${canHaveDeck ? `<video class="pv" id="vpVid"${playUrl ? ` src="${esc(playUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video>` : ''}
        ${posterHtml}
-       <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Downloading clip to phone RAM for 60 fps scrubbing…</p>
-       <p class="hint" id="vpLanErr" hidden style="text-align:center">OptiPlex LAN stream unavailable away from home — open via Google Drive below.</p>
+       <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Caching clip locally for offline &amp; 60 fps scrubbing…</p>
+       <p class="hint" id="vpLanErr" hidden style="text-align:center">${meta.source === 'gymcam' ? 'Offline — connect to home Gym Wi-Fi once to cache this clip on your phone.' : 'OptiPlex LAN stream unavailable away from home — open via Google Drive below.'}</p>
      </div>
      ${canHaveDeck ? `
      <div class="vp-deck" id="vpDeck"${playUrl ? '' : ' hidden'}>
@@ -1851,6 +1906,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
           const dlBlob = await res.blob();
           if (!closed && dlBlob.size > 0 && dlBlob.size <= MAX_LOCAL_CACHE_BYTES) {
             cacheSessionBlob(id, dlBlob);
+            void lifts.saveVideoBlob(id, dlBlob);
             blob = dlBlob;
             const prevUrl = activeObjectUrl;
             activeObjectUrl = URL.createObjectURL(dlBlob);
@@ -2176,13 +2232,13 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (isTrimDirty(st)) await persistTrim();
       const startMs = isTrimmed(st) ? Math.round(st.start * 1000) : undefined;
       const endMs = isTrimmed(st) ? Math.round(st.end * 1000) : undefined;
-      const title = `${ex.name}${setTxt ? ` · ${setTxt}` : ''}`;
+      const title = `${clipTitle}${setTxt ? ` · ${setTxt}` : ''}`;
       if (isNative()) {
         const uri = meta!.uri?.startsWith('content://') ? meta!.uri : undefined;
-        const httpUrl = !uri && meta!.lanUrl ? meta!.lanUrl : undefined;
-        const base64 = !uri && !httpUrl && blob ? await blobToBase64(blob) : undefined;
+        const base64 = !uri && blob ? await blobToBase64(blob) : undefined;
+        const httpUrl = !uri && !base64 && meta!.lanUrl ? meta!.lanUrl : undefined;
         if (!uri && !httpUrl && !base64) {
-          toast('Video file not cached on phone — open via Google Drive');
+          toast('Clip not cached offline yet — connect to Gym Wi-Fi or Google Drive');
           return;
         }
         const res = await exportNativeVideo({
@@ -2218,6 +2274,17 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     if (t.closest('[data-ok]')) { sh.close(); return; }
 
     const vp = t.closest<HTMLElement>('[data-vp]')?.dataset.vp;
+    if (vp === 'tv') {
+      const ok = castClipToWallboard(meta!, {
+        rate: speed < 1 ? speed : 1,
+        exName: clipTitle,
+        setLabel: ctx?.setLabel || setTxt,
+        trimStartSec: isTrimmed(st) ? roundMs(st.start) : meta!.trimStartSec,
+        trimEndSec: isTrimmed(st) ? roundMs(st.end) : meta!.trimEndSec,
+      });
+      toast(ok ? 'Playing on Wallboard TV' : 'TV replay requires a Gym Cam clip');
+      return;
+    }
     if (vp === 'share') {
       shareOpen = !shareOpen;
       syncUi();

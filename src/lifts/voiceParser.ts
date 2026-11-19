@@ -16,7 +16,10 @@ export type VoiceIntent =
   | { kind: 'add_set_prev_ex' }
   | { kind: 'delete_empty_sets' }
   | { kind: 'cam_arm'; camera?: string }
-  | { kind: 'cam_clip_last'; camera?: string };
+  | { kind: 'cam_clip_last'; camera?: string }
+  | { kind: 'cam_guest'; camera?: string }
+  | { kind: 'wb_replay'; exQuery?: string; setNum?: number; slow?: boolean }
+  | { kind: 'wb_close_replay' };
 
 export type VoiceAliasSlot =
   | 'check_set'
@@ -28,6 +31,7 @@ export type VoiceAliasSlot =
   | 'next_ex'
   | 'cam_arm'
   | 'cam_clip_last'
+  | 'wb_replay'
   | 'finish_workout';
 
 export type CustomVoiceAliases = Partial<Record<VoiceAliasSlot, string[]>>;
@@ -42,6 +46,7 @@ export const VOICE_ALIAS_SLOTS: readonly { slot: VoiceAliasSlot; label: string; 
   { slot: 'next_ex', label: 'Next Exercise', hint: 'e.g. move on' },
   { slot: 'cam_arm', label: 'Record Set (Gym Cam)', hint: 'e.g. watch this, roll tape' },
   { slot: 'cam_clip_last', label: 'Clip Last Set', hint: 'e.g. save that, highlight' },
+  { slot: 'wb_replay', label: 'Replay Last Set on TV', hint: 'e.g. instant replay, show that' },
   { slot: 'finish_workout', label: 'Finish Workout', hint: 'e.g. all done, wrap it up' },
 ];
 
@@ -83,9 +88,14 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
     examples: ['skip rest', 'end rest', 'more rest', 'add 30 seconds', 'minus 15 seconds', 'start hold 45'],
   },
   {
-    title: 'Gym Camera DVR',
+    title: 'Gym Camera DVR & Guest Clips',
     slot: 'cam_arm',
-    examples: ['record', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith'],
+    examples: ['record', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith', 'guest record', 'guest smith'],
+  },
+  {
+    title: 'Wallboard TV Video Replay',
+    slot: 'wb_replay',
+    examples: ['replay', 'replay slow', 'play set 2', 'play bench set 3', 'close video'],
   },
   {
     title: 'Workout & Undo',
@@ -295,6 +305,7 @@ function matchCustomVoiceAlias(
     { slot: 'next_ex', make: () => ({ kind: 'next_ex' }) },
     { slot: 'cam_arm', make: () => ({ kind: 'cam_arm' }) },
     { slot: 'cam_clip_last', make: () => ({ kind: 'cam_clip_last' }) },
+    { slot: 'wb_replay', make: () => ({ kind: 'wb_replay' }) },
     { slot: 'finish_workout', make: () => ({ kind: 'finish_workout' }) },
   ];
   for (const { slot, make } of fixedSlots) {
@@ -344,8 +355,53 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): Voi
   if (/^resume(?:\s+workout)?$/.test(tail)) return { kind: 'resume_workout' };
   if (/^(?:finish|end|complete)\s+workout$/.test(tail)) return { kind: 'finish_workout' };
 
+  if (/^(?:close|stop|hide|exit|dismiss)\s+(?:replay|video|clip|tv)$/.test(tail)) {
+    return { kind: 'wb_close_replay' };
+  }
+
+  let repBody = tail;
+  let slow = false;
+  const repSlowEnd = repBody.match(/\s+(?:in\s+)?(?:slow\s*(?:mo|motion)?|half\s*speed)$/);
+  if (repSlowEnd) {
+    slow = true;
+    repBody = repBody.slice(0, repSlowEnd.index).trim();
+  } else {
+    const repSlowStart = repBody.match(/^(?:slow\s*(?:mo|motion)?|half\s*speed)\s+(.+)$/);
+    if (repSlowStart) {
+      slow = true;
+      repBody = repSlowStart[1].trim();
+    }
+  }
+  if (/^(?:(?:instant\s+)?replay(?:\s+that|\s+last(?:\s+set)?)?|(?:play|show|watch)\s+last(?:\s+set)?)$/.test(repBody)) {
+    return { kind: 'wb_replay', ...(slow ? { slow: true } : {}) };
+  }
+  const repSetOnly = repBody.match(/^(?:play|replay|show|watch)\s+(?:the\s+)?set\s+(\d+)$/);
+  if (repSetOnly) {
+    return { kind: 'wb_replay', setNum: Number(repSetOnly[1]), ...(slow ? { slow: true } : {}) };
+  }
+  const repExSet = repBody.match(/^(?:play|replay|show|watch)\s+(?:my\s+)?(.+?)\s+set\s+(\d+)$/);
+  if (repExSet && repExSet[1].trim()) {
+    return { kind: 'wb_replay', exQuery: repExSet[1].trim(), setNum: Number(repExSet[2]), ...(slow ? { slow: true } : {}) };
+  }
+  const repLastEx = repBody.match(/^(?:play|replay|show|watch)\s+(?:the\s+)?last\s+(.+?)(?:\s+set)?$/);
+  if (repLastEx && repLastEx[1].trim()) {
+    return { kind: 'wb_replay', exQuery: repLastEx[1].trim(), ...(slow ? { slow: true } : {}) };
+  }
+
   const mapCamTok = (tok?: string): string | undefined =>
     tok === 'rack' ? 'Rack Cam' : tok === 'smith' ? 'Smith Cam' : undefined;
+  const camGuestA = tail.match(
+    /^(?:guest\s+(?:record|camera|cam|clip)|(?:record|start|stop|arm)\s+guest(?:\s+clip|\s+set|\s+cam(?:era)?)?)(?:\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
+  );
+  if (camGuestA) {
+    const camera = mapCamTok(camGuestA[1]);
+    return camera ? { kind: 'cam_guest', camera } : { kind: 'cam_guest' };
+  }
+  const camGuestB = tail.match(/^guest\s+(rack|smith)(?:\s+cam(?:era)?)?$/);
+  if (camGuestB) {
+    const camera = mapCamTok(camGuestB[1]);
+    return camera ? { kind: 'cam_guest', camera } : { kind: 'cam_guest' };
+  }
   const camArmA = tail.match(
     /^(?:(rack|smith)\s+)?(?:camera|cam|record(?:\s+set)?|start\s+camera|arm\s+camera|stop\s+camera)(?:\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
   );
@@ -508,6 +564,12 @@ export function defaultReadbackForIntent(intent: VoiceIntent): string | null {
       return intent.camera ? `Recording ${intent.camera.replace(/ cam$/i, '')}` : 'Camera toggled';
     case 'cam_clip_last':
       return 'Clipping last set';
+    case 'cam_guest':
+      return intent.camera ? `Guest camera ${intent.camera.replace(/ cam$/i, '')}` : 'Guest camera toggled';
+    case 'wb_replay':
+      return intent.slow ? 'Replaying slow motion on TV' : 'Replaying on TV';
+    case 'wb_close_replay':
+      return 'Closing video';
   }
 }
 

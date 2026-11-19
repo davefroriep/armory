@@ -85,8 +85,8 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertFalse(ping["recording"])
 
             dash_html = client.get("/").get_data(as_text=True)
-            self.assertIn("Motion Zone (Green)", dash_html)
-            self.assertIn("data-roireset", dash_html)
+            self.assertIn("+ Mask Mirror (Red)", dash_html)
+            self.assertIn("data-addexcl", dash_html)
 
             cfg_res = client.post(
                 "/api/config",
@@ -100,6 +100,7 @@ class ArmoryCamTests(unittest.TestCase):
                             "enabled": True,
                             "motionThreshold": 2.0,
                             "roi": [0.3, 0.3, 0.7, 0.7],
+                            "exclusions": [[0.55, 0.1, 0.9, 0.6]],
                             "crop": [0.25, 0.25, 0.75, 0.75],
                             "rotate": 0,
                         },
@@ -112,6 +113,7 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(saved_cfg["retentionDays"], 21)
             self.assertEqual(saved_cfg["cameras"][0]["crop"], [0.25, 0.25, 0.75, 0.75])
             self.assertEqual(saved_cfg["cameras"][0]["roi"], [0.3, 0.3, 0.7, 0.7])
+            self.assertEqual(saved_cfg["cameras"][0]["exclusions"], [[0.55, 0.1, 0.9, 0.6]])
 
             # 2. Start session and synthesize real 2s MPEG-TS segments in Rack Cam ring
             self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-1", "name": "Lower 1"}).status_code, 200)
@@ -487,6 +489,31 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(pr_res.get_json()["camera"], "Rack Cam")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_exclusion_zones_mask_mirror_motion(self) -> None:
+        import numpy as np
+
+        f0 = np.zeros((180, 320, 3), dtype=np.uint8)
+        f_mirror = f0.copy()
+        # Simulate bright flickering reflection only inside right-half mirror [0.65..0.95, 0.1..0.9]
+        f_mirror[18:162, 208:304] = 245
+
+        unmasked = ac.compute_motion_energy_from_frames([f0, f_mirror])
+        masked = ac.compute_motion_energy_from_frames(
+            [f0, f_mirror],
+            exclusions=[(0.6, 0.05, 1.0, 0.95)],
+        )
+        self.assertGreater(unmasked, 5.0)
+        self.assertLess(masked, 0.5)
+
+        # Lifter moving on left side still scores high when mirror is masked
+        f_lift = f_mirror.copy()
+        f_lift[30:150, 30:120] = 230
+        with_lifter = ac.compute_motion_energy_from_frames(
+            [f0, f_lift],
+            exclusions=[(0.6, 0.05, 1.0, 0.95)],
+        )
+        self.assertGreater(with_lifter, 5.0)
 
 
 if __name__ == "__main__":

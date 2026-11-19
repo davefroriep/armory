@@ -47,6 +47,7 @@ export const WALLBOARD_HTML = `<!doctype html>
   .pill { font-size:clamp(11px,1.2vw,15px); font-weight:700; letter-spacing:.08em; padding:6px 12px; border-radius:999px; background:var(--card2); border:1px solid var(--line); color:var(--mut); text-transform:uppercase; }
   .pill.live { color:#86efac; border-color:rgba(34,197,94,.45); background:rgba(34,197,94,.12); }
   .pill.cardio { color:#7dd3fc; border-color:rgba(56,189,248,.45); background:rgba(56,189,248,.12); }
+  .pill.since { color:#7dd3fc; border-color:rgba(56,189,248,.45); background:rgba(56,189,248,.12); font-variant-numeric:tabular-nums; }
   .top-mid { display:flex; justify-content:center; align-items:center; min-width:0; }
   .top-r { display:flex; align-items:center; gap:12px; flex-shrink:0; }
   .mic { display:inline-flex; align-items:center; gap:8px; padding:6px 14px; border-radius:999px; border:1px solid var(--line); background:var(--card); font-size:clamp(12px,1.3vw,16px); color:var(--mut); font-weight:600; }
@@ -190,6 +191,17 @@ export const WALLBOARD_HTML = `<!doctype html>
   .sb-item span { font-size:clamp(13px,1.5vw,19px); color:var(--mut); }
   .ptt { position:fixed; right:16px; bottom:16px; border:1px solid var(--line); background:var(--card2); color:var(--txt); padding:10px 16px; border-radius:999px; font-weight:700; cursor:pointer; opacity:.85; }
   .ptt.on { background:rgba(34,211,238,.25); border-color:var(--cyan); color:#fff; }
+  .wb-replay { position:fixed; inset:0; z-index:50; background:#030712; display:flex; flex-direction:column; }
+  .wb-replay[hidden] { display:none !important; }
+  #wbRepVid { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
+  .wb-rep-top { position:absolute; left:24px; right:24px; top:20px; display:flex; justify-content:space-between; align-items:flex-start; gap:16px; pointer-events:none; }
+  .wb-rep-title { background:rgba(7,11,18,.84); border:1px solid rgba(56,189,248,.45); border-radius:14px; padding:10px 16px; display:flex; flex-direction:column; gap:2px; max-width:60%; }
+  .wb-rep-title b { font-size:clamp(18px,2.2vw,28px); font-weight:900; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .wb-rep-title small { font-size:clamp(12px,1.4vw,18px); color:#93c5fd; font-weight:700; }
+  .wb-rep-hud { display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }
+  .wb-hud-pill { background:rgba(7,11,18,.86); border:1px solid #1e2b42; border-radius:999px; padding:8px 16px; font-weight:800; font-variant-numeric:tabular-nums; font-size:clamp(14px,1.6vw,22px); color:#fff; }
+  .wb-rep-foot { position:absolute; left:24px; right:24px; bottom:20px; display:flex; justify-content:space-between; align-items:center; pointer-events:none; font-size:clamp(12px,1.3vw,17px); font-weight:700; color:#cbd5e1; text-shadow:0 1px 6px #000; }
+  .wb-rep-foot span { background:rgba(7,11,18,.78); padding:6px 12px; border-radius:999px; border:1px solid rgba(255,255,255,.12); }
   @media (max-width:860px) { .grid { grid-template-columns:1fr; } }
   @media (max-height:700px) {
     .wrap { gap:6px; padding:8px 14px; }
@@ -235,6 +247,14 @@ export const WALLBOARD_HTML = `<!doctype html>
 <div class="wrap" id="app">
   <div class="top"><div class="brand"><b>ARMORY FIT</b><span class="pill">Connecting…</span></div><div class="top-mid"></div><div class="top-r"><div class="clk" id="clk">--:--</div></div></div>
 </div>
+<div class="wb-replay" id="wbReplay" hidden>
+  <video id="wbRepVid" playsinline muted></video>
+  <div class="wb-rep-top">
+    <div class="wb-rep-title"><b id="wbRepT">—</b><small id="wbRepSub">—</small></div>
+    <div class="wb-rep-hud" id="wbRepHud"></div>
+  </div>
+  <div class="wb-rep-foot"><span id="wbRepBadge">FORM REPLAY</span><span>Say “Armory close video” to return</span></div>
+</div>
 <button class="ptt" id="ptt" hidden type="button">🎤 Voice Relay</button>
 <script>
 const ZCOL = ['#64748b','#8a94a3','#38bdf8','#22c55e','#f59e0b','#ff4d2e'];
@@ -245,6 +265,101 @@ const mmss = (sec) => {
   return h ? h + ':' + String(m).padStart(2,'0') + ':' + String(r).padStart(2,'0') : m + ':' + String(r).padStart(2,'0');
 };
 let lastJson = '';
+let activeReplayKey = '';
+let dismissedReplayKey = '';
+let replayLoopsLeft = 0;
+let replayT0 = 0;
+let replayT1 = 0;
+let replayEndBound = 0;
+let replayRate = 1;
+let replayMeta = { camera: '', rate: 1 };
+
+const wbReplayEl = document.getElementById('wbReplay');
+const wbRepVid = document.getElementById('wbRepVid');
+const wbRepBadge = document.getElementById('wbRepBadge');
+
+function replayBadgeText(playNum) {
+  return [
+    replayMeta.camera || '',
+    replayMeta.rate && replayMeta.rate !== 1 ? replayMeta.rate + '× SLOW-MO' : '',
+    'PLAY ' + playNum + '/2',
+  ].filter(Boolean).join(' · ');
+}
+
+function closeLocalReplay() {
+  try { wbRepVid.pause(); } catch {}
+  wbRepVid.removeAttribute('src');
+  try { wbRepVid.load(); } catch {}
+  if (wbReplayEl) wbReplayEl.hidden = true;
+}
+
+if (wbRepVid) {
+  wbRepVid.addEventListener('loadedmetadata', () => {
+    const dur = isFinite(wbRepVid.duration) ? wbRepVid.duration : 0;
+    replayEndBound = replayT1 > replayT0 + 0.15 ? (dur ? Math.min(replayT1, dur) : replayT1) : dur;
+    if (replayT0 > 0 && dur > 0.2) wbRepVid.currentTime = Math.min(replayT0, dur - 0.1);
+    wbRepVid.playbackRate = replayRate;
+    wbRepVid.play().catch(() => {});
+  });
+  const advanceReplayLoop = (fromEnded) => {
+    if (!activeReplayKey || wbReplayEl.hidden) return;
+    if (!fromEnded && !(replayEndBound > 0 && wbRepVid.currentTime >= replayEndBound - 0.05)) return;
+    replayLoopsLeft--;
+    if (replayLoopsLeft > 0) {
+      wbRepVid.currentTime = replayT0;
+      wbRepVid.playbackRate = replayRate;
+      wbRepVid.play().catch(() => {});
+      if (wbRepBadge) wbRepBadge.textContent = replayBadgeText(2);
+    } else {
+      dismissedReplayKey = activeReplayKey;
+      closeLocalReplay();
+    }
+  };
+  wbRepVid.addEventListener('timeupdate', () => advanceReplayLoop(false));
+  wbRepVid.addEventListener('ended', () => advanceReplayLoop(true));
+}
+
+function syncReplay(st, hr, hrColor) {
+  const rep = st.replay;
+  const hud = document.getElementById('wbRepHud');
+  if (hud) {
+    const pills = [];
+    if (st.lift && st.lift.rest && st.lift.rest.active) {
+      pills.push('<span class="wb-hud-pill" style="border-color:' + (st.lift.rest.over ? 'var(--green)' : 'var(--blue)') + ';color:' + (st.lift.rest.over ? '#86efac' : '#7dd3fc') + '">' + (st.lift.rest.over ? 'GO +' : 'REST ') + mmss(Math.abs(st.lift.rest.remainingSec)) + '</span>');
+    }
+    if (st.lift) {
+      pills.push('<span class="wb-hud-pill" style="border-color:rgba(56,189,248,.45);color:#7dd3fc">SINCE LAST ' + (st.lift.sinceLastSetSec != null ? mmss(st.lift.sinceLastSetSec) : '--:--') + '</span>');
+    }
+    pills.push('<span class="wb-hud-pill" style="color:' + hrColor + '">' + (hr.fresh && hr.bpm ? '♥ ' + hr.bpm + ' BPM' : 'NO HR') + '</span>');
+    hud.innerHTML = pills.join('');
+  }
+  if (!rep || !rep.url) {
+    if (activeReplayKey || (wbReplayEl && !wbReplayEl.hidden)) closeLocalReplay();
+    activeReplayKey = '';
+    dismissedReplayKey = '';
+    return;
+  }
+  const key = String(rep.id || '') + ':' + String(rep.startedAtMs || 0);
+  if (key === dismissedReplayKey) return;
+  if (key !== activeReplayKey) {
+    activeReplayKey = key;
+    replayLoopsLeft = 2;
+    replayT0 = Math.max(0, Number(rep.trimStartSec) || 0);
+    replayT1 = Number(rep.trimEndSec) || 0;
+    replayEndBound = replayT1;
+    replayRate = Number(rep.rate) || 1;
+    replayMeta = { camera: rep.camera || '', rate: replayRate };
+    const tEl = document.getElementById('wbRepT');
+    const sEl = document.getElementById('wbRepSub');
+    if (tEl) tEl.textContent = rep.title || 'Form Replay';
+    if (sEl) sEl.textContent = rep.subtitle || '';
+    if (wbRepBadge) wbRepBadge.textContent = replayBadgeText(1);
+    if (wbReplayEl) wbReplayEl.hidden = false;
+    wbRepVid.playbackRate = replayRate;
+    wbRepVid.defaultPlaybackRate = replayRate;
+    wbRepVid.src = rep.url;
+  }
+}
 
 function render(st) {
   if (!st) return;
@@ -255,6 +370,9 @@ function render(st) {
     : st.mode === 'cardio'
       ? '<span class="pill cardio">LIVE · CARDIO</span>'
       : '<span class="pill">STANDBY · ' + esc(st.standby?.weekLabel || '') + '</span>';
+  const sincePill = st.mode === 'lift'
+    ? '<span class="pill since">SINCE LAST SET ' + (st.lift.sinceLastSetSec != null ? mmss(st.lift.sinceLastSetSec) : '--:--') + '</span>'
+    : '';
 
   const v = st.voice || {};
   const micCls = v.armed ? 'mic armed' : v.listening ? 'mic on' : 'mic';
@@ -272,6 +390,7 @@ function render(st) {
   };
   const rm = readyMap[hr.readiness || 'idle'];
   const hrHtml = '<section class="card hr-card"><div><div class="kicker">POLAR H10 HEARTRATE</div><div class="hr-bpm" style="color:' + hrColor + '">' + (hr.fresh && hr.bpm ? hr.bpm : '--') + '</div><div class="cur-meta">' + (hr.fresh && hr.bpm ? 'Zone ' + hr.zone + ' · ' + hr.pctMax + '% HRmax' : 'Waiting for chest strap') + '</div></div><div class="hr-ready ' + rm[0] + '"><div>' + rm[1] + '</div><div style="font-size:.7em;opacity:.85;margin-top:4px">' + rm[2] + '</div></div></section>';
+  syncReplay(st, hr, hrColor);
 
   const renderSetRow = (slot, exType) => {
     const tagTxt = slot.kind === 'w' ? 'W' : 'SET ' + slot.label;
@@ -412,7 +531,7 @@ function render(st) {
       + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker">TODAY ON THE SCHEDULE</div>' + items + '</section></div></div>';
   }
 
-  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + '</div><div class="top-mid">' + banner + '</div><div class="top-r">' + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + main;
+  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + sincePill + '</div><div class="top-mid">' + banner + '</div><div class="top-r">' + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + main;
 }
 
 window.addEventListener('message', (ev) => {

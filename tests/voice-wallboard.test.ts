@@ -8,13 +8,13 @@ import {
   advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
   jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
-import { buildExercise } from '../src/lifts/logic';
+import { buildExercise, driveUrlFor, secondsSinceLastSet } from '../src/lifts/logic';
 import {
   defaultReadbackForIntent, hasCommandTailAfterWake, hasWakeWord, parseVoiceTranscript,
 } from '../src/lifts/voiceParser';
 import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
-import { buildWallboardSnapshot, isWallboardWorkoutActive } from '../src/wallboard/snapshot';
+import { buildWallboardSnapshot, isWallboardWorkoutActive, type WallboardReplayState } from '../src/wallboard/snapshot';
 import type { Exercise, LiftSession, LiftSet, SessionEx } from '../src/lifts/types';
 
 const exOf = (id: string): Exercise =>
@@ -722,5 +722,97 @@ describe('wallboard snapshot & routing', () => {
     };
     expect(isWallboardWorkoutActive(activeCardio)).toBe(true);
     expect(isWallboardWorkoutActive({ ...activeCardio, cardio: { ...activeCardio.cardio, paused: true } })).toBe(false);
+  });
+
+  it('tracks since-last-set timer, Wallboard TV replay snapshots & expiry, Drive fallback suppression, and v0.70 voice intents', () => {
+    const sess: LiftSession = {
+      id: 's_v70',
+      name: 'Upper 1',
+      routineId: null,
+      eventId: null,
+      startMs: 100_000,
+      endMs: null,
+      status: 'active',
+      started: true,
+      exs: mkUpper1(),
+      rpe: null,
+      bwKg: 88.5,
+    };
+    expect(secondsSinceLastSet(sess, 120_000)).toBeNull();
+
+    sess.exs[0].sets[0] = { ...sess.exs[0].sets[0], done: true, at: 150_000 };
+    expect(secondsSinceLastSet(sess, 195_500)).toBe(45);
+
+    sess.exs[0].sets[1] = { ...sess.exs[0].sets[1], done: true, at: 210_000 };
+    expect(secondsSinceLastSet(sess, 212_000)).toBe(2);
+
+    expect(secondsSinceLastSet({ ...sess, pausedAt: 220_000 }, 999_000)).toBe(10);
+    expect(secondsSinceLastSet({ ...sess, endMs: 250_000 }, 300_000)).toBeNull();
+
+    expect(driveUrlFor({ fileName: 'Squat_Set1.mp4', source: 'gymcam' })).toBeNull();
+
+    const replaySnap: WallboardReplayState = {
+      id: 'v1',
+      url: 'http://192.168.1.152:8766/api/clip/Squat_Set1.mp4',
+      title: 'Barbell Bench Press',
+      subtitle: 'Set 2 · Rack Cam',
+      camera: 'Rack Cam',
+      rate: 0.5,
+      trimStartSec: 4.5,
+      trimEndSec: 18.2,
+      startedAtMs: 210_000,
+      expiresAtMs: 250_000,
+    };
+    const wbActive = buildWallboardSnapshot({
+      now: 225_000,
+      settings: { hrMax: 180, recoveryHrPct: 72, voiceEnabled: true, voiceWakeWord: 'armory', queue: defaultQueueState() },
+      unit: 'lb',
+      hr: { bpm: 132, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      replaySnap,
+      activeSession: sess,
+      elapsedSec: 125,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(wbActive.lift?.sinceLastSetSec).toBe(15);
+    expect(wbActive.replay).toEqual(replaySnap);
+    expect(WALLBOARD_HTML).toContain('SINCE LAST SET');
+    expect(WALLBOARD_HTML).toContain('id="wbReplay"');
+
+    const wbExpired = buildWallboardSnapshot({
+      now: 255_000,
+      settings: { hrMax: 180, recoveryHrPct: 72, voiceEnabled: true, voiceWakeWord: 'armory', queue: defaultQueueState() },
+      unit: 'lb',
+      hr: { bpm: 132, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      replaySnap,
+      activeSession: sess,
+      elapsedSec: 155,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(wbExpired.replay).toBeUndefined();
+
+    expect(parseVoiceTranscript('Armory replay')).toEqual({ kind: 'wb_replay' });
+    expect(parseVoiceTranscript('Armory replay slow')).toEqual({ kind: 'wb_replay', slow: true });
+    expect(parseVoiceTranscript('Armory play set 2')).toEqual({ kind: 'wb_replay', setNum: 2 });
+    expect(parseVoiceTranscript('Armory play bench set three slow mo')).toEqual({ kind: 'wb_replay', exQuery: 'bench', setNum: 3, slow: true });
+    expect(parseVoiceTranscript('Armory close video')).toEqual({ kind: 'wb_close_replay' });
+    expect(parseVoiceTranscript('Armory guest record')).toEqual({ kind: 'cam_guest' });
+    expect(parseVoiceTranscript('Armory guest smith')).toEqual({ kind: 'cam_guest', camera: 'Smith Cam' });
+    expect(defaultReadbackForIntent({ kind: 'wb_replay', slow: true })).toBe('Replaying slow motion on TV');
+    expect(defaultReadbackForIntent({ kind: 'wb_close_replay' })).toBe('Closing video');
+    expect(defaultReadbackForIntent({ kind: 'cam_guest', camera: 'Smith Cam' })).toBe('Guest camera Smith');
   });
 });

@@ -84,6 +84,8 @@ export interface SessionEx {
   restAuto?: boolean;
   /** Original 0-based index inside the routine this session was started from. */
   slot?: number;
+  /** Last explicitly chosen Gym-Cam station ("Rack Cam" | "Smith Cam") for this exercise in this session. */
+  camPref?: string;
 }
 
 export interface SkippedEx {
@@ -120,6 +122,8 @@ export interface LiftSession {
   bwKg: number | null;
   /** Optional OptiPlex Gym-Cam DVR session identifier for 2-week Session Tape lookup. */
   camSessionId?: string;
+  /** True when lifting with a buddy so motion-based auto camera selection avoids hijacking clips. */
+  buddyMode?: boolean;
 }
 
 export interface RoutineItem {
@@ -172,6 +176,8 @@ export interface VideoMeta {
   /** Non-destructive in-app trim start/end in seconds within the clip. */
   trimStartSec?: number;
   trimEndSec?: number;
+  /** True for Guest / Buddy clips stored outside set.vids tracking. */
+  guest?: boolean;
 }
 
 export const uid = (): string => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;

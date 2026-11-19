@@ -65,6 +65,7 @@ const BASE_BIAS = [
   'add set', 'add set to last exercise', 'delete empty sets',
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
   'camera', 'record set', 'record rack', 'record smith', 'rack camera', 'smith camera', 'clip that', 'save clip', 'clip rack', 'clip smith',
+  'replay', 'replay slow', 'play set', 'close video', 'guest record', 'guest rack', 'guest smith',
 ];
 
 class VoiceController {
@@ -77,7 +78,8 @@ class VoiceController {
   lastAction: VoiceActionNotice | null = null;
   holdStarter: ((exUid: string, setId: string, seconds?: number) => boolean) | null = null;
   finishTrigger: (() => void) | null = null;
-  camHandler: ((mode: 'arm' | 'clip_last', camera?: string) => Promise<string | null> | string | null) | null = null;
+  camHandler: ((mode: 'arm' | 'clip_last' | 'guest', camera?: string) => Promise<string | null> | string | null) | null = null;
+  replayHandler: ((req: { exQuery?: string; setNum?: number; slow?: boolean; close?: boolean }) => Promise<string | null> | string | null) | null = null;
 
   readonly changed = new Emitter<void>();
   readonly toasted = new Emitter<{ msg: string; kind?: 'pr' }>();
@@ -475,16 +477,39 @@ class VoiceController {
       }
       return this.notice('Open active Strength workout to finish', 'warn', true, fallbackSpeech);
     }
-    if (intent.kind === 'cam_arm' || intent.kind === 'cam_clip_last') {
+    if (intent.kind === 'cam_arm' || intent.kind === 'cam_clip_last' || intent.kind === 'cam_guest') {
       if (!this.camHandler) {
         return this.notice('Open active Strength workout to use camera commands', 'warn', true, 'Open a workout first');
       }
-      const mode = intent.kind === 'cam_arm' ? 'arm' : 'clip_last';
+      const mode = intent.kind === 'cam_arm' ? 'arm' : intent.kind === 'cam_guest' ? 'guest' : 'clip_last';
       void Promise.resolve(this.camHandler(mode, intent.camera)).then((msg) => {
         if (msg) this.notice(msg, 'info');
       });
       buzz(25);
-      return this.notice(mode === 'arm' ? 'Camera toggled…' : 'Clipping last set…', 'info', false, fallbackSpeech);
+      return this.notice(
+        mode === 'arm' ? 'Camera toggled…' : mode === 'guest' ? 'Guest camera toggled…' : 'Clipping last set…',
+        'info',
+        false,
+        fallbackSpeech,
+      );
+    }
+    if (intent.kind === 'wb_replay' || intent.kind === 'wb_close_replay') {
+      if (!this.replayHandler) {
+        return this.notice('Open active Strength workout to replay on TV', 'warn', true, 'Open a workout first');
+      }
+      const req = intent.kind === 'wb_close_replay'
+        ? { close: true }
+        : { exQuery: intent.exQuery, setNum: intent.setNum, slow: intent.slow };
+      void Promise.resolve(this.replayHandler(req)).then((msg) => {
+        if (msg) this.notice(msg, 'info');
+      });
+      buzz(20);
+      return this.notice(
+        intent.kind === 'wb_close_replay' ? 'Closing TV replay…' : 'Sending replay to TV…',
+        'info',
+        false,
+        fallbackSpeech,
+      );
     }
 
     const cur = resolveTargetSet(s.exs, this.cursor);

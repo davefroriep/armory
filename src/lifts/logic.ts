@@ -178,6 +178,24 @@ export function elapsedSessionSec(s: LiftSession, now = Date.now()): number {
   return Math.max(0, (end - s.startMs - (s.pausedMs ?? 0)) / 1000);
 }
 
+/**
+ * Seconds elapsed since the most recent completed set check in `s` (`st.at`).
+ * Resets to 0 on every check, freezes if paused, and returns `null` if no set
+ * has been checked yet or the session has ended.
+ */
+export function secondsSinceLastSet(s: LiftSession, now = Date.now()): number | null {
+  if (s.endMs != null) return null;
+  let lastAt = 0;
+  for (const se of s.exs) {
+    for (const st of se.sets) {
+      if (st.done && st.at != null && st.at > lastAt) lastAt = st.at;
+    }
+  }
+  if (!lastAt) return null;
+  const end = s.pausedAt ?? now;
+  return Math.max(0, Math.floor((end - lastAt) / 1000));
+}
+
 /** Starts an unstarted workout clock from zero (`startMs = now`). */
 export function startSessionClock(s: LiftSession, now = Date.now(), manual = false): boolean {
   if (manual) s.manualStart = true;
@@ -300,8 +318,9 @@ export function routineFromSession(s: LiftSession, name: string, order: number):
 }
 
 /** URL that locates a linked clip in Google Drive (direct share URL, timestamp query, or exact filename). */
-export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri' | 'driveQuery'>): string | null {
+export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri' | 'driveQuery' | 'source'>): string | null {
   if (meta.uri && /^https?:\/\//i.test(meta.uri)) return meta.uri;
+  if (meta.source === 'gymcam') return null;
   const q = meta.driveQuery || meta.fileName;
   if (q) return `https://drive.google.com/drive/search?q=${encodeURIComponent(q)}`;
   return null;

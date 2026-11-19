@@ -2,7 +2,7 @@ import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN, type LocalTodayItem } from '../domain/plan';
 import { sessionStats } from '../lifts/calc';
 import { peekNextTargetSet, resolveTargetSet, type CursorRef, type SetPointer } from '../lifts/cursor';
-import { canLog, labels, prevSetFor, supersetGroups } from '../lifts/logic';
+import { canLog, labels, prevSetFor, secondsSinceLastSet, supersetGroups } from '../lifts/logic';
 import { MUSCLE_LABEL } from '../lifts/muscles';
 import { resolvePrescription, type CoachPrescription } from '../lifts/prescriptions';
 import { matchRoutineByTitle } from '../lifts/seed';
@@ -119,6 +119,19 @@ export interface WallboardLiftStage {
   onDeck: WallboardOnDeckBlock | null;
 }
 
+export interface WallboardReplayState {
+  id: string;
+  url: string;
+  title: string;
+  subtitle: string;
+  camera: string;
+  rate: number;
+  trimStartSec: number;
+  trimEndSec: number;
+  startedAtMs: number;
+  expiresAtMs: number;
+}
+
 export interface WallboardState {
   ts: number;
   mode: 'lift' | 'cardio' | 'standby';
@@ -130,9 +143,11 @@ export interface WallboardState {
     wakeWord: string;
     banner: WallboardVoiceBanner | null;
   };
+  replay?: WallboardReplayState | null;
   lift?: {
     title: string;
     elapsedSec: number;
+    sinceLastSetSec: number | null;
     paused: boolean;
     started: boolean;
     setsDone: number;
@@ -183,6 +198,7 @@ export interface WallboardBuildInput {
   voice: { listening: boolean; armed: boolean; banner: WallboardVoiceBanner | null; cursor: CursorRef | null };
   cardioSnap: WallboardCardioSnapshot | null;
   holdSnap: ActiveHoldSnapshot | null;
+  replaySnap?: WallboardReplayState | null;
   activeSession: LiftSession | undefined;
   elapsedSec: number;
   rest: { endMs: number; totalSec: number; label: string } | null;
@@ -490,8 +506,17 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     readiness,
   };
 
+  const activeReplay = inp.replaySnap && inp.replaySnap.expiresAtMs > now ? inp.replaySnap : undefined;
+
   if (inp.cardioSnap) {
-    return { ts: now, mode: 'cardio', hr, voice: voiceState, cardio: { ...inp.cardioSnap } };
+    return {
+      ts: now,
+      mode: 'cardio',
+      hr,
+      voice: voiceState,
+      ...(activeReplay ? { replay: activeReplay } : {}),
+      cardio: { ...inp.cardioSnap },
+    };
   }
 
   const s = inp.activeSession;
@@ -613,9 +638,11 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
       mode: 'lift',
       hr,
       voice: voiceState,
+      ...(activeReplay ? { replay: activeReplay } : {}),
       lift: {
         title: s.name,
         elapsedSec: inp.elapsedSec,
+        sinceLastSetSec: secondsSinceLastSet(s, now),
         paused: s.pausedAt != null,
         started: !!s.started || setsDone > 0,
         setsDone,
@@ -662,6 +689,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     mode: 'standby',
     hr,
     voice: voiceState,
+    ...(activeReplay ? { replay: activeReplay } : {}),
     standby: {
       dateLabel: d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }),
       timeLabel: d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),

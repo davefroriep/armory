@@ -8,16 +8,17 @@ import { calendar } from '../intervals/calendar';
 import { getSettings } from '../store/settings';
 import {
   buildWallboardSnapshot, type ActiveHoldSnapshot, type WallboardCardioSnapshot,
-  type WallboardHrState, type WallboardLiftExerciseSummary, type WallboardState,
+  type WallboardHrState, type WallboardLiftExerciseSummary, type WallboardReplayState, type WallboardState,
 } from './snapshot';
 
 export type {
   ActiveHoldSnapshot, WallboardCardioSnapshot, WallboardHrState,
-  WallboardLiftExerciseSummary, WallboardState,
+  WallboardLiftExerciseSummary, WallboardReplayState, WallboardState,
 };
 
 let cardioSnap: WallboardCardioSnapshot | null = null;
 let holdSnap: ActiveHoldSnapshot | null = null;
+let replaySnap: WallboardReplayState | null = null;
 export const wallboardSnapChanged = new Emitter<void>();
 
 export function setWallboardCardioState(snap: WallboardCardioSnapshot | null): void {
@@ -27,6 +28,11 @@ export function setWallboardCardioState(snap: WallboardCardioSnapshot | null): v
 
 export function setWallboardHoldState(snap: ActiveHoldSnapshot | null): void {
   holdSnap = snap;
+  wallboardSnapChanged.emit();
+}
+
+export function setWallboardReplay(snap: WallboardReplayState | null): void {
+  replaySnap = snap;
   wallboardSnapChanged.emit();
 }
 
@@ -46,6 +52,7 @@ export function buildWallboardState(now = Date.now()): WallboardState {
     },
     cardioSnap,
     holdSnap,
+    replaySnap,
     activeSession: s,
     elapsedSec: s ? active.elapsedSec() : 0,
     rest: active.rest,

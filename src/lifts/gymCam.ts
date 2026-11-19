@@ -62,7 +62,12 @@ class GymCamController {
   clockOffsetMs = 0;
   armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera?: string } | null = null;
   savingSetId: string | null = null;
+  guestArmed: { sessionId: string; startEpochMs: number; camera?: string } | null = null;
+  savingGuest = false;
   private probeMisses = 0;
+  private cachingIds = new Set<string>();
+  private syncInFlight = false;
+  private lastSyncMs = 0;
 
   readonly changed = new Emitter<void>();
 
@@ -127,6 +132,10 @@ class GymCamController {
       this.paused = !!data.paused;
       this.cameras = Array.isArray(data.cameras) ? data.cameras : [];
       this.changed.emit();
+      if (Date.now() - this.lastSyncMs > 60_000) {
+        this.lastSyncMs = Date.now();
+        void this.syncUncachedClips(25);
+      }
       return { online: true, recording: this.recording, paused: this.paused, cameras: this.cameras, latencyMs };
     } catch {
       this.probeMisses += 1;
@@ -216,9 +225,126 @@ class GymCamController {
     return true;
   }
 
-  private resolveLanUrl(raw?: string): string {
+  resolveLanUrl(raw?: string): string {
     if (!raw) return '';
     return /^https?:\/\//i.test(raw) ? raw : `${this.baseUrl()}${raw.startsWith('/') ? '' : '/'}${raw}`;
+  }
+
+  /** Download a LAN Gym-Cam MP4 into phone IndexedDB so it plays & exports off home Wi-Fi. */
+  async cacheClipOffline(meta: VideoMeta, force = false): Promise<boolean> {
+    if (!meta.lanUrl || this.cachingIds.has(meta.id) || typeof fetch === 'undefined') return false;
+    if (!force && lifts.hasVideoBlob(meta.id)) return true;
+    const url = this.resolveLanUrl(meta.lanUrl);
+    if (!url) return false;
+    this.cachingIds.add(meta.id);
+    const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(() => ctrl.abort(), 25_000) : null;
+    try {
+      const res = await fetch(url, { ...(ctrl ? { signal: ctrl.signal } : {}), cache: 'no-store' });
+      if (!res.ok) return false;
+      const blob = await res.blob();
+      if (!blob || blob.size <= 0 || blob.size > 64 * 1024 * 1024) return false;
+      await lifts.saveVideoBlob(meta.id, blob);
+      this.changed.emit();
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
+      this.cachingIds.delete(meta.id);
+    }
+  }
+
+  /** Opportunistically cache recent Gym-Cam clips to phone storage while on home Wi-Fi. */
+  async syncUncachedClips(limit = 25): Promise<number> {
+    if (!this.online || this.syncInFlight) return 0;
+    this.syncInFlight = true;
+    let cached = 0;
+    try {
+      const cutoff = Date.now() - 30 * 86_400_000;
+      const todo = [...lifts.videos.values()]
+        .filter((v) => v.source === 'gymcam' && !!v.lanUrl && v.ms >= cutoff && !lifts.hasVideoBlob(v.id))
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, limit);
+      for (const v of todo) {
+        if (!this.online) break;
+        if (await this.cacheClipOffline(v)) cached++;
+      }
+      return cached;
+    } finally {
+      this.syncInFlight = false;
+    }
+  }
+
+  armGuest(s: LiftSession, camera?: string): void {
+    const cam = camera?.trim();
+    this.guestArmed = {
+      sessionId: s.camSessionId ?? s.id,
+      startEpochMs: this.serverNowMs(),
+      ...(cam ? { camera: cam } : {}),
+    };
+    this.changed.emit();
+  }
+
+  cancelGuest(): void {
+    if (!this.guestArmed) return;
+    this.guestArmed = null;
+    this.changed.emit();
+  }
+
+  async stopAndSaveGuest(s: LiftSession): Promise<VideoMeta | null> {
+    if (!this.guestArmed || this.savingGuest) return null;
+    const { startEpochMs: startMs, camera, sessionId } = this.guestArmed;
+    const endMs = Math.max(startMs + 3000, this.serverNowMs() + 2000);
+    this.guestArmed = null;
+    this.savingGuest = true;
+    this.changed.emit();
+    try {
+      const body = {
+        sessionId: sessionId || (s.camSessionId ?? s.id),
+        exId: '_guest',
+        exName: 'Guest Clip',
+        setId: `_guest_${uid()}`,
+        startMs,
+        endMs,
+        ...(camera ? { camera } : {}),
+      };
+      let res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+      if (!res) {
+        await new Promise((r) => setTimeout(r, 1200));
+        res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+      }
+      const lanUrl = this.resolveLanUrl(res?.lanUrl);
+      if (!lanUrl || !res) return null;
+      this.online = true;
+      this.probeMisses = 0;
+      const meta: VideoMeta = {
+        id: uid(),
+        sessionId: s.id,
+        exId: '_guest',
+        setId: '_guest',
+        ms: Date.now(),
+        mime: 'video/mp4',
+        bytes: res.bytes ?? 0,
+        thumb: res.thumb ?? '',
+        linkOnly: true,
+        guest: true,
+        source: 'gymcam',
+        camera: res.camera || camera || 'Rack Cam',
+        lanUrl,
+        ...(res.fileName ? { fileName: res.fileName } : {}),
+        ...(res.durationSec ? { durationSec: res.durationSec } : {}),
+        ...(res.startMs != null ? { clipStartMs: res.startMs } : {}),
+        ...(res.endMs != null ? { clipEndMs: res.endMs } : {}),
+      };
+      await lifts.addVideo(meta);
+      this.changed.emit();
+      void this.cacheClipOffline(meta);
+      return meta;
+    } finally {
+      this.savingGuest = false;
+      this.changed.emit();
+    }
   }
 
   private async persistClipFromServer(target: GymCamTarget, clip: ClipApiResponse): Promise<VideoMeta | null> {
@@ -246,6 +372,7 @@ class GymCamController {
     target.set.vids = [...(target.set.vids ?? []), meta.id];
     lifts.saveSession(target.session, true);
     this.changed.emit();
+    void this.cacheClipOffline(meta);
     return meta;
   }
 
@@ -288,8 +415,8 @@ class GymCamController {
    * Auto-clips a PR set using server motion-burst alignment while filtering out
    * rapid batch check-check-check timestamps (<20s apart).
    */
-  async autoClipPr(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string): Promise<VideoMeta | null> {
-    if (!this.online || !getSettings().gymCamAutoPr) return null;
+  async autoClipPr(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string, force = false): Promise<VideoMeta | null> {
+    if (!this.online || (!force && !getSettings().gymCamAutoPr)) return null;
     const atMs = set.at ?? Date.now();
     let prevLocalAt = 0;
     for (const ex of s.exs) {
@@ -479,6 +606,7 @@ class GymCamController {
     }
     await lifts.saveVideoMeta(next);
     this.changed.emit();
+    void this.cacheClipOffline(next, true);
     return next;
   }
 
@@ -507,6 +635,7 @@ class GymCamController {
     };
     await lifts.saveVideoMeta(next);
     this.changed.emit();
+    void this.cacheClipOffline(next, true);
     return next;
   }
 }

@@ -63,7 +63,7 @@ class WallboardController {
     hrBeat.on(throttled);
     bikeFrame.on(throttled);
     active.tick.on(throttled);
-    wallboardSnapChanged.on(throttled);
+    wallboardSnapChanged.on(immediate);
     settingsChanged.on(() => {
       void this.syncFromSettings();
       immediate();
@@ -244,23 +244,28 @@ class WallboardController {
     await this.postRelayJson('/api/wallboard/sleep', { reason, delaySec, state }, 2000);
   }
 
+  pushNow(): void {
+    if (this.pushTimer) { clearTimeout(this.pushTimer); this.pushTimer = null; }
+    this.flushPush(Date.now(), true);
+  }
+
   private schedulePush(immediate: boolean): void {
     const now = Date.now();
     const gap = now - this.lastPushMs;
     if (immediate || gap >= 250) {
       if (this.pushTimer) { clearTimeout(this.pushTimer); this.pushTimer = null; }
-      this.flushPush(now);
+      this.flushPush(now, immediate);
       return;
     }
     if (!this.pushTimer) {
       this.pushTimer = setTimeout(() => {
         this.pushTimer = null;
-        this.flushPush(Date.now());
+        this.flushPush(Date.now(), false);
       }, 250 - gap);
     }
   }
 
-  private flushPush(now: number): void {
+  private flushPush(now: number, forceRelay = false): void {
     this.lastPushMs = now;
     const next = buildWallboardState(now);
     this.latestState = next;
@@ -278,7 +283,7 @@ class WallboardController {
 
     const s = getSettings();
     if (s.wallboardRelayEnabled && typeof fetch !== 'undefined' && typeof AbortController !== 'undefined') {
-      const activeNow = isWallboardWorkoutActive(next);
+      const activeNow = isWallboardWorkoutActive(next) || !!next.replay;
       if (activeNow && !this.relayWasActive) {
         this.relayWasActive = true;
         this.relayBackoffUntil = 0;
@@ -289,7 +294,7 @@ class WallboardController {
         void this.pushRelayWake(next, false);
       } else if (activeNow) {
         if (!this.relayBusy && now >= this.relayBackoffUntil
-          && ((json !== this.lastRelayJson && now - this.lastRelayPushMs >= 400) || now - this.lastRelayPushMs >= 5000)) {
+          && (forceRelay || (json !== this.lastRelayJson && now - this.lastRelayPushMs >= 400) || now - this.lastRelayPushMs >= 5000)) {
           void this.pushRelayState(next, json, now);
         }
       } else if (this.relayWasActive) {
