@@ -175,8 +175,11 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('Armory camera')).toEqual({ kind: 'cam_arm' });
     expect(parseVoiceTranscript('armory record set')).toEqual({ kind: 'cam_arm' });
     expect(parseVoiceTranscript('armory start camera')).toEqual({ kind: 'cam_arm' });
+    expect(parseVoiceTranscript('Armory record smith')).toEqual({ kind: 'cam_arm', camera: 'Smith Cam' });
+    expect(parseVoiceTranscript('armory rack camera')).toEqual({ kind: 'cam_arm', camera: 'Rack Cam' });
     expect(parseVoiceTranscript('Armory clip that')).toEqual({ kind: 'cam_clip_last' });
     expect(parseVoiceTranscript('armory save clip')).toEqual({ kind: 'cam_clip_last' });
+    expect(parseVoiceTranscript('armory clip smith')).toEqual({ kind: 'cam_clip_last', camera: 'Smith Cam' });
     expect(parseVoiceTranscript('armory undo')).toEqual({ kind: 'undo' });
 
     // Two-beat wake flow & natural dumbbell/same shortcuts

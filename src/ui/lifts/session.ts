@@ -221,7 +221,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const txt = saving
       ? '● SAVING…'
       : armed
-        ? `● REC ${shortCamLabel(armed.camera)}`
+        ? (armed.camera ? `● REC ${shortCamLabel(armed.camera)}` : '● REC Auto')
         : gymCam.recording && !gymCam.paused
           ? '● CAM'
           : '○ CAM';
@@ -1094,7 +1094,8 @@ function build(root: HTMLElement, id?: string): () => void {
             gymCam.armSet(s, se, set, choice.camera);
             buzz(25);
             syncVisibleCards();
-            toast(`Recording ${shortCamLabel(choice.camera)} · ${setLabel} — tap ✓ or red camera to stop`);
+            const camLbl = choice.camera ? shortCamLabel(choice.camera) : 'Auto';
+            toast(`Recording ${camLbl} · ${setLabel} — tap ✓ or red camera to stop`);
             return;
           }
         }
@@ -1130,7 +1131,7 @@ function build(root: HTMLElement, id?: string): () => void {
     void setKeepScreenOn(true);
     document.addEventListener('visibilitychange', onVisKeepAwake);
     voice.finishTrigger = () => { void finish(); };
-    voice.camHandler = async (mode) => {
+    voice.camHandler = async (mode, camera) => {
       if (mode === 'arm') {
         const ptr = resolveTargetSet(s.exs, voice.cursor);
         if (!ptr) return 'No open set to record';
@@ -1143,9 +1144,10 @@ function build(root: HTMLElement, id?: string): () => void {
         }
         if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
         active.ensureStarted(s, true);
-        gymCam.armSet(s, se, set);
+        gymCam.armSet(s, se, set, camera);
         if (!dead) syncVisibleCards();
-        return `Recording ${exOf(se.exId).name} Set ${ptr.setNumber}`;
+        const camLbl = camera ? shortCamLabel(camera) : 'Auto';
+        return `Recording ${camLbl} · ${exOf(se.exId).name} Set ${ptr.setNumber}`;
       }
       if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
       let latest: { se: SessionEx; set: typeof s.exs[0]['sets'][0]; at: number } | null = null;
@@ -1155,7 +1157,7 @@ function build(root: HTMLElement, id?: string): () => void {
         }
       }
       if (!latest) return 'Log a set first to clip it';
-      const meta = await gymCam.autoClipPr(s, latest.se, latest.set);
+      const meta = await gymCam.autoClipPr(s, latest.se, latest.set, camera);
       if (!dead && meta) { save(); syncVisibleCards(); }
       return meta ? `Clipped ${exOf(latest.se.exId).name}` : 'No motion burst found yet';
     };

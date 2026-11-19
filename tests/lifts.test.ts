@@ -17,7 +17,7 @@ import {
   extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs, sortDeviceVideosNewestFirst,
 } from '../src/lifts/mp4';
 import {
-  createTrimState, dragTrimHandle, fmtPreciseTime, isTrimDirty, isTrimmed, jogTrimDelta,
+  computeTrimViewport, createTrimState, dragTrimHandle, fmtPreciseTime, isTrimDirty, isTrimmed, jogTrimDelta,
   MIN_TRIM_SPAN_SEC, resolvePlayStart, stepTrimFrames,
 } from '../src/lifts/trimmer';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
@@ -404,6 +404,24 @@ describe('precision active-edge trimmer', () => {
     expect(steppedHead.playhead).toBe(4.3);
     expect(steppedHead.start).toBe(4.2);
     expect(steppedHead.end).toBe(13.333);
+
+    // Expanding a heavily trimmed window zooms viewport to fill the rail left-to-right
+    const longFull = createTrimState(60);
+    expect(computeTrimViewport(longFull, true)).toEqual({ start: 0, end: 60, zoomed: false });
+
+    const trimmed80 = dragTrimHandle(dragTrimHandle(longFull, 'in', 24), 'out', 36); // 12s kept (20% of 60s)
+    expect(computeTrimViewport(trimmed80, false)).toEqual({ start: 0, end: 60, zoomed: false });
+    const vp = computeTrimViewport(trimmed80, true);
+    expect(vp.zoomed).toBe(true);
+    expect(vp.start).toBeCloseTo(23.04, 2); // 12 * 0.08 = 0.96s pad
+    expect(vp.end).toBeCloseTo(36.96, 2);
+    expect((36 - 24) / (vp.end - vp.start)).toBeGreaterThan(0.85);
+
+    // Clamps safely at boundaries & stays unzoomed when >=85% of clip is kept
+    const nearEdge = dragTrimHandle(longFull, 'out', 8);
+    expect(computeTrimViewport(nearEdge, true)).toEqual({ start: 0, end: 8.64, zoomed: true });
+    const mostlyKept = dragTrimHandle(dragTrimHandle(longFull, 'in', 2), 'out', 58);
+    expect(computeTrimViewport(mostlyKept, true)).toEqual({ start: 0, end: 60, zoomed: false });
   });
 });
 

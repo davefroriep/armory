@@ -60,7 +60,7 @@ class GymCamController {
   paused = false;
   cameras: string[] = [];
   clockOffsetMs = 0;
-  armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera: string } | null = null;
+  armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera?: string } | null = null;
   savingSetId: string | null = null;
   private probeMisses = 0;
 
@@ -210,8 +210,8 @@ class GymCamController {
 
   armSet(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string): boolean {
     if (!this.online) return false;
-    const cam = (camera && camera.trim()) || this.cameras[0] || 'Rack Cam';
-    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs(), camera: cam };
+    const cam = camera?.trim() || undefined;
+    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs(), ...(cam ? { camera: cam } : {}) };
     this.changed.emit();
     return true;
   }
@@ -265,7 +265,7 @@ class GymCamController {
         setId: set.id,
         startMs,
         endMs,
-        camera,
+        ...(camera ? { camera } : {}),
       };
       let res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
       if (!res) {
@@ -288,7 +288,7 @@ class GymCamController {
    * Auto-clips a PR set using server motion-burst alignment while filtering out
    * rapid batch check-check-check timestamps (<20s apart).
    */
-  async autoClipPr(s: LiftSession, se: SessionEx, set: LiftSet): Promise<VideoMeta | null> {
+  async autoClipPr(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string): Promise<VideoMeta | null> {
     if (!this.online || !getSettings().gymCamAutoPr) return null;
     const atMs = set.at ?? Date.now();
     let prevLocalAt = 0;
@@ -299,6 +299,7 @@ class GymCamController {
         }
       }
     }
+    const cam = camera?.trim();
     const res = await this.postJson<ClipApiResponse>('/api/clip/auto-pr', {
       sessionId: s.camSessionId ?? s.id,
       exId: se.exId,
@@ -306,6 +307,7 @@ class GymCamController {
       setId: set.id,
       setAtMs: atMs + this.clockOffsetMs,
       ...(prevLocalAt > 0 ? { prevSetAtMs: prevLocalAt + this.clockOffsetMs } : {}),
+      ...(cam ? { camera: cam } : {}),
     }, 45_000);
     return res?.lanUrl ? this.persistClipFromServer({ session: s, se, set }, res) : null;
   }
@@ -475,6 +477,34 @@ class GymCamController {
       if (next.trimStartSec != null) next.trimStartSec = Math.max(0, next.trimStartSec + addBeforeSec);
       if (next.trimEndSec != null) next.trimEndSec = Math.max(0.5, next.trimEndSec + addBeforeSec);
     }
+    await lifts.saveVideoMeta(next);
+    this.changed.emit();
+    return next;
+  }
+
+  async switchClipCamera(meta: VideoMeta, nextCamera: string): Promise<VideoMeta | null> {
+    const cam = nextCamera.trim();
+    if (!this.online || !cam || meta.clipStartMs == null || meta.clipEndMs == null) return null;
+    const s = lifts.sessions.get(meta.sessionId);
+    const res = await this.postJson<ClipApiResponse>('/api/clip', {
+      sessionId: s?.camSessionId ?? meta.sessionId,
+      exId: meta.exId,
+      exName: lifts.exOrStub(meta.exId).name,
+      setId: meta.setId,
+      startMs: meta.clipStartMs,
+      endMs: meta.clipEndMs,
+      camera: cam,
+    }, 45_000);
+    if (!res?.lanUrl) return null;
+    const next: VideoMeta = {
+      ...meta,
+      lanUrl: this.resolveLanUrl(res.lanUrl),
+      fileName: res.fileName || meta.fileName,
+      camera: res.camera || cam,
+      thumb: res.thumb || meta.thumb,
+      bytes: res.bytes ?? meta.bytes,
+      durationSec: res.durationSec ?? meta.durationSec,
+    };
     await lifts.saveVideoMeta(next);
     this.changed.emit();
     return next;

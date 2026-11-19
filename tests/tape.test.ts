@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   applyClipMarker,
+  computeClipZoomWindow,
   computeScrubWindow,
   findNearestFrameIndex,
   fmtRelativeToCheck,
@@ -102,5 +103,28 @@ describe('tape linking & scrubbing helpers', () => {
     expect(findNearestFrameIndex(frames, 103_000)).toBe(1); // midpoint ties to lower index
     expect(findNearestFrameIndex(frames, 103_200)).toBe(2);
     expect(findNearestFrameIndex(frames, 106_500)).toBe(3);
+  });
+
+  it('expands Scrub Tape timeline around IN/OUT clip markers across the full rail width', () => {
+    const minMs = 1_000_000;
+    const maxMs = minMs + 20 * 60_000; // 20m workout tape
+    const inMs = minMs + 8 * 60_000;
+    const outMs = inMs + 40_000; // 40s set (~3% of 20m)
+
+    const wIn = computeClipZoomWindow(minMs, maxMs, inMs, outMs, 'in_set');
+    expect(wIn.winStart).toBe(inMs - 8_000);
+    expect(wIn.winEnd - wIn.winStart).toBeGreaterThanOrEqual(75_000);
+    expect(wIn.winEnd - wIn.winStart).toBeLessThanOrEqual(110_000);
+
+    const wBoth = computeClipZoomWindow(minMs, maxMs, inMs, outMs, 'both_set');
+    // 40s * 0.14 = 5.6s pad on each side -> ~51.2s total window (~78% bar fill!)
+    expect(wBoth.winStart).toBe(inMs - 5600);
+    expect(wBoth.winEnd).toBe(outMs + 5600);
+    expect(wBoth.winEnd - wBoth.winStart).toBe(51_200);
+
+    // Clamps safely to tape edges
+    const wEdge = computeClipZoomWindow(minMs, maxMs, minMs + 1000, minMs + 25_000, 'both_set');
+    expect(wEdge.winStart).toBe(minMs);
+    expect(wEdge.winEnd).toBe(minMs + 25_000 + 4000);
   });
 });

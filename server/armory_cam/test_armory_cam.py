@@ -84,6 +84,10 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(ping["cameras"], ["Rack Cam", "Smith Cam"])
             self.assertFalse(ping["recording"])
 
+            dash_html = client.get("/").get_data(as_text=True)
+            self.assertIn("Motion Zone (Green)", dash_html)
+            self.assertIn("data-roireset", dash_html)
+
             cfg_res = client.post(
                 "/api/config",
                 json={
@@ -95,6 +99,7 @@ class ArmoryCamTests(unittest.TestCase):
                             "rtspUrl": "",
                             "enabled": True,
                             "motionThreshold": 2.0,
+                            "roi": [0.3, 0.3, 0.7, 0.7],
                             "crop": [0.25, 0.25, 0.75, 0.75],
                             "rotate": 0,
                         },
@@ -106,6 +111,7 @@ class ArmoryCamTests(unittest.TestCase):
             saved_cfg = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
             self.assertEqual(saved_cfg["retentionDays"], 21)
             self.assertEqual(saved_cfg["cameras"][0]["crop"], [0.25, 0.25, 0.75, 0.75])
+            self.assertEqual(saved_cfg["cameras"][0]["roi"], [0.3, 0.3, 0.7, 0.7])
 
             # 2. Start session and synthesize real 2s MPEG-TS segments in Rack Cam ring
             self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-1", "name": "Lower 1"}).status_code, 200)
@@ -466,6 +472,19 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(pack_res2.status_code, 200)
             rack_thumb_dirs2 = sorted(d.name for d in (svc.thumbs_root / "rack_cam").iterdir() if d.is_dir())
             self.assertEqual(len(rack_thumb_dirs2), 2)
+
+            # /api/clip/auto-pr respects explicit camera override even when another camera has stronger motion
+            pr_res = client.post(
+                "/api/clip/auto-pr",
+                json={
+                    "sessionId": "sess-tape",
+                    "exName": "Squat",
+                    "setAtMs": t0_ms + 42_000,
+                    "camera": "Rack Cam",
+                },
+            )
+            self.assertEqual(pr_res.status_code, 200)
+            self.assertEqual(pr_res.get_json()["camera"], "Rack Cam")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

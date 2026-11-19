@@ -313,8 +313,11 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .vp-stage { display: flex; flex-direction: column; gap: 6px; }
 .vp-deck { display: flex; flex-direction: column; gap: 8px; }
 .vp-readout { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: .74rem; font-weight: 800; color: var(--mut); font-variant-numeric: tabular-nums; }
+.vp-rbtns { display: inline-flex; align-items: center; gap: 5px; }
+.vp-zoom { height: 24px; padding: 0 8px; border-radius: 999px; background: rgba(30, 155, 255, .15); border: 1px solid rgba(30, 155, 255, .45); color: #7cc4ff; font-size: .68rem; font-weight: 800; white-space: nowrap; }
 .vp-focus { height: 24px; padding: 0 9px; border-radius: 999px; background: var(--card2); border: 1px solid var(--line); color: var(--mut); font-size: .7rem; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .vp-focus.edge { background: rgba(245, 158, 11, .14); border-color: rgba(245, 158, 11, .6); color: var(--amber); }
+.vscrub-edges, .vp-edges { display: flex; justify-content: space-between; font-size: .66rem; font-weight: 700; color: var(--mut); font-variant-numeric: tabular-nums; margin-top: -4px; padding: 0 2px; }
 .vp-rail { position: relative; height: 48px; padding: 0 24px; display: flex; align-items: center; touch-action: none; user-select: none; }
 .vp-track { position: relative; flex: 1; height: 34px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
 .vp-track::before { content: ''; position: absolute; left: 0; right: 0; top: 3px; bottom: 3px; border-radius: 6px; background: var(--card2); border: 1px solid var(--line); }

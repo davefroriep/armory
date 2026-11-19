@@ -44,6 +44,30 @@ export function computeScrubWindow(
   return { winStart, winEnd: Math.min(hi, winStart + span) };
 }
 
+/** Computes zoomed `[winStart, winEnd]` ms range expanding IN/OUT trim markers across the full scrub rail. */
+export function computeClipZoomWindow(
+  minMs: number,
+  maxMs: number,
+  inMs: number,
+  outMs: number,
+  mode: 'in_set' | 'both_set',
+): { winStart: number; winEnd: number } {
+  const lo = Math.min(minMs, maxMs);
+  const hi = Math.max(lo + 2000, maxMs);
+  const cIn = Math.max(lo, Math.min(hi, Math.min(inMs, outMs)));
+  const cOut = Math.max(Math.min(hi, cIn + 2000), Math.min(hi, Math.max(inMs, outMs)));
+  const span = Math.max(3_000, cOut - cIn);
+  if (mode === 'in_set') {
+    const winStart = Math.max(lo, cIn - 8_000);
+    const winEnd = Math.min(hi, Math.max(cOut + 20_000, cIn + Math.max(75_000, Math.round(span * 1.6))));
+    return { winStart, winEnd: Math.max(winStart + 4_000, winEnd) };
+  }
+  const pad = Math.min(15_000, Math.max(4_000, Math.round(span * 0.14)));
+  const winStart = Math.max(lo, cIn - pad);
+  const winEnd = Math.min(hi, cOut + pad);
+  return { winStart, winEnd: Math.max(winStart + 4_000, winEnd) };
+}
+
 /** Updates clip IN/OUT marker from `cursorMs`, enforcing a valid `[3s .. 120s]` clip span inside `[minMs, maxMs]`. */
 export function applyClipMarker(
   inMs: number,

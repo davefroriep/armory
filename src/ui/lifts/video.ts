@@ -8,11 +8,11 @@ import { shareImage } from '../../lifts/share';
 import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
 import {
-  applyClipMarker, computeScrubWindow, findNearestFrameIndex, fmtRelativeToCheck, pickNearestBurstIndex, shortCamLabel,
+  applyClipMarker, computeClipZoomWindow, computeScrubWindow, findNearestFrameIndex, fmtRelativeToCheck, pickNearestBurstIndex, shortCamLabel,
 } from '../../lifts/tape';
 import {
-  createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
-  jogTrimDelta, resolvePlayStart, roundMs, stepTrimFrames, type TrimFocus, type TrimState,
+  computeTrimViewport, createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
+  jogTrimDelta, resolvePlayStart, roundMs, stepTrimFrames, type TrimFocus, type TrimState, type TrimViewport,
 } from '../../lifts/trimmer';
 import type { LiftSession, LiftSet, SessionEx, VideoMeta } from '../../lifts/types';
 import { uid } from '../../lifts/types';
@@ -343,10 +343,10 @@ export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDc
 export function pickRecordCameraSheet(
   exName: string,
   setLabel: string,
-): Promise<{ kind: 'cam'; camera: string } | { kind: 'link' } | { kind: 'cancel' }> {
+): Promise<{ kind: 'cam'; camera?: string } | { kind: 'link' } | { kind: 'cancel' }> {
   const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
   return new Promise((resolve) => {
-    let out: { kind: 'cam'; camera: string } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
+    let out: { kind: 'cam'; camera?: string } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
     const sh = openSheet(
       `<h3 class="sh-title">${esc(exName)} · ${esc(setLabel)}</h3>
        <div class="fl">WHICH CAMERA TO RECORD?</div>
@@ -357,6 +357,7 @@ export function pickRecordCameraSheet(
              <small>Auto-stops when you tap ✓</small>
            </button>`).join('')}
        </div>
+       <button class="btn big" type="button" data-rcam="">Auto (Strongest Motion Zone)</button>
        <button class="btn big" type="button" data-rlink>Link Existing Tape / Phone Video…</button>
        <button class="btn big" type="button" data-rcancel>Cancel</button>`,
       { onClose: () => resolve(out) },
@@ -365,7 +366,8 @@ export function pickRecordCameraSheet(
       const el = e.target as HTMLElement;
       const camBtn = el.closest<HTMLElement>('[data-rcam]');
       if (camBtn) {
-        out = { kind: 'cam', camera: camBtn.dataset.rcam! };
+        const picked = camBtn.dataset.rcam?.trim();
+        out = picked ? { kind: 'cam', camera: picked } : { kind: 'cam' };
         sh.close();
         return;
       }
@@ -453,7 +455,10 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   let cursorMs = 0;
   let inMs = 0;
   let outMs = 0;
-  let zoomMin: number | null = 15;
+  let zoomMode: 'clip' | '5' | '15' | 'all' = '15';
+  let customWin: { winStart: number; winEnd: number } | null = null;
+  let inMarked = false;
+  let outMarked = false;
   let dragScrub = false;
 
   let packFrames: GymCamTapeFrame[] = [];
@@ -497,8 +502,18 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   const redrawLinked = (): void => { sh.body.querySelector('#vlinked')!.innerHTML = linkedRows(); };
   const redrawActions = (): void => { sh.body.querySelector('#vactions')!.innerHTML = actionsHtml(); };
 
-  const currentWindow = (): { winStart: number; winEnd: number } =>
-    computeScrubWindow(minMs, maxMs, winCenterMs || cursorMs, zoomMin);
+  const currentWindow = (): { winStart: number; winEnd: number } => {
+    if (zoomMode === 'clip' && customWin) return customWin;
+    return computeScrubWindow(minMs, maxMs, winCenterMs || cursorMs, zoomMode === 'all' ? null : Number(zoomMode));
+  };
+
+  const zoomToClip = (mode: 'in_set' | 'both_set'): void => {
+    if (!minMs || !maxMs) return;
+    customWin = computeClipZoomWindow(minMs, maxMs, inMs, outMs, mode);
+    zoomMode = 'clip';
+    winCenterMs = Math.round((customWin.winStart + customWin.winEnd) / 2);
+    lastPackIdx = -1;
+  };
 
   const paintScrubFrameLocal = (): void => {
     const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
@@ -670,9 +685,10 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
         <div class="vscrub-zrow">
           <div class="vscrub-zpills">
-            ${totalMin > 5 ? `<button class="vscrub-z${zoomMin === 5 ? ' on' : ''}" type="button" data-szoom="5">5m</button>` : ''}
-            ${totalMin > 15 ? `<button class="vscrub-z${zoomMin === 15 ? ' on' : ''}" type="button" data-szoom="15">15m</button>` : ''}
-            <button class="vscrub-z${zoomMin == null ? ' on' : ''}" type="button" data-szoom="all">All</button>
+            ${outMs > inMs ? `<button class="vscrub-z${zoomMode === 'clip' ? ' on' : ''}" type="button" data-szoom="clip">Fit Clip</button>` : ''}
+            ${totalMin > 5 ? `<button class="vscrub-z${zoomMode === '5' ? ' on' : ''}" type="button" data-szoom="5">5m</button>` : ''}
+            ${totalMin > 15 ? `<button class="vscrub-z${zoomMode === '15' ? ' on' : ''}" type="button" data-szoom="15">15m</button>` : ''}
+            <button class="vscrub-z${zoomMode === 'all' ? ' on' : ''}" type="button" data-szoom="all">All</button>
           </div>
           <button class="vscrub-z" type="button" data-sjmp="chk">Jump to ✓</button>
         </div>
@@ -683,6 +699,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
           ${chkInView ? `<div class="vscrub-chk" style="left:${chkPct.toFixed(2)}%"><span>✓</span></div>` : ''}
           <div class="vscrub-head" id="vscrubHead" style="left:${curPct.toFixed(2)}%"></div>
         </div>
+        <div class="vscrub-edges"><span>${fmtEpochClock(winStart)}</span><span>${fmtEpochClock(winEnd)}</span></div>
 
         <div class="vscrub-jumps">
           <button class="btn sm" type="button" data-sjmp="-60000">−1m</button>
@@ -728,7 +745,10 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     minMs = tl?.minMs ?? 0;
     maxMs = tl?.maxMs ?? 0;
     const totalMin = minMs && maxMs ? (maxMs - minMs) / 60_000 : 0;
-    zoomMin = totalMin > 15 ? 15 : null;
+    inMarked = false;
+    outMarked = false;
+    customWin = null;
+    zoomMode = totalMin > 15 ? '15' : 'all';
 
     if (bursts.length) {
       burstIdx = pickNearestBurstIndex(bursts, checkedMs);
@@ -868,7 +888,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       inMs = minMs ? clamp(b.startMs, minMs, maxMs) : b.startMs;
       outMs = maxMs ? clamp(b.endMs, inMs + 3000, maxMs) : b.endMs;
       cursorMs = Math.round((inMs + outMs) / 2);
-      winCenterMs = cursorMs;
+      inMarked = true;
+      outMarked = true;
+      zoomToClip('both_set');
       scrubDirty = true;
       viewMode = 'scrub';
       renderGymCam();
@@ -877,10 +899,15 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const szoom = el.closest<HTMLElement>('[data-szoom]');
     if (szoom) {
-      const raw = szoom.dataset.szoom!;
-      zoomMin = raw === 'all' ? null : Number(raw);
-      winCenterMs = cursorMs;
-      lastPackIdx = -1;
+      const raw = szoom.dataset.szoom! as 'clip' | '5' | '15' | 'all';
+      if (raw === 'clip') {
+        zoomToClip(inMarked && !outMarked ? 'in_set' : 'both_set');
+      } else {
+        zoomMode = raw;
+        customWin = null;
+        winCenterMs = cursorMs;
+        lastPackIdx = -1;
+      }
       renderGymCam();
       return;
     }
@@ -894,7 +921,13 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
         paintScrubOverlaysOnly();
         paintScrubFrameLocal();
       } else {
-        winCenterMs = cursorMs;
+        if (zoomMode === 'clip' && customWin) {
+          const wSpan = customWin.winEnd - customWin.winStart;
+          const ns = clamp(cursorMs - Math.round(wSpan / 2), minMs, Math.max(minMs, maxMs - wSpan));
+          customWin = { winStart: ns, winEnd: Math.min(maxMs, ns + wSpan) };
+        } else {
+          winCenterMs = cursorMs;
+        }
         lastPackIdx = -1;
         renderGymCam();
       }
@@ -908,6 +941,13 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       const next = applyClipMarker(inMs, outMs, cursorMs, side, minMs, maxMs);
       inMs = next.inMs;
       outMs = next.outMs;
+      if (side === 'in') {
+        inMarked = true;
+        zoomToClip(outMarked ? 'both_set' : 'in_set');
+      } else {
+        outMarked = true;
+        zoomToClip('both_set');
+      }
       renderGymCam();
       return;
     }
@@ -1164,11 +1204,18 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   const subTxt = [setTxt, dateTxt, meta.camera].filter(Boolean).join(' · ');
 
   let st: TrimState = createTrimState(meta.durationSec ?? 0, meta.trimStartSec, meta.trimEndSec);
+  let railZoomed = isTrimmed(st);
+  let railView: TrimViewport = computeTrimViewport(st, railZoomed);
   let speed = 1;
   let shareOpen = false;
   let uiTicker: ReturnType<typeof setInterval> | null = null;
   let closed = false;
   const dlCtrl = new AbortController();
+
+  const refreshRailView = (wantZoom: boolean): void => {
+    railView = computeTrimViewport(st, wantZoom);
+    railZoomed = railView.zoomed;
+  };
 
   const posterHtml = meta.thumb
     ? `<div class="pv-poster" id="vpPoster"${playUrl ? ' hidden' : ''} style="background-image:url(${meta.thumb})"><span class="pv-badge">${needsLanLoad ? 'Loading local clip…' : (meta.source === 'gymcam' ? 'Gym Cam · Google Drive' : 'DCIM Backup · Google Drive')}</span></div>`
@@ -1178,7 +1225,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
   const sh = openSheet(
     `<div class="vp-head">
-       <div class="vp-title"><h3 class="sh-title">${esc(ex.name)}</h3><p class="sh-text">${esc(subTxt)}</p></div>
+       <div class="vp-title"><h3 class="sh-title">${esc(ex.name)}</h3><p class="sh-text" id="vpSub">${esc(subTxt)}</p></div>
        <div class="vp-pills">
          ${canHaveDeck ? '<button class="vp-pill on" type="button" id="vpSaveTop" data-vtrim="save" hidden>Save Trim</button>' : ''}
          <button class="vp-pill" type="button" data-vp="share">Share ↗</button>
@@ -1194,7 +1241,10 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
      <div class="vp-deck" id="vpDeck"${playUrl ? '' : ' hidden'}>
        <div class="vp-readout">
          <span><span class="vp-time" id="vpTime">0:00.00 / 0:00.00</span> · <span class="vp-frame" id="vpFrame">f 0</span></span>
-         <button class="vp-focus" type="button" id="vpFocus" data-vfocus-cycle>Full clip</button>
+         <span class="vp-rbtns">
+           <button class="vp-zoom" type="button" id="vpZoomBtn" data-vzoom hidden>⤢ Full</button>
+           <button class="vp-focus" type="button" id="vpFocus" data-vfocus-cycle>Full clip</button>
+         </span>
        </div>
        <div class="vp-rail" id="vpSeek">
          <div class="vp-track" id="vpTrack">
@@ -1206,6 +1256,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
            <button class="vp-bar-h out" id="vpOutH" type="button" aria-label="Trim end bar"><span>›</span></button>
          </div>
        </div>
+       <div class="vp-edges" id="vpEdges" hidden><span id="vpEdgeL"></span><span id="vpEdgeR"></span></div>
        <div class="jog-strip" id="vpJog"><i class="jog-needle"></i><span id="vpJogLbl">◀ Drag to jog frame-by-frame ▶</span></div>
        <div class="vp-step-row">
          <button class="vp-btn step" type="button" data-vstep="-5">−5f</button>
@@ -1231,6 +1282,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
          <small>2-Wk Tape</small>
          <button class="vp-nbtn" type="button" data-vtape="5:0">−5s Earlier</button>
          <button class="vp-nbtn" type="button" data-vtape="0:5">+5s Later</button>
+         <button class="vp-nbtn" type="button" id="vpCamSwitch" data-vcam-switch hidden></button>
        </div>
      </div>` : ''}
      <div class="vp-drawer" id="vpShareBox" hidden>
@@ -1349,9 +1401,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     }
 
     if (total > 0) {
-      const inPct = clamp((st.start / total) * 100, 0, 100);
-      const outPct = clamp((st.end / total) * 100, inPct, 100);
-      const headPct = clamp((cur / total) * 100, 0, 100);
+      const vStart = railView.end > railView.start ? railView.start : 0;
+      const vEnd = railView.end > railView.start ? railView.end : total;
+      const vSpan = Math.max(0.001, vEnd - vStart);
+      const inPct = clamp(((st.start - vStart) / vSpan) * 100, 0, 100);
+      const outPct = clamp(((st.end - vStart) / vSpan) * 100, inPct, 100);
+      const headPct = clamp(((cur - vStart) / vSpan) * 100, 0, 100);
       if (railEl) railEl.classList.toggle('trimmed', trimmed);
       if (shadeL) shadeL.style.width = `${inPct}%`;
       if (shadeR) { shadeR.style.left = `${outPct}%`; shadeR.style.width = `${Math.max(0, 100 - outPct)}%`; }
@@ -1359,6 +1414,18 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (headEl) headEl.style.left = `${headPct}%`;
       if (inH) { inH.style.left = `${inPct}%`; inH.classList.toggle('active', st.focus === 'in'); }
       if (outH) { outH.style.left = `${outPct}%`; outH.classList.toggle('active', st.focus === 'out'); }
+
+      const zoomBtn = q<HTMLButtonElement>('#vpZoomBtn');
+      if (zoomBtn) {
+        zoomBtn.hidden = !trimmed || st.end - st.start >= total * 0.85;
+        zoomBtn.textContent = railView.zoomed ? '⤢ Full' : '⤡ Fit Trim';
+      }
+      const edgesEl = q('#vpEdges');
+      const edgeL = q('#vpEdgeL');
+      const edgeR = q('#vpEdgeR');
+      if (edgesEl) edgesEl.hidden = !railView.zoomed;
+      if (edgeL) edgeL.textContent = fmtPreciseTime(vStart);
+      if (edgeR) edgeR.textContent = fmtPreciseTime(vEnd);
     }
 
     if (jogEl) {
@@ -1397,6 +1464,13 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
     const tapeRow = q('#vpTapeRow');
     if (tapeRow) tapeRow.hidden = !tapeAvail();
+    const camSw = q<HTMLButtonElement>('#vpCamSwitch');
+    if (camSw) {
+      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+      const other = cams.find((c) => c !== meta!.camera);
+      camSw.hidden = !(tapeAvail() && other);
+      if (other) camSw.textContent = `⇄ ${shortCamLabel(other)}`;
+    }
   };
 
   if (vid) {
@@ -1409,6 +1483,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     vid.onloadedmetadata = () => {
       if (Number.isFinite(vid.duration) && vid.duration > 0) {
         st = createTrimState(vid.duration, meta!.trimStartSec, meta!.trimEndSec);
+        refreshRailView(isTrimmed(st));
         if (st.start > 0.015 && vid.currentTime < st.start) seekVid(st.start);
       }
       vid.playbackRate = speed;
@@ -1460,10 +1535,17 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     let dragMode: TrimFocus | null = null;
     let dragGrabOffsetPx = 0;
 
+    const viewBounds = (): { vStart: number; vEnd: number; vSpan: number } => {
+      const vStart = railView.end > railView.start ? railView.start : 0;
+      const vEnd = railView.end > railView.start ? railView.end : st.dur;
+      return { vStart, vEnd, vSpan: Math.max(0.001, vEnd - vStart) };
+    };
+
     const timeAtPtr = (clientX: number): number => {
       if (!trackEl || st.dur <= 0) return 0;
       const rect = trackEl.getBoundingClientRect();
-      return clamp(((clientX - rect.left) / Math.max(1, rect.width)) * st.dur, 0, st.dur);
+      const { vStart, vEnd, vSpan } = viewBounds();
+      return clamp(vStart + ((clientX - rect.left) / Math.max(1, rect.width)) * vSpan, vStart, vEnd);
     };
 
     const startSeekDrag = (mode: TrimFocus, e: PointerEvent): void => {
@@ -1473,11 +1555,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       railEl.setPointerCapture(e.pointerId);
       vid.pause();
       const rect = trackEl.getBoundingClientRect();
+      const { vStart, vSpan } = viewBounds();
       if (mode === 'in') {
-        dragGrabOffsetPx = e.clientX - (rect.left + (st.start / st.dur) * rect.width);
+        dragGrabOffsetPx = e.clientX - (rect.left + ((st.start - vStart) / vSpan) * rect.width);
         st = { ...st, focus: 'in', playhead: st.start };
       } else if (mode === 'out') {
-        dragGrabOffsetPx = e.clientX - (rect.left + (st.end / st.dur) * rect.width);
+        dragGrabOffsetPx = e.clientX - (rect.left + ((st.end - vStart) / vSpan) * rect.width);
         st = { ...st, focus: 'out', playhead: st.end };
       } else {
         dragGrabOffsetPx = 0;
@@ -1496,7 +1579,15 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       seekVid(st.playhead);
       syncUi();
     });
-    const endSeekDrag = (): void => { dragMode = null; dragGrabOffsetPx = 0; };
+    const endSeekDrag = (): void => {
+      const finished = dragMode;
+      dragMode = null;
+      dragGrabOffsetPx = 0;
+      if ((finished === 'in' || finished === 'out') && st.dur > 0) {
+        refreshRailView(isTrimmed(st));
+        syncUi();
+      }
+    };
     railEl?.addEventListener('pointerup', endSeekDrag);
     railEl?.addEventListener('pointercancel', endSeekDrag);
 
@@ -1517,6 +1608,9 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (!jogEl.hasPointerCapture(e.pointerId) || st.dur <= 0) return;
       const secPerPx = 2.5 / Math.max(220, jogEl.clientWidth);
       st = jogTrimDelta(jogBase, (e.clientX - jogStartX) * secPerPx);
+      if (railZoomed && (st.focus === 'in' || st.focus === 'out') && (st.start < railView.start || st.end > railView.end)) {
+        refreshRailView(true);
+      }
       seekVid(st.playhead);
       syncUi();
     });
@@ -1619,6 +1713,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       return;
     }
 
+    if (t.closest('[data-vzoom]') && vid) {
+      refreshRailView(!railView.zoomed);
+      syncUi();
+      return;
+    }
+
     if (t.closest('[data-vfocus-cycle]') && vid) {
       vid.pause();
       const nextFocus: TrimFocus = st.focus === 'playhead' ? 'in' : st.focus === 'in' ? 'out' : 'playhead';
@@ -1651,6 +1751,9 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     if (step && vid) {
       vid.pause();
       st = stepTrimFrames(st, Number(step.dataset.vstep), FRAME_FPS);
+      if (railZoomed && (st.start < railView.start || st.end > railView.end)) {
+        refreshRailView(true);
+      }
       seekVid(st.playhead);
       syncUi();
       return;
@@ -1661,6 +1764,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (vtrim === 'reset') {
         vid.pause();
         st = { ...createTrimState(st.dur), savedStart: 0, savedEnd: st.dur };
+        refreshRailView(false);
         seekVid(st.playhead);
         await persistTrim();
         toast('Trim reset');
@@ -1669,6 +1773,34 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         toast('Clip trimmed');
       } else if (vtrim === 'share') {
         await runExport('share', t.closest('button'));
+      }
+      syncUi();
+      return;
+    }
+
+    if (t.closest('[data-vcam-switch]') && vid && meta!.clipStartMs != null && meta!.clipEndMs != null) {
+      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+      const other = cams.find((c) => c !== meta!.camera);
+      if (!other) return;
+      const btn = t.closest<HTMLButtonElement>('button');
+      if (btn) { btn.disabled = true; btn.textContent = 'Switching…'; }
+      const updated = await gymCam.switchClipCamera(meta!, other);
+      if (btn) btn.disabled = false;
+      if (updated?.lanUrl) {
+        meta = updated;
+        sessionFiles.delete(id);
+        pendingSeekSec = null;
+        const subEl = q('#vpSub');
+        if (subEl) subEl.textContent = [setTxt, dateTxt, updated.camera].filter(Boolean).join(' · ');
+        const nextPlayUrl = await resolveLanPlayable(updated.lanUrl, updated.bytes);
+        if (!closed && nextPlayUrl) {
+          vid.src = nextPlayUrl;
+          vid.load();
+          void vid.play().catch(() => {});
+        }
+        toast(`Switched to ${shortCamLabel(other)}`);
+      } else {
+        toast(`Could not cut ${shortCamLabel(other)} angle`);
       }
       syncUi();
       return;

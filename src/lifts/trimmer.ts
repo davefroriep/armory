@@ -92,6 +92,34 @@ export function stepTrimFrames(st: TrimState, frames: number, fps = FRAME_FPS): 
   return jogTrimDelta(st, frames / Math.max(1, fps));
 }
 
+export interface TrimViewport {
+  start: number;
+  end: number;
+  zoomed: boolean;
+}
+
+/** Computes visible `[start, end]` seconds rail range so trimmed windows expand across the full track width. */
+export function computeTrimViewport(
+  st: Pick<TrimState, 'dur' | 'start' | 'end'>,
+  zoomed: boolean,
+): TrimViewport {
+  if (!zoomed || st.dur <= 0 || !isTrimmed(st)) {
+    return { start: 0, end: st.dur, zoomed: false };
+  }
+  const span = Math.max(MIN_TRIM_SPAN_SEC, st.end - st.start);
+  if (span >= st.dur * 0.85) {
+    return { start: 0, end: st.dur, zoomed: false };
+  }
+  const pad = Math.min(2.5, Math.max(0.25, roundMs(span * 0.08)));
+  const vStart = clamp(roundMs(st.start - pad), 0, st.start);
+  const vEnd = clamp(roundMs(st.end + pad), st.end, st.dur);
+  return {
+    start: vStart,
+    end: vEnd,
+    zoomed: vStart > 0.015 || vEnd < st.dur - 0.015,
+  };
+}
+
 /** Jump back to trim start if user just finished dialing End rail or is outside/at the end of the kept window. */
 export function resolvePlayStart(st: TrimState): TrimState {
   if (st.dur <= 0) return { ...st, focus: 'playhead' };

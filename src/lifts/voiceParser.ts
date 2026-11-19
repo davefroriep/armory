@@ -15,8 +15,8 @@ export type VoiceIntent =
   | { kind: 'add_set' }
   | { kind: 'add_set_prev_ex' }
   | { kind: 'delete_empty_sets' }
-  | { kind: 'cam_arm' }
-  | { kind: 'cam_clip_last' };
+  | { kind: 'cam_arm'; camera?: string }
+  | { kind: 'cam_clip_last'; camera?: string };
 
 const ONES: Record<string, number> = {
   zero: 0, oh: 0, o: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
@@ -197,8 +197,33 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
   if (/^pause(?:\s+workout)?$/.test(tail)) return { kind: 'pause_workout' };
   if (/^resume(?:\s+workout)?$/.test(tail)) return { kind: 'resume_workout' };
   if (/^(?:finish|end|complete)\s+workout$/.test(tail)) return { kind: 'finish_workout' };
-  if (/^(?:camera|cam|record|record\s+set|start\s+camera|arm\s+camera|stop\s+camera)$/.test(tail)) return { kind: 'cam_arm' };
-  if (/^(?:clip\s+that|save\s+clip|clip\s+last(?:\s+set)?|clip\s+set)$/.test(tail)) return { kind: 'cam_clip_last' };
+
+  const mapCamTok = (tok?: string): string | undefined =>
+    tok === 'rack' ? 'Rack Cam' : tok === 'smith' ? 'Smith Cam' : undefined;
+  const camArmA = tail.match(
+    /^(?:(rack|smith)\s+)?(?:camera|cam|record(?:\s+set)?|start\s+camera|arm\s+camera|stop\s+camera)(?:\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
+  );
+  if (camArmA) {
+    const camera = mapCamTok(camArmA[1] || camArmA[2]);
+    return camera ? { kind: 'cam_arm', camera } : { kind: 'cam_arm' };
+  }
+  const camArmB = tail.match(/^(?:start|arm|record|camera)\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?$/);
+  if (camArmB) {
+    const camera = mapCamTok(camArmB[1]);
+    return camera ? { kind: 'cam_arm', camera } : { kind: 'cam_arm' };
+  }
+  const camClipA = tail.match(
+    /^(?:clip\s+that|save\s+clip|clip\s+last(?:\s+set)?|clip\s+set)(?:\s+(?:on\s+|from\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
+  );
+  if (camClipA) {
+    const camera = mapCamTok(camClipA[1]);
+    return camera ? { kind: 'cam_clip_last', camera } : { kind: 'cam_clip_last' };
+  }
+  const camClipB = tail.match(/^clip\s+(?:on\s+|from\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?$/);
+  if (camClipB) {
+    const camera = mapCamTok(camClipB[1]);
+    return camera ? { kind: 'cam_clip_last', camera } : { kind: 'cam_clip_last' };
+  }
 
   if (/^(?:(?:add(?:\s+a|\s+1|\s+another)?\s+set)|(?:(?:1|one|another|extra)\s+(?:more\s+)?set))\s+(?:(?:to|on|of|for)\s+)?(?:the\s+)?(?:last|previous|prev|prior)\s+exercise$/.test(tail)) {
     return { kind: 'add_set_prev_ex' };

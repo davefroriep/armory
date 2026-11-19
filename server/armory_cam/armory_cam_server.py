@@ -2430,6 +2430,13 @@ DASHBOARD_HTML = """<!doctype html>
   .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none}
   .crop-box{position:absolute;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
   .crop-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(255,255,255,.28);pointer-events:none}
+  .roi-box{position:absolute;border:2px solid var(--green);background:rgba(34,197,94,.08);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none;z-index:2}
+  .roi-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(134,239,172,.35);pointer-events:none}
+  .roi-box .handle{background:var(--green)}
+  .box-tag{position:absolute;left:4px;top:4px;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:900;letter-spacing:.06em;pointer-events:none;background:rgba(6,9,13,.82);color:var(--blue)}
+  .roi-box .box-tag{color:#86efac}
+  .crop-box.passive,.roi-box.passive{border-style:dashed;opacity:.55;pointer-events:none;cursor:default}
+  .crop-box.passive .handle,.roi-box.passive .handle{display:none}
   .handle{position:absolute;width:22px;height:22px;border-radius:50%;background:var(--blue);border:2px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.7);touch-action:none}
   .handle.nw{left:-11px;top:-11px;cursor:nwse-resize}
   .handle.ne{right:-11px;top:-11px;cursor:nesw-resize}
@@ -2527,6 +2534,7 @@ const $ = (id) => document.getElementById(id);
 let cfg = null;
 const previewCropped = {};
 const aspectLock = {};
+const editTarget = {};
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const MIN_SPAN = 0.15;
@@ -2554,6 +2562,8 @@ function setZoomAroundCenter(idx, zoom) {
 function syncCropOverlay(idx) {
   const cam = cfg.cameras[idx];
   const c = cam.crop;
+  const r = cam.roi || [0, 0, 1, 1];
+  const mode = editTarget[idx] || 'crop';
   const rot = cam.rotate || 0;
   const stage = $(`stage-${idx}`);
   const layer = $(`layer-${idx}`);
@@ -2563,9 +2573,20 @@ function syncCropOverlay(idx) {
   const showEditor = !previewCropped[idx];
   layer.hidden = !showEditor;
 
-  const [x0, y0, x1, y1] = c;
-  const lPct = x0 * 100, tPct = y0 * 100, wPct = (x1 - x0) * 100, hPct = (y1 - y0) * 100;
-  $(`box-${idx}`).style.cssText = `left:${lPct}%;top:${tPct}%;width:${wPct}%;height:${hPct}%;`;
+  const isFullCrop = c[0] <= 0.001 && c[1] <= 0.001 && c[2] >= 0.999 && c[3] >= 0.999;
+  const isFullRoi = r[0] <= 0.001 && r[1] <= 0.001 && r[2] >= 0.999 && r[3] >= 0.999;
+  const effRoi = isFullRoi ? c : r;
+
+  const boxEl = $(`box-${idx}`);
+  const roiEl = $(`roiBox-${idx}`);
+  boxEl.style.cssText = `left:${c[0]*100}%;top:${c[1]*100}%;width:${(c[2]-c[0])*100}%;height:${(c[3]-c[1])*100}%;`;
+  roiEl.style.cssText = `left:${effRoi[0]*100}%;top:${effRoi[1]*100}%;width:${(effRoi[2]-effRoi[0])*100}%;height:${(effRoi[3]-effRoi[1])*100}%;`;
+  roiEl.hidden = (mode === 'crop' && isFullRoi);
+  boxEl.classList.toggle('passive', mode === 'roi');
+  roiEl.classList.toggle('passive', mode !== 'roi');
+
+  const act = mode === 'roi' ? effRoi : c;
+  const lPct = act[0] * 100, tPct = act[1] * 100, wPct = (act[2] - act[0]) * 100, hPct = (act[3] - act[1]) * 100;
   $(`scT-${idx}`).style.cssText = `left:0;top:0;right:0;height:${tPct}%;`;
   $(`scB-${idx}`).style.cssText = `left:0;top:${tPct + hPct}%;right:0;bottom:0;`;
   $(`scL-${idx}`).style.cssText = `left:0;top:${tPct}%;width:${lPct}%;height:${hPct}%;`;
@@ -2576,16 +2597,20 @@ function syncCropOverlay(idx) {
   if (slider) slider.value = z.toFixed(2);
   const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
   const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
-  const outW = Math.round((x1 - x0) * srcW);
-  const outH = Math.round((y1 - y0) * srcH);
-  const isFull = x0 <= 0.001 && y0 <= 0.001 && x1 >= 0.999 && y1 >= 0.999;
-  $(`cropInfo-${idx}`).textContent = isFull
-    ? `Full frame · ${srcW}×${srcH} · Rotate ${rot}°`
-    : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · Rotate ${rot}°`;
+  const outW = Math.round((c[2] - c[0]) * srcW);
+  const outH = Math.round((c[3] - c[1]) * srcH);
+  const roiLabel = isFullRoi ? 'Motion Zone: follows crop' : 'Motion Zone: custom square';
+  $(`cropInfo-${idx}`).textContent = isFullCrop
+    ? `Full frame · ${srcW}×${srcH} · Rotate ${rot}° · ${roiLabel}`
+    : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · Rotate ${rot}° · ${roiLabel}`;
   const prevBtn = $(`prevBtn-${idx}`);
   if (prevBtn) prevBtn.classList.toggle('on', !!previewCropped[idx]);
   const rotBtn = $(`rotBtn-${idx}`);
   if (rotBtn) rotBtn.textContent = `Rotate ${rot}°`;
+  const mCrop = $(`modeCrop-${idx}`);
+  const mRoi = $(`modeRoi-${idx}`);
+  if (mCrop) mCrop.classList.toggle('on', mode === 'crop');
+  if (mRoi) mRoi.classList.toggle('on', mode === 'roi');
 }
 
 function wireCropDrag(idx) {
@@ -2595,19 +2620,22 @@ function wireCropDrag(idx) {
 
   layer.addEventListener('pointerdown', (e) => {
     const handleEl = e.target.closest('[data-handle]');
-    const boxEl = e.target.closest('.crop-box');
+    const boxEl = e.target.closest('.crop-box:not(.passive), .roi-box:not(.passive)');
     if (!handleEl && !boxEl) return;
     e.preventDefault();
     const rect = layer.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
+    const mode = editTarget[idx] || 'crop';
+    const key = mode === 'roi' ? 'roi' : 'crop';
     layer.setPointerCapture(e.pointerId);
     drag = {
       pid: e.pointerId,
+      dragKey: key,
       mode: handleEl ? handleEl.dataset.handle : 'move',
       sx: e.clientX,
       sy: e.clientY,
       rect,
-      orig: [...cfg.cameras[idx].crop],
+      orig: [...(cfg.cameras[idx][key] || [0, 0, 1, 1])],
     };
   });
 
@@ -2629,7 +2657,7 @@ function wireCropDrag(idx) {
       if (drag.mode.includes('n')) y0 = clamp(y0 + dy, 0, y1 - MIN_SPAN);
       if (drag.mode.includes('s')) y1 = clamp(y1 + dy, y0 + MIN_SPAN, 1);
 
-      const lock = aspectLock[idx];
+      const lock = drag.dragKey === 'crop' ? aspectLock[idx] : null;
       if (lock) {
         const rot = cfg.cameras[idx].rotate || 0;
         const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
@@ -2650,7 +2678,7 @@ function wireCropDrag(idx) {
         else x1 = clamp(x0 + nw, x0 + MIN_SPAN, 1);
       }
     }
-    cfg.cameras[idx].crop = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
+    cfg.cameras[idx][drag.dragKey] = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
     syncCropOverlay(idx);
   });
 
@@ -2679,6 +2707,14 @@ function renderCameras() {
           <div class="scrim" id="scL-${idx}"></div>
           <div class="scrim" id="scR-${idx}"></div>
           <div class="crop-box" id="box-${idx}">
+            <span class="box-tag">CROP</span>
+            <div class="handle nw" data-handle="nw"></div>
+            <div class="handle ne" data-handle="ne"></div>
+            <div class="handle sw" data-handle="sw"></div>
+            <div class="handle se" data-handle="se"></div>
+          </div>
+          <div class="roi-box" id="roiBox-${idx}" hidden>
+            <span class="box-tag">MOTION ZONE</span>
             <div class="handle nw" data-handle="nw"></div>
             <div class="handle ne" data-handle="ne"></div>
             <div class="handle sw" data-handle="sw"></div>
@@ -2693,6 +2729,12 @@ function renderCameras() {
       <div class="mbar-wrap">
         <div class="mbar-fill" id="mbar-${idx}"></div>
         <div class="mbar-th" id="mth-${idx}" style="left:${clamp((c.motionThreshold / 20) * 100, 2, 98)}%"></div>
+      </div>
+      <div class="ctrl-row">
+        <span style="font-size:12px;color:var(--mut)">Edit Box:</span>
+        <button class="btn sec sm on" type="button" data-emode="${idx}:crop" id="modeCrop-${idx}">Frame Crop (Blue)</button>
+        <button class="btn sec sm" type="button" data-emode="${idx}:roi" id="modeRoi-${idx}">Motion Zone (Green)</button>
+        <button class="btn sec sm" type="button" data-roireset="${idx}">Reset Zone</button>
       </div>
       <div class="ctrl-row">
         <span style="font-size:12px;color:var(--mut)">Zoom</span>
@@ -2763,6 +2805,38 @@ $('camGrid').addEventListener('click', (e) => {
     aspectLock[idx] = ratioStr === 'free' ? null : Number(ratioStr);
     b.parentElement.querySelectorAll('[data-asp]').forEach(x => x.classList.toggle('on', x === b));
     if (aspectLock[idx]) setZoomAroundCenter(idx, cropZoomFactor(cfg.cameras[idx].crop));
+    return;
+  }
+  if (b.dataset.emode !== undefined) {
+    const [iStr, mode] = b.dataset.emode.split(':');
+    const idx = Number(iStr);
+    editTarget[idx] = mode;
+    if (mode === 'roi') {
+      if (previewCropped[idx]) {
+        previewCropped[idx] = false;
+        $(`stream-${idx}`).src = streamUrlFor(idx);
+      }
+      const r = cfg.cameras[idx].roi || [0, 0, 1, 1];
+      const isFullRoi = r[0] <= 0.001 && r[1] <= 0.001 && r[2] >= 0.999 && r[3] >= 0.999;
+      if (isFullRoi) {
+        const c = cfg.cameras[idx].crop || [0, 0, 1, 1];
+        const isFullCrop = c[0] <= 0.001 && c[1] <= 0.001 && c[2] >= 0.999 && c[3] >= 0.999;
+        if (isFullCrop) {
+          cfg.cameras[idx].roi = [0.25, 0.2, 0.75, 0.8];
+        } else {
+          const mx = (c[2] - c[0]) * 0.08;
+          const my = (c[3] - c[1]) * 0.08;
+          cfg.cameras[idx].roi = [+(c[0] + mx).toFixed(4), +(c[1] + my).toFixed(4), +(c[2] - mx).toFixed(4), +(c[3] - my).toFixed(4)];
+        }
+      }
+    }
+    syncCropOverlay(idx);
+    return;
+  }
+  if (b.dataset.roireset !== undefined) {
+    const idx = Number(b.dataset.roireset);
+    cfg.cameras[idx].roi = [0, 0, 1, 1];
+    syncCropOverlay(idx);
     return;
   }
   if (b.dataset.save !== undefined) {
@@ -3342,17 +3416,24 @@ def create_app(service: ArmoryCamService) -> Flask:
         set_at_ms = int(body.get("setAtMs") or time.time() * 1000)
         prev_raw = body.get("prevSetAtMs")
         prev_ms = int(prev_raw) if prev_raw is not None else None
+        cam_raw = body.get("camera")
+        cam_override = str(cam_raw).strip() if cam_raw else None
 
         samples = service.session_samples(sid)
         min_thresh = min((c.motion_threshold for c in service.cameras), default=DEFAULT_MOTION_THRESHOLD)
-        bursts = cluster_motion_bursts(samples, threshold=min_thresh)
+        bursts = cluster_motion_bursts(
+            samples,
+            threshold=min_thresh,
+            camera=cam_override,
+            resolve_overlap=(cam_override is None),
+        )
         start_ms, end_ms, cam = select_pr_window(bursts, set_at_ms=set_at_ms, prev_set_at_ms=prev_ms)
         clip = service.cut_clip(
             session_id=sid,
             ex_name=f"{ex_name}_PR",
             start_ms=start_ms,
             end_ms=end_ms,
-            camera_override=cam,
+            camera_override=(cam_override or cam),
         )
         if not clip:
             return jsonify({"ok": False, "error": "No PR video segments found"}), 404
