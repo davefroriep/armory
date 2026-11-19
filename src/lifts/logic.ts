@@ -326,23 +326,34 @@ export function driveUrlFor(meta: Pick<VideoMeta, 'fileName' | 'uri' | 'driveQue
 }
 
 /** Smart station default inferred from exercise equipment and name (Dave's gym layout). */
-export function inferredCamForExercise(ex: Pick<Exercise, 'name' | 'equip'>): string | undefined {
-  if (ex.equip === 'smith' || /\bsmith\b/i.test(ex.name)) return 'Smith Cam';
-  if (
+export function inferredCamForExercise(
+  ex: Pick<Exercise, 'name' | 'equip'>,
+  availableCameras?: readonly string[],
+): string | undefined {
+  let raw: string | undefined;
+  if (ex.equip === 'machine' && /\b(?:fly|pec\s*deck)\b/i.test(ex.name)) raw = 'Fly Machine Cam';
+  else if (ex.equip === 'machine' && /\bleg\s*(?:ext(?:ension)?|curl)\b/i.test(ex.name)) raw = 'Leg Machine Cam';
+  else if (ex.equip === 'smith' || /\bsmith\b/i.test(ex.name)) raw = 'Smith Cam';
+  else if (
     ex.equip === 'cable'
     || /\b(?:cable|pulley|lat\s*pull|pull[\s-]*down|push[\s-]*down|face\s*pull)\b/i.test(ex.name)
     || (ex.equip !== 'db' && /\btriceps?\s*(?:pushdown|extension|pressdown)\b/i.test(ex.name))
   ) {
-    return 'Rack Cam';
-  }
-  if (
+    raw = 'Rack Cam';
+  } else if (
     ex.equip === 'bb'
     || /\b(?:pull[\s-]*up|chin[\s-]*up|dead\s*hang|hanging\s*(?:leg|knee)\s*raise|rack\s*pull)\b/i.test(ex.name)
     || (ex.equip !== 'db' && ex.equip !== 'machine' && /\b(?:squat|bench|deadlift)\b/i.test(ex.name))
   ) {
-    return 'Rack Cam';
+    raw = 'Rack Cam';
   }
-  return undefined;
+  if (!raw) return undefined;
+  if (availableCameras && availableCameras.length > 0) {
+    const match = availableCameras.find((c) => c.toLowerCase() === raw!.toLowerCase());
+    if (match) return match;
+    if (raw !== 'Rack Cam' && raw !== 'Smith Cam') return undefined;
+  }
+  return raw;
 }
 
 /** Resolved preferred camera for an exercise: session override > persisted ExRow > inferred smart default. */
@@ -350,10 +361,11 @@ export function preferredCamForExercise(
   ex: Pick<Exercise, 'name' | 'equip'>,
   row?: Pick<ExRow, 'camPref'> | null,
   sessionCamPref?: string,
+  availableCameras?: readonly string[],
 ): string | undefined {
   const sess = sessionCamPref?.trim();
   if (sess) return sess === 'auto' ? undefined : sess;
   const saved = row?.camPref?.trim();
   if (saved) return saved === 'auto' ? undefined : saved;
-  return inferredCamForExercise(ex);
+  return inferredCamForExercise(ex, availableCameras);
 }

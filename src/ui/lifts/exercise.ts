@@ -96,8 +96,8 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
           <section class="card">
             <div class="line"><span>Rest timer<small>For this exercise</small></span><button class="btn sm" data-act="rest">${clock(row?.restSec ?? liftSettings().restSec)}</button></div>
             <div class="line"><span>Preferred camera<small>Auto station for this exercise</small></span><button class="btn sm" data-act="cam">${(() => {
-              const res = preferredCamForExercise(ex, row);
-              const inf = inferredCamForExercise(ex);
+              const res = preferredCamForExercise(ex, row, undefined, gymCam.cameras);
+              const inf = inferredCamForExercise(ex, gymCam.cameras);
               if (!row?.camPref) return inf ? `${shortCamLabel(inf)} (default)` : 'Auto';
               return row.camPref === 'auto' ? 'Auto' : shortCamLabel(res || row.camPref);
             })()}</button></div>
@@ -129,7 +129,7 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
         const curEx = lifts.exercise(exId)!;
         const curRow = lifts.row(exId);
         const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-        const inf = inferredCamForExercise(curEx);
+        const inf = inferredCamForExercise(curEx, gymCam.cameras);
         const k = await actionSheet('Preferred camera', [
           { key: '__default__', label: inf ? `Default (${shortCamLabel(inf)})` : 'Default (Auto)', on: !curRow?.camPref },
           ...cams.map((c) => ({ key: c, label: shortCamLabel(c), sub: c, on: curRow?.camPref === c })),

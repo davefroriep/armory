@@ -466,17 +466,11 @@ def compute_motion_energy_from_frames(
     return min(100.0, best)
 
 
-def analyze_ts_segment(
-    seg_path: Path,
-    roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
-    exclusions: Sequence[Any] = (),
-    rotate: int = 0,
-    fallback_dur_ms: int = 2000,
-) -> tuple[int, float]:
-    """Read sampled frames from an MPEG-TS segment to get `(duration_ms, motion_energy)`."""
+def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000) -> tuple[int, list[np.ndarray]]:
+    """Read up to 4 sampled raw BGR frames and duration (ms) from an MPEG-TS segment in a single decode pass."""
     cap = cv2.VideoCapture(str(seg_path))
     if not cap.isOpened():
-        return fallback_dur_ms, 0.0
+        return fallback_dur_ms, []
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -490,21 +484,51 @@ def analyze_ts_segment(
                 cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                 ok, frm = cap.read()
                 if ok and frm is not None:
-                    frames.append(apply_frame_transform(frm, rotate=rotate, apply_crop=False))
-        else:
-            while len(frames) < 4:
-                ok, frm = cap.read()
-                if not ok or frm is None:
-                    break
-                frames.append(apply_frame_transform(frm, rotate=rotate, apply_crop=False))
+                    frames.append(frm)
+        if len(frames) < 2:
+            frames.clear()
+            cap.release()
+            cap = cv2.VideoCapture(str(seg_path))
+            if cap.isOpened():
+                if total >= 4:
+                    target_set = {0, total // 3, (2 * total) // 3, total - 1}
+                    for i in range(total):
+                        if not cap.grab():
+                            break
+                        if i in target_set:
+                            ok, frm = cap.retrieve()
+                            if ok and frm is not None:
+                                frames.append(frm)
+                else:
+                    while len(frames) < 4:
+                        ok, frm = cap.read()
+                        if not ok or frm is None:
+                            break
+                        frames.append(frm)
 
         dur_ms = int(round((total / fps) * 1000)) if total >= 2 else fallback_dur_ms
         if dur_ms < 400 or dur_ms > 20_000:
             dur_ms = fallback_dur_ms
-        score = compute_motion_energy_from_frames(frames, roi=roi, exclusions=exclusions)
-        return dur_ms, score
+        return dur_ms, frames
     finally:
         cap.release()
+
+
+def analyze_ts_segment(
+    seg_path: Path,
+    roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+    exclusions: Sequence[Any] = (),
+    rotate: int = 0,
+    fallback_dur_ms: int = 2000,
+) -> tuple[int, float]:
+    """Read sampled frames from an MPEG-TS segment to get `(duration_ms, motion_energy)`."""
+    dur_ms, raw_frames = extract_ts_sampled_frames(seg_path, fallback_dur_ms=fallback_dur_ms)
+    if not raw_frames:
+        return dur_ms, 0.0
+    rot = normalize_rotate(rotate)
+    frames = [apply_frame_transform(frm, rotate=rot, apply_crop=False) for frm in raw_frames]
+    score = compute_motion_energy_from_frames(frames, roi=roi, exclusions=exclusions)
+    return dur_ms, score
 
 
 def encode_thumb_data_url(frame: np.ndarray, max_w: int = 200, quality: int = 65) -> str:
@@ -696,6 +720,7 @@ class CameraConfig:
     exclusions: list[Quad] = field(default_factory=list)
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     rotate: int = 0
+    source_slug: str = ""
 
     def effective_roi(self) -> tuple[float, float, float, float]:
         if self.roi != (0.0, 0.0, 1.0, 1.0):
@@ -714,6 +739,7 @@ class CameraConfig:
             "exclusions": [[[pt[0], pt[1]] for pt in q] for q in self.exclusions],
             "crop": list(self.crop),
             "rotate": self.rotate,
+            "sourceSlug": self.source_slug,
         }
 
 
@@ -1369,6 +1395,118 @@ class ArmoryCamService:
         self.load_or_init_config()
         self._rehydrate_ring_index()
 
+    @staticmethod
+    def _build_camera_configs(
+        raw_items: list[dict[str, Any]],
+        prev_by_slug: dict[str, CameraConfig] | None = None,
+    ) -> list[CameraConfig]:
+        used_slugs: set[str] = set()
+        cams: list[CameraConfig] = []
+        for idx, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip() or f"Camera {idx + 1}"
+            base_slug = safe_slug(str(item.get("slug") or name).lower(), f"cam_{idx + 1}")
+            slug = base_slug
+            suffix = 2
+            while slug in used_slugs:
+                slug = f"{base_slug[:40]}_{suffix}"
+                suffix += 1
+            used_slugs.add(slug)
+
+            old = prev_by_slug.get(slug) if prev_by_slug else None
+            raw_src = str(
+                item["sourceSlug"] if "sourceSlug" in item else (old.source_slug if old else "")
+            ).strip()
+            src_slug = safe_slug(raw_src.lower(), "") if raw_src else ""
+            rtsp_url = str(item["rtspUrl"]).strip() if "rtspUrl" in item else (old.rtsp_url if old else "")
+            enabled = bool(item["enabled"]) if "enabled" in item else (old.enabled if old else True)
+            primary = bool(item["primary"]) if "primary" in item else (old.primary if old else True)
+            thresh = (
+                float(item["motionThreshold"])
+                if "motionThreshold" in item
+                else (old.motion_threshold if old else DEFAULT_MOTION_THRESHOLD)
+            )
+            roi = normalize_crop(item["roi"]) if "roi" in item else (old.roi if old else (0.0, 0.0, 1.0, 1.0))
+            exclusions = (
+                normalize_exclusions(item["exclusions"])
+                if "exclusions" in item
+                else (list(old.exclusions) if old else [])
+            )
+            crop = normalize_crop(item["crop"]) if "crop" in item else (old.crop if old else (0.0, 0.0, 1.0, 1.0))
+            rotate = normalize_rotate(item["rotate"]) if "rotate" in item else (old.rotate if old else 0)
+            cams.append(
+                CameraConfig(
+                    name=name,
+                    slug=slug,
+                    rtsp_url=rtsp_url,
+                    enabled=enabled,
+                    primary=primary,
+                    motion_threshold=thresh,
+                    roi=roi,
+                    exclusions=exclusions,
+                    crop=crop,
+                    rotate=rotate,
+                    source_slug=src_slug,
+                )
+            )
+
+        by_slug = {c.slug: c for c in cams}
+        for c in cams:
+            if not c.source_slug or c.source_slug == c.slug or c.source_slug not in by_slug:
+                c.source_slug = ""
+                continue
+            cur_slug = c.source_slug
+            seen = {c.slug}
+            for _ in range(3):
+                parent = by_slug.get(cur_slug)
+                if not parent or not parent.source_slug or parent.source_slug in seen or parent.source_slug not in by_slug:
+                    break
+                seen.add(cur_slug)
+                cur_slug = parent.source_slug
+            if cur_slug == c.slug or by_slug[cur_slug].source_slug:
+                c.source_slug = ""
+            else:
+                c.source_slug = cur_slug
+                c.rtsp_url = ""
+        return cams
+
+    def _source_slug_for(self, cam: CameraConfig) -> str:
+        if not cam.source_slug or cam.source_slug == cam.slug:
+            return cam.slug
+        by_slug = {c.slug: c for c in self.cameras}
+        cur = cam.source_slug
+        seen = {cam.slug}
+        for _ in range(3):
+            parent = by_slug.get(cur)
+            if not parent:
+                return cam.slug
+            if not parent.source_slug or parent.source_slug in seen:
+                return parent.slug
+            seen.add(cur)
+            cur = parent.source_slug
+        return cam.slug
+
+    def _is_virtual(self, cam: CameraConfig) -> bool:
+        return self._source_slug_for(cam) != cam.slug
+
+    def _source_camera(self, cam: CameraConfig) -> CameraConfig:
+        src_slug = self._source_slug_for(cam)
+        for c in self.cameras:
+            if c.slug == src_slug:
+                return c
+        return cam
+
+    def _views_for_source(self, source_slug: str, enabled_only: bool = True) -> list[CameraConfig]:
+        out: list[CameraConfig] = []
+        for c in self.cameras:
+            if self._source_slug_for(c) == source_slug and (not enabled_only or c.enabled):
+                out.append(c)
+        return out
+
+    def _physical_cameras(self) -> list[CameraConfig]:
+        return [c for c in self.cameras if not self._is_virtual(c)]
+
     def load_or_init_config(self) -> None:
         default_cams = [
             CameraConfig(name="Rack Cam", slug="rack_cam"),
@@ -1387,26 +1525,8 @@ class ArmoryCamService:
             if "driveBackupDir" in raw:
                 self.drive_backup_dir = str(raw.get("driveBackupDir") or "").strip()
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
-            loaded: list[CameraConfig] = []
-            for item in raw.get("cameras", []):
-                name = str(item.get("name", "")).strip()
-                if not name:
-                    continue
-                slug = safe_slug(str(item.get("slug") or name).lower(), "cam")
-                loaded.append(
-                    CameraConfig(
-                        name=name,
-                        slug=slug,
-                        rtsp_url=str(item.get("rtspUrl", "")).strip(),
-                        enabled=bool(item.get("enabled", True)),
-                        primary=bool(item.get("primary", True)),
-                        motion_threshold=float(item.get("motionThreshold", DEFAULT_MOTION_THRESHOLD)),
-                        roi=normalize_crop(item.get("roi")),
-                        exclusions=normalize_exclusions(item.get("exclusions")),
-                        crop=normalize_crop(item.get("crop")),
-                        rotate=normalize_rotate(item.get("rotate", 0)),
-                    )
-                )
+            raw_cams = [item for item in raw.get("cameras", []) if isinstance(item, dict) and str(item.get("name", "")).strip()]
+            loaded = self._build_camera_configs(raw_cams) if raw_cams else []
             self.cameras = loaded or default_cams
         except Exception as exc:
             self.log.warning("Failed parsing config.json (%s); using defaults", exc)
@@ -1477,43 +1597,29 @@ class ArmoryCamService:
                 merged = {**self.wallboard_cfg.to_dict(), **raw["wallboard"]}
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
             if isinstance(raw.get("cameras"), list):
-                next_cams: list[CameraConfig] = []
-                for idx, item in enumerate(raw["cameras"]):
-                    name = str(item.get("name", f"Camera {idx + 1}")).strip() or f"Camera {idx + 1}"
-                    slug = safe_slug(str(item.get("slug") or name).lower(), f"cam_{idx + 1}")
-                    old = prev_by_slug.get(slug)
-                    rtsp_url = str(item["rtspUrl"]).strip() if "rtspUrl" in item else (old.rtsp_url if old else "")
-                    enabled = bool(item["enabled"]) if "enabled" in item else (old.enabled if old else True)
-                    primary = bool(item["primary"]) if "primary" in item else (old.primary if old else True)
-                    thresh = float(item["motionThreshold"]) if "motionThreshold" in item else (old.motion_threshold if old else DEFAULT_MOTION_THRESHOLD)
-                    roi = normalize_crop(item["roi"]) if "roi" in item else (old.roi if old else (0.0, 0.0, 1.0, 1.0))
-                    exclusions = (
-                        normalize_exclusions(item["exclusions"])
-                        if "exclusions" in item
-                        else (list(old.exclusions) if old else [])
-                    )
-                    crop = normalize_crop(item["crop"]) if "crop" in item else (old.crop if old else (0.0, 0.0, 1.0, 1.0))
-                    rotate = normalize_rotate(item["rotate"]) if "rotate" in item else (old.rotate if old else 0)
-                    next_cams.append(
-                        CameraConfig(
-                            name=name,
-                            slug=slug,
-                            rtsp_url=rtsp_url,
-                            enabled=enabled,
-                            primary=primary,
-                            motion_threshold=thresh,
-                            roi=roi,
-                            exclusions=exclusions,
-                            crop=crop,
-                            rotate=rotate,
-                        )
-                    )
+                next_cams = self._build_camera_configs(raw["cameras"], prev_by_slug=prev_by_slug)
                 if next_cams:
                     self.cameras = next_cams
+            for cam in self.cameras:
+                media_slug = self._source_slug_for(cam)
+                if media_slug != cam.slug and not self.ring_segments.get(cam.slug):
+                    src_segs = self.ring_segments.get(media_slug, [])
+                    if src_segs:
+                        self.ring_segments[cam.slug] = [
+                            SegmentInfo(
+                                path=s.path,
+                                start_ms=s.start_ms,
+                                end_ms=s.end_ms,
+                                energy=0.0,
+                                camera=cam.name,
+                            )
+                            for s in src_segs
+                        ]
             self.save_config()
             for slug, old in prev_by_slug.items():
                 cur = next((c for c in self.cameras if c.slug == slug), None)
-                if not cur or not cur.enabled or cur.rtsp_url != old.rtsp_url:
+                has_enabled_views = bool(cur and not self._is_virtual(cur) and self._views_for_source(slug, enabled_only=True))
+                if not cur or self._is_virtual(cur) or not has_enabled_views or cur.rtsp_url != old.rtsp_url:
                     self.live_hub.stop_camera(slug)
             if self._started:
                 self._restart_capture_workers()
@@ -1521,8 +1627,9 @@ class ArmoryCamService:
                     threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True).start()
 
     def _rehydrate_ring_index(self) -> None:
-        for cam in self.cameras:
-            cdir = self.ring_root / cam.slug
+        phys_segs: dict[str, list[SegmentInfo]] = {}
+        for phys in self._physical_cameras():
+            cdir = self.ring_root / phys.slug
             cdir.mkdir(parents=True, exist_ok=True)
             segs: list[SegmentInfo] = []
             for p in sorted(cdir.glob("seg_*.ts")):
@@ -1530,8 +1637,15 @@ class ArmoryCamService:
                 if start_ms is None:
                     continue
                 self.seen_files.add(str(p))
-                segs.append(SegmentInfo(path=p, start_ms=start_ms, end_ms=start_ms + 2000, energy=0.0, camera=cam.name))
-            self.ring_segments[cam.slug] = segs
+                segs.append(SegmentInfo(path=p, start_ms=start_ms, end_ms=start_ms + 2000, energy=0.0, camera=phys.name))
+            phys_segs[phys.slug] = segs
+        for cam in self.cameras:
+            src_slug = self._source_slug_for(cam)
+            base_segs = phys_segs.get(src_slug, [])
+            self.ring_segments[cam.slug] = [
+                SegmentInfo(path=s.path, start_ms=s.start_ms, end_ms=s.end_ms, energy=0.0, camera=cam.name)
+                for s in base_segs
+            ]
 
     def start_background(self) -> None:
         with self.lock:
@@ -1570,14 +1684,18 @@ class ArmoryCamService:
                 pass
 
     def _restart_capture_workers(self) -> None:
+        phys_by_slug = {c.slug: c for c in self._physical_cameras()}
         for slug in list(self._procs.keys()):
-            cur = next((c for c in self.cameras if c.slug == slug), None)
-            if not cur or not cur.enabled or not cur.rtsp_url or self._proc_urls.get(slug) != cur.rtsp_url:
+            cur = phys_by_slug.get(slug)
+            has_views = bool(cur and self._views_for_source(slug, enabled_only=True))
+            if not cur or not has_views or not cur.rtsp_url or self._proc_urls.get(slug) != cur.rtsp_url:
                 self._stop_proc(slug)
         for cam in self.cameras:
-            (self.ring_root / cam.slug).mkdir(parents=True, exist_ok=True)
             self.ring_segments.setdefault(cam.slug, [])
-            if cam.enabled and cam.rtsp_url:
+        for cam in self._physical_cameras():
+            (self.ring_root / cam.slug).mkdir(parents=True, exist_ok=True)
+            has_views = bool(self._views_for_source(cam.slug, enabled_only=True))
+            if has_views and cam.rtsp_url:
                 existing = self._procs.get(cam.slug)
                 if existing and existing.poll() is None and self._proc_urls.get(cam.slug) == cam.rtsp_url:
                     continue
@@ -1602,7 +1720,8 @@ class ArmoryCamService:
         while not self._stop_event.is_set():
             with self.lock:
                 cur = next((c for c in self.cameras if c.slug == cam.slug), None)
-                if not cur or not cur.enabled or cur.rtsp_url != cam.rtsp_url or not self._started:
+                has_views = bool(cur and not self._is_virtual(cur) and self._views_for_source(cam.slug, enabled_only=True))
+                if not cur or not has_views or cur.rtsp_url != cam.rtsp_url or not self._started:
                     return
             # Single RTSP connection outputting both 2s MPEG-TS ring segments AND 10fps MJPEG preview frames.
             cmd = [
@@ -1735,9 +1854,9 @@ class ArmoryCamService:
         while not self._stop_event.is_set():
             now = time.time()
             with self.lock:
-                cams = list(self.cameras)
+                phys_cams = self._physical_cameras()
                 wb_cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
-            for cam in cams:
+            for cam in phys_cams:
                 self._ingest_closed_segments(cam, now)
             with self.wallboard.cond:
                 last_active_ms = self.wallboard.last_active_push_ms
@@ -1766,30 +1885,64 @@ class ArmoryCamService:
             start_ms = parse_segment_start_ms(p.name)
             if start_ms is None:
                 start_ms = int(st.st_mtime * 1000) - 2000
-            dur_ms, energy = analyze_ts_segment(p, roi=cam.effective_roi(), exclusions=cam.exclusions, rotate=cam.rotate)
-            try:
-                self._get_or_create_seg_thumb(cam, p, max_w=DEFAULT_SCRUB_THUMB_W)
-            except Exception:
-                pass
-            info = SegmentInfo(
-                path=p,
-                start_ms=start_ms,
-                end_ms=start_ms + dur_ms,
-                energy=energy,
-                camera=cam.name,
-            )
+            with self.lock:
+                views = self._views_for_source(cam.slug, enabled_only=True)
+            if not views:
+                with self.lock:
+                    self.seen_files.add(key)
+                continue
+
+            dur_ms, raw_frames = extract_ts_sampled_frames(p)
+            rot_cache: dict[int, list[np.ndarray]] = {}
+            first_raw = raw_frames[0] if raw_frames else None
+            view_results: list[tuple[CameraConfig, SegmentInfo]] = []
+            for v in views:
+                rot = normalize_rotate(v.rotate)
+                if rot not in rot_cache:
+                    rot_cache[rot] = (
+                        [apply_frame_transform(frm, rotate=rot, apply_crop=False) for frm in raw_frames]
+                        if rot != 0
+                        else raw_frames
+                    )
+                energy = (
+                    compute_motion_energy_from_frames(
+                        rot_cache[rot], roi=v.effective_roi(), exclusions=v.exclusions
+                    )
+                    if rot_cache[rot]
+                    else 0.0
+                )
+                try:
+                    self._get_or_create_seg_thumb(
+                        v,
+                        p,
+                        max_w=DEFAULT_SCRUB_THUMB_W,
+                        predecoded_frame=first_raw,
+                    )
+                except Exception:
+                    pass
+                info = SegmentInfo(
+                    path=p,
+                    start_ms=start_ms,
+                    end_ms=start_ms + dur_ms,
+                    energy=energy,
+                    camera=v.name,
+                )
+                view_results.append((v, info))
+
             with self.lock:
                 self.seen_files.add(key)
-                self.latest_energy[cam.slug] = energy
-                bucket = self.ring_segments.setdefault(cam.slug, [])
-                bucket.append(info)
-                if len(bucket) > 600:
-                    del bucket[:-600]
-                if self.recording and not self.paused and self.active_session_id:
-                    self._copy_segment_to_session(self.active_session_id, cam, info)
+                for v, info in view_results:
+                    self.latest_energy[v.slug] = info.energy
+                    bucket = self.ring_segments.setdefault(v.slug, [])
+                    bucket.append(info)
+                    if len(bucket) > 600:
+                        del bucket[:-600]
+                    if self.recording and not self.paused and self.active_session_id:
+                        self._copy_segment_to_session(self.active_session_id, v, info)
 
     def _copy_segment_to_session(self, session_id: str, cam: CameraConfig, info: SegmentInfo) -> None:
-        sdir = self.tapes_root / safe_slug(session_id, "session") / cam.slug
+        media_slug = self._source_slug_for(cam)
+        sdir = self.tapes_root / safe_slug(session_id, "session") / media_slug
         sdir.mkdir(parents=True, exist_ok=True)
         dst = sdir / info.path.name
         if not dst.exists() and info.path.exists():
@@ -1815,8 +1968,8 @@ class ArmoryCamService:
     def _prune_storage(self, now_s: float) -> None:
         ring_cutoff = now_s - max(RING_KEEP_MIN_SEC, self.pre_roll_sec * 2)
         with self.lock:
-            cams = list(self.cameras)
-        for cam in cams:
+            phys_cams = self._physical_cameras()
+        for cam in phys_cams:
             cdir = self.ring_root / cam.slug
             if not cdir.exists():
                 continue
@@ -1971,6 +2124,7 @@ class ArmoryCamService:
     def find_segments(self, camera_name: str, session_id: str, start_ms: int, end_ms: int) -> list[SegmentInfo]:
         cam = self._find_camera(camera_name)
         slug = cam.slug if cam else safe_slug(camera_name.lower(), "rack_cam")
+        media_slug = self._source_slug_for(cam) if cam else slug
         canon_name = cam.name if cam else camera_name
         clean_id = safe_slug(session_id, "session") if session_id else ""
 
@@ -1991,19 +2145,34 @@ class ArmoryCamService:
                     except Exception:
                         continue
 
-            tape_cam_dir = self.tapes_root / clean_id / slug
-            if tape_cam_dir.exists():
-                for p in sorted(tape_cam_dir.glob("seg_*.ts")):
-                    m = motion_map.get(p.name)
-                    s_ms = m[0] if m else (parse_segment_start_ms(p.name) or 0)
-                    e_ms = m[1] if m else (s_ms + 2000)
-                    eng = m[2] if m else 0.0
-                    by_name[p.name] = SegmentInfo(path=p, start_ms=s_ms, end_ms=e_ms, energy=eng, camera=canon_name)
+            tape_dirs = [self.tapes_root / clean_id / media_slug]
+            if slug != media_slug:
+                tape_dirs.append(self.tapes_root / clean_id / slug)
+            for tape_cam_dir in tape_dirs:
+                if tape_cam_dir.exists():
+                    for p in sorted(tape_cam_dir.glob("seg_*.ts")):
+                        if p.name in by_name:
+                            continue
+                        m = motion_map.get(p.name)
+                        s_ms = m[0] if m else (parse_segment_start_ms(p.name) or 0)
+                        e_ms = m[1] if m else (s_ms + 2000)
+                        eng = m[2] if m else 0.0
+                        by_name[p.name] = SegmentInfo(path=p, start_ms=s_ms, end_ms=e_ms, energy=eng, camera=canon_name)
 
         with self.lock:
             for info in self.ring_segments.get(slug, []):
                 if info.path.exists() and info.path.name not in by_name:
                     by_name[info.path.name] = info
+            if media_slug != slug:
+                for info in self.ring_segments.get(media_slug, []):
+                    if info.path.exists() and info.path.name not in by_name:
+                        by_name[info.path.name] = SegmentInfo(
+                            path=info.path,
+                            start_ms=info.start_ms,
+                            end_ms=info.end_ms,
+                            energy=0.0,
+                            camera=canon_name,
+                        )
 
         ordered = sorted(by_name.values(), key=lambda s: s.start_ms)
         return [s for s in ordered if s.end_ms >= start_ms - 2500 and s.start_ms <= end_ms + 2500]
@@ -2033,32 +2202,48 @@ class ArmoryCamService:
     def _list_camera_segments(self, camera_name: str, session_id: str) -> list[SegmentInfo]:
         cam = self._find_camera(camera_name)
         slug = cam.slug if cam else safe_slug(camera_name.lower(), "rack_cam")
+        media_slug = self._source_slug_for(cam) if cam else slug
         canon_name = cam.name if cam else camera_name
         clean_id = safe_slug(session_id, "session") if session_id else ""
         by_name: dict[str, SegmentInfo] = {}
 
         if clean_id:
-            tape_cam_dir = self.tapes_root / clean_id / slug
-            if tape_cam_dir.exists():
-                for p in sorted(tape_cam_dir.glob("seg_*.ts")):
-                    s_ms = parse_segment_start_ms(p.name)
-                    if s_ms is None:
-                        try:
-                            s_ms = int(p.stat().st_mtime * 1000) - 2000
-                        except OSError:
+            tape_dirs = [self.tapes_root / clean_id / media_slug]
+            if slug != media_slug:
+                tape_dirs.append(self.tapes_root / clean_id / slug)
+            for tape_cam_dir in tape_dirs:
+                if tape_cam_dir.exists():
+                    for p in sorted(tape_cam_dir.glob("seg_*.ts")):
+                        if p.name in by_name:
                             continue
-                    by_name[p.name] = SegmentInfo(
-                        path=p,
-                        start_ms=s_ms,
-                        end_ms=s_ms + 2000,
-                        energy=0.0,
-                        camera=canon_name,
-                    )
+                        s_ms = parse_segment_start_ms(p.name)
+                        if s_ms is None:
+                            try:
+                                s_ms = int(p.stat().st_mtime * 1000) - 2000
+                            except OSError:
+                                continue
+                        by_name[p.name] = SegmentInfo(
+                            path=p,
+                            start_ms=s_ms,
+                            end_ms=s_ms + 2000,
+                            energy=0.0,
+                            camera=canon_name,
+                        )
 
         with self.lock:
             for info in self.ring_segments.get(slug, []):
                 if info.path.exists() and info.path.name not in by_name:
                     by_name[info.path.name] = info
+            if media_slug != slug:
+                for info in self.ring_segments.get(media_slug, []):
+                    if info.path.exists() and info.path.name not in by_name:
+                        by_name[info.path.name] = SegmentInfo(
+                            path=info.path,
+                            start_ms=info.start_ms,
+                            end_ms=info.end_ms,
+                            energy=0.0,
+                            camera=canon_name,
+                        )
 
         return sorted(by_name.values(), key=lambda s: s.start_ms)
 
@@ -2137,31 +2322,33 @@ class ArmoryCamService:
         cam: CameraConfig | None,
         max_w: int = DEFAULT_SCRUB_THUMB_W,
         quality: int = DEFAULT_SCRUB_THUMB_Q,
+        predecoded_frame: np.ndarray | None = None,
     ) -> bytes | None:
-        cap = cv2.VideoCapture(str(seg_path))
-        if not cap.isOpened():
-            return None
-        try:
-            # Read sequentially from the opening IDR keyframe (never call POS_MSEC/POS_FRAMES on MPEG-TS).
-            frm = None
-            for _ in range(5):
-                ok0, f0 = cap.read()
-                if ok0 and f0 is not None:
-                    frm = f0
-                    break
-            if frm is None:
+        frm = predecoded_frame
+        if frm is None:
+            cap = cv2.VideoCapture(str(seg_path))
+            if not cap.isOpened():
                 return None
-            if cam:
-                frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
-            h, w = frm.shape[:2]
-            tw = max(180, min(720, int(max_w)))
-            if w > tw:
-                th = max(1, int(round(h * (tw / max(1, w)))))
-                frm = cv2.resize(frm, (tw, th), interpolation=cv2.INTER_AREA)
-            ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-            return buf.tobytes() if ok_jpg else None
-        finally:
-            cap.release()
+            try:
+                # Read sequentially from the opening IDR keyframe (never call POS_MSEC/POS_FRAMES on MPEG-TS).
+                for _ in range(5):
+                    ok0, f0 = cap.read()
+                    if ok0 and f0 is not None:
+                        frm = f0
+                        break
+            finally:
+                cap.release()
+        if frm is None:
+            return None
+        if cam:
+            frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
+        h, w = frm.shape[:2]
+        tw = max(180, min(720, int(max_w)))
+        if w > tw:
+            th = max(1, int(round(h * (tw / max(1, w)))))
+            frm = cv2.resize(frm, (tw, th), interpolation=cv2.INTER_AREA)
+        ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        return buf.tobytes() if ok_jpg else None
 
     def _put_mem_thumb(self, mem_key: str, jpg: bytes) -> None:
         with self._thumb_lock:
@@ -2176,10 +2363,13 @@ class ArmoryCamService:
         seg_path: Path,
         max_w: int = DEFAULT_SCRUB_THUMB_W,
         quality: int = DEFAULT_SCRUB_THUMB_Q,
+        predecoded_frame: np.ndarray | None = None,
     ) -> bytes | None:
         tw = max(180, min(720, int(max_w)))
         if cam is None or tw != DEFAULT_SCRUB_THUMB_W:
-            return self._render_segment_thumb_jpeg(seg_path, cam, max_w=tw, quality=quality)
+            return self._render_segment_thumb_jpeg(
+                seg_path, cam, max_w=tw, quality=quality, predecoded_frame=predecoded_frame
+            )
         ck = self._crop_cache_key(cam)
         mem_key = f"{cam.slug}/{ck}/{seg_path.stem}"
         with self._thumb_lock:
@@ -2196,7 +2386,13 @@ class ArmoryCamService:
                 return jpg
         except OSError:
             pass
-        jpg = self._render_segment_thumb_jpeg(seg_path, cam, max_w=DEFAULT_SCRUB_THUMB_W, quality=quality)
+        jpg = self._render_segment_thumb_jpeg(
+            seg_path,
+            cam,
+            max_w=DEFAULT_SCRUB_THUMB_W,
+            quality=quality,
+            predecoded_frame=predecoded_frame,
+        )
         if not jpg:
             return None
         self._put_mem_thumb(mem_key, jpg)
@@ -2362,6 +2558,13 @@ class ArmoryCamService:
     ) -> list[dict[str, Any]]:
         samples = self.session_samples(session_id)
         cam_cfg = self._find_camera(camera) if camera and camera.strip() else None
+        if cam_cfg is None:
+            with self.lock:
+                primary_cams = {c.name for c in self.cameras if c.enabled and c.primary}
+            if primary_cams:
+                prim_samples = [s for s in samples if s.get("camera") in primary_cams]
+                if prim_samples:
+                    samples = prim_samples
         thresh = (
             cam_cfg.motion_threshold
             if cam_cfg
@@ -2404,10 +2607,12 @@ class ArmoryCamService:
         cam = self._find_camera(camera_name)
         if not cam:
             return None
+        media_slug = self._source_slug_for(cam)
+        src_cam = self._source_camera(cam)
 
         if hires:
             with self.lock:
-                segs = list(self.ring_segments.get(cam.slug, []))
+                segs = list(self.ring_segments.get(cam.slug) or self.ring_segments.get(media_slug, []))
             for seg in reversed(segs[-4:]):
                 if seg.path.exists():
                     cap = cv2.VideoCapture(str(seg.path))
@@ -2426,7 +2631,7 @@ class ArmoryCamService:
                             if ok_jpg:
                                 return buf.tobytes()
 
-        live_jpg = self.live_hub.recent_frame(cam.slug, max_age_sec=2.0)
+        live_jpg = self.live_hub.recent_frame(media_slug, max_age_sec=2.0)
         if live_jpg:
             if not raw and (cam.rotate != 0 or cam.crop != (0.0, 0.0, 1.0, 1.0)):
                 img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
@@ -2445,7 +2650,7 @@ class ArmoryCamService:
             return live_jpg
 
         with self.lock:
-            segs = list(self.ring_segments.get(cam.slug, []))
+            segs = list(self.ring_segments.get(cam.slug) or self.ring_segments.get(media_slug, []))
         for seg in reversed(segs[-4:]):
             if seg.path.exists():
                 cap = cv2.VideoCapture(str(seg.path))
@@ -2458,7 +2663,7 @@ class ArmoryCamService:
                         if ok_jpg:
                             return buf.tobytes()
 
-        if cam.enabled and cam.rtsp_url:
+        if cam.enabled and src_cam.rtsp_url:
             cmd = [
                 self.ffmpeg,
                 "-hide_banner",
@@ -2467,7 +2672,7 @@ class ArmoryCamService:
                 "-rtsp_transport",
                 "tcp",
                 "-i",
-                cam.rtsp_url,
+                src_cam.rtsp_url,
                 "-frames:v",
                 "1",
                 "-f",
@@ -2950,11 +3155,15 @@ class ArmoryCamService:
                 {
                     "name": c.name,
                     "slug": c.slug,
+                    "sourceSlug": c.source_slug,
+                    "primary": c.primary,
                     "enabled": c.enabled,
-                    "connected": bool(self.cam_connected.get(c.slug, False)),
+                    "connected": bool(self.cam_connected.get(self._source_slug_for(c), False)),
                     "latestEnergy": float(self.latest_energy.get(c.slug, 0.0)),
                     "motionThreshold": c.motion_threshold,
-                    "ringSegments": len(self.ring_segments.get(c.slug, [])),
+                    "ringSegments": len(
+                        self.ring_segments.get(c.slug) or self.ring_segments.get(self._source_slug_for(c), [])
+                    ),
                 }
                 for c in self.cameras
             ]
@@ -2996,12 +3205,16 @@ DASHBOARD_HTML = """<!doctype html>
   .pill{font-size:11px;padding:3px 10px;border-radius:999px;background:#1d2836;color:var(--mut);font-weight:800;letter-spacing:.04em}
   .pill.ok{background:rgba(34,197,94,.18);color:#86efac}
   .pill.live{background:rgba(30,155,255,.18);color:#7cc4ff}
+  .pill.virt{background:rgba(245,158,11,.18);color:#fcd34d}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin-top:14px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
-  .card h2{margin:0 0 10px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .card h2{margin:0 0 10px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+  .cam-head-l{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}
+  .cam-head-r{display:flex;align-items:center;gap:6px;flex-shrink:0}
+  .cam-name-inp{width:170px;max-width:100%;padding:4px 8px!important;font-weight:800!important;font-size:14px!important;border-radius:8px!important}
   .stage{position:relative;width:100%;aspect-ratio:16/9;background:#06090d;border-radius:10px;border:1px solid var(--line);overflow:hidden;user-select:none;touch-action:none}
   .stage.rot90,.stage.rot270{width:auto;height:480px;max-width:100%;aspect-ratio:9/16;margin:0 auto}
-  .stage img.stream{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
+  .stage img.stream,.stage canvas.stream{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
   .crop-layer{position:absolute;inset:0;pointer-events:auto}
   .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none}
   .crop-box{position:absolute;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
@@ -3191,7 +3404,8 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
   <div id="mmViewport" class="mm-viewport">
     <div id="mmCanvas" class="mm-canvas">
-      <img id="mmStream" class="mm-img" alt="Zoomed mirror mask view">
+      <canvas id="mmLiveCanvas" class="mm-img"></canvas>
+      <img id="mmStream" class="mm-img" alt="Zoomed mirror mask view" hidden>
       <div id="mmCropRef" class="mm-crop-ref"></div>
       <svg id="mmSvg" class="excl-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
       <div id="mmDots"></div>
@@ -3199,6 +3413,7 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 </div>
 
+<div id="rawFeeds" hidden></div>
 <div id="toast" role="status" aria-live="polite"></div>
 
 <script>
@@ -3224,11 +3439,123 @@ const mmState = {
 };
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const MIN_SPAN = 0.15;
 const MAX_EXCLUSIONS = 6;
 const MM_MIN_ZOOM = 1;
 const MM_MAX_ZOOM = 8;
 const MM_PAN_MARGIN = 56;
+const rawFeedUrls = {};
+
+function makeUniqueSlug(rawName) {
+  const base = (String(rawName || 'view').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '_').replace(/^[._-]+|[._-]+$/g, '')).slice(0, 40) || 'view';
+  const taken = new Set((cfg?.cameras || []).map(c => c.slug));
+  if (!taken.has(base)) return base;
+  let k = 2;
+  while (taken.has(`${base}_${k}`)) k += 1;
+  return `${base}_${k}`;
+}
+
+function sourceSlugOf(cam) {
+  return (cam && cam.sourceSlug) ? cam.sourceSlug : (cam ? cam.slug : '');
+}
+
+function syncRawFeeds() {
+  const box = $('rawFeeds');
+  if (!box || !cfg) return;
+  const activePhys = new Map();
+  for (const c of cfg.cameras) {
+    if (!c.sourceSlug && c.rtspUrl) {
+      const hasEnabledView = cfg.cameras.some(v => sourceSlugOf(v) === c.slug && v.enabled);
+      if (hasEnabledView) activePhys.set(c.slug, c);
+    }
+  }
+  Array.from(box.children).forEach(el => {
+    const slug = el.dataset.rawSlug;
+    const phys = activePhys.get(slug);
+    if (!phys || rawFeedUrls[slug] !== phys.rtspUrl) {
+      el.removeAttribute('src');
+      el.remove();
+      delete rawFeedUrls[slug];
+    }
+  });
+  for (const [slug, phys] of activePhys.entries()) {
+    if ($(`rawFeed-${slug}`)) continue;
+    const img = document.createElement('img');
+    img.id = `rawFeed-${slug}`;
+    img.dataset.rawSlug = slug;
+    rawFeedUrls[slug] = phys.rtspUrl;
+    const setSrc = () => {
+      img.src = `/api/stream?camera=${encodeURIComponent(phys.name)}&raw=1&t=${Date.now()}`;
+    };
+    img.onerror = () => setTimeout(() => {
+      if (img.isConnected && rawFeedUrls[slug]) setSrc();
+    }, 2500);
+    setSrc();
+    box.appendChild(img);
+  }
+}
+
+function drawFeedToCanvas(canvas, rawImg, rot, crop, applyCrop) {
+  if (!canvas || !rawImg || !rawImg.complete || rawImg.naturalWidth <= 0 || rawImg.naturalHeight <= 0) return;
+  const sw = rawImg.naturalWidth;
+  const sh = rawImg.naturalHeight;
+  const r = ((rot % 360) + 360) % 360;
+  const rw = (r === 90 || r === 270) ? sh : sw;
+  const rh = (r === 90 || r === 270) ? sw : sh;
+  let sx = 0, sy = 0, cw = rw, ch = rh;
+  if (applyCrop && Array.isArray(crop) && crop.length === 4) {
+    sx = clamp(crop[0], 0, 0.95) * rw;
+    sy = clamp(crop[1], 0, 0.95) * rh;
+    cw = Math.max(2, (clamp(crop[2], 0.05, 1) - clamp(crop[0], 0, 0.95)) * rw);
+    ch = Math.max(2, (clamp(crop[3], 0.05, 1) - clamp(crop[1], 0, 0.95)) * rh);
+  }
+  const tw = Math.max(2, Math.round(cw));
+  const th = Math.max(2, Math.round(ch));
+  if (canvas.width !== tw) canvas.width = tw;
+  if (canvas.height !== th) canvas.height = th;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.save();
+  ctx.clearRect(0, 0, tw, th);
+  ctx.translate(-sx, -sy);
+  if (r === 90) {
+    ctx.translate(rw, 0);
+    ctx.rotate(Math.PI / 2);
+  } else if (r === 180) {
+    ctx.translate(rw, rh);
+    ctx.rotate(Math.PI);
+  } else if (r === 270) {
+    ctx.translate(0, rh);
+    ctx.rotate(-Math.PI / 2);
+  }
+  ctx.drawImage(rawImg, 0, 0, sw, sh);
+  ctx.restore();
+}
+
+function drawAllCanvases() {
+  if (!cfg || !cfg.cameras) return;
+  cfg.cameras.forEach((c, idx) => {
+    const rawImg = $(`rawFeed-${sourceSlugOf(c)}`);
+    const canvas = $(`stream-${idx}`);
+    if (canvas && rawImg) {
+      drawFeedToCanvas(canvas, rawImg, c.rotate || 0, c.crop, !!previewCropped[idx]);
+    }
+  });
+  if (mmState.open && !mmState.hires) {
+    const cam = cfg.cameras[mmState.camIdx];
+    const rawImg = cam ? $(`rawFeed-${sourceSlugOf(cam)}`) : null;
+    const mmCanvas = $('mmLiveCanvas');
+    if (cam && rawImg && mmCanvas) {
+      if (mmState.pendingFit && rawImg.naturalWidth > 0) {
+        mmState.pendingFit = false;
+        if ((cam.exclusions || []).length) fitMaskInModal();
+        else fitCropInModal();
+      }
+      drawFeedToCanvas(mmCanvas, rawImg, cam.rotate || 0, [0, 0, 1, 1], false);
+    }
+  }
+}
 
 function normQuad(item) {
   if (!Array.isArray(item) || item.length !== 4) return null;
@@ -3562,11 +3889,17 @@ function modalBaseMetrics() {
   const img = $('mmStream');
   const cam = cfg?.cameras?.[mmState.camIdx];
   const rot = cam ? (cam.rotate || 0) : 0;
+  const rawImg = cam ? $(`rawFeed-${sourceSlugOf(cam)}`) : null;
   const vw = Math.max(120, vp ? vp.clientWidth : 800);
   const vh = Math.max(120, vp ? vp.clientHeight : 500);
-  const ratio = (img && img.naturalWidth > 0 && img.naturalHeight > 0)
-    ? (img.naturalWidth / img.naturalHeight)
-    : ((rot === 90 || rot === 270) ? (9 / 16) : (16 / 9));
+  let ratio = (rot === 90 || rot === 270) ? (9 / 16) : (16 / 9);
+  if (mmState.hires && img && img.naturalWidth > 0 && img.naturalHeight > 0) {
+    ratio = img.naturalWidth / img.naturalHeight;
+  } else if (!mmState.hires && rawImg && rawImg.naturalWidth > 0 && rawImg.naturalHeight > 0) {
+    ratio = (rot === 90 || rot === 270)
+      ? (rawImg.naturalHeight / rawImg.naturalWidth)
+      : (rawImg.naturalWidth / rawImg.naturalHeight);
+  }
   const maxW = Math.max(100, vw - 24);
   const maxH = Math.max(100, vh - 24);
   let baseW, baseH;
@@ -3660,11 +3993,17 @@ function modalVisibleNormBox() {
 function updateModalMediaSrc() {
   const cam = cfg?.cameras?.[mmState.camIdx];
   const img = $('mmStream');
-  if (!cam || !img) return;
+  const liveCvs = $('mmLiveCanvas');
+  if (!cam || !img || !liveCvs) return;
   if (mmState.hires) {
+    liveCvs.hidden = true;
+    img.hidden = false;
     img.src = `/api/snapshot?camera=${encodeURIComponent(cam.name)}&raw=1&hires=1&t=${Date.now()}`;
   } else {
-    img.src = `/api/stream?camera=${encodeURIComponent(cam.name)}&cropped=0&t=${Date.now()}`;
+    img.hidden = true;
+    img.removeAttribute('src');
+    liveCvs.hidden = false;
+    drawAllCanvases();
   }
   const hBtn = $('mmHiresBtn');
   const rBtn = $('mmRefreshBtn');
@@ -3747,7 +4086,6 @@ function openMaskModal(idx, focusMaskIdx = 0) {
   if (!cfg || !cfg.cameras[idx]) return;
   if (previewCropped[idx]) {
     previewCropped[idx] = false;
-    $(`stream-${idx}`).src = streamUrlFor(idx);
   }
   editTarget[idx] = 'excl';
   syncCropOverlay(idx);
@@ -3764,6 +4102,7 @@ function openMaskModal(idx, focusMaskIdx = 0) {
   updateModalMediaSrc();
   if ((cfg.cameras[idx].exclusions || []).length) fitMaskInModal();
   else fitCropInModal();
+  drawAllCanvases();
 }
 
 function closeMaskModal() {
@@ -3788,6 +4127,8 @@ function wireMaskModal() {
       mmState.pendingFit = false;
       if ((cfg.cameras[mmState.camIdx]?.exclusions || []).length) fitMaskInModal();
       else fitCropInModal();
+    } else if (mmState.hires) {
+      renderMaskModal();
     }
   });
 
@@ -4011,20 +4352,37 @@ function wireMaskModal() {
   });
 }
 
-function streamUrlFor(idx) {
-  const c = cfg.cameras[idx];
-  return `/api/stream?camera=${encodeURIComponent(c.name)}&cropped=${previewCropped[idx] ? '1' : '0'}&t=${Date.now()}`;
-}
-
 function renderCameras() {
-  $('camGrid').innerHTML = cfg.cameras.map((c, idx) => `
+  const physList = cfg.cameras.filter(x => !x.sourceSlug);
+  const physBySlug = new Map(physList.map(x => [x.slug, x]));
+
+  $('camGrid').innerHTML = cfg.cameras.map((c, idx) => {
+    const isVirt = !!c.sourceSlug;
+    const parent = isVirt ? physBySlug.get(c.sourceSlug) : null;
+    const headLeft = isVirt
+      ? `<input type="text" class="cam-name-inp" id="name-${idx}" value="${esc(c.name)}" aria-label="View name">` +
+        `<span class="pill virt">VIRTUAL · from ${esc(parent ? parent.name : c.sourceSlug)}</span>`
+      : `<span>${esc(c.name)}</span>`;
+    const headRight = isVirt
+      ? `<span class="pill live" id="camState-${idx}">CONNECTING</span>` +
+        `<button class="btn red sm" type="button" data-delview="${idx}" title="Remove virtual view">Remove</button>`
+      : `<button class="btn sec sm" type="button" data-addview="${idx}" title="Add another crop/mask view from this camera">+ Add View</button>` +
+        `<span class="pill live" id="camState-${idx}">CONNECTING</span>`;
+    const srcSelect = isVirt ? `
+      <label>Source Camera</label>
+      <select id="src-${idx}">
+        ${physList.map(p => `<option value="${esc(p.slug)}"${p.slug === c.sourceSlug ? ' selected' : ''}>${esc(p.name)} (Shared Feed · No Extra RTSP)</option>`).join('')}
+        <option value="">Own RTSP Camera (Physical)</option>
+      </select>` : '';
+
+    return `
     <div class="card">
       <h2>
-        <span>${c.name}</span>
-        <span class="pill live" id="camState-${idx}">CONNECTING</span>
+        <div class="cam-head-l">${headLeft}</div>
+        <div class="cam-head-r">${headRight}</div>
       </h2>
       <div class="stage" id="stage-${idx}">
-        <img class="stream" id="stream-${idx}" src="${streamUrlFor(idx)}" alt="${c.name} live video">
+        <canvas class="stream" id="stream-${idx}"></canvas>
         <div class="crop-layer" id="layer-${idx}">
           <div class="scrim" id="scT-${idx}"></div>
           <div class="scrim" id="scB-${idx}"></div>
@@ -4073,21 +4431,29 @@ function renderCameras() {
         <button class="btn sec sm" type="button" data-asp="${idx}:0.5625">9:16</button>
         <button class="btn ok sm" type="button" data-save="${idx}" style="margin-left:auto">Save</button>
       </div>
-      <label>RTSP URL</label>
-      <input type="text" id="rtsp-${idx}" value="${c.rtspUrl || ''}" placeholder="rtsp://thingino:thingino@192.168.1.xxx:554/ch0">
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      ${srcSelect}
+      <div id="rtspRow-${idx}"${isVirt ? ' hidden' : ''}>
+        <label>RTSP URL</label>
+        <input type="text" id="rtsp-${idx}" value="${esc(c.rtspUrl || '')}" placeholder="rtsp://thingino:thingino@192.168.1.xxx:554/ch0">
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">
         <div><label>Motion Threshold</label><input type="number" step="0.2" id="thresh-${idx}" value="${c.motionThreshold}"></div>
+        <div>
+          <label>Role</label>
+          <select id="prim-${idx}">
+            <option value="1"${c.primary !== false ? ' selected' : ''}>Primary (Auto + Pick)</option>
+            <option value="0"${c.primary === false ? ' selected' : ''}>Secondary / Pinned</option>
+          </select>
+        </div>
         <div><label>Enabled</label><select id="en-${idx}"><option value="1"${c.enabled?' selected':''}>Yes</option><option value="0"${!c.enabled?' selected':''}>No</option></select></div>
       </div>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 
   cfg.cameras.forEach((c, idx) => {
     syncCropOverlay(idx);
     wireCropDrag(idx);
     $(`zoom-${idx}`).oninput = (e) => setZoomAroundCenter(idx, Number(e.target.value));
-    const img = $(`stream-${idx}`);
-    img.onerror = () => setTimeout(() => { if (cfg.cameras[idx]?.rtspUrl) img.src = streamUrlFor(idx); }, 2500);
     $(`thresh-${idx}`).oninput = (e) => {
       const th = Number(e.target.value) || 2.2;
       cfg.cameras[idx].motionThreshold = th;
@@ -4095,19 +4461,75 @@ function renderCameras() {
       if (tick) tick.style.left = clamp((th / 20) * 100, 2, 98) + '%';
       markDirty();
     };
+    const nameInp = $(`name-${idx}`);
+    if (nameInp) nameInp.oninput = () => markDirty();
+    const srcSel = $(`src-${idx}`);
+    if (srcSel) {
+      srcSel.onchange = () => {
+        const nextSrc = srcSel.value;
+        cfg.cameras[idx].sourceSlug = nextSrc;
+        const rRow = $(`rtspRow-${idx}`);
+        if (rRow) rRow.hidden = !!nextSrc;
+        markDirty();
+      };
+    }
     $(`rtsp-${idx}`).oninput = () => markDirty();
+    $(`prim-${idx}`).onchange = () => markDirty();
     $(`en-${idx}`).onchange = () => markDirty();
   });
+  syncRawFeeds();
+  drawAllCanvases();
 }
 
-$('camGrid').addEventListener('click', (e) => {
+$('camGrid').addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
+  if (b.dataset.addview !== undefined) {
+    const idx = Number(b.dataset.addview);
+    const parent = cfg.cameras[idx];
+    if (!parent) return;
+    const countOnParent = cfg.cameras.filter(x => sourceSlugOf(x) === parent.slug).length;
+    const defName = `${parent.name.replace(/\\s+cam$/i, '')} View ${countOnParent + 1}`;
+    const rawName = window.prompt(`New virtual view name (shares ${parent.name} 1080p feed):`, defName);
+    if (!rawName || !rawName.trim()) return;
+    const name = rawName.trim();
+    const slug = makeUniqueSlug(name);
+    cfg.cameras.push({
+      name,
+      slug,
+      sourceSlug: parent.slug,
+      rtspUrl: '',
+      enabled: true,
+      primary: false,
+      motionThreshold: 2.2,
+      roi: [0, 0, 1, 1],
+      exclusions: [],
+      crop: [0, 0, 1, 1],
+      rotate: parent.rotate || 0,
+    });
+    renderCameras();
+    await saveConfig(null);
+    showToast(`✓ Added virtual view "${name}"`, 'ok');
+    return;
+  }
+  if (b.dataset.delview !== undefined) {
+    const idx = Number(b.dataset.delview);
+    const c = cfg.cameras[idx];
+    if (!c || !c.sourceSlug) return;
+    if (!window.confirm(`Remove virtual view "${c.name}"? Raw camera tape is unaffected.`)) return;
+    if (mmState.open) closeMaskModal();
+    cfg.cameras.splice(idx, 1);
+    renderCameras();
+    await saveConfig(null);
+    showToast(`Removed "${c.name}"`, 'ok');
+    return;
+  }
   if (b.dataset.reset !== undefined) {
     const idx = Number(b.dataset.reset);
     cfg.cameras[idx].crop = [0, 0, 1, 1];
     markDirty();
     syncCropOverlay(idx);
+    drawAllCanvases();
     return;
   }
   if (b.dataset.rot !== undefined) {
@@ -4115,6 +4537,7 @@ $('camGrid').addEventListener('click', (e) => {
     cfg.cameras[idx].rotate = ((cfg.cameras[idx].rotate || 0) + 90) % 360;
     markDirty();
     syncCropOverlay(idx);
+    drawAllCanvases();
     if (previewCropped[idx]) saveConfig();
     return;
   }
@@ -4122,8 +4545,8 @@ $('camGrid').addEventListener('click', (e) => {
     const idx = Number(b.dataset.prev);
     previewCropped[idx] = !previewCropped[idx];
     syncCropOverlay(idx);
-    if (previewCropped[idx]) saveConfig().then(() => { $(`stream-${idx}`).src = streamUrlFor(idx); });
-    else $(`stream-${idx}`).src = streamUrlFor(idx);
+    drawAllCanvases();
+    if (previewCropped[idx]) saveConfig();
     return;
   }
   if (b.dataset.asp !== undefined) {
@@ -4181,12 +4604,20 @@ async function saveConfig(triggerBtn = null) {
   if (!cfg) return;
   if (triggerBtn) setBtnFeedback(triggerBtn, 'saving', 'Saving…');
 
-  const cameras = cfg.cameras.map((c, idx) => ({
-    ...c,
-    rtspUrl: $(`rtsp-${idx}`).value.trim(),
-    motionThreshold: Number($(`thresh-${idx}`).value) || 2.2,
-    enabled: $(`en-${idx}`).value === '1',
-  }));
+  const cameras = cfg.cameras.map((c, idx) => {
+    const nameInp = $(`name-${idx}`);
+    const srcSel = $(`src-${idx}`);
+    const sourceSlug = srcSel ? srcSel.value : (c.sourceSlug || '');
+    return {
+      ...c,
+      name: nameInp ? (nameInp.value.trim() || c.name) : c.name,
+      sourceSlug,
+      rtspUrl: sourceSlug ? '' : ($(`rtsp-${idx}`) ? $(`rtsp-${idx}`).value.trim() : c.rtspUrl),
+      primary: $(`prim-${idx}`) ? ($(`prim-${idx}`).value === '1') : (c.primary !== false),
+      motionThreshold: $(`thresh-${idx}`) ? (Number($(`thresh-${idx}`).value) || 2.2) : c.motionThreshold,
+      enabled: $(`en-${idx}`) ? ($(`en-${idx}`).value === '1') : !!c.enabled,
+    };
+  });
   const wallboard = {
     ...(cfg.wallboard || {}),
     fireTvHost: $('wbHost').value.trim(),
@@ -4203,7 +4634,6 @@ async function saveConfig(triggerBtn = null) {
     cameras,
     wallboard,
   };
-  const prevUrls = cfg.cameras.map(c => c.rtspUrl);
   try {
     const resp = await fetch('/api/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
@@ -4214,9 +4644,7 @@ async function saveConfig(triggerBtn = null) {
     $('wbOut').textContent = `Saved! (${stamp})`;
     cfg.cameras = cameras;
     cfg.wallboard = wallboard;
-    cameras.forEach((c, idx) => {
-      if (c.rtspUrl !== prevUrls[idx]) $(`stream-${idx}`).src = streamUrlFor(idx);
-    });
+    syncRawFeeds();
     markDirty(false);
     if (triggerBtn) {
       setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2200);
@@ -4238,8 +4666,11 @@ async function pollStatus() {
     const badge = $('svcBadge');
     badge.textContent = st.recording ? (st.paused ? 'PAUSED' : 'RECORDING') : 'STANDBY RING';
     badge.className = 'pill ' + (st.recording ? 'ok' : 'live');
-    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB · Drag crop corners or <b>4-dot Mirror Masks</b> (use <b>Zoom Masks</b> for angled corners), then click <b>Save</b>.`;
-    st.cameras.forEach((c, idx) => {
+    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB · Drag crop corners or <b>4-dot Mirror Masks</b>, or click <b>+ Add View</b> to crop extra stations from a camera.`;
+    const bySlug = new Map((st.cameras || []).map(sc => [sc.slug, sc]));
+    (cfg?.cameras || []).forEach((cam, idx) => {
+      const c = bySlug.get(cam.slug) || st.cameras[idx];
+      if (!c) return;
       const sEl = $(`camState-${idx}`);
       if (sEl) {
         sEl.textContent = c.connected ? 'LIVE 25 FPS' : 'RECONNECTING';
@@ -4322,6 +4753,7 @@ async function init() {
   $('wbSleep').value = wb.sleepOnStop === false ? '0' : '1';
   renderCameras();
   wireMaskModal();
+  setInterval(drawAllCanvases, 100);
   await Promise.all([pollStatus(), pollClips()]);
   setInterval(pollStatus, 1000);
   setInterval(pollClips, 6000);
@@ -4446,7 +4878,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             cams = [
                 {
                     **c.to_dict(),
-                    "connected": bool(service.cam_connected.get(c.slug, False)),
+                    "connected": bool(service.cam_connected.get(service._source_slug_for(c), False)),
                     "latestEnergy": float(service.latest_energy.get(c.slug, 0.0)),
                 }
                 for c in service.cameras
@@ -4659,12 +5091,17 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_stream() -> Response:
         cam_name = request.args.get("camera")
         cropped = request.args.get("cropped") in ("1", "true", "yes")
+        raw = request.args.get("raw") in ("1", "true", "yes")
         with service.lock:
             cam = service._find_camera(cam_name)
-        if not cam or not cam.enabled or not cam.rtsp_url:
-            return Response(status=404)
+            if not cam or not cam.enabled:
+                return Response(status=404)
+            media_slug = service._source_slug_for(cam)
+            src_cam = service._source_camera(cam)
+            if not src_cam.rtsp_url:
+                return Response(status=404)
         slug = cam.slug
-        ch = service.live_hub.get_channel(slug)
+        ch = service.live_hub.get_channel(media_slug)
 
         def generate():
             last_seq = 0
@@ -4683,18 +5120,19 @@ def create_app(service: ArmoryCamService) -> Flask:
                     raw_jpg = ch.latest_jpeg
                 last_frame_at = time.time()
 
-                with service.lock:
-                    cur = service._find_camera(slug) or cam
-                    rot = cur.rotate
-                    crop = cur.crop
                 payload = raw_jpg
-                if rot != 0 or (cropped and crop != (0.0, 0.0, 1.0, 1.0)):
-                    img = cv2.imdecode(np.frombuffer(raw_jpg, np.uint8), cv2.IMREAD_COLOR)
-                    if img is not None:
-                        img = apply_frame_transform(img, crop, rot, apply_crop=cropped)
-                        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
-                        if ok:
-                            payload = buf.tobytes()
+                if not raw:
+                    with service.lock:
+                        cur = service._find_camera(slug) or cam
+                        rot = cur.rotate
+                        crop = cur.crop
+                    if rot != 0 or (cropped and crop != (0.0, 0.0, 1.0, 1.0)):
+                        img = cv2.imdecode(np.frombuffer(raw_jpg, np.uint8), cv2.IMREAD_COLOR)
+                        if img is not None:
+                            img = apply_frame_transform(img, crop, rot, apply_crop=cropped)
+                            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
+                            if ok:
+                                payload = buf.tobytes()
 
                 yield (
                     b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "

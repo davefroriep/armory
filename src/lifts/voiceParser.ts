@@ -399,40 +399,48 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): Voi
     return { kind: 'buddy_mode' };
   }
 
-  const mapCamTok = (tok?: string): string | undefined =>
-    tok === 'rack' ? 'Rack Cam' : tok === 'smith' ? 'Smith Cam' : undefined;
+  const CAM_TOK_RE = 'smith\\s+wide|fly\\s+machine|chest\\s+fly|pec\\s+deck|leg\\s+machine|rack|smith|fly|leg';
+  const mapCamTok = (tok?: string): string | undefined => {
+    const t = (tok || '').trim().replace(/\s+/g, ' ');
+    if (t === 'rack') return 'Rack Cam';
+    if (t === 'smith wide') return 'Smith Wide';
+    if (t === 'smith') return 'Smith Cam';
+    if (t === 'fly machine' || t === 'chest fly' || t === 'pec deck' || t === 'fly') return 'Fly Machine Cam';
+    if (t === 'leg machine' || t === 'leg') return 'Leg Machine Cam';
+    return undefined;
+  };
   const camGuestA = tail.match(
-    /^(?:guest\s+(?:record|camera|cam|clip)|(?:record|start|stop|arm)\s+guest(?:\s+clip|\s+set|\s+cam(?:era)?)?)(?:\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
+    new RegExp(`^(?:guest\\s+(?:record|camera|cam|clip)|(?:record|start|stop|arm)\\s+guest(?:\\s+clip|\\s+set|\\s+cam(?:era)?)?)(?:\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?)?$`),
   );
   if (camGuestA) {
     const camera = mapCamTok(camGuestA[1]);
     return camera ? { kind: 'cam_guest', camera } : { kind: 'cam_guest' };
   }
-  const camGuestB = tail.match(/^guest\s+(rack|smith)(?:\s+cam(?:era)?)?$/);
+  const camGuestB = tail.match(new RegExp(`^guest\\s+(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?$`));
   if (camGuestB) {
     const camera = mapCamTok(camGuestB[1]);
     return camera ? { kind: 'cam_guest', camera } : { kind: 'cam_guest' };
   }
   const camArmA = tail.match(
-    /^(?:(rack|smith)\s+)?(?:camera|cam|record(?:\s+set)?|start\s+camera|arm\s+camera|stop\s+camera)(?:\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
+    new RegExp(`^(?:(${CAM_TOK_RE})\\s+)?(?:camera|cam|record(?:\\s+set)?|start\\s+camera|arm\\s+camera|stop\\s+camera)(?:\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?)?$`),
   );
   if (camArmA) {
     const camera = mapCamTok(camArmA[1] || camArmA[2]);
     return camera ? { kind: 'cam_arm', camera } : { kind: 'cam_arm' };
   }
-  const camArmB = tail.match(/^(?:start|arm|record|camera)\s+(?:on\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?$/);
+  const camArmB = tail.match(new RegExp(`^(?:start|arm|record|camera)\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?$`));
   if (camArmB) {
     const camera = mapCamTok(camArmB[1]);
     return camera ? { kind: 'cam_arm', camera } : { kind: 'cam_arm' };
   }
   const camClipA = tail.match(
-    /^(?:clip\s+that|save\s+clip|clip\s+last(?:\s+set)?|clip\s+set)(?:\s+(?:on\s+|from\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?)?$/,
+    new RegExp(`^(?:clip\\s+that|save\\s+clip|clip\\s+last(?:\\s+set)?|clip\\s+set)(?:\\s+(?:on\\s+|from\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?)?$`),
   );
   if (camClipA) {
     const camera = mapCamTok(camClipA[1]);
     return camera ? { kind: 'cam_clip_last', camera } : { kind: 'cam_clip_last' };
   }
-  const camClipB = tail.match(/^clip\s+(?:on\s+|from\s+)?(?:the\s+)?(rack|smith)(?:\s+cam(?:era)?)?$/);
+  const camClipB = tail.match(new RegExp(`^clip\\s+(?:on\\s+|from\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?$`));
   if (camClipB) {
     const camera = mapCamTok(camClipB[1]);
     return camera ? { kind: 'cam_clip_last', camera } : { kind: 'cam_clip_last' };

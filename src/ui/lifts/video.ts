@@ -559,7 +559,7 @@ export function pickRecordCameraSheet(
     const sh = openSheet(
       `<h3 class="sh-title">${esc(exName)} · ${esc(setLabel)}</h3>
        <div class="fl">${buddyMode ? 'WHICH CAMERA TO RECORD? · 👥 BUDDY MODE' : 'WHICH CAMERA TO RECORD?'}</div>
-       <div class="vcam-pick">
+       <div class="vcam-pick${cams.length > 2 ? ' many' : ''}">
          ${cams.map((c) => `
            <button class="vcam-btn${c === effectiveDef ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
              <b>${esc(shortCamLabel(c))}</b>
@@ -1000,7 +1000,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     if (!selectedCam) {
       box.innerHTML = `
         <div class="fl">GYM CAM · RACK OR SMITH?</div>
-        <div class="vcam-pick">
+        <div class="vcam-pick${cams.length > 2 ? ' many' : ''}">
           ${cams.map((c) => `
             <button class="vcam-btn" type="button" data-pickcam="${esc(c)}">
               <b>${esc(shortCamLabel(c))}</b>

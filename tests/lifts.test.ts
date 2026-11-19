@@ -788,7 +788,7 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
     ]);
   });
 
-  it('infers Smith vs Rack station defaults and respects persistent ExRow camPref overrides', () => {
+  it('infers Smith, Rack, Fly Machine & Leg Machine defaults and respects persistent ExRow camPref overrides', () => {
     expect(inferredCamForExercise({ name: 'Smith Machine Row', equip: 'smith' })).toBe('Smith Cam');
     expect(inferredCamForExercise({ name: 'Smith Calf Raise', equip: 'other' })).toBe('Smith Cam');
     expect(inferredCamForExercise({ name: 'Low Bar Squat', equip: 'bb' })).toBe('Rack Cam');
@@ -800,6 +800,34 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
     expect(inferredCamForExercise({ name: 'Tricep Extension', equip: 'other' })).toBe('Rack Cam');
     expect(inferredCamForExercise({ name: 'Dumbbell Curl', equip: 'db' })).toBeUndefined();
     expect(inferredCamForExercise({ name: 'Dumbbell Bench Press', equip: 'db' })).toBeUndefined();
+
+    // Machine flys -> Fly Machine Cam; DB flys -> Auto; Cable flys -> Rack Cam
+    expect(inferredCamForExercise({ name: 'Chest Fly Machine', equip: 'machine' })).toBe('Fly Machine Cam');
+    expect(inferredCamForExercise({ name: 'Reverse Pec Deck', equip: 'machine' })).toBe('Fly Machine Cam');
+    expect(inferredCamForExercise({ name: 'Dumbbell Fly', equip: 'db' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Incline Dumbbell Fly', equip: 'db' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Rear Delt Fly', equip: 'db' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Cable Crossover', equip: 'cable' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Low-to-High Cable Fly', equip: 'cable' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Cable Rear Delt Fly', equip: 'cable' })).toBe('Rack Cam');
+
+    // Leg Extension / Leg Curl only -> Leg Machine Cam; other leg/calf exercises untouched
+    expect(inferredCamForExercise({ name: 'Leg Extension', equip: 'machine' })).toBe('Leg Machine Cam');
+    expect(inferredCamForExercise({ name: 'Lying Leg Curl', equip: 'machine' })).toBe('Leg Machine Cam');
+    expect(inferredCamForExercise({ name: 'Seated Leg Curl', equip: 'machine' })).toBe('Leg Machine Cam');
+    expect(inferredCamForExercise({ name: 'Leg Press', equip: 'machine' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Seated Calf Raise', equip: 'machine' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Leg Press Calf Raise', equip: 'machine' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Nordic Hamstring Curl', equip: 'bw' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Hanging Leg Raise', equip: 'bw' })).toBe('Rack Cam');
+
+    // availableCameras filter hides unconfigured virtual views gracefully
+    const chestFly = { name: 'Chest Fly Machine', equip: 'machine' as const };
+    const legExt = { name: 'Leg Extension', equip: 'machine' as const };
+    expect(inferredCamForExercise(chestFly, ['Rack Cam', 'Smith Cam'])).toBeUndefined();
+    expect(inferredCamForExercise(legExt, ['Rack Cam', 'Smith Cam'])).toBeUndefined();
+    expect(inferredCamForExercise(chestFly, ['Rack Cam', 'Smith Cam', 'Fly Machine Cam'])).toBe('Fly Machine Cam');
+    expect(inferredCamForExercise(legExt, ['Rack Cam', 'Smith Cam', 'Leg Machine Cam'])).toBe('Leg Machine Cam');
 
     // Persistent ExRow.camPref & explicit 'auto' opt-out + session precedence
     const curl = { name: 'Dumbbell Curl', equip: 'db' as const };

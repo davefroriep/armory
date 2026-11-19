@@ -547,7 +547,7 @@ function build(root: HTMLElement, id?: string): () => void {
       }
       if (!gymCam.online) return;
       if (!hadPr && hits.has(set.id) && getSettings().gymCamAutoPr && !set.vids?.length) {
-        const resolved = preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref);
+        const resolved = preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref, gymCam.cameras);
         const prefCam = resolved || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
         void gymCam.autoClipPr(s, se, set, prefCam).then((meta) => {
           if (!dead && meta) { toast('★ PR auto-clipped from Gym Cam'); save(); syncVisibleCards(); }
@@ -614,7 +614,7 @@ function build(root: HTMLElement, id?: string): () => void {
   const defaultSets = (ex: Exercise): number => (ex.type === 'time' ? 2 : 3);
 
   const camForEx = (se: SessionEx): string | undefined =>
-    preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref);
+    preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref, gymCam.cameras);
 
   const exMenu = async (se: SessionEx): Promise<void> => {
     const ex = exOf(se.exId);
@@ -689,7 +689,7 @@ function build(root: HTMLElement, id?: string): () => void {
         .map((o) => `<button class="fchip${o === cur ? ' on' : ''}" type="button" data-d="${o}">${clock(o)}</button>`)
         .join('');
       const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-      const inferred = inferredCamForExercise(ex);
+      const inferred = inferredCamForExercise(ex, gymCam.cameras);
       const savedPref = lifts.row(se.exId)?.camPref ?? '';
       const defLabel = inferred ? `Default (${shortCamLabel(inferred)})` : 'Default (Auto)';
       const camChoices: [string, string][] = [

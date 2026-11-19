@@ -379,12 +379,13 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .vp-foot-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .vcam-pick { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .vcam-btn { padding: 16px 12px; border-radius: 14px; background: var(--card2); border: 1.5px solid var(--blue); text-align: center; display: flex; flex-direction: column; align-items: center; gap: 4px; color: var(--fg); }
+.vcam-pick.many .vcam-btn { padding: 11px 10px; }
 .vcam-btn:active { opacity: .82; background: rgba(30, 155, 255, .14); }
 .vcam-btn b { font-size: 1.15rem; font-weight: 900; color: var(--blue); }
 .vcam-btn small { font-size: .72rem; color: var(--mut); }
 .vcam-btn.sel { background: rgba(30, 155, 255, .16); box-shadow: inset 0 0 0 1px rgba(30, 155, 255, .45); }
 .vcam-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
-.vcam-pills, .vcam-tabs { display: flex; gap: 6px; }
+.vcam-pills, .vcam-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
 .vcam-pill, .vcam-tab { height: 32px; padding: 0 11px; border-radius: 999px; background: var(--card2); border: 1px solid var(--line); color: var(--mut); font-size: .76rem; font-weight: 800; }
 .vcam-pill.on { background: rgba(30, 155, 255, .18); border-color: var(--blue); color: #7cc4ff; }
 .vcam-tab.on { background: var(--blue); border-color: var(--blue); color: #00131f; }

@@ -840,6 +840,160 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_virtual_views_shared_capture_independent_motion_and_coach_angles(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_virt_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash_html = client.get("/").get_data(as_text=True)
+            self.assertIn("data-addview", dash_html)
+            self.assertIn("sourceSlug", dash_html)
+
+            res = client.post(
+                "/api/config",
+                json={
+                    "cameras": [
+                        {
+                            "name": "Rack Cam",
+                            "slug": "rack_cam",
+                            "rtspUrl": "",
+                            "enabled": True,
+                            "primary": True,
+                            "motionThreshold": 2.0,
+                            "crop": [0.0, 0.0, 1.0, 1.0],
+                        },
+                        {
+                            "name": "Smith Cam",
+                            "slug": "smith_cam",
+                            "rtspUrl": "",
+                            "enabled": True,
+                            "primary": True,
+                            "motionThreshold": 2.0,
+                        },
+                        {
+                            "name": "Fly Machine Cam",
+                            "slug": "fly_machine_cam",
+                            "sourceSlug": "rack_cam",
+                            "rtspUrl": "rtsp://should-be-cleared",
+                            "enabled": True,
+                            "primary": False,
+                            "motionThreshold": 2.0,
+                            "crop": [0.0, 0.0, 0.45, 1.0],
+                        },
+                        {
+                            "name": "Smith Wide",
+                            "slug": "smith_wide",
+                            "sourceSlug": "rack_cam",
+                            "enabled": True,
+                            "primary": False,
+                            "motionThreshold": 2.0,
+                            "crop": [0.55, 0.0, 1.0, 1.0],
+                        },
+                    ]
+                },
+            )
+            self.assertEqual(res.status_code, 200)
+            saved_cfg = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+            fly_cfg = next(c for c in saved_cfg["cameras"] if c["slug"] == "fly_machine_cam")
+            self.assertEqual(fly_cfg["sourceSlug"], "rack_cam")
+            self.assertEqual(fly_cfg["rtspUrl"], "")
+            self.assertFalse(fly_cfg["primary"])
+
+            self.assertEqual(
+                [c.slug for c in svc._physical_cameras()],
+                ["rack_cam", "smith_cam"],
+            )
+            self.assertFalse(svc._is_virtual(svc._find_camera("Rack Cam")))
+            self.assertTrue(svc._is_virtual(svc._find_camera("Fly Machine Cam")))
+            self.assertEqual(svc._source_slug_for(svc._find_camera("Fly Machine Cam")), "rack_cam")
+
+            self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-virt", "name": "Virt Lift"}).status_code, 200)
+
+            # Create 3 x 2s segments in ring/rack_cam only: seg 0 & 2 quiet, seg 1 & 2 have motion strictly in left 45%
+            t0_dt = datetime(2026, 11, 19, 14, 0, 0)
+            t0_ms = int(t0_dt.timestamp() * 1000)
+            ring_rack = svc.ring_root / "rack_cam"
+            ring_rack.mkdir(parents=True, exist_ok=True)
+            for i in range(3):
+                seg_dt = datetime.fromtimestamp((t0_ms + i * 2000) / 1000.0)
+                seg_path = ring_rack / f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                vf_src = (
+                    "color=c=black:s=320x240:r=20:d=2,drawbox=x=10:y=10:w=120:h=220:color=white@1.0:t=fill:enable='gte(n,2)'"
+                    if i in (1, 2)
+                    else "color=c=black:s=320x240:r=20:d=2"
+                )
+                subprocess.run(
+                    [
+                        svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", vf_src,
+                        "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                    ],
+                    check=True,
+                )
+                old_m = time.time() - 5.0
+                os.utime(seg_path, (old_m, old_m))
+
+            rack_phys = svc._find_camera("Rack Cam")
+            svc._ingest_closed_segments(rack_phys, time.time())
+
+            self.assertGreater(svc.latest_energy["fly_machine_cam"], 8.0)
+            self.assertEqual(svc.latest_energy["smith_wide"], 0.0)
+            self.assertTrue((svc.tapes_root / "sess-virt" / "rack_cam").is_dir())
+            self.assertFalse((svc.tapes_root / "sess-virt" / "fly_machine_cam").exists())
+            self.assertFalse((svc.tapes_root / "sess-virt" / "smith_wide").exists())
+
+            # Auto bursts ignore primary=False virtual views; explicit camera="Fly Machine Cam" returns its burst
+            auto_bursts = client.get("/api/bursts?sessionId=sess-virt").get_json()["bursts"]
+            self.assertTrue(auto_bursts)
+            self.assertTrue(all(b["camera"] == "Rack Cam" for b in auto_bursts))
+            fly_bursts = client.get("/api/bursts?sessionId=sess-virt&camera=Fly%20Machine%20Cam").get_json()["bursts"]
+            self.assertEqual(len(fly_bursts), 1)
+            self.assertEqual(fly_bursts[0]["camera"], "Fly Machine Cam")
+
+            # Coach View tape angles include virtual views sharing Rack Cam tape
+            ang_data = client.get(f"/api/tape/angles?sessionId=sess-virt&startMs={t0_ms}&endMs={t0_ms + 5000}").get_json()
+            self.assertEqual(ang_data["cameras"], ["Rack Cam", "Fly Machine Cam", "Smith Wide"])
+
+            # Cutting explicit clip on Fly Machine Cam uses virtual view's own [0,0,0.45,1] crop -> 144x240
+            clip_res = client.post(
+                "/api/clip",
+                json={
+                    "sessionId": "sess-virt",
+                    "exName": "Chest Fly Machine",
+                    "startMs": t0_ms + 2000,
+                    "endMs": t0_ms + 5500,
+                    "camera": "Fly Machine Cam",
+                },
+            )
+            self.assertEqual(clip_res.status_code, 200)
+            clip_data = clip_res.get_json()
+            self.assertEqual(clip_data["camera"], "Fly Machine Cam")
+            out_file = svc.clips_root / clip_data["lanUrl"].removeprefix("/clips/")
+            probe_out = subprocess.check_output(
+                [
+                    svc.ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height",
+                    "-of", "csv=p=0:s=x", str(out_file),
+                ],
+                text=True,
+            ).strip()
+            self.assertEqual(probe_out, "144x240")
+
+            # Snapshot & ephemeral preview also work on virtual views
+            snap = client.get("/api/snapshot?camera=Fly%20Machine%20Cam")
+            self.assertEqual(snap.status_code, 200)
+            self.assertTrue(snap.data.startswith(b"\xff\xd8"))
+            prev_res = client.post(
+                "/api/tape/preview",
+                json={"sessionId": "sess-virt", "startMs": t0_ms, "endMs": t0_ms + 3000, "camera": "Smith Wide"},
+            )
+            self.assertEqual(prev_res.status_code, 200)
+            self.assertEqual(prev_res.get_json()["camera"], "Smith Wide")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

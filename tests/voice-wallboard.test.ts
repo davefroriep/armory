@@ -179,10 +179,13 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('armory record set')).toEqual({ kind: 'cam_arm' });
     expect(parseVoiceTranscript('armory start camera')).toEqual({ kind: 'cam_arm' });
     expect(parseVoiceTranscript('Armory record smith')).toEqual({ kind: 'cam_arm', camera: 'Smith Cam' });
+    expect(parseVoiceTranscript('Armory record smith wide')).toEqual({ kind: 'cam_arm', camera: 'Smith Wide' });
+    expect(parseVoiceTranscript('Armory record fly machine')).toEqual({ kind: 'cam_arm', camera: 'Fly Machine Cam' });
     expect(parseVoiceTranscript('armory rack camera')).toEqual({ kind: 'cam_arm', camera: 'Rack Cam' });
     expect(parseVoiceTranscript('Armory clip that')).toEqual({ kind: 'cam_clip_last' });
     expect(parseVoiceTranscript('armory save clip')).toEqual({ kind: 'cam_clip_last' });
     expect(parseVoiceTranscript('armory clip smith')).toEqual({ kind: 'cam_clip_last', camera: 'Smith Cam' });
+    expect(parseVoiceTranscript('armory clip leg machine')).toEqual({ kind: 'cam_clip_last', camera: 'Leg Machine Cam' });
     expect(parseVoiceTranscript('armory undo')).toEqual({ kind: 'undo' });
 
     // Two-beat wake flow & natural dumbbell/same shortcuts
@@ -813,6 +816,7 @@ describe('wallboard snapshot & routing', () => {
     expect(parseVoiceTranscript('Armory close video')).toEqual({ kind: 'wb_close_replay' });
     expect(parseVoiceTranscript('Armory guest record')).toEqual({ kind: 'cam_guest' });
     expect(parseVoiceTranscript('Armory guest smith')).toEqual({ kind: 'cam_guest', camera: 'Smith Cam' });
+    expect(parseVoiceTranscript('Armory guest fly')).toEqual({ kind: 'cam_guest', camera: 'Fly Machine Cam' });
     expect(defaultReadbackForIntent({ kind: 'wb_replay', slow: true })).toBe('Replaying slow motion on TV');
     expect(defaultReadbackForIntent({ kind: 'wb_close_replay' })).toBe('Closing video');
     expect(defaultReadbackForIntent({ kind: 'cam_guest', camera: 'Smith Cam' })).toBe('Guest camera Smith');
