@@ -11,6 +11,7 @@ import { getSettings, settingsChanged, updateSettings } from '../store/settings'
 import { liftSettings, toDisplay, fmtNum, fromDisplay } from '../lifts/settings';
 import { gymCam } from '../lifts/gymCam';
 import { voice } from '../lifts/voice';
+import { VOICE_ALIAS_SLOTS, VOICE_COMMAND_GROUPS, type VoiceAliasSlot } from '../lifts/voiceParser';
 import { wallboard } from '../wallboard/sync';
 import { backupCardHtml, wireBackupCard } from './backupUi';
 import { revFooter, topbar, wireChips } from './chrome';
@@ -47,7 +48,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       </div>
     </section>
 
-    <h2 class="sec">GYM DISPLAY &amp; VOICE</h2>
+    <h2 class="sec">GYM DISPLAY &amp; CAMERAS</h2>
     <section class="card">
       <div class="line"><span>Auto-Wake 32&quot; TV on Workout<small>Streams wallboard via OptiPlex &amp; wakes Fire TV over ADB when a workout starts</small></span>${tog('wallboardRelayEnabled', s.wallboardRelayEnabled)}</div>
       <div class="line"><span>Smart TV Wallboard (Pixel Direct)<small>Optional local HTTP/SSE server hosted directly on this Pixel</small></span><button class="switch ${s.wallboardEnabled ? 'on' : ''}" id="wbTog" role="switch" aria-checked="${s.wallboardEnabled}"><i></i></button></div>
@@ -56,18 +57,33 @@ export function settingsScreen(root: HTMLElement): () => void {
         <button class="btn sm" id="wbCopy">Copy TV URL</button>
         <a class="btn sm primary" href="#/wallboard">Open Preview &amp; Setup ›</a>
       </div>
-      <div class="line" style="margin-top:8px"><span>Hands-Free Voice Commands<small>Strength workouts only · listens while an active lift is open</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
-      <label class="field">Wake word<input id="vxWake" value="${esc(s.voiceWakeWord || 'armory')}" placeholder="armory" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
-      <p class="hint">Say: “Armory 225 for 8” · “Armory check” · “Armory add set” · “Armory add set to last exercise” · “Armory delete empty sets” · “Armory next exercise” · “Armory undo”.</p>
-      <div class="hint" id="vxStatus"></div>
-      <div class="row" style="margin-top:6px">
-        <input class="lf-input" id="vxTest" style="flex:1;padding:8px 10px;font-size:.88rem" placeholder="Test phrase (e.g. armory 225 for 8)" autocomplete="off">
-        <button class="btn sm" id="vxRun">Run</button>
-      </div>
-      <div class="line" style="margin-top:12px"><span>Gym Camera DVR<small>Probes OptiPlex silently on home Wi-Fi; stays hidden away</small></span>${tog('gymCamEnabled', s.gymCamEnabled)}</div>
+      <div class="line" style="margin-top:10px"><span>Gym Camera DVR<small>Probes OptiPlex silently on home Wi-Fi; stays hidden away</small></span>${tog('gymCamEnabled', s.gymCamEnabled)}</div>
       <div class="line"><span>Auto-clip PR sets (★)<small>Automatically clips new 1RM–40RM personal records</small></span>${tog('gymCamAutoPr', s.gymCamAutoPr)}</div>
       <label class="field">Gym Camera DVR URL<input id="camUrl" value="${esc(s.gymCamUrl || 'http://192.168.1.152:8766')}" placeholder="http://192.168.1.152:8766" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
       <div class="row" style="margin-top:6px"><button class="btn sm" id="camTest">Test Cam</button><span id="camOut" class="hint"></span></div>
+    </section>
+
+    <h2 class="sec">VOICE COMMANDS</h2>
+    <section class="card">
+      <div class="line"><span>Hands-Free Voice Commands<small>Strength workouts only · listens while an active lift is open</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
+      <div class="line"><span>Spoken Voice Readback<small>Says “For 10, got it” or “Didn’t catch that” after commands</small></span>${tog('voiceReadback', s.voiceReadback)}</div>
+      <label class="field">Wake word<input id="vxWake" value="${esc(s.voiceWakeWord || 'armory')}" placeholder="armory" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
+      <div class="hint" id="vxStatus"></div>
+      <div class="row" style="margin-top:4px">
+        <input class="lf-input" id="vxTest" style="flex:1;padding:8px 10px;font-size:.88rem" placeholder="Test phrase (e.g. armory by 10)" autocomplete="off">
+        <button class="btn sm" id="vxRun">Run</button>
+      </div>
+      <div class="fl" style="margin-top:6px">MY CUSTOM PHRASES</div>
+      <label class="field">When I say a phrase for<select class="lf-input sel" id="vxAliasSlot">${VOICE_ALIAS_SLOTS.map((sl) => `<option value="${sl.slot}">${esc(sl.label)}</option>`).join('')}</select></label>
+      <div class="row">
+        <input class="lf-input" id="vxAliasPhrase" style="flex:1;padding:8px 10px;font-size:.88rem" placeholder="${esc(VOICE_ALIAS_SLOTS[0].hint)}" autocapitalize="off" autocomplete="off">
+        <button class="btn sm primary" id="vxAliasAdd">Add</button>
+      </div>
+      <div class="vx-chips" id="vxAliasList"></div>
+      <details class="vx-ref">
+        <summary>All Voice Commands &amp; Variations (tap any to test)</summary>
+        <div id="vxCatalog"></div>
+      </details>
     </section>
 
     <h2 class="sec">INTERVALS.ICU</h2>
@@ -166,10 +182,52 @@ export function settingsScreen(root: HTMLElement): () => void {
     const vxTog = $<HTMLElement>('#vxTog', root);
     vxTog.classList.toggle('on', cur.voiceEnabled);
     vxTog.setAttribute('aria-checked', String(cur.voiceEnabled));
+    const vxRb = root.querySelector<HTMLElement>('[data-tog="voiceReadback"]');
+    if (vxRb) {
+      vxRb.classList.toggle('on', cur.voiceReadback);
+      vxRb.setAttribute('aria-checked', String(cur.voiceReadback));
+    }
     const vxEl = $('#vxStatus', root);
     if (voice.lastError) vxEl.innerHTML = `<span style="color:#fca5a5">${esc(voice.lastError)}</span>`;
     else if (voice.lastAction) vxEl.innerHTML = `Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
     else vxEl.textContent = cur.voiceEnabled ? `${voice.listening ? `● Listening for “${cur.voiceWakeWord || 'armory'}”` : 'Ready while Armory Fit is open'}${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}` : 'Off';
+
+    const aliasListEl = root.querySelector<HTMLElement>('#vxAliasList');
+    const aliases = cur.voiceCustomAliases ?? {};
+    if (aliasListEl) {
+      const slotLabel = new Map(VOICE_ALIAS_SLOTS.map((sl) => [sl.slot, sl.label]));
+      const chips: string[] = [];
+      for (const sl of VOICE_ALIAS_SLOTS) {
+        for (const p of aliases[sl.slot] ?? []) {
+          chips.push(`<button class="vx-chip" type="button" data-rm-slot="${sl.slot}" data-rm-phrase="${esc(p)}"><b>“${esc(p)}”</b><span>→ ${esc(slotLabel.get(sl.slot) ?? sl.slot)}</span><i>✕</i></button>`);
+        }
+      }
+      aliasListEl.innerHTML = chips.length
+        ? chips.join('')
+        : '<span class="hint">No custom phrases yet — add any phrase you naturally say above.</span>';
+    }
+
+    const catEl = root.querySelector<HTMLElement>('#vxCatalog');
+    if (catEl) {
+      const wake = (cur.voiceWakeWord || 'armory').trim() || 'armory';
+      catEl.innerHTML = VOICE_COMMAND_GROUPS.map((g) => {
+        const extra = g.slot ? (aliases[g.slot] ?? []) : [];
+        return `<div class="vx-grp">
+          <b>${esc(g.title)}</b>
+          ${g.note ? `<small>${esc(g.note)}</small>` : ''}
+          <div class="vx-exs">
+            ${g.examples.map((ex) => {
+              const exShown = `${wake} ${ex}`;
+              return `<button class="vx-ex" type="button" data-vxex="${esc(exShown)}">${esc(exShown)}</button>`;
+            }).join('')}
+            ${extra.map((ex) => {
+              const exShown = `${wake} ${ex.replace(/#/g, '10')}`;
+              return `<button class="vx-ex custom" type="button" data-vxex="${esc(exShown)}">★ ${esc(exShown)}</button>`;
+            }).join('')}
+          </div>
+        </div>`;
+      }).join('');
+    }
 
     const camIn = root.querySelector<HTMLInputElement>('#camUrl');
     if (camIn && document.activeElement !== camIn) {
@@ -193,7 +251,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'wallboardRelayEnabled';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'wallboardRelayEnabled' | 'voiceReadback';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
@@ -229,8 +287,49 @@ export function settingsScreen(root: HTMLElement): () => void {
     if (t.closest('#vxRun')) {
       const phrase = $<HTMLInputElement>('#vxTest', root).value.trim();
       if (phrase) {
-        const res = voice.runTextCommand(phrase, false);
-        toast(res ? res.text : 'Did not match a lift voice command');
+        const res = voice.testPhrase(phrase);
+        toast(res.text);
+        paintFtpBox();
+      }
+    }
+    if (t.closest('#vxAliasAdd')) {
+      const slot = $<HTMLSelectElement>('#vxAliasSlot', root).value as VoiceAliasSlot;
+      const inp = $<HTMLInputElement>('#vxAliasPhrase', root);
+      const phrase = inp.value.trim().toLowerCase();
+      if (!phrase) { toast('Enter a phrase to add'); return; }
+      const curAliases = { ...(getSettings().voiceCustomAliases ?? {}) };
+      const list = [...(curAliases[slot] ?? [])];
+      if (!list.some((x) => x.toLowerCase() === phrase)) {
+        list.push(phrase);
+        curAliases[slot] = list;
+        updateSettings({ voiceCustomAliases: curAliases });
+        voice.refreshBiasPhrases();
+        toast(`Added “${phrase}”`);
+      }
+      inp.value = '';
+      paintFtpBox();
+    }
+    const rmChip = t.closest<HTMLElement>('[data-rm-slot]');
+    if (rmChip) {
+      const slot = rmChip.dataset.rmSlot as VoiceAliasSlot;
+      const phrase = rmChip.dataset.rmPhrase ?? '';
+      const curAliases = { ...(getSettings().voiceCustomAliases ?? {}) };
+      const nextList = (curAliases[slot] ?? []).filter((x) => x !== phrase);
+      if (nextList.length) curAliases[slot] = nextList;
+      else delete curAliases[slot];
+      updateSettings({ voiceCustomAliases: curAliases });
+      voice.refreshBiasPhrases();
+      toast(`Removed “${phrase}”`);
+      paintFtpBox();
+    }
+    const exBtn = t.closest<HTMLElement>('[data-vxex]');
+    if (exBtn) {
+      const phrase = exBtn.dataset.vxex ?? '';
+      if (phrase) {
+        const inp = $<HTMLInputElement>('#vxTest', root);
+        inp.value = phrase;
+        const res = voice.testPhrase(phrase);
+        toast(res.text);
         paintFtpBox();
       }
     }
@@ -248,6 +347,11 @@ export function settingsScreen(root: HTMLElement): () => void {
     const t = e.target as HTMLInputElement;
     if (t.id === 'aid') updateSettings({ athleteId: t.value.trim() });
     else if (t.id === 'vxWake') updateSettings({ voiceWakeWord: t.value.trim().toLowerCase() || 'armory' });
+    else if (t.id === 'vxAliasSlot') {
+      const slotMeta = VOICE_ALIAS_SLOTS.find((sl) => sl.slot === t.value);
+      const pInp = root.querySelector<HTMLInputElement>('#vxAliasPhrase');
+      if (slotMeta && pInp) pInp.placeholder = slotMeta.hint;
+    }
     else if (t.id === 'camUrl') updateSettings({ gymCamUrl: t.value.trim().replace(/\/+$/, '') || 'http://192.168.1.152:8766' });
     else if (t.id === 'restDay') {
       updateSettings({ restDay: t.value === 'none' ? null : Number(t.value) });

@@ -39,6 +39,7 @@ final class VoiceRecognitionManager {
 
     private static volatile boolean desiredEnabled = false;
     private static volatile boolean appVisible = true;
+    private static volatile boolean ttsPaused = false;
     private static volatile boolean active = false;
     private static volatile boolean useGoogleTts = true;
     private static volatile boolean usingGoogleTts = false;
@@ -67,14 +68,35 @@ final class VoiceRecognitionManager {
         Context app = c.getApplicationContext();
         MAIN.post(() -> {
             if (!appVisible) {
+                ttsPaused = false;
                 destroyInternal();
                 if (desiredEnabled) {
                     WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "paused_bg", null);
                 }
-            } else if (desiredEnabled) {
+            } else if (desiredEnabled && !ttsPaused) {
                 ensureWatchdog(app);
                 scheduleRestart(app, 250, true);
             }
+        });
+    }
+
+    static void pauseForTts() {
+        ttsPaused = true;
+        MAIN.post(() -> {
+            boolean keepActive = active;
+            destroyInternal();
+            active = keepActive;
+        });
+    }
+
+    static void resumeAfterTts(Context c) {
+        ttsPaused = false;
+        if (!desiredEnabled || !appVisible || c == null) return;
+        Context app = c.getApplicationContext();
+        MAIN.post(() -> {
+            if (ttsPaused || !desiredEnabled || !appVisible) return;
+            ensureWatchdog(app);
+            scheduleRestart(app, 160, true);
         });
     }
 
@@ -82,6 +104,7 @@ final class VoiceRecognitionManager {
         desiredEnabled = enabled;
         biasStrings = bias != null ? new ArrayList<>(bias) : new ArrayList<>();
         lastError = null;
+        if (!enabled) ttsPaused = false;
         if (forceRestart) {
             consecutiveModeFailures = 0;
             consecutiveDeadRestarts = 0;
@@ -90,7 +113,7 @@ final class VoiceRecognitionManager {
         MAIN.post(() -> {
             if (desiredEnabled && appVisible) {
                 ensureWatchdog(app);
-                if (forceRestart || !listeningInProgress) {
+                if (!ttsPaused && (forceRestart || !listeningInProgress)) {
                     startListeningCycle(app, forceRestart);
                 }
             } else {
@@ -103,10 +126,10 @@ final class VoiceRecognitionManager {
     }
 
     static void onAudioFocusRestored(Context c) {
-        if (!desiredEnabled || !appVisible || c == null) return;
+        if (!desiredEnabled || !appVisible || ttsPaused || c == null) return;
         Context app = c.getApplicationContext();
         MAIN.post(() -> {
-            if (!desiredEnabled || !appVisible) return;
+            if (!desiredEnabled || !appVisible || ttsPaused) return;
             long now = SystemClock.elapsedRealtime();
             if (!listeningInProgress || (now - lastCallbackElapsedMs > 2_000L && now - lastSpeechElapsedMs > 2_000L)) {
                 scheduleRestart(app, 200, true);
@@ -116,6 +139,7 @@ final class VoiceRecognitionManager {
 
     static void stop() {
         desiredEnabled = false;
+        ttsPaused = false;
         MAIN.post(() -> {
             destroyInternal();
             WorkoutServicePlugin.deliverVoiceEvent("", false, "mic", "stopped", null);
@@ -169,6 +193,10 @@ final class VoiceRecognitionManager {
             @Override
             public void run() {
                 if (!desiredEnabled || !appVisible || watchdogRunnable != this) return;
+                if (ttsPaused) {
+                    MAIN.postDelayed(this, WATCHDOG_PERIOD_MS);
+                    return;
+                }
                 long now = SystemClock.elapsedRealtime();
                 if (!listeningInProgress && pendingRestart == null) {
                     Log.w(TAG, "Watchdog: idle without pending restart, restarting");
@@ -202,10 +230,10 @@ final class VoiceRecognitionManager {
 
     private static void scheduleRestart(Context app, long delayMs, boolean forceRecreate) {
         cancelRestart();
-        if (!desiredEnabled || !appVisible) return;
+        if (!desiredEnabled || !appVisible || ttsPaused) return;
         pendingRestart = () -> {
             pendingRestart = null;
-            if (desiredEnabled && appVisible) startListeningCycle(app, forceRecreate);
+            if (desiredEnabled && appVisible && !ttsPaused) startListeningCycle(app, forceRecreate);
         };
         MAIN.postDelayed(pendingRestart, delayMs);
     }
@@ -434,7 +462,7 @@ final class VoiceRecognitionManager {
 
     private static void startListeningCycle(Context app, boolean forceRecreate) {
         cancelRestart();
-        if (!desiredEnabled || !appVisible) return;
+        if (!desiredEnabled || !appVisible || ttsPaused) return;
         if (forceRecreate) {
             boolean keepActive = active;
             destroyInternal();

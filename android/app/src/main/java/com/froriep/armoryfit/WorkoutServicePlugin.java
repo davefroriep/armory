@@ -336,6 +336,13 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve(ret);
     }
 
+    @PluginMethod
+    public void speakVoice(PluginCall call) {
+        String text = call.getString("text", "");
+        VoiceSpeaker.speak(getContext(), text);
+        call.resolve();
+    }
+
     private static ArrayList<String> readBiasPhrases(PluginCall call) {
         ArrayList<String> out = new ArrayList<>();
         JSArray arr = call.getArray("biasPhrases");

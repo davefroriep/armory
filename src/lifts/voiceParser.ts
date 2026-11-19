@@ -18,6 +18,82 @@ export type VoiceIntent =
   | { kind: 'cam_arm'; camera?: string }
   | { kind: 'cam_clip_last'; camera?: string };
 
+export type VoiceAliasSlot =
+  | 'check_set'
+  | 'reps_only'
+  | 'undo'
+  | 'rest_skip'
+  | 'rest_more'
+  | 'add_set'
+  | 'next_ex'
+  | 'cam_arm'
+  | 'cam_clip_last'
+  | 'finish_workout';
+
+export type CustomVoiceAliases = Partial<Record<VoiceAliasSlot, string[]>>;
+
+export const VOICE_ALIAS_SLOTS: readonly { slot: VoiceAliasSlot; label: string; hint: string }[] = [
+  { slot: 'check_set', label: 'Check / Complete Set', hint: 'e.g. crushed it, money, send it' },
+  { slot: 'reps_only', label: 'Log Reps Only (use # for reps)', hint: 'e.g. pushed #, knocked out #' },
+  { slot: 'undo', label: 'Undo Last Action', hint: 'e.g. take that back, oops' },
+  { slot: 'rest_skip', label: 'Skip Rest Timer', hint: 'e.g. lets go, im ready' },
+  { slot: 'rest_more', label: 'Add +30s Rest', hint: 'e.g. hold on, breather' },
+  { slot: 'add_set', label: 'Add a Set', hint: 'e.g. bonus set, run it back' },
+  { slot: 'next_ex', label: 'Next Exercise', hint: 'e.g. move on' },
+  { slot: 'cam_arm', label: 'Record Set (Gym Cam)', hint: 'e.g. watch this, roll tape' },
+  { slot: 'cam_clip_last', label: 'Clip Last Set', hint: 'e.g. save that, highlight' },
+  { slot: 'finish_workout', label: 'Finish Workout', hint: 'e.g. all done, wrap it up' },
+];
+
+export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSlot; examples: readonly string[]; note?: string }[] = [
+  {
+    title: 'Log Set (Weight + Reps)',
+    examples: ['225 for 8', '225 by 8', '225 x 8', '8 reps at 225', '35s for 12', 'bodyweight for 12', '45 seconds', '185 for 10 rpe 8.5'],
+    note: 'Supports spoken numbers ("two twenty five for eight", "thirty fives") and optional trailing RPE 6–10.',
+  },
+  {
+    title: 'Log Reps Only (Keep Weight)',
+    slot: 'reps_only',
+    examples: ['for 10', 'by 10', 'did 5', 'got 8', 'hit 6', 'x 10', 'times 10', '10 reps'],
+    note: 'Keeps the target set’s prefilled/current weight and updates reps only.',
+  },
+  {
+    title: 'Check / Complete Set As-Is',
+    slot: 'check_set',
+    examples: ['check', 'done', 'log', 'got it', 'same', 'repeat', 'crushed it', 'nailed it', 'good set', 'easy', 'boom'],
+  },
+  {
+    title: 'Preview Weight / Reps Only',
+    examples: ['weight 225', 'set weight to 185', 'reps 10', 'set reps to 8'],
+    note: 'Updates the input box without checking the set off yet.',
+  },
+  {
+    title: 'Switch / Jump Exercise',
+    slot: 'next_ex',
+    examples: ['next', 'next exercise', 'previous exercise', 'go to bench', 'jump to pull ups', '2A', '2B'],
+  },
+  {
+    title: 'Add / Remove Sets',
+    slot: 'add_set',
+    examples: ['add set', 'one more set', 'add set to last exercise', 'delete empty sets'],
+  },
+  {
+    title: 'Rest & Hold Timers',
+    slot: 'rest_skip',
+    examples: ['skip rest', 'end rest', 'more rest', 'add 30 seconds', 'minus 15 seconds', 'start hold 45'],
+  },
+  {
+    title: 'Gym Camera DVR',
+    slot: 'cam_arm',
+    examples: ['record', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith'],
+  },
+  {
+    title: 'Workout & Undo',
+    slot: 'undo',
+    examples: ['undo', 'pause workout', 'resume workout', 'finish workout'],
+  },
+];
+
 const ONES: Record<string, number> = {
   zero: 0, oh: 0, o: 0, one: 1, two: 2, three: 3, four: 4, five: 5,
   six: 6, seven: 7, eight: 8, nine: 9, ten: 10, eleven: 11, twelve: 12,
@@ -128,8 +204,8 @@ export function normalizeVoiceText(raw: string): string {
       i++;
       continue;
     }
-    // Leave "for", "four" alone here if acting as connector; convert explicit "ate" -> 8 after "for/by/x"
-    if (t === 'ate' && out.length > 0 && ['for', 'by', 'x', 'times', 'did', 'got'].includes(out[out.length - 1])) {
+    // Leave "for", "four" alone here if acting as connector; convert explicit "ate" -> 8 after connector/verb
+    if (t === 'ate' && out.length > 0 && ['for', 'by', 'x', 'times', 'did', 'got', 'hit'].includes(out[out.length - 1])) {
       out.push('8');
       i++;
       continue;
@@ -139,10 +215,26 @@ export function normalizeVoiceText(raw: string): string {
       i++;
       continue;
     }
-    if (t === 'four' && out.length > 0 && /^\d+(?:\.\d+)?$/.test(out[out.length - 1]) && toks[i + 1] && (ONES[toks[i + 1]] != null || /^\d+$/.test(toks[i + 1]))) {
-      out.push('for');
-      i++;
-      continue;
+    if (t === 'four') {
+      const prevIsNum = out.length > 0 && /^\d+(?:\.\d+)?$/.test(out[out.length - 1]);
+      const nextTok = toks[i + 1];
+      const afterNext = toks[i + 2];
+      const nextIsRep = !!nextTok && (
+        /^\d+$/.test(nextTok) ||
+        nextTok === 'ate' ||
+        (ONES[nextTok] != null && nextTok !== 'oh' && nextTok !== 'o') ||
+        TENS[nextTok] != null
+      );
+      if (prevIsNum && nextTok && (ONES[nextTok] != null || /^\d+$/.test(nextTok) || nextTok === 'ate')) {
+        out.push('for');
+        i++;
+        continue;
+      }
+      if (!prevIsNum && nextIsRep && (!afterNext || afterNext === 'reps' || afterNext === 'rep' || afterNext === 'rpe')) {
+        out.push('for');
+        i++;
+        continue;
+      }
     }
     const parsed = parseSpokenNumberTokens(toks, i);
     if (parsed) {
@@ -161,9 +253,9 @@ export function normalizeVoiceText(raw: string): string {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // Separator homophones strictly between two numeric values
+  // Separator homophones before numeric values
   joined = joined
-    .replace(/\b(\d+(?:\.\d+)?)\s*(?:buy|bye)\s+(\d+)\b/g, '$1 by $2')
+    .replace(/\b(?:buy|bye)\s+(\d+)\b/g, 'by $1')
     .replace(/\b(\d+(?:\.\d+)?)\s*to\s+(\d+)\b(?![a-d])/g, '$1 for $2')
     .replace(/\bfor\s+ate\b/g, 'for 8');
   return joined;
@@ -173,13 +265,67 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function parseBodytail(tailRaw: string): VoiceIntent | null {
-  let tail = tailRaw.trim().replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '');
+function matchCustomVoiceAlias(
+  tail: string,
+  customAliases?: CustomVoiceAliases,
+  rpe?: number,
+): VoiceIntent | null {
+  if (!customAliases) return null;
+  const rpeSpread = rpe != null ? { rpe } : {};
+  const ph = '__repnum__';
+  for (const rawAlias of customAliases.reps_only ?? []) {
+    const trimmed = rawAlias.trim();
+    if (!trimmed) continue;
+    const hasHash = trimmed.includes('#');
+    const normAlias = normalizeVoiceText(trimmed.replace(/#/g, ` ${ph} `));
+    if (!normAlias) continue;
+    const re = hasHash
+      ? new RegExp(`^${escapeRe(normAlias).replace(ph, '(\\d+)')}${normAlias.endsWith(ph) ? '(?:\\s*reps?)?' : ''}$`)
+      : new RegExp(`^${escapeRe(normAlias)}\\s+(\\d+)(?:\\s*reps?)?$`);
+    const m = tail.match(re);
+    if (m) return { kind: 'log_current', reps: Number(m[1]), ...rpeSpread };
+  }
+
+  const fixedSlots: { slot: Exclude<VoiceAliasSlot, 'reps_only'>; make: () => VoiceIntent }[] = [
+    { slot: 'check_set', make: () => ({ kind: 'log_current', ...rpeSpread }) },
+    { slot: 'undo', make: () => ({ kind: 'undo' }) },
+    { slot: 'rest_skip', make: () => ({ kind: 'rest_skip' }) },
+    { slot: 'rest_more', make: () => ({ kind: 'rest_add', deltaSec: 30 }) },
+    { slot: 'add_set', make: () => ({ kind: 'add_set' }) },
+    { slot: 'next_ex', make: () => ({ kind: 'next_ex' }) },
+    { slot: 'cam_arm', make: () => ({ kind: 'cam_arm' }) },
+    { slot: 'cam_clip_last', make: () => ({ kind: 'cam_clip_last' }) },
+    { slot: 'finish_workout', make: () => ({ kind: 'finish_workout' }) },
+  ];
+  for (const { slot, make } of fixedSlots) {
+    for (const rawAlias of customAliases[slot] ?? []) {
+      const normAlias = normalizeVoiceText(rawAlias).replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '');
+      if (normAlias && tail === normAlias) return make();
+    }
+  }
+  return null;
+}
+
+function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): VoiceIntent | null {
+  const tail = tailRaw.trim().replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '');
   if (!tail) return { kind: 'arm_wake' };
 
+  // Non-destructively extract optional trailing/embedded RPE ("... rpe 8.5") for logging aliases & set commands
+  let tailNoRpe = tail;
+  let rpe: number | undefined;
+  const rpeM = tail.match(/(?:^|\s)(?:@|at\s+)?rpe\s*(\d+(?:\.\d+)?)\b/);
+  if (rpeM) {
+    const val = Number(rpeM[1]);
+    if (val >= 6 && val <= 10) rpe = Math.round(val * 2) / 2;
+    tailNoRpe = (tail.slice(0, rpeM.index) + tail.slice((rpeM.index ?? 0) + rpeM[0].length)).trim();
+  }
+
+  const customHit = matchCustomVoiceAlias(tailNoRpe, customAliases, rpe);
+  if (customHit) return customHit;
+
   if (/^(?:undo|uncheck|undo\s+last|cancel(?:\s+last)?)$/.test(tail)) return { kind: 'undo' };
-  if (/^(?:check|log|done|same|same\s+reps|same\s+weight|repeat|log\s+set|check\s+set|mark\s+done|complete(?:\s+set)?|yep|got\s+it)$/.test(tail)) {
-    return { kind: 'log_current' };
+  if (/^(?:check|check\s+it|check\s+set|log|log\s+it|log\s+set|done|same|same\s+reps|same\s+weight|repeat|mark\s+done|complete(?:\s+set)?|yep|got\s+it|crushed\s+it|nailed\s+it|good(?:\s+set)?|easy|boom|locked\s+in)$/.test(tailNoRpe)) {
+    return { kind: 'log_current', ...(rpe != null ? { rpe } : {}) };
   }
 
   const holdM = tail.match(/^(?:start|begin)\s+(?:hold|timer|countdown)(?:\s+(\d+)\s*(?:s|sec|secs|seconds)?)?$/);
@@ -243,47 +389,39 @@ function parseBodytail(tailRaw: string): VoiceIntent | null {
   const bareLabelM = tail.match(/^([1-9]\s*[a-d])$/);
   if (bareLabelM) return { kind: 'jump_ex', target: bareLabelM[1].replace(/\s+/g, '') };
 
-  // Extract optional trailing/embedded RPE ("... rpe 8.5")
-  let rpe: number | undefined;
-  const rpeM = tail.match(/(?:^|\s)(?:@|at\s+)?rpe\s*(\d+(?:\.\d+)?)\b/);
-  if (rpeM) {
-    const val = Number(rpeM[1]);
-    if (val >= 6 && val <= 10) rpe = Math.round(val * 2) / 2;
-    tail = (tail.slice(0, rpeM.index) + tail.slice((rpeM.index ?? 0) + rpeM[0].length)).trim();
-  }
-
   // Weight-only or Reps-only preview updates (no auto-check)
-  const setW = tail.match(/^(?:set\s+)?weight\s+(?:to\s+)?(\d+(?:\.\d+)?)(?:\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos))?$/);
+  const setW = tailNoRpe.match(/^(?:set\s+)?weight\s+(?:to\s+)?(\d+(?:\.\d+)?)(?:\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos))?$/);
   if (setW) return { kind: 'set_only', weight: Number(setW[1]) };
-  const setR = tail.match(/^(?:set\s+)?reps\s+(?:to\s+)?(\d+)$/);
+  const setR = tailNoRpe.match(/^(?:set\s+)?reps\s+(?:to\s+)?(\d+)$/);
   if (setR) return { kind: 'set_only', reps: Number(setR[1]) };
 
   // Bodyweight + reps ("bodyweight for 12", "bw 10")
-  const bwM = tail.match(/^(?:body\s*weight|bw)\s*(?:for|by|x|times|reps)?\s*(\d+)(?:\s*reps)?$/);
+  const bwM = tailNoRpe.match(/^(?:body\s*weight|bw)\s*(?:for|by|x|times|reps)?\s*(\d+)(?:\s*reps)?$/);
   if (bwM) {
     return { kind: 'log_current', bodyweight: true, weight: 0, reps: Number(bwM[1]), ...(rpe != null ? { rpe } : {}) };
   }
 
   // Timed hold logging ("45 seconds", "hold 60 sec done")
-  const secM = tail.match(/^(?:hold\s+)?(\d+)\s*(?:s|sec|secs|seconds)(?:\s+(?:done|check|log))?$/);
+  const secM = tailNoRpe.match(/^(?:hold\s+)?(\d+)\s*(?:s|sec|secs|seconds)(?:\s+(?:done|check|log))?$/);
   if (secM) {
     return { kind: 'log_current', seconds: Number(secM[1]), ...(rpe != null ? { rpe } : {}) };
   }
 
   // Weight + reps ("225 for 8", "225 by 8", "225 x 8", "225 lbs for 8 reps")
-  const wrM = tail.match(/^(\d+(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos)?\s*(?:for|by|x|times|at|@)?\s*(\d+)(?:\s*reps?)?$/);
+  const wrM = tailNoRpe.match(/^(\d+(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos)?\s*(?:for|by|x|times|at|@)?\s*(\d+)(?:\s*reps?)?$/);
   if (wrM) {
     return { kind: 'log_current', weight: Number(wrM[1]), reps: Number(wrM[2]), ...(rpe != null ? { rpe } : {}) };
   }
 
   // Reps at weight ("8 reps at 225", "10 at 185 lbs")
-  const rwM = tail.match(/^(\d+)\s*(?:reps?)?\s*(?:at|with|@|of)\s*(\d+(?:\.\d+)?)(?:\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos))?$/);
+  const rwM = tailNoRpe.match(/^(\d+)\s*(?:reps?)?\s*(?:at|with|@|of)\s*(\d+(?:\.\d+)?)(?:\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos))?$/);
   if (rwM) {
     return { kind: 'log_current', weight: Number(rwM[2]), reps: Number(rwM[1]), ...(rpe != null ? { rpe } : {}) };
   }
 
-  // Reps-only logging using pre-filled / current weight ("10 reps", "for 8", "got 12")
-  const rOnlyM = tail.match(/^(?:for|did|got)?\s*(\d+)\s*reps$/) ?? tail.match(/^(?:for|did|got)\s+(\d+)$/);
+  // Reps-only logging using pre-filled / current weight ("for 10", "by 10", "did 5", "10 reps")
+  const rOnlyM = tailNoRpe.match(/^(?:for|by|x|times|did|got|hit)?\s*(\d+)\s*reps?$/)
+    ?? tailNoRpe.match(/^(?:for|by|x|times|did|got|hit)\s+(\d+)$/);
   if (rOnlyM) {
     return { kind: 'log_current', reps: Number(rOnlyM[1]), ...(rpe != null ? { rpe } : {}) };
   }
@@ -306,6 +444,78 @@ export function hasWakeWord(raw: string, wakeWord?: string): boolean {
   return buildWakeRegex(wakeWord).test(norm);
 }
 
+/** True when user spoke something after the wake word (or while already armed) — gates "Didn't catch that" away from ambient chatter. */
+export function hasCommandTailAfterWake(raw: string, wakeWord?: string, armed = false): boolean {
+  const norm = normalizeVoiceText(raw);
+  if (!norm) return false;
+  const wakeRe = buildWakeRegex(wakeWord);
+  let lastEnd = -1;
+  let m: RegExpExecArray | null;
+  while ((m = wakeRe.exec(norm)) !== null) {
+    lastEnd = m.index + m[0].length;
+  }
+  if (lastEnd >= 0) {
+    return norm.slice(lastEnd).replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '').length > 0;
+  }
+  if (armed) {
+    return norm.replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '').length > 0;
+  }
+  return false;
+}
+
+/** Returns concise spoken readback confirmation text (or `null` for silent wake arming). */
+export function defaultReadbackForIntent(intent: VoiceIntent): string | null {
+  switch (intent.kind) {
+    case 'arm_wake':
+      return null;
+    case 'log_current':
+      if (intent.seconds != null) return `${intent.seconds} seconds, got it`;
+      if (intent.bodyweight && intent.reps != null) return `Bodyweight for ${intent.reps}, got it`;
+      if (intent.weight != null && intent.reps != null) return `${intent.weight} for ${intent.reps}, got it`;
+      if (intent.reps != null) return `For ${intent.reps}, got it`;
+      return 'Checked, got it';
+    case 'set_only':
+      if (intent.weight != null) return `Weight ${intent.weight}, got it`;
+      if (intent.reps != null) return `Reps ${intent.reps}, got it`;
+      return 'Updated';
+    case 'start_hold':
+      return intent.seconds != null ? `Hold ${intent.seconds} seconds` : 'Hold started';
+    case 'next_ex':
+      return 'Next exercise';
+    case 'prev_ex':
+      return 'Previous exercise';
+    case 'jump_ex':
+      return `Jumping to ${intent.target}`;
+    case 'undo':
+      return 'Undid last';
+    case 'rest_skip':
+      return 'Rest skipped';
+    case 'rest_add':
+      return intent.deltaSec >= 0 ? `Added ${intent.deltaSec} seconds` : `Minus ${Math.abs(intent.deltaSec)} seconds`;
+    case 'pause_workout':
+      return 'Workout paused';
+    case 'resume_workout':
+      return 'Workout resumed';
+    case 'finish_workout':
+      return 'Finishing workout';
+    case 'add_set':
+      return 'Set added';
+    case 'add_set_prev_ex':
+      return 'Added set to last exercise';
+    case 'delete_empty_sets':
+      return 'Deleted empty sets';
+    case 'cam_arm':
+      return intent.camera ? `Recording ${intent.camera.replace(/ cam$/i, '')}` : 'Camera toggled';
+    case 'cam_clip_last':
+      return 'Clipping last set';
+  }
+}
+
+/** Human-readable intent description shown in Voice tester / logs. */
+export function describeVoiceIntent(intent: VoiceIntent): string {
+  return defaultReadbackForIntent(intent) ?? 'Wake word armed (listening…)';
+}
+
 /**
  * Parses a speech transcript gated by the configured wake word (e.g. `"armory"`).
  * When `armed` is true (user already said the wake word within the active window),
@@ -313,7 +523,7 @@ export function hasWakeWord(raw: string, wakeWord?: string): boolean {
  */
 export function parseVoiceTranscript(
   raw: string,
-  opts: { wakeWord?: string; armed?: boolean; requireWake?: boolean } = {},
+  opts: { wakeWord?: string; armed?: boolean; requireWake?: boolean; customAliases?: CustomVoiceAliases } = {},
 ): VoiceIntent | null {
   const norm = normalizeVoiceText(raw);
   if (!norm) return null;
@@ -329,11 +539,11 @@ export function parseVoiceTranscript(
   if (lastEnd >= 0) {
     const tail = norm.slice(lastEnd).trim();
     if (!tail) return { kind: 'arm_wake' };
-    return parseBodytail(tail);
+    return parseBodytail(tail, opts.customAliases);
   }
 
   if (opts.requireWake === false || opts.armed) {
-    return parseBodytail(norm);
+    return parseBodytail(norm, opts.customAliases);
   }
   return null;
 }

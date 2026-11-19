@@ -2,7 +2,7 @@ import { buzz } from '../audio/audio';
 import { Emitter } from '../emitter';
 import {
   ensureNativeVoicePermission, getNativeVoiceStatus, isNative, onNativeVoiceResult,
-  setNativeVoiceListening, type NativeVoiceEvent,
+  setNativeVoiceListening, speakNativeVoice, type NativeVoiceEvent,
 } from '../native/service';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { active } from './active';
@@ -14,12 +14,16 @@ import { gymCam } from './gymCam';
 import { canLog, editReps, editWeight, labels, toggleDone } from './logic';
 import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
-import { hasWakeWord, parseVoiceTranscript, type VoiceIntent } from './voiceParser';
+import {
+  defaultReadbackForIntent, describeVoiceIntent, hasCommandTailAfterWake, hasWakeWord,
+  parseVoiceTranscript, type VoiceIntent,
+} from './voiceParser';
 
 export interface VoiceActionNotice {
   text: string;
   kind: 'ok' | 'info' | 'warn';
   atMs: number;
+  speech?: string | null;
 }
 
 type UndoEntry =
@@ -120,18 +124,31 @@ class VoiceController {
     this.changed.emit();
   }
 
-  /** Computes speech biasing phrases (wake word + active workout exercises & labels). */
+  /** Computes speech biasing phrases (wake word + active workout exercises + user custom aliases). */
   biasPhrases(): string[] {
     const out = new Set<string>(BASE_BIAS);
-    const wake = getSettings().voiceWakeWord.trim().toLowerCase();
+    const st = getSettings();
+    const wake = st.voiceWakeWord.trim().toLowerCase();
     if (wake) out.add(wake);
+    for (const list of Object.values(st.voiceCustomAliases ?? {})) {
+      for (const raw of list ?? []) {
+        const clean = raw.replace(/#/g, '').trim();
+        if (clean) out.add(clean);
+      }
+    }
     const s = lifts.active;
     if (s) {
       for (const se of s.exs) {
         out.add(lifts.exOrStub(se.exId).name);
       }
     }
-    return [...out].slice(0, 40);
+    return [...out].slice(0, 60);
+  }
+
+  refreshBiasPhrases(): void {
+    if (this.listening && isNative()) {
+      void setNativeVoiceListening(true, this.biasPhrases(), false);
+    }
   }
 
   async setEnabled(on: boolean): Promise<boolean> {
@@ -175,9 +192,43 @@ class VoiceController {
       wakeWord: s.voiceWakeWord,
       armed: this.isArmed(),
       requireWake,
+      customAliases: s.voiceCustomAliases,
     });
     if (!intent) return null;
-    return this.executeIntent(intent);
+    return this.executeIntent(intent, false);
+  }
+
+  /** Tests any phrase in `#/settings` (works with or without an active workout) and speaks readback. */
+  testPhrase(raw: string): { matched: boolean; text: string; speech: string | null } {
+    const s = getSettings();
+    const trimmed = raw.trim();
+    this.lastHeard = trimmed;
+    const intent = parseVoiceTranscript(trimmed, {
+      wakeWord: s.voiceWakeWord,
+      armed: this.isArmed(),
+      requireWake: false,
+      customAliases: s.voiceCustomAliases,
+    });
+    if (!intent) {
+      this.notice(`Didn’t catch “${trimmed}”`, 'warn', false, "Didn't catch that");
+      this.speak("Didn't catch that");
+      return { matched: false, text: 'Did not match a lift voice command', speech: "Didn't catch that" };
+    }
+    if (lifts.active) {
+      const res = this.executeIntent(intent, true);
+      return { matched: true, text: res.text, speech: res.speech ?? null };
+    }
+    const text = `✓ Matched: ${describeVoiceIntent(intent)}`;
+    const speech = defaultReadbackForIntent(intent);
+    this.notice(text, 'info', false, speech);
+    if (speech) this.speak(speech);
+    return { matched: true, text, speech };
+  }
+
+  speak(text: string | null | undefined): void {
+    const clean = text?.trim();
+    if (!clean || !getSettings().voiceReadback) return;
+    void speakNativeVoice(clean);
   }
 
   private syncCursorToSession(): void {
@@ -336,10 +387,11 @@ class VoiceController {
     this.lastFinalAt = now;
 
     const armed = this.isArmed();
+    const customAliases = getSettings().voiceCustomAliases;
     let matchedCand: string | null = null;
     let intent: VoiceIntent | null = null;
     for (const cand of pool) {
-      const hit = parseVoiceTranscript(cand, { wakeWord, armed });
+      const hit = parseVoiceTranscript(cand, { wakeWord, armed, customAliases });
       if (hit) {
         matchedCand = cand;
         intent = hit;
@@ -348,73 +400,91 @@ class VoiceController {
     }
     this.lastHeard = matchedCand ?? pool[0];
     if (!intent) {
-      this.changed.emit();
+      if (hasCommandTailAfterWake(pool[0], wakeWord, armed)) {
+        this.armedUntilMs = 0;
+        this.notice(`Didn’t catch “${pool[0]}”`, 'warn', true, "Didn't catch that");
+        this.speak("Didn't catch that");
+      } else {
+        this.changed.emit();
+      }
       return;
     }
-    this.executeIntent(intent);
+    this.executeIntent(intent, true);
   }
 
-  private notice(text: string, kind: VoiceActionNotice['kind'], toastIt = true): VoiceActionNotice {
-    const n: VoiceActionNotice = { text, kind, atMs: Date.now() };
+  private notice(
+    text: string,
+    kind: VoiceActionNotice['kind'],
+    toastIt = true,
+    speech: string | null = null,
+  ): VoiceActionNotice {
+    const n: VoiceActionNotice = { text, kind, atMs: Date.now(), ...(speech ? { speech } : {}) };
     this.lastAction = n;
     this.changed.emit();
     if (toastIt) this.toasted.emit({ msg: text });
     return n;
   }
 
-  private executeIntent(intent: VoiceIntent): VoiceActionNotice {
+  private executeIntent(intent: VoiceIntent, speakIt = false): VoiceActionNotice {
+    const n = this.runIntent(intent);
+    if (speakIt && n.speech) this.speak(n.speech);
+    return n;
+  }
+
+  private runIntent(intent: VoiceIntent): VoiceActionNotice {
     this.syncCursorToSession();
     if (intent.kind === 'arm_wake') {
       this.armNow();
       buzz(20);
-      return this.notice('Listening… say weight & reps or "check"', 'info', false);
+      return this.notice('Listening… say weight & reps or "check"', 'info', false, null);
     }
 
+    const fallbackSpeech = defaultReadbackForIntent(intent);
     this.armedUntilMs = 0;
     const s = lifts.active;
     if (!s) {
-      return this.notice('Start a Strength workout to use voice set commands', 'warn');
+      return this.notice('Start a Strength workout to use voice set commands', 'warn', true, 'Start a workout first');
     }
 
     if (intent.kind === 'rest_skip') {
       active.clearRest();
       buzz(20);
-      return this.notice('Rest timer skipped', 'info');
+      return this.notice('Rest timer skipped', 'info', true, fallbackSpeech);
     }
     if (intent.kind === 'rest_add') {
       if (!active.rest) {
-        return this.notice('No rest timer running', 'warn');
+        return this.notice('No rest timer running', 'warn', true, 'No rest running');
       }
       active.adjustRest(intent.deltaSec);
       buzz(20);
-      return this.notice(`${intent.deltaSec >= 0 ? '+' : ''}${intent.deltaSec}s rest`, 'info');
+      return this.notice(`${intent.deltaSec >= 0 ? '+' : ''}${intent.deltaSec}s rest`, 'info', true, fallbackSpeech);
     }
     if (intent.kind === 'pause_workout') {
-      if (active.pause()) return this.notice('Workout paused', 'info');
-      return this.notice('Workout is not running', 'warn');
+      if (active.pause()) return this.notice('Workout paused', 'info', true, fallbackSpeech);
+      return this.notice('Workout is not running', 'warn', true, 'Not running');
     }
     if (intent.kind === 'resume_workout') {
-      if (active.resume()) return this.notice('Workout resumed', 'info');
-      return this.notice('Workout is not paused', 'warn');
+      if (active.resume()) return this.notice('Workout resumed', 'info', true, fallbackSpeech);
+      return this.notice('Workout is not paused', 'warn', true, 'Not paused');
     }
     if (intent.kind === 'finish_workout') {
       if (this.finishTrigger) {
         buzz(25);
         this.finishTrigger();
-        return this.notice('Finishing workout…', 'info', false);
+        return this.notice('Finishing workout…', 'info', false, fallbackSpeech);
       }
-      return this.notice('Open active Strength workout to finish', 'warn');
+      return this.notice('Open active Strength workout to finish', 'warn', true, fallbackSpeech);
     }
     if (intent.kind === 'cam_arm' || intent.kind === 'cam_clip_last') {
       if (!this.camHandler) {
-        return this.notice('Open active Strength workout to use camera commands', 'warn');
+        return this.notice('Open active Strength workout to use camera commands', 'warn', true, 'Open a workout first');
       }
       const mode = intent.kind === 'cam_arm' ? 'arm' : 'clip_last';
       void Promise.resolve(this.camHandler(mode, intent.camera)).then((msg) => {
         if (msg) this.notice(msg, 'info');
       });
       buzz(25);
-      return this.notice(mode === 'arm' ? 'Camera toggled…' : 'Clipping last set…', 'info', false);
+      return this.notice(mode === 'arm' ? 'Camera toggled…' : 'Clipping last set…', 'info', false, fallbackSpeech);
     }
 
     const cur = resolveTargetSet(s.exs, this.cursor);
@@ -433,7 +503,7 @@ class VoiceController {
 
     if (intent.kind === 'add_set') {
       const targetSe = cur ? s.exs[cur.exIdx] : (this.lastLoggedExUid ? s.exs.find((e) => e.uid === this.lastLoggedExUid) : undefined) ?? s.exs[s.exs.length - 1];
-      if (!targetSe) return this.notice('Add an exercise first', 'warn');
+      if (!targetSe) return this.notice('Add an exercise first', 'warn', true, 'Add an exercise first');
       const name = lifts.exOrStub(targetSe.exId).name;
       pushExsUndo(name);
       const res = applyAddSet(s.exs, this.cursor, this.lastLoggedExUid, prevOf);
@@ -441,27 +511,27 @@ class VoiceController {
       lifts.saveSession(s, true);
       buzz(25);
       const setCount = targetSe.sets.filter((x) => x.kind !== 'w').length;
-      return this.notice(`+ Set ${setCount} added · ${name}`, 'info');
+      return this.notice(`+ Set ${setCount} added · ${name}`, 'info', true, `Set ${setCount} added`);
     }
 
     if (intent.kind === 'add_set_prev_ex') {
       let prevSe = this.lastLoggedExUid ? s.exs.find((e) => e.uid === this.lastLoggedExUid) : undefined;
       if (!prevSe && cur && cur.exIdx > 0) prevSe = s.exs[cur.exIdx - 1];
-      if (!prevSe) return this.notice('No previous exercise to add a set to', 'warn');
+      if (!prevSe) return this.notice('No previous exercise to add a set to', 'warn', true, 'No previous exercise');
       const name = lifts.exOrStub(prevSe.exId).name;
       pushExsUndo(name);
       const res = applyAddSetToLastEx(s.exs, this.cursor, this.lastLoggedExUid, prevOf);
-      if (!res.changed) return this.notice('No previous exercise to add a set to', 'warn');
+      if (!res.changed) return this.notice('No previous exercise to add a set to', 'warn', true, 'No previous exercise');
       this.cursor = res.cursor;
       const labs = labels(s.exs);
       lifts.saveSession(s, true);
       buzz(25);
       const setCount = prevSe.sets.filter((x) => x.kind !== 'w').length;
-      return this.notice(`+ Set ${setCount} on ${labs[res.exIdx] ?? ''} ${name}`, 'info');
+      return this.notice(`+ Set ${setCount} on ${labs[res.exIdx] ?? ''} ${name}`, 'info', true, fallbackSpeech);
     }
 
     if (intent.kind === 'delete_empty_sets') {
-      if (!cur) return this.notice('No empty sets on current exercise', 'warn');
+      if (!cur) return this.notice('No empty sets on current exercise', 'warn', true, 'No empty sets');
       const seCur = s.exs[cur.exIdx];
       const nameCur = lifts.exOrStub(seCur.exId).name;
       const snapJson = JSON.stringify(s.exs);
@@ -469,7 +539,7 @@ class VoiceController {
       const snapLast = this.lastLoggedExUid;
       const res = applyDeleteEmptySets(s.exs, this.cursor);
       if (!res.changed || !res.deletedCount) {
-        return this.notice('No empty sets on current exercise', 'warn');
+        return this.notice('No empty sets on current exercise', 'warn', true, 'No empty sets');
       }
       this.undoStack.push({
         type: 'exs',
@@ -485,30 +555,47 @@ class VoiceController {
       buzz(25);
       const nextPtr = resolveTargetSet(s.exs, this.cursor);
       const nextLabel = nextPtr ? ` → ${nextPtr.label} ${lifts.exOrStub(s.exs[nextPtr.exIdx].exId).name}` : '';
-      return this.notice(`Deleted ${res.deletedCount} empty set${res.deletedCount === 1 ? '' : 's'} · ${nameCur}${nextLabel}`, 'info');
+      return this.notice(
+        `Deleted ${res.deletedCount} empty set${res.deletedCount === 1 ? '' : 's'} · ${nameCur}${nextLabel}`,
+        'info',
+        true,
+        `Deleted ${res.deletedCount} empty ${res.deletedCount === 1 ? 'set' : 'sets'}`,
+      );
     }
 
     if (intent.kind === 'next_ex' || intent.kind === 'prev_ex') {
       const next = stepExerciseCursor(s.exs, cur, intent.kind === 'next_ex' ? 1 : -1);
-      if (!next) return this.notice('All sets already logged', 'info');
+      if (!next) return this.notice('All sets already logged', 'info', true, 'All sets logged');
       this.cursor = next;
       const ptr = resolveTargetSet(s.exs, this.cursor);
+      const exTitle = ptr ? lifts.exOrStub(s.exs[ptr.exIdx].exId).name : '';
       buzz(20);
-      return this.notice(ptr ? `Target → ${ptr.label} ${lifts.exOrStub(s.exs[ptr.exIdx].exId).name} (Set ${ptr.setNumber})` : 'Moved exercise', 'info');
+      return this.notice(
+        ptr ? `Target → ${ptr.label} ${exTitle} (Set ${ptr.setNumber})` : 'Moved exercise',
+        'info',
+        true,
+        exTitle ? `Up now, ${exTitle}` : fallbackSpeech,
+      );
     }
 
     if (intent.kind === 'jump_ex') {
       const jumped = jumpToExerciseCursor(s.exs, intent.target, lifts.exOrStub);
-      if (!jumped) return this.notice(`Could not find "${intent.target}" in workout`, 'warn');
+      if (!jumped) return this.notice(`Could not find "${intent.target}" in workout`, 'warn', true, "Didn't find that exercise");
       this.cursor = jumped;
       const ptr = resolveTargetSet(s.exs, this.cursor);
+      const exTitle = ptr ? lifts.exOrStub(s.exs[ptr.exIdx].exId).name : intent.target;
       buzz(20);
-      return this.notice(ptr ? `Target → ${ptr.label} ${lifts.exOrStub(s.exs[ptr.exIdx].exId).name}` : 'Jumped exercise', 'info');
+      return this.notice(
+        ptr ? `Target → ${ptr.label} ${lifts.exOrStub(s.exs[ptr.exIdx].exId).name}` : 'Jumped exercise',
+        'info',
+        true,
+        `Up now, ${exTitle}`,
+      );
     }
 
     if (intent.kind === 'undo') {
       const last = this.undoStack.pop();
-      if (!last || last.sessionId !== s.id) return this.notice('Nothing to undo', 'warn');
+      if (!last || last.sessionId !== s.id) return this.notice('Nothing to undo', 'warn', true, 'Nothing to undo');
       if (last.type === 'exs') {
         s.exs = JSON.parse(last.exsJson);
         this.cursor = last.prevCursor;
@@ -516,11 +603,11 @@ class VoiceController {
         void active.resetIfNoneLogged(s);
         lifts.saveSession(s, true);
         buzz(25);
-        return this.notice(`↶ Undid ${last.label}`, 'warn');
+        return this.notice(`↶ Undid ${last.label}`, 'warn', true, `Undid ${last.label}`);
       }
       const se = s.exs.find((e) => e.uid === last.exUid);
       const set = se?.sets.find((x) => x.id === last.setId);
-      if (!se || !set) return this.notice('Set no longer exists', 'warn');
+      if (!se || !set) return this.notice('Set no longer exists', 'warn', true, 'Set no longer exists');
       set.done = false;
       set.w = last.w;
       set.r = last.r;
@@ -532,10 +619,10 @@ class VoiceController {
       void active.resetIfNoneLogged(s);
       lifts.saveSession(s, true);
       buzz(25);
-      return this.notice(`↶ Undid ${lifts.exOrStub(se.exId).name}`, 'warn');
+      return this.notice(`↶ Undid ${lifts.exOrStub(se.exId).name}`, 'warn', true, 'Undid last set');
     }
 
-    if (!cur) return this.notice('All sets in this workout are complete!', 'ok');
+    if (!cur) return this.notice('All sets in this workout are complete!', 'ok', true, 'Workout complete');
     const se = s.exs[cur.exIdx];
     const set = se.sets[cur.setIdx];
     const ex = lifts.exOrStub(se.exId);
@@ -545,13 +632,13 @@ class VoiceController {
       if (ex.type !== 'time') {
         active.ensureStarted(s);
         active.startRest(intent.seconds ?? active.restSecFor(se), ex.name);
-        return this.notice(`Rest timer started · ${ex.name}`, 'info');
+        return this.notice(`Rest timer started · ${ex.name}`, 'info', true, 'Rest started');
       }
       if (this.holdStarter?.(se.uid, set.id, intent.seconds)) {
         buzz(25);
-        return this.notice(`▶ Hold countdown · ${intent.seconds ?? set.r ?? 45}s`, 'info');
+        return this.notice(`▶ Hold countdown · ${intent.seconds ?? set.r ?? 45}s`, 'info', true, fallbackSpeech);
       }
-      return this.notice('Open active workout view to run hold countdown', 'warn');
+      return this.notice('Open active workout view to run hold countdown', 'warn', true, 'Open active workout');
     }
 
     if (intent.kind === 'set_only') {
@@ -559,7 +646,7 @@ class VoiceController {
       if (intent.reps != null) editReps(se, cur.setIdx, intent.reps);
       this.cursor = { exUid: se.uid, setId: set.id };
       lifts.saveSession(s, true);
-      return this.notice(`Updated ${cur.label} ${ex.name}`, 'info');
+      return this.notice(`Updated ${cur.label} ${ex.name}`, 'info', true, fallbackSpeech);
     }
 
     // intent.kind === 'log_current'
@@ -589,12 +676,12 @@ class VoiceController {
     if (intent.rpe != null) set.rpe = intent.rpe;
 
     if (!canLog(set, ex)) {
-      return this.notice(`Need weight & reps for ${cur.label} ${ex.name} (e.g. "Armory 135 for 10")`, 'warn');
+      return this.notice(`Need weight & reps for ${cur.label} ${ex.name} (e.g. "Armory 135 for 10")`, 'warn', true, 'Need weight and reps');
     }
     const wasArmed = gymCam.isArmed(set.id);
     const logged = toggleDone(se, cur.setIdx, ex);
     if (!logged) {
-      return this.notice(`Could not log ${ex.name}`, 'warn');
+      return this.notice(`Could not log ${ex.name}`, 'warn', true, 'Could not log set');
     }
     this.undoStack.push(undoSnap);
     if (this.undoStack.length > 20) this.undoStack.shift();
@@ -614,7 +701,15 @@ class VoiceController {
       : ex.type === 'bodyweight' && !set.w
         ? `BW × ${set.r ?? 0}`
         : `${set.w != null ? fmtKg(set.w) : '0'} ${u} × ${set.r ?? 0}`;
-    return this.notice(`✓ ${cur.label} ${ex.name} · ${valTxt}`, 'ok');
+    const hasSpokenNums = intent.weight != null || intent.reps != null || intent.seconds != null;
+    const spokenCheck = ex.type === 'time'
+      ? `${set.r ?? 0} seconds, got it`
+      : ex.type === 'bodyweight' && !set.w
+        ? `Bodyweight for ${set.r ?? 0}, got it`
+        : set.w != null
+          ? `${fmtKg(set.w)} for ${set.r ?? 0}, got it`
+          : `For ${set.r ?? 0}, got it`;
+    return this.notice(`✓ ${cur.label} ${ex.name} · ${valTxt}`, 'ok', true, hasSpokenNums ? fallbackSpeech : spokenCheck);
   }
 }
 

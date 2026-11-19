@@ -2,6 +2,7 @@ import { Emitter } from '../emitter';
 import type { MetroMode } from '../domain/pacer';
 import type { RecoveryMode } from '../domain/gate';
 import { defaultQueueState, type QueueState } from '../domain/plan';
+import type { CustomVoiceAliases, VoiceAliasSlot } from '../lifts/voiceParser';
 
 export interface Settings {
   /** Intervals.icu athlete id (not a secret). */
@@ -58,6 +59,10 @@ export interface Settings {
   /** Foreground-only hands-free voice command listener ("armory ..."). */
   voiceEnabled: boolean;
   voiceWakeWord: string;
+  /** Speak short confirmation readbacks ("For 10, got it" / "Didn't catch that") after voice commands. */
+  voiceReadback: boolean;
+  /** User-added phrase aliases keyed by command action slot. */
+  voiceCustomAliases: CustomVoiceAliases;
   /** OptiPlex Gym Camera LAN DVR integration (probes silently; hidden off home Wi-Fi). */
   gymCamEnabled: boolean;
   gymCamUrl: string;
@@ -103,11 +108,24 @@ export const DEFAULTS: Settings = {
   wallboardRelayEnabled: true,
   voiceEnabled: false,
   voiceWakeWord: 'armory',
+  voiceReadback: true,
+  voiceCustomAliases: {},
   gymCamEnabled: true,
   gymCamUrl: 'http://192.168.1.152:8766',
   gymCamAutoPr: true,
   queue: defaultQueueState(),
 };
+
+function sanitizeAliases(raw: unknown): CustomVoiceAliases {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: CustomVoiceAliases = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(v)) continue;
+    const cleaned = v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean);
+    if (cleaned.length) out[k as VoiceAliasSlot] = [...new Set(cleaned)];
+  }
+  return out;
+}
 
 function load(): Settings {
   try {
@@ -118,6 +136,8 @@ function load(): Settings {
       ...DEFAULTS,
       ...parsed,
       apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
+      voiceReadback: typeof parsed.voiceReadback === 'boolean' ? parsed.voiceReadback : DEFAULTS.voiceReadback,
+      voiceCustomAliases: sanitizeAliases(parsed.voiceCustomAliases),
       queue: q,
     };
   } catch {

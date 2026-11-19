@@ -95,6 +95,7 @@ interface WorkoutServicePlugin {
   setVoiceListening(o: { enabled: boolean; biasPhrases: string[]; forceRestart?: boolean }): Promise<NativeVoiceStatus>;
   getVoiceStatus(): Promise<NativeVoiceStatus>;
   ensureVoicePermission(): Promise<{ granted: boolean }>;
+  speakVoice(o: { text: string }): Promise<void>;
   launchVideoCamera(): Promise<{ opened: boolean }>;
   recordVideo(): Promise<PickedNativeVideo>;
   listDeviceVideos(o: { limit?: number }): Promise<DeviceVideoListResult>;
@@ -297,4 +298,21 @@ export function onNativeVoiceResult(cb: (ev: NativeVoiceEvent) => void): () => v
     dead = true;
     if (handle) void handle.remove();
   };
+}
+
+export async function speakNativeVoice(text: string): Promise<void> {
+  const clean = text.trim();
+  if (!clean) return;
+  if (plugin) {
+    try { await plugin.speakVoice({ text: clean }); } catch { /* ignore */ }
+    return;
+  }
+  if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(clean);
+      u.rate = 1.1;
+      window.speechSynthesis.speak(u);
+    } catch { /* ignore */ }
+  }
 }

@@ -9,7 +9,9 @@ import {
   jumpToExerciseCursor, peekNextTargetSet, plannedSetSequence, resolveTargetSet, stepExerciseCursor,
 } from '../src/lifts/cursor';
 import { buildExercise } from '../src/lifts/logic';
-import { hasWakeWord, parseVoiceTranscript } from '../src/lifts/voiceParser';
+import {
+  defaultReadbackForIntent, hasCommandTailAfterWake, hasWakeWord, parseVoiceTranscript,
+} from '../src/lifts/voiceParser';
 import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
 import { buildWallboardSnapshot, isWallboardWorkoutActive } from '../src/wallboard/snapshot';
@@ -200,6 +202,52 @@ describe('voice transcript parser', () => {
     expect(hasWakeWord('Armory 22', 'armory')).toBe(true);
     expect(hasWakeWord("Armory's", 'armory')).toBe(true);
     expect(hasWakeWord('just talking', 'armory')).toBe(false);
+  });
+
+  it('supports by/for/did reps-only phrases, completion synonyms, custom aliases, and spoken readback helpers', () => {
+    // Reps-only variations & homophones
+    expect(parseVoiceTranscript('Armory for 10')).toEqual({ kind: 'log_current', reps: 10 });
+    expect(parseVoiceTranscript('Armory by 10')).toEqual({ kind: 'log_current', reps: 10 });
+    expect(parseVoiceTranscript('Armory buy 10')).toEqual({ kind: 'log_current', reps: 10 });
+    expect(parseVoiceTranscript('Armory four 10')).toEqual({ kind: 'log_current', reps: 10 });
+    expect(parseVoiceTranscript('Armory four ten')).toEqual({ kind: 'log_current', reps: 10 });
+    expect(parseVoiceTranscript('Armory did 5')).toEqual({ kind: 'log_current', reps: 5 });
+    expect(parseVoiceTranscript('Armory got 8')).toEqual({ kind: 'log_current', reps: 8 });
+    expect(parseVoiceTranscript('Armory hit 6')).toEqual({ kind: 'log_current', reps: 6 });
+    expect(parseVoiceTranscript('Armory x 8')).toEqual({ kind: 'log_current', reps: 8 });
+    expect(parseVoiceTranscript('Armory times 10')).toEqual({ kind: 'log_current', reps: 10 });
+    expect(parseVoiceTranscript('Armory by 5 rpe 8.5')).toEqual({ kind: 'log_current', reps: 5, rpe: 8.5 });
+    // Ensure 400+ weights like "four ten for five" don't break
+    expect(parseVoiceTranscript('Armory four ten for five')).toEqual({ kind: 'log_current', weight: 410, reps: 5 });
+
+    // Natural set-completion synonyms
+    expect(parseVoiceTranscript('Armory crushed it')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armory nailed it')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armory good set')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armory boom')).toEqual({ kind: 'log_current' });
+
+    // Custom user variations
+    const customAliases = {
+      check_set: ['send it'],
+      reps_only: ['knocked out #', 'pushed'],
+      undo: ['my bad'],
+    };
+    expect(parseVoiceTranscript('Armory send it', { customAliases })).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armory knocked out 12', { customAliases })).toEqual({ kind: 'log_current', reps: 12 });
+    expect(parseVoiceTranscript('Armory pushed 8', { customAliases })).toEqual({ kind: 'log_current', reps: 8 });
+    expect(parseVoiceTranscript('Armory my bad', { customAliases })).toEqual({ kind: 'undo' });
+
+    // Wake tail gating for "Didn't catch that" & concise spoken readback strings
+    expect(hasCommandTailAfterWake('just chatting in the gym', 'armory', false)).toBe(false);
+    expect(hasCommandTailAfterWake('Armory', 'armory', false)).toBe(false);
+    expect(hasCommandTailAfterWake('Armory purple banana', 'armory', false)).toBe(true);
+    expect(hasCommandTailAfterWake('purple banana', 'armory', true)).toBe(true);
+
+    expect(defaultReadbackForIntent({ kind: 'arm_wake' })).toBeNull();
+    expect(defaultReadbackForIntent({ kind: 'log_current', reps: 10 })).toBe('For 10, got it');
+    expect(defaultReadbackForIntent({ kind: 'log_current', weight: 225, reps: 8 })).toBe('225 for 8, got it');
+    expect(defaultReadbackForIntent({ kind: 'log_current' })).toBe('Checked, got it');
+    expect(defaultReadbackForIntent({ kind: 'undo' })).toBe('Undid last');
   });
 });
 
