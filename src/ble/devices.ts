@@ -20,9 +20,12 @@ const NUS_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const NUS_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
 const BIKE_SILENCE_MS = 6000;
+const CMD_PACE_MS = 35;
 
 class NusBikeLink extends BleLink {
   private lines = new LineBuffer();
+  private txChain: Promise<void> = Promise.resolve();
+  private lastTxAt = 0;
 
   /** Both bikes stream at 5 Hz even when idle, so 6 s of silence means the link is dead. */
   protected isHealthy(): boolean {
@@ -39,9 +42,19 @@ class NusBikeLink extends BleLink {
     });
   }
 
-  /** ASCII command to the bike (AirBike: RESET_PULSES; SS2K Spin: SET_MODE:0|1, SET_WATTS:<w>, SET_LEVEL:<lvl>). */
-  async command(cmd: string): Promise<void> {
-    if (this.id) await transport.write(this.id, NUS_SERVICE, NUS_RX, new TextEncoder().encode(cmd + '\n'));
+  /** ASCII command to the bike, serialized & paced so Android GATT / ESP32 BLE RX never drop back-to-back writes. */
+  command(cmd: string): Promise<void> {
+    const run = async (): Promise<void> => {
+      if (!this.id || !this.connected) return;
+      const wait = CMD_PACE_MS - (Date.now() - this.lastTxAt);
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (!this.id || !this.connected) return;
+      this.lastTxAt = Date.now();
+      await transport.write(this.id, NUS_SERVICE, NUS_RX, new TextEncoder().encode(cmd + '\n'));
+    };
+    const next = this.txChain.then(run, run);
+    this.txChain = next.catch(() => {});
+    return next;
   }
 }
 

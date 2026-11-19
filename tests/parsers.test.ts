@@ -29,6 +29,13 @@ describe('BLE parsers', () => {
       dev: 'spin', w: 132, cad: 85.2, dist: 0, kcal: 0, spd: 0,
       lvl: 24.3, tlvl: 24, tgt_w: 130, mode: 1, pot: 1158, pos: 8600,
     });
+    const full = parseBikeLine(
+      '{"dev":"spin","w":132,"pos":8600,"pot":1158,"v":0.93,"sg":100,"ma":750,"spd":3000,"run":0,"cad":85.2,"stall":0,"pls":28798,"mode":1,"tgt_w":130,"rehab":0,"wo":0,"auto":0,"ws":0,"wp":0,"rev":0.0,"wk":0.000,"mw":0,"ratio":4.557,"tlvl":24,"lvl":24.3,"ew":132}',
+    );
+    expect(full).toMatchObject({
+      dev: 'spin', w: 132, cad: 85.2, spd: 0, pls: 28798, ratio: 4.557,
+      lvl: 24.3, tlvl: 24, tgt_w: 130, mode: 1, pot: 1158, pos: 8600,
+    });
   });
 });
 

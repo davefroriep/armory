@@ -123,4 +123,20 @@ describe('HR-based calories (Keytel et al. 2005)', () => {
     expect(live.dist).toBeGreaterThan(7);
     expect(live.kcal).toBeCloseTo(0.2, 2); // 200 W * 1 s = 0.2 kJ = 0.2 kcal
   });
+
+  it('integrates Spin virtual odometer even when spd carries stepper Hz and ignores >2s idle gaps', () => {
+    resetSpinOdometer();
+    pushBike({ dev: 'spin', w: 200, cad: 85, dist: 0, kcal: 0, spd: 3000, tgt_w: 200, mode: 1 }, T0);
+    pushBike({ dev: 'spin', w: 200, cad: 85, dist: 0, kcal: 0, spd: 3000, tgt_w: 200, mode: 1 }, T0 + 1000);
+    expect(live.spd).toBeGreaterThan(25);
+    expect(live.spd).toBeLessThan(60);
+    expect(live.dist).toBeGreaterThan(7);
+    expect(live.kcal).toBeCloseTo(0.2, 2);
+    const distAfter1s = live.dist;
+    const kcalAfter1s = live.kcal;
+    // >2s gap must not add phantom distance or kcal
+    pushBike({ dev: 'spin', w: 200, cad: 85, dist: 0, kcal: 0, spd: 3000, tgt_w: 200, mode: 1 }, T0 + 10_000);
+    expect(live.dist).toBe(distAfter1s);
+    expect(live.kcal).toBe(kcalAfter1s);
+  });
 });

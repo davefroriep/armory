@@ -47,19 +47,21 @@ export function parseBikeLine(line: string): BikeFrame | null {
     const o = JSON.parse(line);
     if (typeof o !== 'object' || o === null || typeof o.w !== 'number' || typeof o.cad !== 'number') return null;
     if (o.dev && o.dev !== 'airbike' && o.dev !== 'spin') return null;
+    const isSpin = o.dev === 'spin';
     const out: BikeFrame = {
       w: o.w,
       cad: o.cad,
       dist: Number(o.dist) || 0,
       kcal: Number(o.kcal) || 0,
-      spd: Number(o.spd) || 0,
+      // SS2K Spin uses `spd` for stepper motor speed in Hz (e.g. 1500/3000), not road speed in km/h.
+      spd: isSpin ? 0 : (Number(o.spd) || 0),
       ...(typeof o.fan === 'number' ? { fan: o.fan } : {}),
       ...(typeof o.rfan === 'number' ? { rfan: o.rfan } : {}),
       ...(typeof o.pls === 'number' ? { pls: o.pls } : {}),
       ...(typeof o.dt === 'number' ? { dt: o.dt } : {}),
       ...(typeof o.ratio === 'number' ? { ratio: o.ratio } : {}),
     };
-    if (o.dev === 'spin') {
+    if (isSpin) {
       out.dev = 'spin';
       if (typeof o.lvl === 'number') out.lvl = o.lvl;
       if (typeof o.tlvl === 'number') out.tlvl = o.tlvl;

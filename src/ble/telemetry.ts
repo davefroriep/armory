@@ -145,8 +145,9 @@ export function pushBike(f: {
   live.dev = dev;
   live.w = f.w;
   live.cad = f.cad;
-  if (dev === 'spin' && f.dist <= 0 && f.kcal <= 0 && f.spd <= 0) {
-    const dtSec = spinLastAt && now > spinLastAt ? Math.min(2, (now - spinLastAt) / 1000) : 0;
+  if (dev === 'spin' && f.dist <= 0 && f.kcal <= 0) {
+    const dtMs = spinLastAt && now > spinLastAt ? now - spinLastAt : 0;
+    const dtSec = dtMs > 0 && dtMs <= 2000 ? dtMs / 1000 : 0;
     spinLastAt = now;
     const pedaling = f.cad > 2 && f.w > 0;
     const vMps = pedaling ? Math.cbrt(f.w / 0.23) : 0;
