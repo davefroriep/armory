@@ -1,7 +1,75 @@
 import { Emitter } from '../emitter';
-import { getSettings } from '../store/settings';
+import { getSettings, updateSettings } from '../store/settings';
 import { lifts } from './store';
 import { uid, type LiftSession, type LiftSet, type SessionEx, type VideoMeta } from './types';
+
+export const GYM_CAM_PREVIEW_DRIVE_FALLBACK = 'https://drive.google.com/drive/search?q=Armory_Cam_Preview.jpg';
+
+export function formatPreviewAge(updatedMs: number | null, nowMs = Date.now()): string {
+  if (updatedMs == null || !Number.isFinite(updatedMs) || updatedMs <= 0) {
+    return 'Current camera views on Google Drive';
+  }
+  const diffMs = Math.max(0, nowMs - updatedMs);
+  if (diffMs < 90_000) return 'Updated just now';
+  const diffMin = Math.round(diffMs / 60_000);
+  if (diffMin < 60) return `Updated ${diffMin}m ago`;
+  const diffHr = Math.round(diffMs / 3_600_000);
+  if (diffHr < 36) return `Updated ${diffHr}h ago`;
+  const monDay = new Date(updatedMs).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return `Updated ${monDay}`;
+}
+
+export interface GymCamConfigLinkState {
+  mode: 'local' | 'offline';
+  href: string;
+  btnLabel: string;
+  btnPrimary: boolean;
+  showOfflineBanner: boolean;
+  previewHref: string;
+  bannerSub: string;
+}
+
+export function gymCamConfigLinkState(args: {
+  online: boolean;
+  probing: boolean;
+  enabled: boolean;
+  baseUrl: string;
+  previewUrl: string;
+  previewUpdatedMs: number | null;
+  nowMs?: number;
+}): GymCamConfigLinkState {
+  const rawBase = (args.baseUrl || '').trim().replace(/\/+$/, '');
+  const configHref = /^https?:\/\//i.test(rawBase) ? rawBase : 'http://192.168.1.152:8766';
+  const rawPrev = (args.previewUrl || '').trim();
+  const previewHref = /^https?:\/\//i.test(rawPrev) ? rawPrev : GYM_CAM_PREVIEW_DRIVE_FALLBACK;
+  if (args.enabled && args.online) {
+    return {
+      mode: 'local',
+      href: configHref,
+      btnLabel: 'Config ↗',
+      btnPrimary: true,
+      showOfflineBanner: false,
+      previewHref,
+      bannerSub: '',
+    };
+  }
+  const updatedMs =
+    args.previewUpdatedMs != null && Number.isFinite(args.previewUpdatedMs) && args.previewUpdatedMs > 0
+      ? args.previewUpdatedMs
+      : null;
+  const bannerSub = updatedMs
+    ? `${formatPreviewAge(updatedMs, args.nowMs)} · Google Drive`
+    : 'Current camera views on Google Drive';
+  return {
+    mode: 'offline',
+    href: previewHref,
+    btnLabel: 'Preview ↗',
+    btnPrimary: false,
+    showOfflineBanner: !args.probing || !args.enabled,
+    previewHref,
+    bannerSub,
+  };
+}
 
 export interface GymCamBurst {
   id: string | number;
@@ -35,6 +103,8 @@ export interface GymCamProbeInfo {
   retentionDays: number;
   cameras: string[];
   latencyMs: number;
+  previewDriveUrl?: string;
+  previewUpdatedMs?: number | null;
 }
 
 export interface GymCamPreviewResult {
@@ -89,6 +159,20 @@ class GymCamController {
     return (getSettings().gymCamUrl || 'http://192.168.1.152:8766').trim().replace(/\/+$/, '');
   }
 
+  configUrl(): string {
+    return this.baseUrl();
+  }
+
+  previewDriveUrl(): string {
+    const u = (getSettings().gymCamPreviewUrl || '').trim();
+    return /^https?:\/\//i.test(u) ? u : GYM_CAM_PREVIEW_DRIVE_FALLBACK;
+  }
+
+  previewUpdatedMs(): number | null {
+    const v = getSettings().gymCamPreviewUpdatedMs;
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
+  }
+
   serverNowMs(): number {
     return Date.now() + this.clockOffsetMs;
   }
@@ -112,7 +196,7 @@ class GymCamController {
     return `${this.baseUrl()}/api/snapshot${q}`;
   }
 
-  async probe(timeoutMs = 2500): Promise<GymCamProbeInfo> {
+  async probe(timeoutMs = 2500, strict = false): Promise<GymCamProbeInfo> {
     if (!getSettings().gymCamEnabled || typeof fetch === 'undefined' || typeof AbortController === 'undefined') {
       const was = this.online || this.recording;
       this.probeMisses = 0;
@@ -121,7 +205,16 @@ class GymCamController {
       this.paused = false;
       this.cameras = [];
       if (was) this.changed.emit();
-      return { online: false, recording: false, paused: false, retentionDays: this.retentionDays, cameras: [], latencyMs: 0 };
+      return {
+        online: false,
+        recording: false,
+        paused: false,
+        retentionDays: this.retentionDays,
+        cameras: [],
+        latencyMs: 0,
+        previewDriveUrl: this.previewDriveUrl(),
+        previewUpdatedMs: this.previewUpdatedMs(),
+      };
     }
 
     const ctrl = new AbortController();
@@ -138,6 +231,8 @@ class GymCamController {
         paused?: boolean;
         retentionDays?: number;
         cameras?: string[];
+        previewDriveUrl?: string;
+        previewUpdatedMs?: number | null;
       };
       if (data?.service !== 'armory-cam') throw new Error('Not armory-cam');
       this.probeMisses = 0;
@@ -149,6 +244,25 @@ class GymCamController {
         this.retentionDays = Math.round(data.retentionDays);
       }
       this.cameras = Array.isArray(data.cameras) ? data.cameras : [];
+      const curSettings = getSettings();
+      const nextPreviewUrl =
+        typeof data.previewDriveUrl === 'string' && /^https?:\/\//i.test(data.previewDriveUrl.trim())
+          ? data.previewDriveUrl.trim()
+          : '';
+      const nextUpdatedMs =
+        typeof data.previewUpdatedMs === 'number' && Number.isFinite(data.previewUpdatedMs) && data.previewUpdatedMs > 0
+          ? Math.round(data.previewUpdatedMs)
+          : null;
+      const patch: Partial<Pick<typeof curSettings, 'gymCamPreviewUrl' | 'gymCamPreviewUpdatedMs'>> = {};
+      if (nextPreviewUrl && nextPreviewUrl !== curSettings.gymCamPreviewUrl) {
+        patch.gymCamPreviewUrl = nextPreviewUrl;
+      }
+      if (nextUpdatedMs !== null && nextUpdatedMs !== curSettings.gymCamPreviewUpdatedMs) {
+        patch.gymCamPreviewUpdatedMs = nextUpdatedMs;
+      }
+      if (patch.gymCamPreviewUrl !== undefined || patch.gymCamPreviewUpdatedMs !== undefined) {
+        updateSettings(patch);
+      }
       this.changed.emit();
       if (Date.now() - this.lastSyncMs > 60_000) {
         this.lastSyncMs = Date.now();
@@ -161,10 +275,12 @@ class GymCamController {
         retentionDays: this.retentionDays,
         cameras: this.cameras,
         latencyMs,
+        previewDriveUrl: this.previewDriveUrl(),
+        previewUpdatedMs: this.previewUpdatedMs(),
       };
     } catch {
       this.probeMisses += 1;
-      if (!this.online || this.probeMisses >= 2) {
+      if (strict || !this.online || this.probeMisses >= 2) {
         const was = this.online || this.recording;
         this.online = false;
         this.recording = false;
@@ -179,6 +295,8 @@ class GymCamController {
         retentionDays: this.retentionDays,
         cameras: this.cameras,
         latencyMs: 0,
+        previewDriveUrl: this.previewDriveUrl(),
+        previewUpdatedMs: this.previewUpdatedMs(),
       };
     } finally {
       clearTimeout(timer);

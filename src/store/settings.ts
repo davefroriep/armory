@@ -66,6 +66,10 @@ export interface Settings {
   /** OptiPlex Gym Camera LAN DVR integration (probes silently; hidden off home Wi-Fi). */
   gymCamEnabled: boolean;
   gymCamUrl: string;
+  /** Permanent Google Drive URL for the live-updated Armory Cam multi-view preview screenshot. */
+  gymCamPreviewUrl: string;
+  /** Epoch ms when the Drive Armory Cam preview screenshot was last refreshed by OptiPlex. */
+  gymCamPreviewUpdatedMs: number | null;
   gymCamAutoPr: boolean;
   /** Persistent Buddy Mode lock: avoids motion-based Auto camera fallbacks across workouts. */
   gymCamBuddyMode: boolean;
@@ -75,6 +79,7 @@ export interface Settings {
 
 const KEY = 'armory.settings.v1';
 const BAKED_KEY = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_INTERVALS_API_KEY ?? '').trim();
+const BAKED_PREVIEW_URL = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_GYM_CAM_PREVIEW_URL ?? '').trim();
 
 export const DEFAULTS: Settings = {
   athleteId: 'i758105',
@@ -114,6 +119,8 @@ export const DEFAULTS: Settings = {
   voiceCustomAliases: {},
   gymCamEnabled: true,
   gymCamUrl: 'http://192.168.1.152:8766',
+  gymCamPreviewUrl: BAKED_PREVIEW_URL,
+  gymCamPreviewUpdatedMs: null,
   gymCamAutoPr: true,
   gymCamBuddyMode: false,
   queue: defaultQueueState(),
@@ -141,6 +148,8 @@ function load(): Settings {
       apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
       voiceReadback: typeof parsed.voiceReadback === 'boolean' ? parsed.voiceReadback : DEFAULTS.voiceReadback,
       gymCamBuddyMode: typeof parsed.gymCamBuddyMode === 'boolean' ? parsed.gymCamBuddyMode : DEFAULTS.gymCamBuddyMode,
+      gymCamPreviewUrl: typeof parsed.gymCamPreviewUrl === 'string' && parsed.gymCamPreviewUrl.trim() ? parsed.gymCamPreviewUrl.trim() : DEFAULTS.gymCamPreviewUrl,
+      gymCamPreviewUpdatedMs: typeof parsed.gymCamPreviewUpdatedMs === 'number' && Number.isFinite(parsed.gymCamPreviewUpdatedMs) ? parsed.gymCamPreviewUpdatedMs : null,
       voiceCustomAliases: sanitizeAliases(parsed.voiceCustomAliases),
       queue: q,
     };

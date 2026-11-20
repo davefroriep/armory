@@ -14,7 +14,7 @@ import base64
 import bisect
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 import glob
 import json
@@ -59,6 +59,8 @@ DRIFT_CHECK_INTERVAL_SEC = 600.0
 DRIFT_PX_THRESHOLD = 18.0
 DRIFT_DEG_THRESHOLD = 1.2
 DRIFT_NTFY_COOLDOWN_SEC = 6 * 3600.0
+PREVIEW_DRIVE_FILENAME = "Armory_Cam_Preview.jpg"
+PREVIEW_DRIVE_INTERVAL_SEC = 1800.0
 SEG_NAME_RE = re.compile(r"^seg_(\d{8})_(\d{6})\.ts$")
 
 FALLBACK_WALLBOARD_HTML = """<!doctype html>
@@ -1675,6 +1677,7 @@ class ArmoryCamService:
         self.config_path = self.root / "config.json"
         self.clips_index_path = self.clips_root / "index.jsonl"
         self.cal_state_path = self.root / "calibration_state.json"
+        self.preview_local_path = self.root / "preview_overview.jpg"
         for d in (
             self.root,
             self.ring_root,
@@ -1732,6 +1735,13 @@ class ArmoryCamService:
         self._thumb_mem: OrderedDict[str, bytes] = OrderedDict()
         self._preview_locks_guard = threading.Lock()
         self._preview_locks: dict[str, threading.Lock] = {}
+        self._preview_refresh_lock = threading.Lock()
+        self._preview_last_refresh_s: float = 0.0
+        self._preview_started_at_s: float = 0.0
+        self._preview_updated_ms: int | None = None
+        self._preview_drive_file_id: str | None = None
+        self._preview_drive_url: str | None = None
+        self._preview_drive_dest_str: str = ""
 
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._proc_urls: dict[str, str] = {}
@@ -2004,6 +2014,8 @@ class ArmoryCamService:
                 self.capture_reference(pslug)
             except Exception:
                 pass
+        if self._started and ("cameras" in raw or "driveBackupDir" in raw):
+            self._trigger_preview_refresh_async()
 
     def _rehydrate_ring_index(self) -> None:
         phys_segs: dict[str, list[SegmentInfo]] = {}
@@ -2031,6 +2043,7 @@ class ArmoryCamService:
             if self._started:
                 return
             self._started = True
+            self._preview_started_at_s = time.time()
             self._stop_event.clear()
             self._restart_capture_workers()
             poll_t = threading.Thread(target=self._segment_poll_loop, name="armory-cam-poller", daemon=True)
@@ -2248,6 +2261,27 @@ class ArmoryCamService:
                     self.check_camera_drift_background(now)
                 except Exception as exc:
                     self.log.debug("Background drift check error: %s", exc)
+            enabled_phys_slugs = [c.slug for c in phys_cams if c.enabled]
+            with self.lock:
+                should_refresh_preview = False
+                if enabled_phys_slugs:
+                    if self._preview_last_refresh_s == 0.0:
+                        all_conn = all(self.cam_connected.get(s, False) for s in enabled_phys_slugs)
+                        any_ready = any(
+                            self.cam_connected.get(s, False) or bool(self.ring_segments.get(s))
+                            for s in enabled_phys_slugs
+                        )
+                        if all_conn or (any_ready and (now - self._preview_started_at_s) >= 12.0):
+                            self._preview_last_refresh_s = now
+                            should_refresh_preview = True
+                    elif (
+                        (now - self._preview_last_refresh_s) >= PREVIEW_DRIVE_INTERVAL_SEC
+                        and not (self.recording and not self.paused)
+                    ):
+                        self._preview_last_refresh_s = now
+                        should_refresh_preview = True
+            if should_refresh_preview:
+                self._trigger_preview_refresh_async()
             if now - last_prune > 60.0:
                 last_prune = now
                 self._prune_storage(now)
@@ -3363,6 +3397,195 @@ class ArmoryCamService:
                 copied += 1
         return copied
 
+    def _drive_preview_path(self) -> Path | None:
+        with self.lock:
+            backup_dir = self.drive_backup_dir.strip()
+        if not backup_dir:
+            return None
+        dest_root = Path(backup_dir)
+        anchor = Path(dest_root.anchor) if dest_root.anchor else dest_root
+        if dest_root.anchor and not anchor.exists():
+            return None
+        base_dir = dest_root.parent if dest_root.name.lower() == "clips" else dest_root
+        return base_dir / PREVIEW_DRIVE_FILENAME
+
+    def preview_drive_info(self) -> dict[str, Any]:
+        dest = self._drive_preview_path()
+        dest_str = str(dest) if dest is not None else ""
+        if dest is not None and dest.is_file():
+            if dest_str != self._preview_drive_dest_str or not self._preview_drive_file_id:
+                fid = read_google_drive_file_id(dest)
+                self._preview_drive_dest_str = dest_str
+                if fid:
+                    self._preview_drive_file_id = fid
+                    self._preview_drive_url = google_drive_view_url(fid)
+        elif dest_str != self._preview_drive_dest_str:
+            self._preview_drive_dest_str = dest_str
+            self._preview_drive_file_id = None
+            self._preview_drive_url = None
+
+        updated_ms = self._preview_updated_ms
+        if updated_ms is None and dest is not None and dest.is_file():
+            try:
+                updated_ms = int(dest.stat().st_mtime * 1000)
+            except OSError:
+                pass
+        if updated_ms is None and self.preview_local_path.is_file():
+            try:
+                updated_ms = int(self.preview_local_path.stat().st_mtime * 1000)
+            except OSError:
+                pass
+
+        return {
+            "fileName": PREVIEW_DRIVE_FILENAME,
+            "driveFileId": self._preview_drive_file_id,
+            "driveUrl": self._preview_drive_url,
+            "updatedMs": updated_ms,
+            "localUrl": "/api/preview.jpg",
+        }
+
+    def render_preview_overview_jpeg(self) -> tuple[bytes | None, int, int]:
+        with self.lock:
+            enabled_cams = [replace(c, exclusions=list(c.exclusions)) for c in self.cameras if c.enabled]
+            phys_names = {c.slug: c.name for c in self.cameras if not self._is_virtual(c)}
+        if not enabled_cams:
+            return None, 0, 0
+
+        frames: list[tuple[CameraConfig, np.ndarray | None]] = []
+        live_count = 0
+        for cam in enabled_cams:
+            frm: np.ndarray | None = None
+            try:
+                jpg = self.get_snapshot_jpeg(cam.name, raw=False, hires=True)
+                if jpg:
+                    decoded = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                    if decoded is not None and decoded.size > 0:
+                        frm = decoded
+                        live_count += 1
+            except Exception:
+                frm = None
+            frames.append((cam, frm))
+
+        if live_count == 0:
+            return None, len(enabled_cams), 0
+
+        n = len(enabled_cams)
+        cols = 1 if n == 1 else (2 if n <= 4 else 3)
+        rows = math.ceil(n / cols)
+        pad = 24
+        header_h = 64
+        tile_hdr = 42
+        cell_w = 760
+        cell_h = 460
+        total_w = pad + cols * (cell_w + pad)
+        total_h = header_h + pad + rows * (tile_hdr + cell_h + pad)
+        canvas = np.full((total_h, total_w, 3), (28, 17, 11), dtype=np.uint8)
+
+        def _ascii(txt: str) -> str:
+            return txt.encode("ascii", "replace").decode("ascii")
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(canvas, "ARMORY CAM PREVIEW", (pad, 42), font, 0.85, (245, 248, 252), 2, cv2.LINE_AA)
+        right_banner = _ascii(f"{live_count}/{n} views  |  {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+        (rw, _), _ = cv2.getTextSize(right_banner, font, 0.56, 1)
+        cv2.putText(canvas, right_banner, (max(pad, total_w - pad - rw), 40), font, 0.56, (191, 162, 143), 1, cv2.LINE_AA)
+
+        for idx, (cam, frm) in enumerate(frames):
+            r, c = divmod(idx, cols)
+            tx = pad + c * (cell_w + pad)
+            ty = header_h + pad + r * (tile_hdr + cell_h + pad)
+            cv2.rectangle(canvas, (tx, ty), (tx + cell_w - 1, ty + tile_hdr - 1), (43, 27, 18), -1)
+            cv2.rectangle(canvas, (tx, ty + tile_hdr), (tx + cell_w - 1, ty + tile_hdr + cell_h - 1), (15, 9, 6), -1)
+            cv2.rectangle(canvas, (tx, ty), (tx + cell_w - 1, ty + tile_hdr + cell_h - 1), (61, 43, 31), 1)
+
+            title = _ascii(cam.name)
+            cv2.putText(canvas, title, (tx + 12, ty + 27), font, 0.58, (245, 248, 252), 2, cv2.LINE_AA)
+
+            meta_parts: list[str] = []
+            if cam.source_slug:
+                src_name = phys_names.get(cam.source_slug, cam.source_slug)
+                meta_parts.append(f"via {src_name}")
+            if cam.rotate:
+                meta_parts.append(f"{cam.rotate} deg")
+            if abs(cam.tilt) >= 0.05:
+                meta_parts.append(f"{cam.tilt:+.1f} deg")
+            if meta_parts:
+                meta_txt = _ascii(" | ".join(meta_parts))
+                (mw, _), _ = cv2.getTextSize(meta_txt, font, 0.45, 1)
+                cv2.putText(
+                    canvas,
+                    meta_txt,
+                    (max(tx + 12, tx + cell_w - 12 - mw), ty + 26),
+                    font,
+                    0.45,
+                    (191, 162, 143),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            if frm is not None and frm.shape[0] > 0 and frm.shape[1] > 0:
+                fh, fw = frm.shape[:2]
+                scale = min(cell_w / fw, cell_h / fh)
+                nw = max(1, min(cell_w, int(round(fw * scale))))
+                nh = max(1, min(cell_h, int(round(fh * scale))))
+                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                resized = cv2.resize(frm, (nw, nh), interpolation=interp)
+                ox = tx + (cell_w - nw) // 2
+                oy = ty + tile_hdr + (cell_h - nh) // 2
+                canvas[oy : oy + nh, ox : ox + nw] = resized
+            else:
+                off_txt = "Camera Offline"
+                (ow, oh), _ = cv2.getTextSize(off_txt, font, 0.65, 2)
+                ox = tx + (cell_w - ow) // 2
+                oy = ty + tile_hdr + (cell_h + oh) // 2
+                cv2.putText(canvas, off_txt, (ox, oy), font, 0.65, (11, 158, 245), 2, cv2.LINE_AA)
+
+        ok_jpg, buf = cv2.imencode(".jpg", canvas, [int(cv2.IMWRITE_JPEG_QUALITY), 86])
+        if not ok_jpg:
+            return None, len(enabled_cams), live_count
+        return buf.tobytes(), len(enabled_cams), live_count
+
+    def refresh_drive_preview(self) -> dict[str, Any]:
+        with self._preview_refresh_lock:
+            jpg_bytes, total_views, live_views = self.render_preview_overview_jpeg()
+            if not jpg_bytes:
+                return {"ok": False, "error": "No live camera frames available", "views": total_views, "liveViews": 0}
+            tmp_local = self.preview_local_path.with_suffix(".jpg.tmp")
+            tmp_local.write_bytes(jpg_bytes)
+            tmp_local.replace(self.preview_local_path)
+            now_s = time.time()
+            self._preview_last_refresh_s = now_s
+            self._preview_updated_ms = int(now_s * 1000)
+
+            dest = self._drive_preview_path()
+            if dest is not None:
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    # Write in-place so Google Drive for Desktop preserves the permanent file ID across revisions.
+                    with open(dest, "wb") as fh:
+                        fh.write(jpg_bytes)
+                    fid = read_google_drive_file_id(dest)
+                    self._preview_drive_dest_str = str(dest)
+                    if fid:
+                        self._preview_drive_file_id = fid
+                        self._preview_drive_url = google_drive_view_url(fid)
+                except Exception as exc:
+                    self.log.warning("Failed writing Drive preview overview %s: %s", dest, exc)
+
+            return {"ok": True, "views": total_views, "liveViews": live_views, **self.preview_drive_info()}
+
+    def _trigger_preview_refresh_async(self) -> None:
+        if self._preview_refresh_lock.locked():
+            return
+
+        def _worker() -> None:
+            try:
+                self.refresh_drive_preview()
+            except Exception as exc:
+                self.log.debug("Async preview refresh error: %s", exc)
+
+        threading.Thread(target=_worker, name="drive-preview-refresh", daemon=True).start()
+
     def _probe_duration_sec(self, path: Path) -> int:
         try:
             res = subprocess.run(
@@ -3764,6 +3987,8 @@ class ArmoryCamService:
 
         if not results and errors:
             return {"ok": False, "error": "; ".join(errors), "results": [], "errors": errors, "cameras": cams_out, "alignment": align_out}
+        if apply and results:
+            self._trigger_preview_refresh_async()
         return {"ok": True, "results": results, "errors": errors, "cameras": cams_out, "alignment": align_out}
 
     def check_camera_drift_background(self, now_s: float) -> list[dict[str, Any]]:
@@ -3950,6 +4175,7 @@ class ArmoryCamService:
                 "disk": self.disk_stats(),
                 "calibration": self.calibration_status(),
                 "alignment": self.alignment_snapshot(),
+                "preview": self.preview_drive_info(),
                 "cameras": cams,
                 "wallboard": wb_status,
             }
@@ -6416,16 +6642,35 @@ def create_app(service: ArmoryCamService) -> Flask:
             rec = service.recording
             paused = service.paused
             ret_days = service.retention_days
-        return jsonify(
-            {
-                "service": "armory-cam",
-                "serverEpochMs": int(time.time() * 1000),
-                "recording": rec,
-                "paused": paused,
-                "retentionDays": ret_days,
-                "cameras": cams,
-            }
-        )
+        prev = service.preview_drive_info()
+        payload: dict[str, Any] = {
+            "service": "armory-cam",
+            "serverEpochMs": int(time.time() * 1000),
+            "recording": rec,
+            "paused": paused,
+            "retentionDays": ret_days,
+            "cameras": cams,
+        }
+        if prev.get("driveUrl"):
+            payload["previewDriveUrl"] = prev["driveUrl"]
+        if prev.get("updatedMs") is not None:
+            payload["previewUpdatedMs"] = prev["updatedMs"]
+        return jsonify(payload)
+
+    @app.get("/api/preview.jpg")
+    def api_preview_jpg() -> Response:
+        if not service.preview_local_path.is_file():
+            service.refresh_drive_preview()
+        if not service.preview_local_path.is_file():
+            return jsonify({"ok": False, "error": "Preview unavailable"}), 503
+        resp = Response(service.preview_local_path.read_bytes(), mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/preview/refresh")
+    def api_preview_refresh() -> Response:
+        res = service.refresh_drive_preview()
+        return jsonify(res), (200 if res.get("ok") else 503)
 
     @app.get("/api/status")
     def api_status() -> Response:

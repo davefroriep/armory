@@ -1,4 +1,23 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('../src/lifts/store', () => ({
+  lifts: {
+    videos: new Map(),
+    sessions: new Map(),
+    saveVideoMeta: vi.fn(),
+    addVideo: vi.fn(),
+    saveSession: vi.fn(),
+    exOrStub: (id: string) => ({ id, name: id }),
+  },
+}));
+
+import {
+  formatPreviewAge,
+  GYM_CAM_PREVIEW_DRIVE_FALLBACK,
+  gymCam,
+  gymCamConfigLinkState,
+} from '../src/lifts/gymCam';
+import { getSettings, updateSettings } from '../src/store/settings';
 import {
   applyClipMarker,
   buildCoachAngleOptions,
@@ -222,5 +241,114 @@ describe('tape linking & scrubbing helpers', () => {
       { camera: 'Smith Cam', label: 'Smith', kind: 'saved' },
       { camera: 'Low Knee Cam', label: 'Low Knee', kind: 'tape' },
     ]);
+  });
+
+  it('resolves Gym Cam Config vs offline Drive Preview link states and caches /api/ping preview metadata', async () => {
+    const now = 1_795_200_000_000;
+    expect(formatPreviewAge(null, now)).toBe('Current camera views on Google Drive');
+    expect(formatPreviewAge(now - 30_000, now)).toBe('Updated just now');
+    expect(formatPreviewAge(now - 18 * 60_000, now)).toBe('Updated 18m ago');
+    expect(formatPreviewAge(now - 4 * 3_600_000, now)).toBe('Updated 4h ago');
+
+    const localState = gymCamConfigLinkState({
+      online: true,
+      probing: false,
+      enabled: true,
+      baseUrl: 'http://192.168.1.152:8766/',
+      previewUrl: 'https://drive.google.com/file/d/abc123/view',
+      previewUpdatedMs: now - 300_000,
+      nowMs: now,
+    });
+    expect(localState).toEqual({
+      mode: 'local',
+      href: 'http://192.168.1.152:8766',
+      btnLabel: 'Config ↗',
+      btnPrimary: true,
+      showOfflineBanner: false,
+      previewHref: 'https://drive.google.com/file/d/abc123/view',
+      bannerSub: '',
+    });
+
+    const probingOffline = gymCamConfigLinkState({
+      online: false,
+      probing: true,
+      enabled: true,
+      baseUrl: 'http://192.168.1.152:8766',
+      previewUrl: '',
+      previewUpdatedMs: null,
+      nowMs: now,
+    });
+    expect(probingOffline.mode).toBe('offline');
+    expect(probingOffline.btnLabel).toBe('Preview ↗');
+    expect(probingOffline.btnPrimary).toBe(false);
+    expect(probingOffline.showOfflineBanner).toBe(false);
+    expect(probingOffline.href).toBe(GYM_CAM_PREVIEW_DRIVE_FALLBACK);
+
+    const awayState = gymCamConfigLinkState({
+      online: false,
+      probing: false,
+      enabled: true,
+      baseUrl: 'http://192.168.1.152:8766',
+      previewUrl: 'https://drive.google.com/file/d/abc123/view',
+      previewUpdatedMs: now - 12 * 60_000,
+      nowMs: now,
+    });
+    expect(awayState).toEqual({
+      mode: 'offline',
+      href: 'https://drive.google.com/file/d/abc123/view',
+      btnLabel: 'Preview ↗',
+      btnPrimary: false,
+      showOfflineBanner: true,
+      previewHref: 'https://drive.google.com/file/d/abc123/view',
+      bannerSub: 'Updated 12m ago · Google Drive',
+    });
+
+    const origFetch = globalThis.fetch;
+    const origSettings = getSettings();
+    try {
+      updateSettings({
+        gymCamEnabled: true,
+        gymCamUrl: 'http://192.168.1.152:8766',
+        gymCamPreviewUrl: '',
+        gymCamPreviewUpdatedMs: null,
+      });
+      globalThis.fetch = vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            service: 'armory-cam',
+            serverEpochMs: now,
+            recording: false,
+            paused: false,
+            retentionDays: 14,
+            cameras: ['Rack Cam', 'Smith Cam'],
+            previewDriveUrl: 'https://drive.google.com/file/d/testfid9876543210abcdef/view',
+            previewUpdatedMs: now - 60_000,
+          }),
+          { status: 200 },
+        ),
+      ) as unknown as typeof fetch;
+
+      const onRes = await gymCam.probe(500, true);
+      expect(onRes.online).toBe(true);
+      expect(gymCam.online).toBe(true);
+      expect(getSettings().gymCamPreviewUrl).toBe('https://drive.google.com/file/d/testfid9876543210abcdef/view');
+      expect(getSettings().gymCamPreviewUpdatedMs).toBe(now - 60_000);
+
+      // Strict probe transitions online -> offline on the first failed check
+      globalThis.fetch = vi.fn(async () => {
+        throw new Error('LAN unreachable');
+      }) as unknown as typeof fetch;
+      const offRes = await gymCam.probe(500, true);
+      expect(offRes.online).toBe(false);
+      expect(gymCam.online).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+      updateSettings({
+        gymCamEnabled: origSettings.gymCamEnabled,
+        gymCamUrl: origSettings.gymCamUrl,
+        gymCamPreviewUrl: origSettings.gymCamPreviewUrl,
+        gymCamPreviewUpdatedMs: origSettings.gymCamPreviewUpdatedMs,
+      });
+    }
   });
 });

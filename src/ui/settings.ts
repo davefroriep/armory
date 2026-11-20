@@ -10,7 +10,7 @@ import { PHASE1_PLAN } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { liftSettings, toDisplay, fmtNum, fromDisplay } from '../lifts/settings';
 import { lifts } from '../lifts/store';
-import { gymCam } from '../lifts/gymCam';
+import { gymCam, gymCamConfigLinkState } from '../lifts/gymCam';
 import { voice } from '../lifts/voice';
 import { VOICE_ALIAS_SLOTS, VOICE_COMMAND_GROUPS, type VoiceAliasSlot } from '../lifts/voiceParser';
 import { wallboard } from '../wallboard/sync';
@@ -61,8 +61,18 @@ export function settingsScreen(root: HTMLElement): () => void {
       <div class="line" style="margin-top:10px"><span>Gym Camera DVR<small>Probes OptiPlex silently on home Wi-Fi; stays hidden away</small></span>${tog('gymCamEnabled', s.gymCamEnabled)}</div>
       <div class="line"><span>Auto-clip PR sets (★)<small>Automatically clips new 1RM–40RM personal records</small></span>${tog('gymCamAutoPr', s.gymCamAutoPr)}</div>
       <div class="line"><span>Lifting With a Buddy<small>Locks Auto camera fallbacks to your exercise default (or Rack) across workouts</small></span>${tog('gymCamBuddyMode', s.gymCamBuddyMode)}</div>
-      <label class="field">Gym Camera DVR URL<input id="camUrl" value="${esc(s.gymCamUrl || 'http://192.168.1.152:8766')}" placeholder="http://192.168.1.152:8766" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
-      <div class="row" style="margin-top:6px"><button class="btn sm" id="camTest">Test Cam</button><span id="camOut" class="hint"></span></div>
+      <div class="field">
+        <label for="camUrl">Gym Camera DVR URL</label>
+        <div class="cam-url-row">
+          <input id="camUrl" value="${esc(s.gymCamUrl || 'http://192.168.1.152:8766')}" placeholder="http://192.168.1.152:8766" autocapitalize="off" autocomplete="off" spellcheck="false">
+          <a class="btn sm cam-url-btn" id="camCfgBtn" href="${esc(s.gymCamUrl || 'http://192.168.1.152:8766')}" target="_blank" rel="noopener">Config ↗</a>
+        </div>
+      </div>
+      <a class="cam-preview-link" id="camPreviewBanner" href="${esc(gymCam.previewDriveUrl())}" target="_blank" rel="noopener" hidden>
+        <span class="cam-prev-txt"><b>Realtime adjustments not available</b> — Preview ↗</span>
+        <small id="camPreviewSub"></small>
+      </a>
+      <div class="row" style="margin-top:2px"><button class="btn sm" id="camTest">Test Cam</button><span id="camOut" class="hint"></span></div>
     </section>
 
     <h2 class="sec">VOICE COMMANDS</h2>
@@ -150,6 +160,8 @@ export function settingsScreen(root: HTMLElement): () => void {
   </main>`;
 
   const cleanupChips = wireChips(root);
+  let dead = false;
+  let camProbing = false;
   const paintFtpBox = () => {
     const cur = getSettings();
     $('#ftpInfo', root).innerHTML = ftpStatus();
@@ -235,16 +247,53 @@ export function settingsScreen(root: HTMLElement): () => void {
     if (camIn && document.activeElement !== camIn) {
       camIn.value = cur.gymCamUrl || 'http://192.168.1.152:8766';
     }
+    const camLink = gymCamConfigLinkState({
+      online: gymCam.online,
+      probing: camProbing,
+      enabled: cur.gymCamEnabled,
+      baseUrl: cur.gymCamUrl || 'http://192.168.1.152:8766',
+      previewUrl: cur.gymCamPreviewUrl || '',
+      previewUpdatedMs: cur.gymCamPreviewUpdatedMs ?? null,
+    });
+    const camBtn = root.querySelector<HTMLAnchorElement>('#camCfgBtn');
+    if (camBtn) {
+      camBtn.href = camLink.href;
+      camBtn.textContent = camLink.btnLabel;
+      camBtn.classList.toggle('primary', camLink.btnPrimary);
+    }
+    const prevBanner = root.querySelector<HTMLAnchorElement>('#camPreviewBanner');
+    if (prevBanner) {
+      prevBanner.href = camLink.previewHref;
+      prevBanner.hidden = !camLink.showOfflineBanner;
+    }
+    const prevSub = root.querySelector<HTMLElement>('#camPreviewSub');
+    if (prevSub) prevSub.textContent = camLink.bannerSub;
     const buddyTg = root.querySelector<HTMLElement>('[data-tog="gymCamBuddyMode"]');
     if (buddyTg) {
       buddyTg.classList.toggle('on', !!cur.gymCamBuddyMode);
       buddyTg.setAttribute('aria-checked', String(!!cur.gymCamBuddyMode));
     }
   };
-  paintFtpBox();
+  const runCamProbe = async (showBusyText: boolean): Promise<void> => {
+    const out = root.querySelector<HTMLElement>('#camOut');
+    if (showBusyText && out) out.textContent = 'Probing…';
+    camProbing = getSettings().gymCamEnabled;
+    paintFtpBox();
+    const r = await gymCam.probe(1500, true);
+    if (dead) return;
+    camProbing = false;
+    paintFtpBox();
+    if (showBusyText && out) {
+      out.textContent = r.online
+        ? `✓ Connected (${r.latencyMs} ms${r.cameras.length ? ` · ${r.cameras.join(', ')}` : ''})`
+        : 'Offline (normal when away from Armory Wi-Fi)';
+    }
+  };
+  void runCamProbe(false);
   const offSet = settingsChanged.on(paintFtpBox);
   const offWb = wallboard.changed.on(paintFtpBox);
   const offVx = voice.changed.on(paintFtpBox);
+  const offCam = gymCam.changed.on(paintFtpBox);
   void wallboard.refreshStatus();
   if (hasKey()) void syncAthleteFtp(false).catch(() => {});
 
@@ -264,7 +313,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
-      if (name === 'gymCamEnabled') void gymCam.probe();
+      if (name === 'gymCamEnabled') void runCamProbe(false);
       if (name === 'gymCamBuddyMode' && lifts.active) {
         lifts.active.buddyMode = on;
         lifts.saveSession(lifts.active, true);
@@ -345,13 +394,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       }
     }
     if (t.closest('#camTest')) {
-      const out = $('#camOut', root);
-      out.textContent = 'Probing…';
-      void gymCam.probe(1500).then((r) => {
-        out.textContent = r.online
-          ? `✓ Connected (${r.latencyMs} ms${r.cameras.length ? ` · ${r.cameras.join(', ')}` : ''})`
-          : 'Offline (normal when away from Armory Wi-Fi)';
-      });
+      void runCamProbe(true);
     }
   };
   const onInput = (e: Event) => {
@@ -417,11 +460,13 @@ export function settingsScreen(root: HTMLElement): () => void {
   const offBackup = wireBackupCard(root, paintFtpBox);
 
   return () => {
+    dead = true;
     offBackup();
     cleanupChips();
     offSet();
     offWb();
     offVx();
+    offCam();
     root.removeEventListener('click', onClick);
     root.removeEventListener('input', onInput);
     if (hasKey()) void calendar.refresh();

@@ -1385,6 +1385,111 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_drive_preview_overview_render_routes_and_ping_fields(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_preview_"))
+        try:
+            drive_clips = tmp / "drive" / "Clips"
+            drive_clips.mkdir(parents=True, exist_ok=True)
+            drive_preview = drive_clips.parent / ac.PREVIEW_DRIVE_FILENAME
+            sentinel_bytes = b"sentinel-keep-me"
+            drive_preview.write_bytes(sentinel_bytes)
+
+            svc = ac.ArmoryCamService(root_dir=tmp / "root", drive_backup_dir=drive_clips)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            client.post(
+                "/api/config",
+                json={
+                    "cameras": [
+                        {
+                            "name": "Rack Cam",
+                            "slug": "rack_cam",
+                            "rtspUrl": "rtsp://127.0.0.1:554/rack",
+                            "enabled": True,
+                            "primary": True,
+                            "motionThreshold": 2.2,
+                            "crop": [0.0, 0.0, 1.0, 1.0],
+                            "rotate": 0,
+                            "tilt": -1.5,
+                        },
+                        {
+                            "name": "Fly Machine Cam",
+                            "slug": "fly_machine_cam",
+                            "sourceSlug": "rack_cam",
+                            "rtspUrl": "",
+                            "enabled": True,
+                            "primary": False,
+                            "motionThreshold": 2.2,
+                            "crop": [0.0, 0.05, 0.45, 0.95],
+                            "rotate": 0,
+                            "tilt": 5.0,
+                        },
+                    ]
+                },
+            )
+
+            # With no live frames/segments, refresh returns 503 and preserves existing Drive preview
+            no_res = client.post("/api/preview/refresh")
+            self.assertEqual(no_res.status_code, 503)
+            self.assertFalse(no_res.get_json()["ok"])
+            self.assertEqual(drive_preview.read_bytes(), sentinel_bytes)
+
+            # Generate synthetic MPEG-TS segment for Rack Cam
+            t0_ms = int(datetime(2026, 11, 20, 6, 30, 0).timestamp() * 1000)
+            seg_dir = svc.ring_root / "rack_cam"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            seg_p = seg_dir / "seg_20261120_063000.ts"
+            png_p = tmp / "frame.png"
+            img = np.zeros((360, 640, 3), dtype=np.uint8)
+            cv2.rectangle(img, (20, 20), (620, 340), (60, 130, 200), 4)
+            cv2.line(img, (320, 0), (320, 360), (90, 220, 120), 3)
+            cv2.imwrite(str(png_p), img)
+            subprocess.run(
+                [
+                    svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-loop", "1", "-t", "1.0", "-i", str(png_p),
+                    "-r", "15", "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p",
+                    "-f", "mpegts", str(seg_p),
+                ],
+                check=True,
+            )
+            seg_info = ac.SegmentInfo(path=seg_p, start_ms=t0_ms, end_ms=t0_ms + 1000, energy=0.0, camera="Rack Cam")
+            svc.ring_segments["rack_cam"] = [seg_info]
+            svc.ring_segments["fly_machine_cam"] = [seg_info]
+
+            fake_fid = "1AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+            with mock.patch.object(ac, "read_google_drive_file_id", return_value=fake_fid):
+                ref_res = client.post("/api/preview/refresh")
+                self.assertEqual(ref_res.status_code, 200)
+                ref_json = ref_res.get_json()
+                self.assertTrue(ref_json["ok"])
+                self.assertEqual(ref_json["views"], 2)
+                self.assertEqual(ref_json["liveViews"], 2)
+                self.assertEqual(ref_json["driveUrl"], f"https://drive.google.com/file/d/{fake_fid}/view")
+                self.assertIsNotNone(ref_json["updatedMs"])
+
+                self.assertTrue(drive_preview.is_file())
+                self.assertTrue(svc.preview_local_path.is_file())
+                decoded = cv2.imread(str(drive_preview))
+                self.assertIsNotNone(decoded)
+                self.assertGreaterEqual(decoded.shape[1], 1500)
+
+                jpg_res = client.get("/api/preview.jpg")
+                self.assertEqual(jpg_res.status_code, 200)
+                self.assertTrue(jpg_res.data.startswith(b"\xff\xd8"))
+                self.assertEqual(jpg_res.headers.get("Cache-Control"), "no-store")
+
+                ping_json = client.get("/api/ping").get_json()
+                self.assertEqual(ping_json["previewDriveUrl"], f"https://drive.google.com/file/d/{fake_fid}/view")
+                self.assertIsNotNone(ping_json["previewUpdatedMs"])
+
+                status_json = client.get("/api/status").get_json()
+                self.assertEqual(status_json["preview"]["driveUrl"], f"https://drive.google.com/file/d/{fake_fid}/view")
+                self.assertIsNotNone(status_json["preview"]["updatedMs"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
