@@ -55,6 +55,10 @@ Quad = tuple[tuple[float, float], tuple[float, float], tuple[float, float], tupl
 RING_KEEP_MIN_SEC = 300
 PREVIEW_KEEP_SEC = 24 * 3600
 PREVIEW_MAX_FILES = 120
+DRIFT_CHECK_INTERVAL_SEC = 600.0
+DRIFT_PX_THRESHOLD = 18.0
+DRIFT_DEG_THRESHOLD = 1.2
+DRIFT_NTFY_COOLDOWN_SEC = 6 * 3600.0
 SEG_NAME_RE = re.compile(r"^seg_(\d{8})_(\d{6})\.ts$")
 
 FALLBACK_WALLBOARD_HTML = """<!doctype html>
@@ -459,6 +463,232 @@ def apply_frame_transform(
     return out
 
 
+def view_transform_matrix(
+    w: int,
+    h: int,
+    rotate: int = 0,
+    tilt: float = 0.0,
+) -> tuple[np.ndarray, int, int]:
+    """Return 3x3 affine matrix `(M, fw, fh)` matching `apply_frame_transform` from raw `(w, h)` pixels."""
+    rot = normalize_rotate(rotate)
+    if rot == 90:
+        mat = np.array([[0.0, -1.0, float(h)], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+        rw, rh = h, w
+    elif rot == 180:
+        mat = np.array([[-1.0, 0.0, float(w)], [0.0, -1.0, float(h)], [0.0, 0.0, 1.0]], dtype=np.float64)
+        rw, rh = w, h
+    elif rot == 270:
+        mat = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, float(w)], [0.0, 0.0, 1.0]], dtype=np.float64)
+        rw, rh = h, w
+    else:
+        mat = np.eye(3, dtype=np.float64)
+        rw, rh = w, h
+
+    tlt = normalize_tilt(tilt)
+    if tlt != 0.0:
+        nw, nh = tilted_frame_size(rw, rh, tlt)
+        r2 = cv2.getRotationMatrix2D((rw / 2.0, rh / 2.0), -tlt, 1.0)
+        r2[0, 2] += (nw - rw) / 2.0
+        r2[1, 2] += (nh - rh) / 2.0
+        mat = np.vstack([r2, [0.0, 0.0, 1.0]]) @ mat
+        rw, rh = nw, nh
+    return mat, rw, rh
+
+
+def estimate_auto_level_tilt(
+    frame: np.ndarray,
+    crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
+    rotate: int = 0,
+) -> dict[str, Any]:
+    """Estimate fine leveling angle (`tilt`) from dominant structural vertical/horizontal segments inside `crop`."""
+    if frame is None or frame.size == 0:
+        return {"ok": False, "error": "No image frame available", "lines": 0}
+    rot_frame = apply_frame_transform(frame, rotate=normalize_rotate(rotate), tilt=0.0, apply_crop=False)
+    h, w = rot_frame.shape[:2]
+    x0, y0, x1, y1 = normalize_crop(crop)
+    cx0 = max(0, min(w - 2, int(round(w * x0))))
+    cy0 = max(0, min(h - 2, int(round(h * y0))))
+    cx1 = max(cx0 + 2, min(w, int(round(w * x1))))
+    cy1 = max(cy0 + 2, min(h, int(round(h * y1))))
+    roi = rot_frame[cy0:cy1, cx0:cx1]
+    rh, rw = roi.shape[:2]
+    if rw < 32 or rh < 32:
+        return {"ok": False, "error": "Crop region too small to auto-level", "lines": 0}
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(gray)
+    lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
+    detected = lsd.detect(enhanced)[0]
+
+    min_len = max(24.0, min(rw, rh) * 0.12)
+    vals: list[float] = []
+    weights: list[float] = []
+    if detected is not None:
+        for ln in detected:
+            lx0, ly0, lx1, ly1 = ln[0]
+            dx, dy = float(lx1 - lx0), float(ly1 - ly0)
+            length = math.hypot(dx, dy)
+            if length < min_len:
+                continue
+            vdx, vdy = (dx, dy) if dy >= 0 else (-dx, -dy)
+            dev_v = math.degrees(math.atan2(vdx, vdy))
+            hdx, hdy = (dx, dy) if dx >= 0 else (-dx, -dy)
+            dev_h = -math.degrees(math.atan2(hdy, hdx))
+            if abs(dev_v) <= 20.0:
+                vals.append(dev_v)
+                weights.append(length * length)
+            elif abs(dev_h) <= 20.0:
+                vals.append(dev_h)
+                weights.append((length * length) * 0.5)
+
+    if len(vals) < 3:
+        return {"ok": False, "error": "Not enough structural lines detected", "lines": len(vals)}
+
+    bins = np.arange(-20.25, 20.75, 0.5)
+    hist, edges = np.histogram(vals, bins=bins, weights=weights)
+    smoothed = np.convolve(hist, [0.25, 0.5, 0.25], mode="same")
+    best_bin = int(np.argmax(smoothed))
+    center = float((edges[best_bin] + edges[best_bin + 1]) / 2.0)
+    inliers = [(v, wt) for v, wt in zip(vals, weights) if abs(v - center) <= 2.5]
+    if inliers:
+        tot_w = sum(wt for _, wt in inliers)
+        angle = sum(v * wt for v, wt in inliers) / tot_w if tot_w > 0 else center
+    else:
+        angle = center
+    return {"ok": True, "tilt": normalize_tilt(angle), "lines": len(vals)}
+
+
+def _match_feature_pairs(g1: np.ndarray, g2: np.ndarray) -> tuple[list[Any], list[Any], list[Any]]:
+    det = cv2.AKAZE_create()
+    kp1, d1 = det.detectAndCompute(g1, None)
+    kp2, d2 = det.detectAndCompute(g2, None)
+    good: list[Any] = []
+    if d1 is not None and d2 is not None and len(kp1) >= 8 and len(kp2) >= 8:
+        matches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(d1, d2, k=2)
+        good = [m[0] for m in matches if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
+    if len(good) < 15:
+        orb = cv2.ORB_create(nfeatures=1500)
+        okp1, od1 = orb.detectAndCompute(g1, None)
+        okp2, od2 = orb.detectAndCompute(g2, None)
+        if od1 is not None and od2 is not None and len(okp1) >= 8 and len(okp2) >= 8:
+            omatches = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(od1, od2, k=2)
+            ogood = [m[0] for m in omatches if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
+            if len(ogood) > len(good):
+                return okp1, okp2, ogood
+    return kp1, kp2, good
+
+
+def estimate_camera_drift(ref_bgr: np.ndarray, cur_bgr: np.ndarray) -> dict[str, Any]:
+    """Estimate rigid `(dx, dy, dAngle)` camera shift from saved `ref_bgr` to live `cur_bgr` via RANSAC."""
+    if ref_bgr is None or ref_bgr.size == 0 or cur_bgr is None or cur_bgr.size == 0:
+        return {"ok": False, "error": "Reference or live frame missing"}
+    h1, w1 = ref_bgr.shape[:2]
+    h2, w2 = cur_bgr.shape[:2]
+    s1 = min(1.0, 960.0 / max(1, w1))
+    s2 = min(1.0, 960.0 / max(1, w2))
+    g1 = cv2.cvtColor(cv2.resize(ref_bgr, (0, 0), fx=s1, fy=s1) if s1 < 1.0 else ref_bgr, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(cv2.resize(cur_bgr, (0, 0), fx=s2, fy=s2) if s2 < 1.0 else cur_bgr, cv2.COLOR_BGR2GRAY)
+
+    kp1, kp2, good = _match_feature_pairs(g1, g2)
+    if len(good) < 10:
+        return {"ok": False, "error": "Insufficient visual features to match reference", "matches": len(good)}
+
+    p1 = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    p2 = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    m_s, inliers = cv2.estimateAffinePartial2D(p1, p2, method=cv2.RANSAC, ransacReprojThreshold=3.0)
+    if m_s is None or inliers is None:
+        return {"ok": False, "error": "RANSAC transform fit failed", "matches": len(good)}
+
+    inlier_cnt = int(inliers.sum())
+    inlier_ratio = inlier_cnt / max(1, len(good))
+    scale_s = math.hypot(float(m_s[0, 0]), float(m_s[1, 0]))
+    scale_raw = scale_s * (s1 / s2)
+    if inlier_cnt < 12 or inlier_ratio < 0.25 or not (0.85 <= scale_raw <= 1.15):
+        return {
+            "ok": False,
+            "error": "Low-confidence reference match (scene blocked or lighting changed)",
+            "matches": len(good),
+            "inliers": inlier_cnt,
+        }
+
+    s1_mat = np.array([[s1, 0.0, 0.0], [0.0, s1, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    s2_inv = np.array([[1.0 / s2, 0.0, 0.0], [0.0, 1.0 / s2, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    m_raw = s2_inv @ np.vstack([m_s, [0.0, 0.0, 1.0]]) @ s1_mat
+    d_angle_cw = math.degrees(math.atan2(float(m_raw[1, 0]), float(m_raw[0, 0])))
+    cx, cy = w1 / 2.0, h1 / 2.0
+    mapped = m_raw @ np.array([cx, cy, 1.0], dtype=np.float64)
+    dx = float(mapped[0] - (w2 / 2.0))
+    dy = float(mapped[1] - (h2 / 2.0))
+    shift_px = math.hypot(dx, dy)
+    return {
+        "ok": True,
+        "matrix": m_raw,
+        "dx": round(dx, 1),
+        "dy": round(dy, 1),
+        "shiftPx": round(shift_px, 1),
+        "dAngle": round(d_angle_cw, 2),
+        "scale": round(scale_raw, 4),
+        "inliers": inlier_cnt,
+    }
+
+
+def project_view_from_reference(
+    ref_view: dict[str, Any],
+    cur_view: "CameraConfig",
+    cur_raw: np.ndarray,
+    m_raw: np.ndarray,
+    ref_w: int,
+    ref_h: int,
+) -> tuple[float, tuple[float, float, float, float], list[Quad]]:
+    """Project a view's baseline `(tilt, crop, exclusions)` onto `cur_raw` using raw-frame transform `m_raw`."""
+    cur_h, cur_w = cur_raw.shape[:2]
+    ref_rot = normalize_rotate(ref_view.get("rotate", cur_view.rotate))
+    ref_tilt = normalize_tilt(ref_view.get("tilt", cur_view.tilt))
+    ref_crop = normalize_crop(ref_view.get("crop", cur_view.crop))
+    ref_excls = normalize_exclusions(ref_view.get("exclusions", cur_view.exclusions))
+
+    d_angle_cw = math.degrees(math.atan2(float(m_raw[1, 0]), float(m_raw[0, 0])))
+    base_tilt = normalize_tilt(ref_tilt - d_angle_cw)
+
+    t_ref, fw_ref, fh_ref = view_transform_matrix(ref_w, ref_h, ref_rot, ref_tilt)
+    t_ref_inv = np.linalg.inv(t_ref)
+    ref_cx = ((ref_crop[0] + ref_crop[2]) / 2.0) * fw_ref
+    ref_cy = ((ref_crop[1] + ref_crop[3]) / 2.0) * fh_ref
+    ref_w_px = (ref_crop[2] - ref_crop[0]) * fw_ref
+    ref_h_px = (ref_crop[3] - ref_crop[1]) * fh_ref
+
+    def _project_for_tilt(tlt: float) -> tuple[tuple[float, float, float, float], np.ndarray, int, int]:
+        t_cur, fw_cur, fh_cur = view_transform_matrix(cur_w, cur_h, cur_view.rotate, tlt)
+        h_view = t_cur @ m_raw @ t_ref_inv
+        pt = h_view @ np.array([ref_cx, ref_cy, 1.0], dtype=np.float64)
+        nw = max(MIN_CROP_SPAN, min(1.0, ref_w_px / max(1, fw_cur)))
+        nh = max(MIN_CROP_SPAN, min(1.0, ref_h_px / max(1, fh_cur)))
+        nx0 = max(0.0, min(1.0 - nw, (float(pt[0]) / max(1, fw_cur)) - nw / 2.0))
+        ny0 = max(0.0, min(1.0 - nh, (float(pt[1]) / max(1, fh_cur)) - nh / 2.0))
+        return normalize_crop((nx0, ny0, nx0 + nw, ny0 + nh)), h_view, fw_cur, fh_cur
+
+    new_tilt = base_tilt
+    new_crop, h_view, fw_cur, fh_cur = _project_for_tilt(new_tilt)
+    if cur_view.auto_level:
+        lvl = estimate_auto_level_tilt(cur_raw, crop=new_crop, rotate=cur_view.rotate)
+        if lvl.get("ok"):
+            new_tilt = normalize_tilt(lvl["tilt"])
+            new_crop, h_view, fw_cur, fh_cur = _project_for_tilt(new_tilt)
+
+    new_excls: list[Quad] = []
+    for q in ref_excls:
+        pts: list[tuple[float, float]] = []
+        for px, py in q:
+            mapped = h_view @ np.array([px * fw_ref, py * fh_ref, 1.0], dtype=np.float64)
+            mx = max(0.0, min(1.0, float(mapped[0]) / max(1, fw_cur)))
+            my = max(0.0, min(1.0, float(mapped[1]) / max(1, fh_cur)))
+            pts.append((round(mx, 4), round(my, 4)))
+        if len(pts) == 4:
+            new_excls.append((pts[0], pts[1], pts[2], pts[3]))
+    return new_tilt, new_crop, normalize_exclusions(new_excls)
+
+
 def compute_motion_energy_from_frames(
     frames: list[np.ndarray],
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
@@ -769,6 +999,7 @@ class CameraConfig:
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     rotate: int = 0
     tilt: float = 0.0
+    auto_level: bool = False
     source_slug: str = ""
 
     def effective_roi(self) -> tuple[float, float, float, float]:
@@ -789,6 +1020,7 @@ class CameraConfig:
             "crop": list(self.crop),
             "rotate": self.rotate,
             "tilt": self.tilt,
+            "autoLevel": self.auto_level,
             "sourceSlug": self.source_slug,
         }
 
@@ -1381,6 +1613,7 @@ class ArmoryCamService:
         self.clips_root = self.root / "clips"
         self.previews_root = self.root / "previews"
         self.thumbs_root = self.root / "thumbs"
+        self.refs_root = self.root / "refs"
         self.logs_root = self.root / "logs"
         self.config_path = self.root / "config.json"
         self.clips_index_path = self.clips_root / "index.jsonl"
@@ -1392,6 +1625,7 @@ class ArmoryCamService:
             self.clips_root,
             self.previews_root,
             self.thumbs_root,
+            self.refs_root,
             self.logs_root,
         ):
             d.mkdir(parents=True, exist_ok=True)
@@ -1421,6 +1655,12 @@ class ArmoryCamService:
         else:
             self.ntfy_topic = ""
         self.cameras: list[CameraConfig] = []
+        self.realign_mode: str = "manual"
+        self.drift_alert_ntfy: bool = False
+        self.drift_status: dict[str, dict[str, Any]] = {}
+        self._drift_strikes: dict[str, int] = {}
+        self._drift_last_ntfy: dict[str, float] = {}
+        self._drift_last_check: dict[str, float] = {}
 
         self.active_session_id: str | None = None
         self.active_session_name: str = ""
@@ -1486,6 +1726,7 @@ class ArmoryCamService:
             crop = normalize_crop(item["crop"]) if "crop" in item else (old.crop if old else (0.0, 0.0, 1.0, 1.0))
             rotate = normalize_rotate(item["rotate"]) if "rotate" in item else (old.rotate if old else 0)
             tilt = normalize_tilt(item["tilt"]) if "tilt" in item else (old.tilt if old else 0.0)
+            auto_level = bool(item["autoLevel"]) if "autoLevel" in item else (old.auto_level if old else False)
             cams.append(
                 CameraConfig(
                     name=name,
@@ -1499,6 +1740,7 @@ class ArmoryCamService:
                     crop=crop,
                     rotate=rotate,
                     tilt=tilt,
+                    auto_level=auto_level,
                     source_slug=src_slug,
                 )
             )
@@ -1576,6 +1818,10 @@ class ArmoryCamService:
             self.pre_roll_sec = max(30, int(raw.get("preRollSec", DEFAULT_PRE_ROLL_SEC)))
             if "driveBackupDir" in raw:
                 self.drive_backup_dir = str(raw.get("driveBackupDir") or "").strip()
+            self.realign_mode = (
+                "auto" if str(raw.get("realignMode", "manual")).strip().lower() == "auto" else "manual"
+            )
+            self.drift_alert_ntfy = bool(raw.get("driftAlertNtfy", False))
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
             raw_cams = [item for item in raw.get("cameras", []) if isinstance(item, dict) and str(item.get("name", "")).strip()]
             loaded = self._build_camera_configs(raw_cams) if raw_cams else []
@@ -1590,6 +1836,8 @@ class ArmoryCamService:
             "retentionDays": self.retention_days,
             "preRollSec": self.pre_roll_sec,
             "driveBackupDir": self.drive_backup_dir,
+            "realignMode": self.realign_mode,
+            "driftAlertNtfy": self.drift_alert_ntfy,
             "cameras": [c.to_dict() for c in self.cameras],
             "wallboard": self.wallboard_cfg.to_dict(),
         }
@@ -1645,6 +1893,12 @@ class ArmoryCamService:
                 next_dir = str(raw.get("driveBackupDir") or "").strip()
                 drive_changed = next_dir != self.drive_backup_dir and bool(next_dir)
                 self.drive_backup_dir = next_dir
+            if "realignMode" in raw:
+                self.realign_mode = (
+                    "auto" if str(raw.get("realignMode") or "manual").strip().lower() == "auto" else "manual"
+                )
+            if "driftAlertNtfy" in raw:
+                self.drift_alert_ntfy = bool(raw.get("driftAlertNtfy"))
             if isinstance(raw.get("wallboard"), dict):
                 merged = {**self.wallboard_cfg.to_dict(), **raw["wallboard"]}
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
@@ -1677,6 +1931,16 @@ class ArmoryCamService:
                 self._restart_capture_workers()
                 if drive_changed:
                     threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True).start()
+            cap_ref_slugs = [
+                p.slug
+                for p in self._physical_cameras()
+                if p.enabled and (bool(raw.get("captureReference")) or not (self.refs_root / f"{p.slug}.json").exists())
+            ]
+        for pslug in cap_ref_slugs:
+            try:
+                self.capture_reference(pslug)
+            except Exception:
+                pass
 
     def _rehydrate_ring_index(self) -> None:
         phys_segs: dict[str, list[SegmentInfo]] = {}
@@ -1903,6 +2167,7 @@ class ArmoryCamService:
 
     def _segment_poll_loop(self) -> None:
         last_prune = 0.0
+        last_drift = 0.0
         while not self._stop_event.is_set():
             now = time.time()
             with self.lock:
@@ -1914,6 +2179,12 @@ class ArmoryCamService:
                 last_active_ms = self.wallboard.last_active_push_ms
                 workout_active = self.wallboard.workout_active
             self.adb.check_timers(wb_cfg, last_active_ms, workout_active)
+            if now - last_drift > 30.0:
+                last_drift = now
+                try:
+                    self.check_camera_drift_background(now)
+                except Exception as exc:
+                    self.log.debug("Background drift check error: %s", exc)
             if now - last_prune > 60.0:
                 last_prune = now
                 self._prune_storage(now)
@@ -3155,6 +3426,359 @@ class ArmoryCamService:
             "driveDeleted": drive_deleted,
         }
 
+    def _get_raw_frame_bgr(self, source_slug: str) -> np.ndarray | None:
+        """Fetch latest uncropped/unrotated BGR frame for `source_slug` from ring TS or live MJPEG hub."""
+        with self.lock:
+            segs = list(self.ring_segments.get(source_slug, []))
+        for seg in reversed(segs[-4:]):
+            if seg.path.exists():
+                cap = cv2.VideoCapture(str(seg.path))
+                if cap.isOpened():
+                    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                    ok, frm = (False, None)
+                    if total > 1:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+                        ok, frm = cap.read()
+                    if not ok or frm is None:
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ok, frm = cap.read()
+                    cap.release()
+                    if ok and frm is not None:
+                        return frm
+        live_jpg = self.live_hub.recent_frame(source_slug, max_age_sec=3.0)
+        if live_jpg:
+            img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
+            if img is not None:
+                return img
+        return None
+
+    def capture_reference(self, camera_name: str | None = None) -> dict[str, Any]:
+        """Save clean raw baseline JPEG + view geometry into `refs/<slug>.jpg|.json`."""
+        with self.lock:
+            if camera_name:
+                target = self._find_camera(camera_name)
+                if not target:
+                    return {"ok": False, "error": f"Unknown camera: {camera_name}"}
+                phys_list = [self._source_camera(target)]
+            else:
+                phys_list = [p for p in self._physical_cameras() if p.enabled]
+            views_by_src = {p.slug: [c for c in self._views_for_source(p.slug, enabled_only=False)] for p in phys_list}
+
+        captured: list[dict[str, Any]] = []
+        errors: list[str] = []
+        now_ms = int(time.time() * 1000)
+        for phys in phys_list:
+            raw_bgr = self._get_raw_frame_bgr(phys.slug)
+            if raw_bgr is None:
+                errors.append(f"{phys.name}: no live frame available")
+                continue
+            h, w = raw_bgr.shape[:2]
+            jpg_path = self.refs_root / f"{phys.slug}.jpg"
+            meta_path = self.refs_root / f"{phys.slug}.json"
+            ok_w = cv2.imwrite(str(jpg_path), raw_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            if not ok_w:
+                errors.append(f"{phys.name}: failed writing reference JPEG")
+                continue
+            views_meta = {
+                v.slug: {
+                    "name": v.name,
+                    "rotate": v.rotate,
+                    "tilt": v.tilt,
+                    "autoLevel": v.auto_level,
+                    "crop": list(v.crop),
+                    "exclusions": [[[pt[0], pt[1]] for pt in q] for q in v.exclusions],
+                }
+                for v in views_by_src.get(phys.slug, [])
+            }
+            meta = {
+                "slug": phys.slug,
+                "name": phys.name,
+                "savedAtMs": now_ms,
+                "width": w,
+                "height": h,
+                "views": views_meta,
+            }
+            tmp_meta = meta_path.with_suffix(".json.tmp")
+            tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            tmp_meta.replace(meta_path)
+            with self.lock:
+                self.drift_status[phys.slug] = {
+                    "slug": phys.slug,
+                    "name": phys.name,
+                    "hasRef": True,
+                    "savedAtMs": now_ms,
+                    "checkedAtMs": now_ms,
+                    "shiftPx": 0.0,
+                    "dAngle": 0.0,
+                    "dx": 0.0,
+                    "dy": 0.0,
+                    "drifted": False,
+                }
+                self._drift_strikes[phys.slug] = 0
+            captured.append({"slug": phys.slug, "name": phys.name, "width": w, "height": h, "views": len(views_meta)})
+
+        return {
+            "ok": bool(captured) or not errors,
+            "captured": captured,
+            "errors": errors,
+            "alignment": self.alignment_snapshot(),
+        }
+
+    def auto_level_camera(
+        self,
+        camera_name: str,
+        crop_override: tuple[float, float, float, float] | None = None,
+        rotate_override: int | None = None,
+    ) -> dict[str, Any]:
+        """Run OpenCV structural line auto-leveling inside a view's crop box."""
+        with self.lock:
+            cam = self._find_camera(camera_name)
+            if not cam:
+                return {"ok": False, "error": f"Unknown camera: {camera_name}"}
+            src_slug = self._source_slug_for(cam)
+            eff_crop = normalize_crop(crop_override) if crop_override is not None else cam.crop
+            eff_rot = normalize_rotate(rotate_override) if rotate_override is not None else cam.rotate
+        raw_bgr = self._get_raw_frame_bgr(src_slug)
+        if raw_bgr is None:
+            return {"ok": False, "error": "Camera frame unavailable"}
+        res = estimate_auto_level_tilt(raw_bgr, crop=eff_crop, rotate=eff_rot)
+        return {**res, "camera": cam.name, "slug": cam.slug}
+
+    def alignment_snapshot(self) -> dict[str, Any]:
+        """Summarize saved reference status and latest drift telemetry per physical camera."""
+        cams_out: list[dict[str, Any]] = []
+        for phys in self._physical_cameras():
+            meta_p = self.refs_root / f"{phys.slug}.json"
+            has_ref = meta_p.is_file() and (self.refs_root / f"{phys.slug}.jpg").is_file()
+            saved_at = 0
+            if has_ref:
+                try:
+                    saved_at = int(json.loads(meta_p.read_text(encoding="utf-8")).get("savedAtMs", 0))
+                except Exception:
+                    saved_at = 0
+            st = dict(self.drift_status.get(phys.slug) or {})
+            cams_out.append(
+                {
+                    "slug": phys.slug,
+                    "name": phys.name,
+                    "hasRef": has_ref,
+                    "savedAtMs": saved_at,
+                    "checkedAtMs": int(st.get("checkedAtMs", 0)),
+                    "shiftPx": float(st.get("shiftPx", 0.0)),
+                    "dAngle": float(st.get("dAngle", 0.0)),
+                    "dx": float(st.get("dx", 0.0)),
+                    "dy": float(st.get("dy", 0.0)),
+                    "drifted": bool(st.get("drifted", False)),
+                    "error": str(st.get("error", "")),
+                }
+            )
+        return {
+            "realignMode": self.realign_mode,
+            "driftAlertNtfy": self.drift_alert_ntfy,
+            "cameras": cams_out,
+        }
+
+    def realign_camera(self, camera_name: str | None = None, apply: bool = True) -> dict[str, Any]:
+        """Measure camera bump/reposition vs saved reference and optionally update all views sharing it."""
+        with self.lock:
+            if camera_name:
+                target = self._find_camera(camera_name)
+                if not target:
+                    return {"ok": False, "error": f"Unknown camera: {camera_name}"}
+                phys_list = [self._source_camera(target)]
+            else:
+                phys_list = [p for p in self._physical_cameras() if p.enabled]
+
+        results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        any_changed = False
+        now_ms = int(time.time() * 1000)
+
+        for phys in phys_list:
+            jpg_path = self.refs_root / f"{phys.slug}.jpg"
+            meta_path = self.refs_root / f"{phys.slug}.json"
+            if not jpg_path.is_file() or not meta_path.is_file():
+                errors.append(f"{phys.name}: no saved reference (click Pin Ref first)")
+                continue
+            ref_bgr = cv2.imread(str(jpg_path), cv2.IMREAD_COLOR)
+            if ref_bgr is None:
+                errors.append(f"{phys.name}: failed reading reference image")
+                continue
+            try:
+                ref_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                ref_meta = {}
+            cur_bgr = self._get_raw_frame_bgr(phys.slug)
+            if cur_bgr is None:
+                errors.append(f"{phys.name}: live frame unavailable")
+                continue
+
+            drift = estimate_camera_drift(ref_bgr, cur_bgr)
+            if not drift.get("ok"):
+                err_msg = str(drift.get("error") or "Drift check failed")
+                errors.append(f"{phys.name}: {err_msg}")
+                with self.lock:
+                    prev = dict(self.drift_status.get(phys.slug) or {})
+                    self.drift_status[phys.slug] = {
+                        **prev,
+                        "slug": phys.slug,
+                        "name": phys.name,
+                        "hasRef": True,
+                        "checkedAtMs": now_ms,
+                        "error": err_msg,
+                    }
+                continue
+
+            shift_px = float(drift["shiftPx"])
+            d_angle = float(drift["dAngle"])
+            drifted = shift_px >= DRIFT_PX_THRESHOLD or abs(d_angle) >= DRIFT_DEG_THRESHOLD
+            m_raw = drift["matrix"]
+            ref_h, ref_w = ref_bgr.shape[:2]
+            ref_views = ref_meta.get("views") if isinstance(ref_meta.get("views"), dict) else {}
+
+            updated_views: list[str] = []
+            with self.lock:
+                self.drift_status[phys.slug] = {
+                    "slug": phys.slug,
+                    "name": phys.name,
+                    "hasRef": True,
+                    "savedAtMs": int(ref_meta.get("savedAtMs", 0)),
+                    "checkedAtMs": now_ms,
+                    "shiftPx": shift_px,
+                    "dAngle": d_angle,
+                    "dx": float(drift["dx"]),
+                    "dy": float(drift["dy"]),
+                    "drifted": drifted,
+                    "error": "",
+                }
+                if apply:
+                    for v in self._views_for_source(phys.slug, enabled_only=False):
+                        baseline = ref_views.get(v.slug)
+                        if not isinstance(baseline, dict):
+                            baseline = {
+                                "rotate": v.rotate,
+                                "tilt": v.tilt,
+                                "crop": list(v.crop),
+                                "exclusions": [[[pt[0], pt[1]] for pt in q] for q in v.exclusions],
+                            }
+                        new_tilt, new_crop, new_excls = project_view_from_reference(
+                            baseline, v, cur_bgr, m_raw, ref_w, ref_h
+                        )
+                        if (
+                            abs(new_tilt - v.tilt) >= 0.05
+                            or any(abs(a - b) >= 0.0005 for a, b in zip(new_crop, v.crop))
+                            or new_excls != v.exclusions
+                        ):
+                            any_changed = True
+                        v.tilt = new_tilt
+                        v.crop = new_crop
+                        v.exclusions = new_excls
+                        updated_views.append(v.name)
+
+            results.append(
+                {
+                    "slug": phys.slug,
+                    "name": phys.name,
+                    "dx": drift["dx"],
+                    "dy": drift["dy"],
+                    "shiftPx": shift_px,
+                    "dAngle": d_angle,
+                    "inliers": drift["inliers"],
+                    "drifted": drifted,
+                    "applied": bool(apply),
+                    "updatedViews": updated_views,
+                }
+            )
+
+        with self.lock:
+            if any_changed:
+                self.save_config()
+            cams_out = [{**c.to_dict()} for c in self.cameras]
+            align_out = self.alignment_snapshot()
+
+        if not results and errors:
+            return {"ok": False, "error": "; ".join(errors), "results": [], "errors": errors, "cameras": cams_out, "alignment": align_out}
+        return {"ok": True, "results": results, "errors": errors, "cameras": cams_out, "alignment": align_out}
+
+    def check_camera_drift_background(self, now_s: float) -> list[dict[str, Any]]:
+        """Periodic quiet-gym drift check: auto-seeds missing refs, confirms 2x before auto-realign or ntfy."""
+        with self.lock:
+            if self.recording and not self.paused:
+                return []
+            phys_cams = [p for p in self._physical_cameras() if p.enabled]
+            mode = self.realign_mode
+            ntfy_on = self.drift_alert_ntfy
+            topic = self.ntfy_topic
+
+        events: list[dict[str, Any]] = []
+        for phys in phys_cams:
+            with self.lock:
+                views = self._views_for_source(phys.slug, enabled_only=True)
+                quiet = all(self.latest_energy.get(v.slug, 0.0) < 1.0 for v in views)
+                has_media = (
+                    self.cam_connected.get(phys.slug, False)
+                    or bool(self.ring_segments.get(phys.slug))
+                    or (self.live_hub.recent_frame(phys.slug, max_age_sec=10.0) is not None)
+                )
+            if not quiet or not has_media:
+                continue
+
+            meta_p = self.refs_root / f"{phys.slug}.json"
+            if not meta_p.is_file():
+                try:
+                    self.capture_reference(phys.slug)
+                except Exception:
+                    pass
+                continue
+
+            if mode != "auto" and not ntfy_on:
+                continue
+
+            min_interval = 30.0 if self._drift_strikes.get(phys.slug, 0) == 1 else DRIFT_CHECK_INTERVAL_SEC
+            last_chk = self._drift_last_check.get(phys.slug)
+            if last_chk is not None and (now_s - last_chk) < min_interval:
+                continue
+            self._drift_last_check[phys.slug] = now_s
+
+            chk = self.realign_camera(phys.slug, apply=False)
+            if not chk.get("ok") or not chk.get("results"):
+                continue
+            r = chk["results"][0]
+            if not r.get("drifted"):
+                self._drift_strikes[phys.slug] = 0
+                continue
+
+            strikes = self._drift_strikes.get(phys.slug, 0) + 1
+            self._drift_strikes[phys.slug] = strikes
+            if strikes < 2:
+                continue
+
+            self._drift_strikes[phys.slug] = 0
+            did_apply = False
+            if mode == "auto":
+                res_apply = self.realign_camera(phys.slug, apply=True)
+                did_apply = bool(res_apply.get("ok"))
+
+            last_n = self._drift_last_ntfy.get(phys.slug)
+            can_ntfy = bool(ntfy_on and topic and (last_n is None or (now_s - last_n) >= DRIFT_NTFY_COOLDOWN_SEC))
+            if can_ntfy:
+                self._drift_last_ntfy[phys.slug] = now_s
+                if did_apply:
+                    title = f"Armory Cam Auto-Realigned: {phys.name}"
+                    msg = f"Detected {r['shiftPx']:.0f}px / {r['dAngle']:+.1f}° bump on {phys.name} and auto-realigned views."
+                else:
+                    title = f"Armory Cam Drift Alert: {phys.name}"
+                    msg = f"{phys.name} shifted {r['shiftPx']:.0f}px ({r['dAngle']:+.1f}°). Open http://192.168.1.152:{self.port} and tap Realign Now."
+                threading.Thread(
+                    target=send_ntfy_alert,
+                    args=(topic, title, msg),
+                    kwargs={"tags": "movie_camera,warning"},
+                    name="ntfy-cam-drift",
+                    daemon=True,
+                ).start()
+            events.append({"slug": phys.slug, "shiftPx": r["shiftPx"], "dAngle": r["dAngle"], "applied": did_apply, "notified": can_ntfy})
+        return events
+
     def calibration_status(self) -> dict[str, Any]:
         """Return unique clean clip count and notified pose-calibration milestones."""
         with self.lock:
@@ -3259,6 +3883,7 @@ class ArmoryCamService:
                 "paused": self.paused,
                 "disk": self.disk_stats(),
                 "calibration": self.calibration_status(),
+                "alignment": self.alignment_snapshot(),
                 "cameras": cams,
                 "wallboard": wb_status,
             }
@@ -3392,6 +4017,17 @@ DASHBOARD_HTML = """<!doctype html>
   </h1>
   <div id="subInfo" style="color:var(--mut)">Loading OptiPlex status…</div>
 
+  <div id="alignBar" class="card" style="margin-top:12px;padding:10px 14px;display:flex;flex-wrap:wrap;align-items:center;gap:8px">
+    <span style="font-weight:800;font-size:13px">Alignment &amp; Drift Guard</span>
+    <span id="alignStatus" style="font-size:12px;color:var(--mut)">Checking references…</span>
+    <div style="margin-left:auto;display:flex;flex-wrap:wrap;gap:6px;align-items:center">
+      <button class="btn sec sm" id="pinRefBtn" type="button" title="Save clean reference frame &amp; crop baseline for connected cameras">Pin Ref</button>
+      <button class="btn sec sm" id="realignModeBtn" type="button" title="Toggle Auto vs Manual reference re-alignment when gym is quiet">Re-Align: Manual</button>
+      <button class="btn ok sm" id="realignNowBtn" type="button" title="Match live camera views against saved reference and re-align crops, angles &amp; masks">↻ Realign Now</button>
+      <button class="btn sec sm" id="driftNtfyBtn" type="button" title="Send ntfy push notification when camera drift is detected">Drift Alert ntfy: OFF</button>
+    </div>
+  </div>
+
   <div id="camGrid" class="grid"></div>
 
   <div class="card" style="margin-top:14px">
@@ -3489,6 +4125,13 @@ DASHBOARD_HTML = """<!doctype html>
       <input type="number" class="tilt-num" id="mmTiltNum" min="-45" max="45" step="0.1" value="0.0" aria-label="Full-screen rotate angle">
       <button class="btn sec sm" id="mmTiltReset" type="button" title="Reset angle to 0°">0°</button>
       <button class="btn sec sm" id="mmGridBtn" type="button" title="Toggle plumb alignment grid (G)">Grid</button>
+      <button class="btn sec sm" id="mmAutoLvlBtn" type="button" title="Detect structural upright/horizontal tilt inside crop">Auto-Level: OFF</button>
+    </div>
+    <div class="mm-sep"></div>
+    <div class="mm-bar-grp">
+      <button class="btn sec sm" id="mmRealignModeBtn" type="button" title="Toggle Auto vs Manual reference re-alignment">Re-Align: Manual</button>
+      <button class="btn ok sm" id="mmRealignNowBtn" type="button" title="Re-align this camera against saved reference">↻ Realign Now</button>
+      <button class="btn sec sm" id="mmDriftNtfyBtn" type="button" title="Toggle drift alert ntfy push notifications">Drift ntfy: OFF</button>
     </div>
     <div class="mm-sep"></div>
     <div class="mm-bar-grp" id="mmCropTools">
@@ -4001,6 +4644,11 @@ function syncCropOverlay(idx) {
   if (tiltSlider) tiltSlider.value = String(tilt);
   const tiltNum = $(`tiltNum-${idx}`);
   if (tiltNum && document.activeElement !== tiltNum) tiltNum.value = tilt.toFixed(1);
+  const autoBtn = $(`autoLvl-${idx}`);
+  if (autoBtn) {
+    autoBtn.classList.toggle('on', !!cam.autoLevel);
+    autoBtn.textContent = `Auto-Level: ${cam.autoLevel ? 'ON' : 'OFF'}`;
+  }
   const prevBtn = $(`prevBtn-${idx}`);
   if (prevBtn) prevBtn.classList.toggle('on', !!previewCropped[idx]);
   const rotBtn = $(`rotBtn-${idx}`);
@@ -4293,6 +4941,11 @@ function renderMaskModal() {
   const mmTiltNum = $('mmTiltNum');
   if (mmTiltNum && document.activeElement !== mmTiltNum) mmTiltNum.value = tilt.toFixed(1);
   if ($('mmGridBtn')) $('mmGridBtn').classList.toggle('on', !!mmState.gridPinned);
+  if ($('mmAutoLvlBtn')) {
+    $('mmAutoLvlBtn').classList.toggle('on', !!cam.autoLevel);
+    $('mmAutoLvlBtn').textContent = `Auto-Level: ${cam.autoLevel ? 'ON' : 'OFF'}`;
+  }
+  syncAlignmentUI();
 
   const lock = aspectLock[mmState.camIdx] || null;
   document.querySelectorAll('[data-mmasp]').forEach(btn => {
@@ -4736,6 +5389,13 @@ function wireMaskModal() {
     mmState.gridPinned = !mmState.gridPinned;
     renderMaskModal();
   };
+  $('mmAutoLvlBtn').onclick = () => toggleAutoLevelView(mmState.camIdx, $('mmAutoLvlBtn'));
+  $('mmRealignModeBtn').onclick = () => toggleAlignmentPref('realignMode', $('mmRealignModeBtn'));
+  $('mmRealignNowBtn').onclick = () => {
+    const cam = cfg?.cameras?.[mmState.camIdx];
+    runRealignNow(cam ? cam.name : null, $('mmRealignNowBtn'));
+  };
+  $('mmDriftNtfyBtn').onclick = () => toggleAlignmentPref('driftAlertNtfy', $('mmDriftNtfyBtn'));
   $('mmResetCropBtn').onclick = () => {
     const idx = mmState.camIdx;
     if (!cfg.cameras[idx]) return;
@@ -4924,6 +5584,7 @@ function renderCameras() {
         <button class="btn sec sm" type="button" data-tiltstep="${idx}:0.5" title="Rotate clockwise 0.5°">+0.5°</button>
         <input type="number" class="tilt-num" id="tiltNum-${idx}" min="-45" max="45" step="0.1" value="${normTilt(c.tilt || 0).toFixed(1)}" aria-label="Custom rotate angle in degrees">
         <button class="btn sec sm" type="button" data-tiltreset="${idx}" title="Reset angle to 0°">0°</button>
+        <button class="btn sec sm${c.autoLevel ? ' on' : ''}" type="button" data-autolevel="${idx}" id="autoLvl-${idx}" title="Detect upright/horizontal tilt inside crop">Auto-Level: ${c.autoLevel ? 'ON' : 'OFF'}</button>
       </div>
       <div class="ctrl-row">
         <span style="font-size:12px;color:var(--mut)">Box Ratio:</span>
@@ -5011,8 +5672,9 @@ function renderCameras() {
 }
 
 const levelTimers = new Map();
-function setViewTilt(idx, val, flashGrid = false) {
+function setViewTilt(idx, val, flashGrid = false, manual = true) {
   if (!cfg || !cfg.cameras || !cfg.cameras[idx]) return;
+  if (manual) cfg.cameras[idx].autoLevel = false;
   cfg.cameras[idx].tilt = normTilt(val);
   markDirty();
   syncCropOverlay(idx);
@@ -5038,6 +5700,171 @@ function setViewTilt(idx, val, flashGrid = false) {
     }
     scheduleModalHiresRefresh(false);
     renderMaskModal();
+  }
+}
+
+function syncAlignmentUI() {
+  if (!cfg) return;
+  const isAuto = cfg.realignMode === 'auto';
+  const ntfyOn = !!cfg.driftAlertNtfy;
+  const rmBtn = $('realignModeBtn');
+  if (rmBtn) {
+    rmBtn.textContent = isAuto ? 'Re-Align: Auto' : 'Re-Align: Manual';
+    rmBtn.classList.toggle('on', isAuto);
+  }
+  const mmRmBtn = $('mmRealignModeBtn');
+  if (mmRmBtn) {
+    mmRmBtn.textContent = isAuto ? 'Re-Align: Auto' : 'Re-Align: Manual';
+    mmRmBtn.classList.toggle('on', isAuto);
+  }
+  const dnBtn = $('driftNtfyBtn');
+  if (dnBtn) {
+    dnBtn.textContent = ntfyOn ? 'Drift Alert ntfy: ON' : 'Drift Alert ntfy: OFF';
+    dnBtn.classList.toggle('on', ntfyOn);
+  }
+  const mmDnBtn = $('mmDriftNtfyBtn');
+  if (mmDnBtn) {
+    mmDnBtn.textContent = ntfyOn ? 'Drift ntfy: ON' : 'Drift ntfy: OFF';
+    mmDnBtn.classList.toggle('on', ntfyOn);
+  }
+  const stEl = $('alignStatus');
+  if (stEl) {
+    const alCams = cfg.alignment?.cameras || [];
+    const pinnedCount = alCams.filter(x => x.hasRef).length;
+    if (!alCams.length) {
+      stEl.textContent = 'Waiting for cameras…';
+    } else if (!pinnedCount) {
+      stEl.textContent = 'No reference pinned yet — click Pin Ref (or auto-pins when quiet)';
+    } else {
+      const parts = alCams.map(x => {
+        if (!x.hasRef) return `${x.name}: no ref`;
+        if (x.checkedAtMs <= 0) return `${x.name}: ref pinned`;
+        const flag = x.drifted ? '⚠ DRIFT ' : '';
+        return `${x.name}: ${flag}${x.shiftPx.toFixed(0)}px, ${x.dAngle >= 0 ? '+' : ''}${x.dAngle.toFixed(1)}°`;
+      });
+      stEl.textContent = parts.join(' · ');
+    }
+  }
+}
+
+async function toggleAutoLevelView(idx, triggerBtn = null) {
+  if (!cfg || !cfg.cameras || !cfg.cameras[idx]) return;
+  const cam = cfg.cameras[idx];
+  const nextOn = !cam.autoLevel;
+  cam.autoLevel = nextOn;
+  syncCropOverlay(idx);
+  if (mmState.open && mmState.camIdx === idx) renderMaskModal();
+  if (!nextOn) {
+    markDirty();
+    showToast(`Auto-Level OFF (${cam.name})`, 'ok');
+    return;
+  }
+  if (triggerBtn) triggerBtn.disabled = true;
+  try {
+    const resp = await fetch('/api/camera/auto-level', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ camera: cam.name, crop: cam.crop, rotate: cam.rotate || 0 }),
+    });
+    const res = await resp.json();
+    if (!resp.ok || !res || !res.ok) throw new Error(res?.error || 'Auto-level failed');
+    setViewTilt(idx, res.tilt, true, false);
+    showToast(`✓ Auto-Level (${cam.name}): ${res.tilt >= 0 ? '+' : ''}${Number(res.tilt).toFixed(1)}° (${res.lines} lines)`, 'ok');
+  } catch (err) {
+    cam.autoLevel = false;
+    syncCropOverlay(idx);
+    if (mmState.open && mmState.camIdx === idx) renderMaskModal();
+    showToast('✗ ' + (err?.message || 'Auto-level failed'), 'err');
+  } finally {
+    if (triggerBtn) triggerBtn.disabled = false;
+  }
+}
+
+async function toggleAlignmentPref(field) {
+  if (!cfg) return;
+  const prev = field === 'realignMode' ? cfg.realignMode : cfg.driftAlertNtfy;
+  if (field === 'realignMode') {
+    cfg.realignMode = cfg.realignMode === 'auto' ? 'manual' : 'auto';
+  } else {
+    cfg.driftAlertNtfy = !cfg.driftAlertNtfy;
+  }
+  syncAlignmentUI();
+  try {
+    const body = { [field]: cfg[field], captureReference: false };
+    const resp = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const res = await resp.json();
+    if (!resp.ok || !res || !res.ok) throw new Error('Save failed');
+    if (field === 'realignMode') {
+      showToast(`✓ Reference Re-Align set to ${cfg.realignMode === 'auto' ? 'Auto' : 'Manual'}`, 'ok');
+    } else {
+      showToast(`✓ Drift Alert ntfy ${cfg.driftAlertNtfy ? 'enabled' : 'disabled'}`, 'ok');
+    }
+  } catch {
+    cfg[field] = prev;
+    syncAlignmentUI();
+    showToast('✗ Failed updating drift preference', 'err');
+  }
+}
+
+async function runPinReference(triggerBtn = null) {
+  if (triggerBtn) setBtnFeedback(triggerBtn, 'saving', 'Pinning…');
+  try {
+    const resp = await fetch('/api/camera/reference', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    const res = await resp.json();
+    if (!resp.ok || !res || !res.ok) throw new Error(res?.error || (res?.errors || []).join('; ') || 'Pin failed');
+    if (res.alignment) cfg.alignment = res.alignment;
+    syncAlignmentUI();
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'saved', '✓ Ref Saved!', 2200);
+    showToast(`✓ Pinned reference (${(res.captured || []).length} camera${(res.captured || []).length === 1 ? '' : 's'})`, 'ok');
+  } catch (err) {
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Pin Failed', 2600);
+    showToast('✗ ' + (err?.message || 'Failed pinning reference'), 'err');
+  }
+}
+
+async function runRealignNow(cameraName = null, triggerBtn = null) {
+  if (triggerBtn) setBtnFeedback(triggerBtn, 'saving', 'Realigning…');
+  try {
+    const resp = await fetch('/api/camera/realign', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ camera: cameraName || undefined, apply: true }),
+    });
+    const res = await resp.json();
+    if (!resp.ok || !res || !res.ok) throw new Error(res?.error || (res?.errors || []).join('; ') || 'Realign failed');
+    if (Array.isArray(res.cameras) && cfg && Array.isArray(cfg.cameras)) {
+      const bySlug = new Map(res.cameras.map(c => [c.slug, c]));
+      cfg.cameras.forEach((cam, i) => {
+        const updated = bySlug.get(cam.slug);
+        if (updated) {
+          cam.tilt = normTilt(updated.tilt || 0);
+          cam.crop = Array.isArray(updated.crop) ? updated.crop : cam.crop;
+          cam.exclusions = (Array.isArray(updated.exclusions) ? updated.exclusions : []).map(normQuad).filter(Boolean);
+        }
+        syncCropOverlay(i);
+      });
+    }
+    if (res.alignment) cfg.alignment = res.alignment;
+    syncAlignmentUI();
+    drawAllCanvases();
+    if (mmState.open) {
+      scheduleModalHiresRefresh(true);
+      renderMaskModal();
+    }
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'saved', '✓ Realigned!', 2200);
+    const summary = (res.results || []).map(r => `${r.name}: ${r.shiftPx.toFixed(0)}px, ${r.dAngle >= 0 ? '+' : ''}${r.dAngle.toFixed(1)}°`).join(' · ');
+    showToast(`✓ ${summary || 'Realigned'}`, 'ok');
+  } catch (err) {
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Failed', 2600);
+    showToast('✗ ' + (err?.message || 'Realign failed'), 'err');
   }
 }
 
@@ -5095,6 +5922,7 @@ $('camGrid').addEventListener('click', async (e) => {
       crop: [0, 0, 1, 1],
       rotate: parent.rotate || 0,
       tilt: 0,
+      autoLevel: false,
     });
     renderCameras();
     await saveConfig(null);
@@ -5140,6 +5968,11 @@ $('camGrid').addEventListener('click', async (e) => {
   if (b.dataset.tiltreset !== undefined) {
     const idx = Number(b.dataset.tiltreset);
     setViewTilt(idx, 0, true);
+    return;
+  }
+  if (b.dataset.autolevel !== undefined) {
+    const idx = Number(b.dataset.autolevel);
+    toggleAutoLevelView(idx, b);
     return;
   }
   if (b.dataset.prev !== undefined) {
@@ -5215,6 +6048,7 @@ async function saveConfig(triggerBtn = null) {
       primary: $(`prim-${idx}`) ? ($(`prim-${idx}`).value === '1') : (c.primary !== false),
       motionThreshold: $(`thresh-${idx}`) ? (Number($(`thresh-${idx}`).value) || 2.2) : c.motionThreshold,
       tilt: normTilt(c.tilt || 0),
+      autoLevel: !!c.autoLevel,
       enabled: $(`en-${idx}`) ? ($(`en-${idx}`).value === '1') : !!c.enabled,
     };
   });
@@ -5231,6 +6065,9 @@ async function saveConfig(triggerBtn = null) {
     retentionDays: Number($('retDays').value) || 14,
     preRollSec: Number($('preRoll').value) || 120,
     driveBackupDir: $('driveDir').value.trim(),
+    realignMode: cfg.realignMode === 'auto' ? 'auto' : 'manual',
+    driftAlertNtfy: !!cfg.driftAlertNtfy,
+    captureReference: triggerBtn !== $('wbSaveBtn'),
     cameras,
     wallboard,
   };
@@ -5245,7 +6082,9 @@ async function saveConfig(triggerBtn = null) {
     cfg.cameras = cameras;
     cfg.wallboard = wallboard;
     syncRawFeeds();
+    syncAlignmentUI();
     markDirty(false);
+    pollStatus();
     if (triggerBtn) {
       setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2200);
       showToast(triggerBtn === $('mmSaveBtn') ? '✓ View settings saved & applied live' : '✓ Saved & applied live', 'ok');
@@ -5320,6 +6159,10 @@ async function pollStatus() {
         calEl.className = 'pill ' + (cal.clipCount >= 5 ? 'ok' : '');
       }
     }
+    if (st.alignment && cfg) {
+      cfg.alignment = st.alignment;
+      syncAlignmentUI();
+    }
   } catch {}
 }
 
@@ -5352,6 +6195,7 @@ async function init() {
   $('wbWake').value = wb.wakeOnStart === false ? '0' : '1';
   $('wbSleep').value = wb.sleepOnStop === false ? '0' : '1';
   renderCameras();
+  syncAlignmentUI();
   wireMaskModal();
   setInterval(drawAllCanvases, 100);
   await Promise.all([pollStatus(), pollClips()]);
@@ -5370,6 +6214,10 @@ $('openEditorTop').onclick = () => {
   if (!cfg || !cfg.cameras || !cfg.cameras.length) return;
   openMaskModal(clamp(mmState.camIdx || 0, 0, cfg.cameras.length - 1), { mode: 'crop' });
 };
+$('pinRefBtn').onclick = () => runPinReference($('pinRefBtn'));
+$('realignModeBtn').onclick = () => toggleAlignmentPref('realignMode');
+$('realignNowBtn').onclick = () => runRealignNow(null, $('realignNowBtn'));
+$('driftNtfyBtn').onclick = () => toggleAlignmentPref('driftAlertNtfy');
 $('saveBtn').onclick = () => saveConfig($('saveBtn'));
 $('saveAllTop').onclick = () => saveConfig($('saveAllTop'));
 $('wbSaveBtn').onclick = () => saveConfig($('wbSaveBtn'));
@@ -5492,6 +6340,9 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "retentionDays": service.retention_days,
                 "preRollSec": service.pre_roll_sec,
                 "driveBackupDir": service.drive_backup_dir,
+                "realignMode": service.realign_mode,
+                "driftAlertNtfy": service.drift_alert_ntfy,
+                "alignment": service.alignment_snapshot(),
                 "cameras": cams,
                 "wallboard": service.wallboard_cfg.to_dict(),
                 "disk": service.disk_stats(),
@@ -5503,6 +6354,32 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         service.update_config(body)
         return jsonify({"ok": True})
+
+    @app.post("/api/camera/auto-level")
+    def api_camera_auto_level() -> Response:
+        body = request.get_json(silent=True) or {}
+        cam_name = str(body.get("camera") or "").strip()
+        crop_ov = normalize_crop(body["crop"]) if "crop" in body else None
+        rot_ov = normalize_rotate(body["rotate"]) if "rotate" in body else None
+        res = service.auto_level_camera(cam_name, crop_override=crop_ov, rotate_override=rot_ov)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/camera/reference")
+    def api_camera_reference() -> Response:
+        body = request.get_json(silent=True) or {}
+        cam_raw = body.get("camera")
+        cam_name = str(cam_raw).strip() if cam_raw else None
+        res = service.capture_reference(cam_name)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/camera/realign")
+    def api_camera_realign() -> Response:
+        body = request.get_json(silent=True) or {}
+        cam_raw = body.get("camera")
+        cam_name = str(cam_raw).strip() if cam_raw else None
+        apply_flag = bool(body.get("apply", True))
+        res = service.realign_camera(cam_name, apply=apply_flag)
+        return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.get("/wallboard")
     @app.get("/wallboard/")

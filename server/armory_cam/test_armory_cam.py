@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import cv2
 import numpy as np
@@ -1191,6 +1192,174 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertGreater(ph, 0)
             self.assertEqual(pw % 2, 0)
             self.assertEqual(ph % 2, 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_auto_level_reference_realign_and_drift_ntfy(self) -> None:
+        # 1. Verify OpenCV LSD auto-level estimation on +6.0 deg CW tilted structural rack bars -> -6.0 deg correction
+        w, h = 640, 360
+        base = np.full((h, w, 3), 24, dtype=np.uint8)
+        for x in range(80, 580, 60):
+            cv2.line(base, (x, 20), (x, 340), (225, 225, 225), 4)
+        for y in range(40, 340, 55):
+            cv2.line(base, (60, y), (580, y), (185, 185, 185), 3)
+        for k, (cx, cy) in enumerate([(130, 90), (270, 150), (410, 110), (500, 230), (210, 270), (350, 250)]):
+            cv2.putText(base, f"R{k}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (90, 210, 255), 2)
+            cv2.circle(base, (cx + 18, cy + 16), 14, (240, 140, 70), 2)
+
+        m_tilt = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -6.0, 1.0)  # +6.0 deg CW
+        tilted_src = cv2.warpAffine(base, m_tilt, (w, h), flags=cv2.INTER_LINEAR, borderValue=(24, 24, 24))
+        lvl_res = ac.estimate_auto_level_tilt(tilted_src, crop=(0.1, 0.1, 0.9, 0.9), rotate=0)
+        self.assertTrue(lvl_res["ok"], lvl_res)
+        self.assertAlmostEqual(lvl_res["tilt"], -6.0, delta=0.6)
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_align_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestDriftTopic")
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash_html = client.get("/").get_data(as_text=True)
+            for marker in (
+                "autoLvl-",
+                "mmAutoLvlBtn",
+                "realignModeBtn",
+                "realignNowBtn",
+                "driftNtfyBtn",
+                "pinRefBtn",
+                "mmRealignModeBtn",
+                "mmRealignNowBtn",
+                "mmDriftNtfyBtn",
+            ):
+                self.assertIn(marker, dash_html)
+
+            # Configure Rack Cam (manual tilt) + Fly Machine Cam (virtual view with autoLevel=True)
+            cfg_res = client.post(
+                "/api/config",
+                json={
+                    "realignMode": "manual",
+                    "driftAlertNtfy": True,
+                    "cameras": [
+                        {
+                            "name": "Rack Cam",
+                            "slug": "rack_cam",
+                            "rtspUrl": "rtsp://127.0.0.1:554/rack",
+                            "enabled": True,
+                            "primary": True,
+                            "crop": [0.25, 0.15, 0.75, 0.85],
+                            "exclusions": [[[0.6, 0.2], [0.7, 0.2], [0.7, 0.6], [0.6, 0.6]]],
+                            "rotate": 0,
+                            "tilt": 0.0,
+                            "autoLevel": False,
+                        },
+                        {
+                            "name": "Fly Machine Cam",
+                            "slug": "fly_machine_cam",
+                            "sourceSlug": "rack_cam",
+                            "rtspUrl": "",
+                            "enabled": True,
+                            "primary": False,
+                            "crop": [0.08, 0.2, 0.38, 0.85],
+                            "rotate": 0,
+                            "tilt": 0.0,
+                            "autoLevel": True,
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            got_cfg = client.get("/api/config").get_json()
+            self.assertEqual(got_cfg["realignMode"], "manual")
+            self.assertTrue(got_cfg["driftAlertNtfy"])
+            self.assertTrue(got_cfg["cameras"][1]["autoLevel"])
+
+            # Write clean baseline TS segment and pin reference
+            ring_rack = svc.ring_root / "rack_cam"
+            ring_rack.mkdir(parents=True, exist_ok=True)
+            t0_dt = datetime(2026, 11, 19, 16, 0, 0)
+            t0_ms = int(t0_dt.timestamp() * 1000)
+
+            def _write_img_ts(img_bgr: np.ndarray, ts_ms: int) -> Path:
+                png_p = tmp / f"frame_{ts_ms}.png"
+                seg_dt = datetime.fromtimestamp(ts_ms / 1000.0)
+                seg_p = ring_rack / f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                cv2.imwrite(str(png_p), img_bgr)
+                subprocess.run(
+                    [
+                        svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                        "-loop", "1", "-t", "1.2", "-i", str(png_p),
+                        "-r", "15", "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p",
+                        "-f", "mpegts", str(seg_p),
+                    ],
+                    check=True,
+                )
+                return seg_p
+
+            ref_seg = _write_img_ts(base, t0_ms)
+            svc.cam_connected["rack_cam"] = True
+            svc.ring_segments["rack_cam"] = [ac.SegmentInfo(path=ref_seg, start_ms=t0_ms, end_ms=t0_ms + 1200, energy=0.0, camera="Rack Cam")]
+
+            # Test /api/camera/auto-level endpoint directly on current Rack Cam frame
+            al_res = client.post("/api/camera/auto-level", json={"camera": "Rack Cam"})
+            self.assertEqual(al_res.status_code, 200)
+            self.assertTrue(al_res.get_json()["ok"])
+
+            # Pin reference baseline
+            pin_res = client.post("/api/camera/reference", json={"camera": "Rack Cam"})
+            self.assertEqual(pin_res.status_code, 200)
+            self.assertTrue((svc.refs_root / "rack_cam.jpg").is_file())
+            ref_json_before = (svc.refs_root / "rack_cam.json").read_text(encoding="utf-8")
+
+            # Simulate physical bump: +28px X, -18px Y, +3.5 deg CW roll on live stream
+            m_bump = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -3.5, 1.0)
+            m_bump[0, 2] += 28.0
+            m_bump[1, 2] += -18.0
+            bumped = cv2.warpAffine(base, m_bump, (w, h), flags=cv2.INTER_LINEAR, borderValue=(24, 24, 24))
+            bumped_seg = _write_img_ts(bumped, t0_ms + 4000)
+            svc.ring_segments["rack_cam"].append(
+                ac.SegmentInfo(path=bumped_seg, start_ms=t0_ms + 4000, end_ms=t0_ms + 5200, energy=0.0, camera="Rack Cam")
+            )
+
+            # Realign Now updates both Rack Cam & Fly Machine Cam while preserving refs/rack_cam.json
+            ra_res = client.post("/api/camera/realign", json={"camera": "Rack Cam", "apply": True})
+            self.assertEqual(ra_res.status_code, 200)
+            ra_data = ra_res.get_json()
+            self.assertTrue(ra_data["ok"])
+            self.assertTrue(ra_data["results"][0]["drifted"])
+            self.assertAlmostEqual(ra_data["results"][0]["dx"], 28.0, delta=3.0)
+            self.assertAlmostEqual(ra_data["results"][0]["dy"], -18.0, delta=3.0)
+            self.assertAlmostEqual(ra_data["results"][0]["dAngle"], 3.5, delta=0.5)
+            self.assertEqual((svc.refs_root / "rack_cam.json").read_text(encoding="utf-8"), ref_json_before)
+
+            by_slug = {c["slug"]: c for c in client.get("/api/config").get_json()["cameras"]}
+            self.assertAlmostEqual(by_slug["rack_cam"]["tilt"], -3.5, delta=0.6)
+            self.assertAlmostEqual(by_slug["fly_machine_cam"]["tilt"], -3.5, delta=0.7)
+            # Rack Cam crop shifted right & up to follow the +28px, -18px camera motion
+            rack_crop = by_slug["rack_cam"]["crop"]
+            self.assertGreater((rack_crop[0] + rack_crop[2]) / 2.0, 0.50)
+            self.assertLess((rack_crop[1] + rack_crop[3]) / 2.0, 0.50)
+            self.assertNotEqual(by_slug["rack_cam"]["exclusions"], [[[0.6, 0.2], [0.7, 0.2], [0.7, 0.6], [0.6, 0.6]]])
+
+            # Background drift watchdog: requires 2 consecutive quiet strikes and respects 6h ntfy cooldown
+            svc.realign_mode = "manual"
+            svc.drift_alert_ntfy = True
+            svc.latest_energy = {"rack_cam": 0.1, "fly_machine_cam": 0.1}
+            with mock.patch.object(ac, "send_ntfy_alert", return_value=True) as m_ntfy:
+                ev1 = svc.check_camera_drift_background(1000.0)
+                self.assertEqual(ev1, [])  # Strike 1 only
+                self.assertEqual(m_ntfy.call_count, 0)
+
+                ev2 = svc.check_camera_drift_background(1035.0)
+                self.assertEqual(len(ev2), 1)  # Strike 2 confirmed -> alert
+                self.assertTrue(ev2[0]["notified"])
+                time.sleep(0.15)
+                self.assertEqual(m_ntfy.call_count, 1)
+
+                # Within 6h cooldown -> no second ntfy even after 2 more strikes
+                svc._drift_strikes["rack_cam"] = 1
+                svc.check_camera_drift_background(1070.0)
+                time.sleep(0.1)
+                self.assertEqual(m_ntfy.call_count, 1)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
