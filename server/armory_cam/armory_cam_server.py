@@ -2667,12 +2667,14 @@ class ArmoryCamService:
         hires: bool = False,
         rotate_override: int | None = None,
         tilt_override: float | None = None,
+        crop_override: tuple[float, float, float, float] | None = None,
     ) -> bytes | None:
         cam = self._find_camera(camera_name)
         if not cam:
             return None
         eff_rot = normalize_rotate(rotate_override) if rotate_override is not None else cam.rotate
         eff_tilt = normalize_tilt(tilt_override) if tilt_override is not None else cam.tilt
+        eff_crop = normalize_crop(crop_override) if crop_override is not None else cam.crop
         media_slug = self._source_slug_for(cam)
         src_cam = self._source_camera(cam)
 
@@ -2693,7 +2695,7 @@ class ArmoryCamService:
                         cap.release()
                         if ok and frm is not None:
                             frm = apply_frame_transform(
-                                frm, cam.crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
+                                frm, eff_crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
                             )
                             ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
                             if ok_jpg:
@@ -2701,17 +2703,17 @@ class ArmoryCamService:
 
         live_jpg = self.live_hub.recent_frame(media_slug, max_age_sec=2.0)
         if live_jpg:
-            if not raw and (eff_rot != 0 or eff_tilt != 0.0 or cam.crop != (0.0, 0.0, 1.0, 1.0)):
+            if not raw and (eff_rot != 0 or eff_tilt != 0.0 or eff_crop != (0.0, 0.0, 1.0, 1.0)):
                 img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    img = apply_frame_transform(img, cam.crop, eff_rot, apply_crop=True, tilt=eff_tilt)
+                    img = apply_frame_transform(img, eff_crop, eff_rot, apply_crop=True, tilt=eff_tilt)
                     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                     if ok:
                         return buf.tobytes()
             elif eff_rot != 0 or eff_tilt != 0.0:
                 img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    img = apply_frame_transform(img, cam.crop, eff_rot, apply_crop=False, tilt=eff_tilt)
+                    img = apply_frame_transform(img, eff_crop, eff_rot, apply_crop=False, tilt=eff_tilt)
                     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                     if ok:
                         return buf.tobytes()
@@ -2727,7 +2729,7 @@ class ArmoryCamService:
                     cap.release()
                     if ok and frm is not None:
                         frm = apply_frame_transform(
-                            frm, cam.crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
+                            frm, eff_crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
                         )
                         ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                         if ok_jpg:
@@ -2757,7 +2759,7 @@ class ArmoryCamService:
                     img = cv2.imdecode(np.frombuffer(res.stdout, np.uint8), cv2.IMREAD_COLOR)
                     if img is not None:
                         img = apply_frame_transform(
-                            img, cam.crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
+                            img, eff_crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
                         )
                         ok_jpg, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                         if ok_jpg:
@@ -3290,8 +3292,8 @@ DASHBOARD_HTML = """<!doctype html>
   .stage.leveling .level-grid{opacity:1}
   .tilt-num{width:58px!important;padding:4px 6px!important;font-size:12px!important;text-align:right;font-variant-numeric:tabular-nums}
   .crop-layer{position:absolute;inset:0;pointer-events:auto}
-  .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none}
-  .crop-box{position:absolute;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
+  .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none;z-index:1}
+  .crop-box{position:absolute;z-index:2;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
   .crop-box::after{content:'';position:absolute;inset:0;border:1px dashed rgba(255,255,255,.28);pointer-events:none}
   .box-tag{position:absolute;left:4px;top:4px;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:900;letter-spacing:.06em;pointer-events:none;background:rgba(6,9,13,.82);color:var(--blue)}
   .crop-box.passive{border-style:dashed;opacity:.52;pointer-events:none;cursor:default}
@@ -3351,12 +3353,21 @@ DASHBOARD_HTML = """<!doctype html>
   .mm-tab-del{border:0;background:rgba(239,68,68,.3);color:#fecaca;border-radius:5px;width:18px;height:18px;font:900 12px/1 system-ui,sans-serif;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;padding:0}
   .mm-tab-del:hover{background:var(--red);color:#fff}
   .mm-zoombar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 10px}
-  .mm-zoombar input[type=range]{width:140px;accent-color:var(--blue)}
+  .mm-zoombar input[type=range]{width:110px;accent-color:var(--blue)}
+  .mm-view-sel{width:auto!important;min-width:170px;max-width:260px;padding:4px 8px!important;font-size:13px!important;font-weight:800;border-radius:8px!important}
+  .mm-bar-grp{display:inline-flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .mm-sep{width:1px;height:18px;background:var(--line);margin:0 2px}
+  .mm-canvas.leveling .level-grid{opacity:1}
+  .mm-canvas .handle{width:26px;height:26px}
+  .mm-canvas .handle.nw{left:-13px;top:-13px}
+  .mm-canvas .handle.ne{right:-13px;top:-13px}
+  .mm-canvas .handle.sw{left:-13px;bottom:-13px}
+  .mm-canvas .handle.se{right:-13px;bottom:-13px}
+  .mm-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--mut);padding:0 4px;font-variant-numeric:tabular-nums;flex-wrap:wrap}
   .mm-viewport{flex:1;min-height:0;position:relative;overflow:hidden;background:#05080d;border:1px solid var(--line);border-radius:12px;touch-action:none;cursor:grab}
   .mm-viewport.panning{cursor:grabbing}
   .mm-canvas{position:absolute;transform-origin:0 0;touch-action:none}
   .mm-img{width:100%;height:100%;display:block;pointer-events:none}
-  .mm-crop-ref{position:absolute;border:1.5px dashed rgba(30,155,255,.72);background:rgba(30,155,255,.04);pointer-events:none}
   .mm-mbar{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
   .mm-mbar-track{position:relative;width:72px;height:8px;border-radius:999px;background:#0b1017;border:1px solid var(--line);overflow:hidden}
   .mm-mbar-fill{position:absolute;left:0;top:0;bottom:0;width:0%;background:var(--blue);transition:width .2s}
@@ -3376,7 +3387,8 @@ DASHBOARD_HTML = """<!doctype html>
   <h1>
     <span>ARMORY CAM</span>
     <span id="svcBadge" class="pill">Checking…</span>
-    <button class="btn" id="saveAllTop" type="button" style="margin-left:auto">Save Camera Settings</button>
+    <button class="btn sec" id="openEditorTop" type="button" style="margin-left:auto">⤢ Full-Screen Editor</button>
+    <button class="btn" id="saveAllTop" type="button">Save Camera Settings</button>
   </h1>
   <div id="subInfo" style="color:var(--mut)">Loading OptiPlex status…</div>
 
@@ -3447,43 +3459,89 @@ DASHBOARD_HTML = """<!doctype html>
 <div id="maskModal" class="mask-modal" hidden>
   <div class="mm-top">
     <div class="mm-title">
-      <span id="mmTitle">Mirror Mask Editor</span>
+      <button class="btn sec sm" id="mmPrevView" type="button" title="Previous view ([)">◀</button>
+      <select id="mmViewSel" class="mm-view-sel" aria-label="Select camera view"></select>
+      <button class="btn sec sm" id="mmNextView" type="button" title="Next view (])">▶</button>
+      <span id="mmTitle" hidden>View Calibration Studio</span>
       <div class="mm-mbar">
         <div class="mm-mbar-track"><div id="mmMotionBar" class="mm-mbar-fill"></div></div>
         <span id="mmMotionTxt">Motion: 0.0</span>
       </div>
     </div>
-    <div id="mmMaskTabs" class="mm-tabs"></div>
+    <div class="mm-bar-grp">
+      <button class="btn sec sm on" id="mmModeCrop" type="button">Crop &amp; Level (Blue)</button>
+      <button class="btn sec sm" id="mmModeMask" type="button">Mirror Masks (Red)</button>
+      <button class="btn sec sm" id="mmPreviewBtn" type="button" title="Toggle cropped preview (P)">Preview Cropped</button>
+    </div>
     <div class="ctrl-row" style="margin-top:0">
-      <button class="btn red sm" id="mmAddBtn" type="button">+ Add Mask</button>
-      <button class="btn sec sm" id="mmClearBtn" type="button">Clear All</button>
       <button class="btn sec sm" id="mmHiresBtn" type="button">1080p Still</button>
       <button class="btn sec sm" id="mmRefreshBtn" type="button" hidden>↻ Grab Frame</button>
-      <button class="btn ok sm" id="mmSaveBtn" type="button">Save Masks</button>
+      <button class="btn ok sm" id="mmSaveBtn" type="button">Save View</button>
       <button class="btn sec sm" id="mmCloseBtn" type="button">Done</button>
     </div>
   </div>
   <div class="mm-zoombar">
-    <span style="font-size:12px;color:var(--mut)">Zoom:</span>
-    <button class="btn sec sm" type="button" data-mmz="1">1×</button>
-    <button class="btn sec sm" type="button" data-mmz="2">2×</button>
-    <button class="btn sec sm" type="button" data-mmz="3">3×</button>
-    <button class="btn sec sm" type="button" data-mmz="5">5×</button>
-    <button class="btn sec sm" type="button" data-mmz="8">8×</button>
-    <button class="btn sec sm" type="button" id="mmFitMaskBtn">Fit Mask</button>
-    <button class="btn sec sm" type="button" id="mmFitCropBtn">Fit Crop</button>
-    <input type="range" id="mmZoomRange" min="1" max="8" step="0.1" value="1">
-    <span id="mmZoomVal" style="font-size:12px;font-weight:800;min-width:38px;font-variant-numeric:tabular-nums">1.0×</span>
-    <span id="mmHint" style="margin-left:auto;font-size:12px;color:var(--mut)">Drag 4 dots to match angled mirror corners · Wheel/pinch to zoom · Drag outside mask to pan</span>
+    <div class="mm-bar-grp">
+      <button class="btn sec sm" id="mmRotBtn" type="button">Rotate 0°</button>
+      <button class="btn sec sm" id="mmTiltMinus" type="button" title="Rotate counter-clockwise 0.5°">−0.5°</button>
+      <input type="range" id="mmTiltRange" min="-45" max="45" step="0.5" value="0" aria-label="Full-screen custom angle slider">
+      <button class="btn sec sm" id="mmTiltPlus" type="button" title="Rotate clockwise 0.5°">+0.5°</button>
+      <input type="number" class="tilt-num" id="mmTiltNum" min="-45" max="45" step="0.1" value="0.0" aria-label="Full-screen rotate angle">
+      <button class="btn sec sm" id="mmTiltReset" type="button" title="Reset angle to 0°">0°</button>
+      <button class="btn sec sm" id="mmGridBtn" type="button" title="Toggle plumb alignment grid (G)">Grid</button>
+    </div>
+    <div class="mm-sep"></div>
+    <div class="mm-bar-grp" id="mmCropTools">
+      <span style="font-size:12px;color:var(--mut)">Ratio:</span>
+      <button class="btn sec sm on" type="button" data-mmasp="free">Free</button>
+      <button class="btn sec sm" type="button" data-mmasp="1.7778">16:9</button>
+      <button class="btn sec sm" type="button" data-mmasp="0.5625">9:16</button>
+      <button class="btn sec sm" type="button" id="mmResetCropBtn">Reset Crop</button>
+    </div>
+    <div class="mm-bar-grp" id="mmMaskTools" hidden>
+      <div id="mmMaskTabs" class="mm-tabs"></div>
+      <button class="btn red sm" id="mmAddBtn" type="button">+ Add Mask</button>
+      <button class="btn sec sm" id="mmClearBtn" type="button">Clear All</button>
+    </div>
+    <div class="mm-sep"></div>
+    <div class="mm-bar-grp">
+      <span style="font-size:12px;color:var(--mut)">Zoom:</span>
+      <button class="btn sec sm" type="button" data-mmz="1">1×</button>
+      <button class="btn sec sm" type="button" data-mmz="2">2×</button>
+      <button class="btn sec sm" type="button" data-mmz="3">3×</button>
+      <button class="btn sec sm" type="button" data-mmz="5">5×</button>
+      <button class="btn sec sm" type="button" data-mmz="8">8×</button>
+      <button class="btn sec sm" type="button" id="mmFitCropBtn">Fit Crop</button>
+      <button class="btn sec sm" type="button" id="mmFitMaskBtn">Fit Mask</button>
+      <input type="range" id="mmZoomRange" min="1" max="8" step="0.1" value="1">
+      <span id="mmZoomVal" style="font-size:12px;font-weight:800;min-width:38px;font-variant-numeric:tabular-nums">1.0×</span>
+    </div>
   </div>
   <div id="mmViewport" class="mm-viewport">
     <div id="mmCanvas" class="mm-canvas">
       <canvas id="mmLiveCanvas" class="mm-img"></canvas>
-      <img id="mmStream" class="mm-img" alt="Zoomed mirror mask view" hidden>
-      <div id="mmCropRef" class="mm-crop-ref"></div>
-      <svg id="mmSvg" class="excl-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
-      <div id="mmDots"></div>
+      <img id="mmStream" class="mm-img" alt="Full-screen calibration view" hidden>
+      <div id="mmLevelGrid" class="level-grid"></div>
+      <div class="scrim" id="mmScT"></div>
+      <div class="scrim" id="mmScB"></div>
+      <div class="scrim" id="mmScL"></div>
+      <div class="scrim" id="mmScR"></div>
+      <div id="mmCropRef" class="crop-box">
+        <span class="box-tag">CROP</span>
+        <div class="handle nw" data-handle="nw"></div>
+        <div class="handle ne" data-handle="ne"></div>
+        <div class="handle sw" data-handle="sw"></div>
+        <div class="handle se" data-handle="se"></div>
+      </div>
+      <div id="mmExclWrap" class="excl-wrap">
+        <svg id="mmSvg" class="excl-svg" viewBox="0 0 1000 1000" preserveAspectRatio="none"></svg>
+        <div id="mmDots"></div>
+      </div>
     </div>
+  </div>
+  <div class="mm-foot">
+    <span id="mmInfo"></span>
+    <span id="mmHint">Drag blue crop handles to frame · Angle slider + Grid to level · Switch views via dropdown or [ / ]</span>
   </div>
 </div>
 
@@ -3503,6 +3561,10 @@ const btnTimers = new WeakMap();
 const mmState = {
   open: false,
   camIdx: 0,
+  mode: 'crop',
+  previewCropped: false,
+  gridPinned: false,
+  leveling: false,
   activeMask: 0,
   zoom: 1,
   panX: 0,
@@ -3511,6 +3573,8 @@ const mmState = {
   pendingFit: false,
   dragDot: null,
 };
+let mmHiresTimer = null;
+let mmLevelTimer = null;
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -3671,10 +3735,22 @@ function drawAllCanvases() {
     if (cam && rawImg && mmCanvas) {
       if (mmState.pendingFit && rawImg.naturalWidth > 0) {
         mmState.pendingFit = false;
-        if ((cam.exclusions || []).length) fitMaskInModal();
-        else fitCropInModal();
+        if (mmState.mode === 'mask' && (cam.exclusions || []).length) {
+          fitMaskInModal();
+        } else {
+          mmState.zoom = 1;
+          clampModalPan();
+          renderMaskModal();
+        }
       }
-      drawFeedToCanvas(mmCanvas, rawImg, cam.rotate || 0, cam.tilt || 0, [0, 0, 1, 1], false);
+      drawFeedToCanvas(
+        mmCanvas,
+        rawImg,
+        cam.rotate || 0,
+        cam.tilt || 0,
+        mmState.previewCropped ? cam.crop : [0, 0, 1, 1],
+        !!mmState.previewCropped
+      );
     }
   }
 }
@@ -3816,6 +3892,50 @@ function setZoomAroundCenter(idx, zoom) {
   syncCropOverlay(idx);
 }
 
+function applyScrimRects(scT, scB, scL, scR, c) {
+  if (!scT || !scB || !scL || !scR) return;
+  const lPct = c[0] * 100, tPct = c[1] * 100, wPct = (c[2] - c[0]) * 100, hPct = (c[3] - c[1]) * 100;
+  scT.style.cssText = `left:0;top:0;right:0;height:${tPct}%;`;
+  scB.style.cssText = `left:0;top:${tPct + hPct}%;right:0;bottom:0;`;
+  scL.style.cssText = `left:0;top:${tPct}%;width:${lPct}%;height:${hPct}%;`;
+  scR.style.cssText = `left:${lPct + wPct}%;top:${tPct}%;right:0;height:${hPct}%;`;
+}
+
+function applyCropDragDelta(camIdx, origCrop, mode, dx, dy, minS = MIN_SPAN) {
+  let [x0, y0, x1, y1] = origCrop;
+  const ow = x1 - x0, oh = y1 - y0;
+  if (mode === 'move') {
+    x0 = clamp(x0 + dx, 0, 1 - ow);
+    y0 = clamp(y0 + dy, 0, 1 - oh);
+    x1 = x0 + ow;
+    y1 = y0 + oh;
+  } else {
+    if (mode.includes('w')) x0 = clamp(x0 + dx, 0, x1 - minS);
+    if (mode.includes('e')) x1 = clamp(x1 + dx, x0 + minS, 1);
+    if (mode.includes('n')) y0 = clamp(y0 + dy, 0, y1 - minS);
+    if (mode.includes('s')) y1 = clamp(y1 + dy, y0 + minS, 1);
+
+    const lock = aspectLock[camIdx];
+    if (lock) {
+      const [srcW, srcH] = viewFullDims(cfg.cameras[camIdx]);
+      const targetNormRatio = lock * (srcH / srcW);
+      let nw = x1 - x0;
+      let nh = nw / targetNormRatio;
+      if (nh < minS) { nh = minS; nw = nh * targetNormRatio; }
+      if (mode.includes('n')) {
+        y0 = y1 - nh;
+        if (y0 < 0) { y0 = 0; nh = y1; nw = nh * targetNormRatio; }
+      } else {
+        y1 = y0 + nh;
+        if (y1 > 1) { y1 = 1; nh = 1 - y0; nw = nh * targetNormRatio; }
+      }
+      if (mode.includes('w')) x0 = clamp(x1 - nw, 0, x1 - minS);
+      else x1 = clamp(x0 + nw, x0 + minS, 1);
+    }
+  }
+  return [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
+}
+
 function syncCropOverlay(idx) {
   const cam = cfg.cameras[idx];
   const c = cam.crop;
@@ -3858,11 +3978,7 @@ function syncCropOverlay(idx) {
     });
   }
 
-  const lPct = c[0] * 100, tPct = c[1] * 100, wPct = (c[2] - c[0]) * 100, hPct = (c[3] - c[1]) * 100;
-  $(`scT-${idx}`).style.cssText = `left:0;top:0;right:0;height:${tPct}%;`;
-  $(`scB-${idx}`).style.cssText = `left:0;top:${tPct + hPct}%;right:0;bottom:0;`;
-  $(`scL-${idx}`).style.cssText = `left:0;top:${tPct}%;width:${lPct}%;height:${hPct}%;`;
-  $(`scR-${idx}`).style.cssText = `left:${lPct + wPct}%;top:${tPct}%;right:0;height:${hPct}%;`;
+  applyScrimRects($(`scT-${idx}`), $(`scB-${idx}`), $(`scL-${idx}`), $(`scR-${idx}`), c);
 
   const z = Math.min(3.5, Math.max(1.0, cropZoomFactor(c)));
   const slider = $(`zoom-${idx}`);
@@ -3876,6 +3992,11 @@ function syncCropOverlay(idx) {
   $(`cropInfo-${idx}`).textContent = isFullCrop
     ? `Full frame · ${srcW}×${srcH} · ${rotLabel} · ${maskLabel}`
     : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · ${rotLabel} · ${maskLabel}`;
+  const lock = aspectLock[idx] || null;
+  document.querySelectorAll(`[data-asp^="${idx}:"]`).forEach(x => {
+    const r = x.dataset.asp.split(':')[1];
+    x.classList.toggle('on', r === 'free' ? !lock : Math.abs(Number(r) - (lock || 0)) < 0.01);
+  });
   const tiltSlider = $(`tilt-${idx}`);
   if (tiltSlider) tiltSlider.value = String(tilt);
   const tiltNum = $(`tiltNum-${idx}`);
@@ -3970,42 +4091,10 @@ function wireCropDrag(idx) {
 
     const dx = (e.clientX - drag.sx) / drag.rect.width;
     const dy = (e.clientY - drag.sy) / drag.rect.height;
-    let [x0, y0, x1, y1] = drag.orig;
-    const ow = x1 - x0, oh = y1 - y0;
-    const minS = drag.minSpan || MIN_SPAN;
-
-    if (drag.mode === 'move') {
-      x0 = clamp(x0 + dx, 0, 1 - ow);
-      y0 = clamp(y0 + dy, 0, 1 - oh);
-      x1 = x0 + ow;
-      y1 = y0 + oh;
-    } else {
-      if (drag.mode.includes('w')) x0 = clamp(x0 + dx, 0, x1 - minS);
-      if (drag.mode.includes('e')) x1 = clamp(x1 + dx, x0 + minS, 1);
-      if (drag.mode.includes('n')) y0 = clamp(y0 + dy, 0, y1 - minS);
-      if (drag.mode.includes('s')) y1 = clamp(y1 + dy, y0 + minS, 1);
-
-      const lock = aspectLock[idx];
-      if (lock) {
-        const [srcW, srcH] = viewFullDims(cfg.cameras[idx]);
-        const targetNormRatio = lock * (srcH / srcW);
-        let nw = x1 - x0;
-        let nh = nw / targetNormRatio;
-        if (nh < minS) { nh = minS; nw = nh * targetNormRatio; }
-        if (drag.mode.includes('n')) {
-          y0 = y1 - nh;
-          if (y0 < 0) { y0 = 0; nh = y1; nw = nh * targetNormRatio; }
-        } else {
-          y1 = y0 + nh;
-          if (y1 > 1) { y1 = 1; nh = 1 - y0; nw = nh * targetNormRatio; }
-        }
-        if (drag.mode.includes('w')) x0 = clamp(x1 - nw, 0, x1 - minS);
-        else x1 = clamp(x0 + nw, x0 + minS, 1);
-      }
-    }
-    cfg.cameras[idx].crop = [+x0.toFixed(4), +y0.toFixed(4), +x1.toFixed(4), +y1.toFixed(4)];
+    cfg.cameras[idx].crop = applyCropDragDelta(idx, drag.orig, drag.mode, dx, dy, drag.minSpan || MIN_SPAN);
     markDirty();
     syncCropOverlay(idx);
+    if (mmState.open && mmState.camIdx === idx) renderMaskModal();
   });
 
   const endDrag = (e) => { if (drag && e.pointerId === drag.pid) drag = null; };
@@ -4028,6 +4117,12 @@ function modalBaseMetrics() {
   const rh = (rot === 90 || rot === 270) ? rawW : rawH;
   const [fw, fh] = tiltedSize(rw, rh, tilt);
   let ratio = fw / fh;
+  if (mmState.previewCropped && cam && Array.isArray(cam.crop) && cam.crop.length === 4) {
+    const c = cam.crop;
+    const cw = Math.max(0.05, c[2] - c[0]) * fw;
+    const ch = Math.max(0.05, c[3] - c[1]) * fh;
+    ratio = cw / ch;
+  }
   if (mmState.hires && img && img.naturalWidth > 0 && img.naturalHeight > 0) {
     ratio = img.naturalWidth / img.naturalHeight;
   }
@@ -4121,6 +4216,19 @@ function modalVisibleNormBox() {
   return [x0, y0, x1, y1];
 }
 
+function scheduleModalHiresRefresh(immediate = false) {
+  if (!mmState.open || !mmState.hires) return;
+  if (mmHiresTimer) { clearTimeout(mmHiresTimer); mmHiresTimer = null; }
+  if (immediate) {
+    updateModalMediaSrc();
+    return;
+  }
+  mmHiresTimer = setTimeout(() => {
+    mmHiresTimer = null;
+    if (mmState.open && mmState.hires) updateModalMediaSrc();
+  }, 180);
+}
+
 function updateModalMediaSrc() {
   const cam = cfg?.cameras?.[mmState.camIdx];
   const img = $('mmStream');
@@ -4129,7 +4237,11 @@ function updateModalMediaSrc() {
   if (mmState.hires) {
     liveCvs.hidden = true;
     img.hidden = false;
-    img.src = `/api/snapshot?camera=${encodeURIComponent(cam.name)}&raw=1&hires=1&rotate=${cam.rotate || 0}&tilt=${normTilt(cam.tilt || 0)}&t=${Date.now()}`;
+    const rawFlag = mmState.previewCropped ? '0' : '1';
+    const cropQ = mmState.previewCropped
+      ? '&crop=' + (cam.crop || [0, 0, 1, 1]).map(v => Number(v).toFixed(4)).join(',')
+      : '';
+    img.src = `/api/snapshot?camera=${encodeURIComponent(cam.name)}&raw=${rawFlag}&hires=1&rotate=${cam.rotate || 0}&tilt=${normTilt(cam.tilt || 0)}${cropQ}&t=${Date.now()}`;
   } else {
     img.hidden = true;
     img.removeAttribute('src');
@@ -4145,6 +4257,18 @@ function updateModalMediaSrc() {
   if (rBtn) rBtn.hidden = !mmState.hires;
 }
 
+function populateModalViewSelect() {
+  const sel = $('mmViewSel');
+  if (!sel || !cfg || !Array.isArray(cfg.cameras)) return;
+  const bySlug = new Map(cfg.cameras.map(x => [x.slug, x]));
+  sel.innerHTML = cfg.cameras.map((c, i) => {
+    const p = c.sourceSlug ? bySlug.get(c.sourceSlug) : null;
+    const label = p ? `${c.name} (via ${p.name})` : c.name;
+    return `<option value="${i}">${esc(label)}</option>`;
+  }).join('');
+  sel.value = String(clamp(mmState.camIdx, 0, Math.max(0, cfg.cameras.length - 1)));
+}
+
 function renderMaskModal() {
   if (!mmState.open || !cfg) return;
   const cam = cfg.cameras[mmState.camIdx];
@@ -4152,7 +4276,30 @@ function renderMaskModal() {
   const excls = cam.exclusions || [];
   if (mmState.activeMask >= excls.length) mmState.activeMask = Math.max(0, excls.length - 1);
 
-  $('mmTitle').textContent = `Mirror Mask Editor · ${cam.name}`;
+  populateModalViewSelect();
+  $('mmTitle').textContent = `View Calibration · ${cam.name}`;
+  const isMaskMode = mmState.mode === 'mask';
+  const prevOn = !!mmState.previewCropped;
+  if ($('mmModeCrop')) $('mmModeCrop').classList.toggle('on', !isMaskMode);
+  if ($('mmModeMask')) $('mmModeMask').classList.toggle('on', isMaskMode);
+  if ($('mmPreviewBtn')) $('mmPreviewBtn').classList.toggle('on', prevOn);
+  if ($('mmCropTools')) $('mmCropTools').hidden = isMaskMode;
+  if ($('mmMaskTools')) $('mmMaskTools').hidden = !isMaskMode;
+
+  const rot = cam.rotate || 0;
+  const tilt = normTilt(cam.tilt || 0);
+  if ($('mmRotBtn')) $('mmRotBtn').textContent = `Rotate ${rot}°`;
+  if ($('mmTiltRange')) $('mmTiltRange').value = String(tilt);
+  const mmTiltNum = $('mmTiltNum');
+  if (mmTiltNum && document.activeElement !== mmTiltNum) mmTiltNum.value = tilt.toFixed(1);
+  if ($('mmGridBtn')) $('mmGridBtn').classList.toggle('on', !!mmState.gridPinned);
+
+  const lock = aspectLock[mmState.camIdx] || null;
+  document.querySelectorAll('[data-mmasp]').forEach(btn => {
+    const r = btn.dataset.mmasp;
+    btn.classList.toggle('on', r === 'free' ? !lock : Math.abs(Number(r) - (lock || 0)) < 0.01);
+  });
+
   const tabsEl = $('mmMaskTabs');
   if (tabsEl) {
     tabsEl.innerHTML = excls.map((_, ei) => `
@@ -4177,18 +4324,35 @@ function renderMaskModal() {
     canvas.style.height = dispH.toFixed(1) + 'px';
     canvas.style.left = mmState.panX.toFixed(1) + 'px';
     canvas.style.top = mmState.panY.toFixed(1) + 'px';
+    canvas.classList.toggle('leveling', !!(mmState.gridPinned || mmState.leveling));
   }
 
   const c = cam.crop || [0, 0, 1, 1];
+  const scEls = [$('mmScT'), $('mmScB'), $('mmScL'), $('mmScR')];
   const cropRef = $('mmCropRef');
-  if (cropRef) {
-    cropRef.style.cssText = `left:${c[0]*100}%;top:${c[1]*100}%;width:${(c[2]-c[0])*100}%;height:${(c[3]-c[1])*100}%;`;
+  const exclWrap = $('mmExclWrap');
+  if (prevOn) {
+    scEls.forEach(el => { if (el) el.hidden = true; });
+    if (cropRef) cropRef.hidden = true;
+    if (exclWrap) exclWrap.hidden = true;
+  } else {
+    scEls.forEach(el => { if (el) el.hidden = false; });
+    applyScrimRects(scEls[0], scEls[1], scEls[2], scEls[3], c);
+    if (cropRef) {
+      cropRef.hidden = false;
+      cropRef.style.cssText = `left:${c[0]*100}%;top:${c[1]*100}%;width:${(c[2]-c[0])*100}%;height:${(c[3]-c[1])*100}%;`;
+      cropRef.classList.toggle('passive', isMaskMode);
+    }
+    if (exclWrap) {
+      exclWrap.hidden = false;
+      exclWrap.classList.toggle('passive', !isMaskMode);
+    }
   }
 
   renderQuadLayer($('mmSvg'), $('mmDots'), excls, {
-    activeIdx: mmState.activeMask,
+    activeIdx: isMaskMode ? mmState.activeMask : -1,
     dragDot: mmState.dragDot,
-    showNums: true,
+    showNums: isMaskMode,
   });
 
   const zr = $('mmZoomRange');
@@ -4196,31 +4360,62 @@ function renderMaskModal() {
   if (zr) zr.value = mmState.zoom.toFixed(1);
   if (zv) zv.textContent = mmState.zoom.toFixed(1) + '×';
 
+  const [srcW, srcH] = viewFullDims(cam);
+  const outW = Math.round((c[2] - c[0]) * srcW);
+  const outH = Math.round((c[3] - c[1]) * srcH);
+  const isFullCrop = c[0] <= 0.001 && c[1] <= 0.001 && c[2] >= 0.999 && c[3] >= 0.999;
+  const tiltTag = tilt !== 0 ? `${tilt > 0 ? '+' : ''}${tilt.toFixed(1)}°` : '';
+  const rotLabel = tilt === 0 ? `Rotate ${rot}°` : (rot === 0 ? `Angle ${tiltTag}` : `Rotate ${rot}° (${tiltTag})`);
+  const infoEl = $('mmInfo');
+  if (infoEl) {
+    infoEl.textContent = (isFullCrop ? `Full frame ${srcW}×${srcH}` : `Cropped ~${outW}×${outH}`) +
+      ` · ${rotLabel} · ${excls.length} mask${excls.length === 1 ? '' : 's'}${prevOn ? ' · Preview Cropped' : ''}`;
+  }
+
   const activeQ = excls[mmState.activeMask];
   const hint = $('mmHint');
   if (hint) {
-    if (activeQ && quadHasCrossing(activeQ)) {
+    if (isMaskMode && activeQ && quadHasCrossing(activeQ)) {
       hint.innerHTML = `<span style="color:var(--amber);font-weight:800">Corners crossed on Mask ${mmState.activeMask + 1} — drag dots to uncross</span>`;
-    } else if (mmState.dragDot && excls[mmState.dragDot.ei]) {
+    } else if (isMaskMode && mmState.dragDot && excls[mmState.dragDot.ei]) {
       const pt = excls[mmState.dragDot.ei][mmState.dragDot.ci];
-      const [srcW, srcH] = viewFullDims(cam);
       hint.textContent = `Mask ${mmState.dragDot.ei + 1} · Corner ${mmState.dragDot.ci + 1} · px (${Math.round(pt[0] * srcW)}, ${Math.round(pt[1] * srcH)})`;
+    } else if (prevOn) {
+      hint.textContent = 'Showing cropped result · Wheel/pinch to zoom · Toggle Preview Cropped (P) to adjust blue box';
+    } else if (isMaskMode) {
+      hint.textContent = 'Drag 4 red dots onto corners · Drag mask to slide · Wheel/pinch or drag background to pan · Switch view [ / ]';
     } else {
-      hint.textContent = 'Drag 4 dots onto mirror corners · Drag mask to slide · Wheel/pinch or drag background to pan';
+      hint.textContent = 'Drag blue handles or box to frame · Angle slider + Grid (G) to level · Switch view [ / ] · Ctrl+S to save';
     }
   }
 }
 
-function openMaskModal(idx, focusMaskIdx = 0) {
-  if (!cfg || !cfg.cameras[idx]) return;
-  if (previewCropped[idx]) {
-    previewCropped[idx] = false;
+function fitInitialModalView() {
+  const cam = cfg?.cameras?.[mmState.camIdx];
+  if (!cam) return;
+  if (mmState.mode === 'mask' && (cam.exclusions || []).length) {
+    fitMaskInModal();
+  } else {
+    mmState.zoom = 1;
+    clampModalPan();
+    renderMaskModal();
   }
-  editTarget[idx] = 'excl';
+}
+
+function openMaskModal(idx, opts = {}) {
+  if (!cfg || !cfg.cameras[idx]) return;
+  const normOpts = typeof opts === 'number' ? { mode: 'mask', focusMaskIdx: opts } : (opts || {});
+  const mode = normOpts.mode === 'mask' ? 'mask' : 'crop';
+  const focusMaskIdx = Number.isFinite(normOpts.focusMaskIdx) ? normOpts.focusMaskIdx : 0;
+
+  if (previewCropped[idx]) previewCropped[idx] = false;
+  editTarget[idx] = mode === 'mask' ? 'excl' : 'crop';
   syncCropOverlay(idx);
 
   mmState.open = true;
   mmState.camIdx = idx;
+  mmState.mode = mode;
+  mmState.previewCropped = false;
   mmState.activeMask = focusMaskIdx;
   mmState.hires = false;
   mmState.dragDot = null;
@@ -4229,8 +4424,25 @@ function openMaskModal(idx, focusMaskIdx = 0) {
   $('maskModal').hidden = false;
   document.body.style.overflow = 'hidden';
   updateModalMediaSrc();
-  if ((cfg.cameras[idx].exclusions || []).length) fitMaskInModal();
-  else fitCropInModal();
+  fitInitialModalView();
+  drawAllCanvases();
+}
+
+function switchModalView(nextIdx) {
+  if (!cfg || !cfg.cameras || !cfg.cameras.length) return;
+  const n = cfg.cameras.length;
+  const targetIdx = ((nextIdx % n) + n) % n;
+  const oldIdx = mmState.camIdx;
+  mmState.camIdx = targetIdx;
+  mmState.activeMask = 0;
+  mmState.previewCropped = false;
+  mmState.dragDot = null;
+  mmState.pendingFit = true;
+  editTarget[targetIdx] = mmState.mode === 'mask' ? 'excl' : 'crop';
+  if (oldIdx !== targetIdx && cfg.cameras[oldIdx]) syncCropOverlay(oldIdx);
+  syncCropOverlay(targetIdx);
+  updateModalMediaSrc();
+  fitInitialModalView();
   drawAllCanvases();
 }
 
@@ -4238,6 +4450,8 @@ function closeMaskModal() {
   if (!mmState.open) return;
   mmState.open = false;
   mmState.dragDot = null;
+  mmState.leveling = false;
+  if (mmHiresTimer) { clearTimeout(mmHiresTimer); mmHiresTimer = null; }
   $('maskModal').hidden = true;
   document.body.style.overflow = '';
   const img = $('mmStream');
@@ -4254,8 +4468,7 @@ function wireMaskModal() {
     if (!mmState.open) return;
     if (mmState.pendingFit) {
       mmState.pendingFit = false;
-      if ((cfg.cameras[mmState.camIdx]?.exclusions || []).length) fitMaskInModal();
-      else fitCropInModal();
+      fitInitialModalView();
     } else if (mmState.hires) {
       renderMaskModal();
     }
@@ -4292,38 +4505,59 @@ function wireMaskModal() {
     e.preventDefault();
     vp.setPointerCapture(e.pointerId);
     const camIdx = mmState.camIdx;
-    const dotEl = e.target.closest('.quad-dot');
-    const polyEl = e.target.closest('.quad-poly');
     const canvas = $('mmCanvas');
     const rect = canvas.getBoundingClientRect();
 
-    if (dotEl && rect.width && rect.height) {
-      const ei = Number(dotEl.dataset.exclIdx);
-      const ci = Number(dotEl.dataset.cornerIdx);
-      mmState.activeMask = ei;
-      mmState.dragDot = { ei, ci };
-      drag = { pid: e.pointerId, type: 'dot', ei, ci };
-      renderMaskModal();
-      return;
+    if (!mmState.previewCropped && mmState.mode === 'mask') {
+      const dotEl = e.target.closest('.quad-dot');
+      const polyEl = e.target.closest('.quad-poly');
+      if (dotEl && rect.width && rect.height) {
+        const ei = Number(dotEl.dataset.exclIdx);
+        const ci = Number(dotEl.dataset.cornerIdx);
+        mmState.activeMask = ei;
+        mmState.dragDot = { ei, ci };
+        drag = { pid: e.pointerId, type: 'dot', ei, ci };
+        renderMaskModal();
+        return;
+      }
+      if (polyEl && rect.width && rect.height) {
+        const ei = Number(polyEl.dataset.exclIdx);
+        const q = cfg.cameras[camIdx].exclusions[ei];
+        if (!q) return;
+        mmState.activeMask = ei;
+        drag = {
+          pid: e.pointerId,
+          type: 'move',
+          ei,
+          sx: e.clientX,
+          sy: e.clientY,
+          w: rect.width,
+          h: rect.height,
+          origQuad: q.map(p => [...p]),
+        };
+        renderMaskModal();
+        return;
+      }
     }
 
-    if (polyEl && rect.width && rect.height) {
-      const ei = Number(polyEl.dataset.exclIdx);
-      const q = cfg.cameras[camIdx].exclusions[ei];
-      if (!q) return;
-      mmState.activeMask = ei;
-      drag = {
-        pid: e.pointerId,
-        type: 'move',
-        ei,
-        sx: e.clientX,
-        sy: e.clientY,
-        w: rect.width,
-        h: rect.height,
-        origQuad: q.map(p => [...p]),
-      };
-      renderMaskModal();
-      return;
+    if (!mmState.previewCropped && mmState.mode === 'crop' && rect.width && rect.height) {
+      const handleEl = e.target.closest('#mmCropRef [data-handle]');
+      const cropEl = e.target.closest('#mmCropRef:not(.passive)');
+      const orig = [...(cfg.cameras[camIdx].crop || [0, 0, 1, 1])];
+      const isFull = (orig[2] - orig[0]) >= 0.998 && (orig[3] - orig[1]) >= 0.998;
+      if (handleEl || (cropEl && !isFull)) {
+        drag = {
+          pid: e.pointerId,
+          type: 'crop',
+          mode: handleEl ? handleEl.dataset.handle : 'move',
+          sx: e.clientX,
+          sy: e.clientY,
+          w: rect.width,
+          h: rect.height,
+          orig,
+        };
+        return;
+      }
     }
 
     vp.classList.add('panning');
@@ -4381,6 +4615,15 @@ function wireMaskModal() {
       syncCropOverlay(camIdx);
       return;
     }
+    if (drag.type === 'crop') {
+      const dx = (e.clientX - drag.sx) / drag.w;
+      const dy = (e.clientY - drag.sy) / drag.h;
+      cfg.cameras[camIdx].crop = applyCropDragDelta(camIdx, drag.orig, drag.mode, dx, dy, MIN_SPAN);
+      markDirty();
+      renderMaskModal();
+      syncCropOverlay(camIdx);
+      return;
+    }
     if (drag.type === 'pan') {
       mmState.panX = drag.origPanX + (e.clientX - drag.sx);
       mmState.panY = drag.origPanY + (e.clientY - drag.sy);
@@ -4409,6 +4652,108 @@ function wireMaskModal() {
     setModalZoom(mmState.zoom * factor, e.clientX, e.clientY);
   }, { passive: false });
 
+  $('mmViewSel').onchange = (e) => switchModalView(Number(e.target.value));
+  $('mmPrevView').onclick = () => switchModalView(mmState.camIdx - 1);
+  $('mmNextView').onclick = () => switchModalView(mmState.camIdx + 1);
+
+  $('mmModeCrop').onclick = () => {
+    mmState.mode = 'crop';
+    const wasPrev = mmState.previewCropped;
+    mmState.previewCropped = false;
+    editTarget[mmState.camIdx] = 'crop';
+    syncCropOverlay(mmState.camIdx);
+    if (wasPrev && mmState.hires) updateModalMediaSrc();
+    else drawAllCanvases();
+    renderMaskModal();
+  };
+  $('mmModeMask').onclick = () => {
+    mmState.mode = 'mask';
+    const wasPrev = mmState.previewCropped;
+    mmState.previewCropped = false;
+    const cam = cfg.cameras[mmState.camIdx];
+    editTarget[mmState.camIdx] = (cam?.exclusions || []).length ? 'excl' : 'crop';
+    syncCropOverlay(mmState.camIdx);
+    if (wasPrev && mmState.hires) updateModalMediaSrc();
+    else drawAllCanvases();
+    renderMaskModal();
+  };
+  $('mmPreviewBtn').onclick = () => {
+    mmState.previewCropped = !mmState.previewCropped;
+    mmState.zoom = 1;
+    clampModalPan();
+    updateModalMediaSrc();
+    drawAllCanvases();
+    renderMaskModal();
+  };
+
+  $('mmRotBtn').onclick = () => {
+    const idx = mmState.camIdx;
+    const cam = cfg.cameras[idx];
+    if (!cam) return;
+    cam.rotate = ((cam.rotate || 0) + 90) % 360;
+    markDirty();
+    syncCropOverlay(idx);
+    drawAllCanvases();
+    scheduleModalHiresRefresh(true);
+    renderMaskModal();
+  };
+
+  const mmTiltRange = $('mmTiltRange');
+  const mmTiltNum = $('mmTiltNum');
+  const setModalLevel = (on) => {
+    mmState.leveling = on;
+    const cvs = $('mmCanvas');
+    if (cvs) cvs.classList.toggle('leveling', !!(mmState.gridPinned || mmState.leveling));
+  };
+  if (mmTiltRange) {
+    mmTiltRange.oninput = (e) => setViewTilt(mmState.camIdx, e.target.value, false);
+    mmTiltRange.addEventListener('pointerdown', () => setModalLevel(true));
+    mmTiltRange.addEventListener('focus', () => setModalLevel(true));
+    mmTiltRange.addEventListener('pointerup', () => setModalLevel(false));
+    mmTiltRange.addEventListener('pointercancel', () => setModalLevel(false));
+    mmTiltRange.addEventListener('blur', () => setModalLevel(false));
+  }
+  if (mmTiltNum) {
+    mmTiltNum.oninput = (e) => {
+      const raw = String(e.target.value || '').trim();
+      if (raw === '' || raw === '-' || raw === '.' || raw === '-.') return;
+      setViewTilt(mmState.camIdx, raw, false);
+    };
+    mmTiltNum.onchange = () => {
+      setViewTilt(mmState.camIdx, mmTiltNum.value, false);
+      mmTiltNum.value = normTilt(cfg.cameras[mmState.camIdx]?.tilt || 0).toFixed(1);
+    };
+    mmTiltNum.addEventListener('focus', () => setModalLevel(true));
+    mmTiltNum.addEventListener('blur', () => {
+      setModalLevel(false);
+      mmTiltNum.value = normTilt(cfg.cameras[mmState.camIdx]?.tilt || 0).toFixed(1);
+    });
+  }
+  $('mmTiltMinus').onclick = () => setViewTilt(mmState.camIdx, (cfg.cameras[mmState.camIdx]?.tilt || 0) - 0.5, true);
+  $('mmTiltPlus').onclick = () => setViewTilt(mmState.camIdx, (cfg.cameras[mmState.camIdx]?.tilt || 0) + 0.5, true);
+  $('mmTiltReset').onclick = () => setViewTilt(mmState.camIdx, 0, true);
+  $('mmGridBtn').onclick = () => {
+    mmState.gridPinned = !mmState.gridPinned;
+    renderMaskModal();
+  };
+  $('mmResetCropBtn').onclick = () => {
+    const idx = mmState.camIdx;
+    if (!cfg.cameras[idx]) return;
+    cfg.cameras[idx].crop = [0, 0, 1, 1];
+    aspectLock[idx] = null;
+    markDirty();
+    syncCropOverlay(idx);
+    drawAllCanvases();
+    scheduleModalHiresRefresh(true);
+    renderMaskModal();
+  };
+  document.querySelectorAll('[data-mmasp]').forEach(btn => {
+    btn.onclick = () => {
+      const ratioStr = btn.dataset.mmasp;
+      setCropAspectRatio(mmState.camIdx, ratioStr === 'free' ? null : Number(ratioStr));
+    };
+  });
+
   $('mmMaskTabs').addEventListener('click', (e) => {
     const delBtn = e.target.closest('[data-mm-del]');
     const camIdx = mmState.camIdx;
@@ -4436,6 +4781,7 @@ function wireMaskModal() {
     if (list.length >= MAX_EXCLUSIONS) return;
     list.push(defaultQuadFor(cam, list.length, modalVisibleNormBox()));
     mmState.activeMask = list.length - 1;
+    mmState.mode = 'mask';
     editTarget[mmState.camIdx] = 'excl';
     markDirty();
     syncCropOverlay(mmState.camIdx);
@@ -4472,11 +4818,27 @@ function wireMaskModal() {
 
   window.addEventListener('resize', () => { if (mmState.open) renderMaskModal(); });
   window.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape' && mmState.open) {
+    if (!mmState.open) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        saveConfig($('saveAllTop'));
+      }
+      return;
+    }
+    if (e.key === 'Escape') {
       closeMaskModal();
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
       e.preventDefault();
-      saveConfig(mmState.open ? $('mmSaveBtn') : $('saveAllTop'));
+      saveConfig($('mmSaveBtn'));
+    } else if (!e.target.closest('input,select,textarea')) {
+      if (e.key === '[') switchModalView(mmState.camIdx - 1);
+      else if (e.key === ']') switchModalView(mmState.camIdx + 1);
+      else if (e.key.toLowerCase() === 'g') {
+        mmState.gridPinned = !mmState.gridPinned;
+        renderMaskModal();
+      } else if (e.key.toLowerCase() === 'p') {
+        $('mmPreviewBtn').click();
+      }
     }
   });
 }
@@ -4492,10 +4854,11 @@ function renderCameras() {
       ? `<input type="text" class="cam-name-inp" id="name-${idx}" value="${esc(c.name)}" aria-label="View name">` +
         `<span class="pill">via ${esc(parent ? parent.name : c.sourceSlug)}</span>`
       : `<span>${esc(c.name)}</span>`;
+    const fsBtn = `<button class="btn sec sm" type="button" data-fullscreen="${idx}" title="Open full-screen calibration editor for this view">⤢ Full Screen</button>`;
     const headRight = isVirt
-      ? `<span class="pill live" id="camState-${idx}">CONNECTING</span>` +
+      ? `${fsBtn}<span class="pill live" id="camState-${idx}">CONNECTING</span>` +
         `<button class="btn red sm" type="button" data-delview="${idx}" title="Remove view">Remove</button>`
-      : `<button class="btn sec sm" type="button" data-addview="${idx}" title="Add another crop/mask view from this camera">+ Add View</button>` +
+      : `${fsBtn}<button class="btn sec sm" type="button" data-addview="${idx}" title="Add another crop/mask view from this camera">+ Add View</button>` +
         `<span class="pill live" id="camState-${idx}">CONNECTING</span>`;
     const srcSelect = isVirt ? `
       <label>Source Camera</label>
@@ -4663,11 +5026,52 @@ function setViewTilt(idx, val, flashGrid = false) {
       levelTimers.set(idx, setTimeout(() => { st.classList.remove('leveling'); }, 900));
     }
   }
+  if (mmState.open && mmState.camIdx === idx) {
+    if (flashGrid) {
+      mmState.leveling = true;
+      if (mmLevelTimer) clearTimeout(mmLevelTimer);
+      mmLevelTimer = setTimeout(() => {
+        mmState.leveling = false;
+        const cvs = $('mmCanvas');
+        if (cvs) cvs.classList.toggle('leveling', !!(mmState.gridPinned || mmState.leveling));
+      }, 900);
+    }
+    scheduleModalHiresRefresh(false);
+    renderMaskModal();
+  }
+}
+
+function setCropAspectRatio(idx, lock) {
+  if (!cfg || !cfg.cameras || !cfg.cameras[idx]) return;
+  aspectLock[idx] = lock;
+  if (lock) {
+    const cam = cfg.cameras[idx];
+    const c = cam.crop || [0, 0, 1, 1];
+    const cx = (c[0] + c[2]) / 2;
+    const cy = (c[1] + c[3]) / 2;
+    const [srcW, srcH] = viewFullDims(cam);
+    const targetNormRatio = lock * (srcH / srcW);
+    let nw = clamp(c[2] - c[0], MIN_SPAN, 1);
+    let nh = nw / targetNormRatio;
+    if (nh < MIN_SPAN) { nh = MIN_SPAN; nw = Math.min(1, nh * targetNormRatio); }
+    if (nh > 1) { nh = 1; nw = clamp(nh * targetNormRatio, MIN_SPAN, 1); }
+    const x0 = clamp(cx - nw / 2, 0, 1 - nw);
+    const y0 = clamp(cy - nh / 2, 0, 1 - nh);
+    cam.crop = [+x0.toFixed(4), +y0.toFixed(4), +(x0 + nw).toFixed(4), +(y0 + nh).toFixed(4)];
+  }
+  markDirty();
+  syncCropOverlay(idx);
+  drawAllCanvases();
+  if (mmState.open && mmState.camIdx === idx) renderMaskModal();
 }
 
 $('camGrid').addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
+  if (b.dataset.fullscreen !== undefined) {
+    openMaskModal(Number(b.dataset.fullscreen), { mode: 'crop' });
+    return;
+  }
   if (b.dataset.addview !== undefined) {
     const idx = Number(b.dataset.addview);
     const parent = cfg.cameras[idx];
@@ -4749,9 +5153,7 @@ $('camGrid').addEventListener('click', async (e) => {
   if (b.dataset.asp !== undefined) {
     const [iStr, ratioStr] = b.dataset.asp.split(':');
     const idx = Number(iStr);
-    aspectLock[idx] = ratioStr === 'free' ? null : Number(ratioStr);
-    b.parentElement.querySelectorAll('[data-asp]').forEach(x => x.classList.toggle('on', x === b));
-    if (aspectLock[idx]) setZoomAroundCenter(idx, cropZoomFactor(cfg.cameras[idx].crop));
+    setCropAspectRatio(idx, ratioStr === 'free' ? null : Number(ratioStr));
     return;
   }
   if (b.dataset.addexcl !== undefined) {
@@ -4763,13 +5165,13 @@ $('camGrid').addEventListener('click', async (e) => {
       focusIdx = list.length - 1;
       markDirty();
     }
-    openMaskModal(idx, focusIdx);
+    openMaskModal(idx, { mode: 'mask', focusMaskIdx: focusIdx });
     return;
   }
   if (b.dataset.zoomexcl !== undefined) {
     const idx = Number(b.dataset.zoomexcl);
     if (!(cfg.cameras[idx].exclusions || []).length) return;
-    openMaskModal(idx, 0);
+    openMaskModal(idx, { mode: 'mask', focusMaskIdx: 0 });
     return;
   }
   if (b.dataset.exclclear !== undefined) {
@@ -4785,7 +5187,7 @@ $('camGrid').addEventListener('click', async (e) => {
     const idx = Number(iStr);
     if (mode === 'excl') {
       if (!(cfg.cameras[idx].exclusions || []).length) return;
-      openMaskModal(idx, 0);
+      openMaskModal(idx, { mode: 'mask', focusMaskIdx: 0 });
       return;
     }
     editTarget[idx] = mode;
@@ -4846,7 +5248,7 @@ async function saveConfig(triggerBtn = null) {
     markDirty(false);
     if (triggerBtn) {
       setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2200);
-      showToast(triggerBtn === $('mmSaveBtn') ? '✓ Masks saved & applied live' : '✓ Saved & applied live', 'ok');
+      showToast(triggerBtn === $('mmSaveBtn') ? '✓ View settings saved & applied live' : '✓ Saved & applied live', 'ok');
     }
   } catch (err) {
     $('saveMsg').textContent = 'Save failed';
@@ -4964,6 +5366,10 @@ async function init() {
   $(id).addEventListener('change', () => markDirty());
 });
 
+$('openEditorTop').onclick = () => {
+  if (!cfg || !cfg.cameras || !cfg.cameras.length) return;
+  openMaskModal(clamp(mmState.camIdx || 0, 0, cfg.cameras.length - 1), { mode: 'crop' });
+};
 $('saveBtn').onclick = () => saveConfig($('saveBtn'));
 $('saveAllTop').onclick = () => saveConfig($('saveAllTop'));
 $('wbSaveBtn').onclick = () => saveConfig($('wbSaveBtn'));
@@ -5280,18 +5686,28 @@ def create_app(service: ArmoryCamService) -> Flask:
         hires = request.args.get("hires") in ("1", "true", "yes")
         rot_arg = request.args.get("rotate")
         tilt_arg = request.args.get("tilt")
+        crop_arg = request.args.get("crop")
         rot_ov: int | None = None
         if rot_arg is not None:
             rot_ov = normalize_rotate(rot_arg)
         tilt_ov: float | None = None
         if tilt_arg is not None:
             tilt_ov = normalize_tilt(tilt_arg)
+        crop_ov: tuple[float, float, float, float] | None = None
+        if crop_arg is not None:
+            parts = [p.strip() for p in crop_arg.split(",") if p.strip()]
+            if len(parts) == 4:
+                try:
+                    crop_ov = normalize_crop([float(p) for p in parts])
+                except Exception:
+                    crop_ov = None
         jpg = service.get_snapshot_jpeg(
             cam,
             raw=raw,
             hires=hires,
             rotate_override=rot_ov,
             tilt_override=tilt_ov,
+            crop_override=crop_ov,
         )
         if not jpg:
             return Response(status=404)

@@ -1066,6 +1066,18 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIn("data-tiltstep", dash_html)
             self.assertIn("data-tiltreset", dash_html)
             self.assertIn("level-grid", dash_html)
+            for fs_marker in (
+                "openEditorTop",
+                "data-fullscreen",
+                "mmViewSel",
+                "mmModeCrop",
+                "mmModeMask",
+                "mmPreviewBtn",
+                "mmTiltRange",
+                "mmGridBtn",
+                "mmResetCropBtn",
+            ):
+                self.assertIn(fs_marker, dash_html)
 
             cfg_res = client.post(
                 "/api/config",
@@ -1137,6 +1149,19 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIsNotNone(snap_img)
             exp_w, exp_h = ac.tilted_frame_size(320, 240, 4.5)
             self.assertEqual((snap_img.shape[1], snap_img.shape[0]), (exp_w, exp_h))
+
+            snap_crop = client.get("/api/snapshot?camera=Fly%20Machine%20Cam&raw=0&hires=1&tilt=4.5&crop=0.1,0.1,0.7,0.8")
+            self.assertEqual(snap_crop.status_code, 200)
+            snap_crop_img = cv2.imdecode(np.frombuffer(snap_crop.data, np.uint8), cv2.IMREAD_COLOR)
+            self.assertIsNotNone(snap_crop_img)
+            exp_cropped = ac.apply_frame_transform(
+                np.zeros((240, 320, 3), dtype=np.uint8),
+                crop=(0.1, 0.1, 0.7, 0.8),
+                rotate=0,
+                apply_crop=True,
+                tilt=4.5,
+            )
+            self.assertEqual(snap_crop_img.shape, exp_cropped.shape)
 
             clip_res = client.post(
                 "/api/clip",
