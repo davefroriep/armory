@@ -367,6 +367,15 @@ def normalize_tilt(raw: Any) -> float:
     return 0.0 if abs(v) < 0.05 else v
 
 
+def normalize_auto_level_axis(raw: Any) -> str:
+    s = str(raw or "").strip().lower()
+    if s in ("v", "vert", "vertical"):
+        return "vertical"
+    if s in ("h", "horiz", "horizontal"):
+        return "horizontal"
+    return "both"
+
+
 def tilted_frame_size(w: int, h: int, tilt: float) -> tuple[int, int]:
     t = normalize_tilt(tilt)
     if t == 0.0:
@@ -495,14 +504,29 @@ def view_transform_matrix(
     return mat, rw, rh
 
 
+def _weighted_angle_mode(vals: list[float], weights: list[float]) -> float:
+    bins = np.arange(-20.25, 20.75, 0.5)
+    hist, edges = np.histogram(vals, bins=bins, weights=weights)
+    smoothed = np.convolve(hist, [0.25, 0.5, 0.25], mode="same")
+    best_bin = int(np.argmax(smoothed))
+    center = float((edges[best_bin] + edges[best_bin + 1]) / 2.0)
+    inliers = [(v, wt) for v, wt in zip(vals, weights) if abs(v - center) <= 2.5]
+    if inliers:
+        tot_w = sum(wt for _, wt in inliers)
+        return sum(v * wt for v, wt in inliers) / tot_w if tot_w > 0 else center
+    return center
+
+
 def estimate_auto_level_tilt(
     frame: np.ndarray,
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
     rotate: int = 0,
+    axis: str = "both",
 ) -> dict[str, Any]:
-    """Estimate fine leveling angle (`tilt`) from dominant structural vertical/horizontal segments inside `crop`."""
+    """Estimate fine leveling angle (`tilt`) from vertical, horizontal, or balanced both structural lines."""
+    ax = normalize_auto_level_axis(axis)
     if frame is None or frame.size == 0:
-        return {"ok": False, "error": "No image frame available", "lines": 0}
+        return {"ok": False, "error": "No image frame available", "axis": ax, "lines": 0}
     rot_frame = apply_frame_transform(frame, rotate=normalize_rotate(rotate), tilt=0.0, apply_crop=False)
     h, w = rot_frame.shape[:2]
     x0, y0, x1, y1 = normalize_crop(crop)
@@ -513,7 +537,7 @@ def estimate_auto_level_tilt(
     roi = rot_frame[cy0:cy1, cx0:cx1]
     rh, rw = roi.shape[:2]
     if rw < 32 or rh < 32:
-        return {"ok": False, "error": "Crop region too small to auto-level", "lines": 0}
+        return {"ok": False, "error": "Crop region too small to auto-level", "axis": ax, "lines": 0}
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -522,8 +546,10 @@ def estimate_auto_level_tilt(
     detected = lsd.detect(enhanced)[0]
 
     min_len = max(24.0, min(rw, rh) * 0.12)
-    vals: list[float] = []
-    weights: list[float] = []
+    v_vals: list[float] = []
+    v_weights: list[float] = []
+    h_vals: list[float] = []
+    h_weights: list[float] = []
     if detected is not None:
         for ln in detected:
             lx0, ly0, lx1, ly1 = ln[0]
@@ -531,32 +557,59 @@ def estimate_auto_level_tilt(
             length = math.hypot(dx, dy)
             if length < min_len:
                 continue
+            wgt = length * length
             vdx, vdy = (dx, dy) if dy >= 0 else (-dx, -dy)
             dev_v = math.degrees(math.atan2(vdx, vdy))
             hdx, hdy = (dx, dy) if dx >= 0 else (-dx, -dy)
             dev_h = -math.degrees(math.atan2(hdy, hdx))
             if abs(dev_v) <= 20.0:
-                vals.append(dev_v)
-                weights.append(length * length)
+                v_vals.append(dev_v)
+                v_weights.append(wgt)
             elif abs(dev_h) <= 20.0:
-                vals.append(dev_h)
-                weights.append((length * length) * 0.5)
+                h_vals.append(dev_h)
+                h_weights.append(wgt)
 
-    if len(vals) < 3:
-        return {"ok": False, "error": "Not enough structural lines detected", "lines": len(vals)}
+    v_ang = _weighted_angle_mode(v_vals, v_weights) if len(v_vals) >= 2 else None
+    h_ang = _weighted_angle_mode(h_vals, h_weights) if len(h_vals) >= 2 else None
 
-    bins = np.arange(-20.25, 20.75, 0.5)
-    hist, edges = np.histogram(vals, bins=bins, weights=weights)
-    smoothed = np.convolve(hist, [0.25, 0.5, 0.25], mode="same")
-    best_bin = int(np.argmax(smoothed))
-    center = float((edges[best_bin] + edges[best_bin + 1]) / 2.0)
-    inliers = [(v, wt) for v, wt in zip(vals, weights) if abs(v - center) <= 2.5]
-    if inliers:
-        tot_w = sum(wt for _, wt in inliers)
-        angle = sum(v * wt for v, wt in inliers) / tot_w if tot_w > 0 else center
+    if ax == "vertical":
+        if v_ang is None:
+            return {"ok": False, "error": "Not enough vertical lines detected", "axis": ax, "lines": len(v_vals)}
+        angle = v_ang
+        line_count = len(v_vals)
+    elif ax == "horizontal":
+        if h_ang is None:
+            return {"ok": False, "error": "Not enough horizontal lines detected", "axis": ax, "lines": len(h_vals)}
+        angle = h_ang
+        line_count = len(h_vals)
     else:
-        angle = center
-    return {"ok": True, "tilt": normalize_tilt(angle), "lines": len(vals)}
+        if v_ang is not None and h_ang is not None:
+            angle = (v_ang + h_ang) / 2.0
+            line_count = len(v_vals) + len(h_vals)
+        elif v_ang is not None:
+            angle = v_ang
+            line_count = len(v_vals)
+        elif h_ang is not None:
+            angle = h_ang
+            line_count = len(h_vals)
+        else:
+            return {
+                "ok": False,
+                "error": "Not enough structural lines detected",
+                "axis": ax,
+                "lines": len(v_vals) + len(h_vals),
+            }
+
+    return {
+        "ok": True,
+        "tilt": normalize_tilt(angle),
+        "axis": ax,
+        "lines": line_count,
+        "vLines": len(v_vals),
+        "hLines": len(h_vals),
+        "vTilt": normalize_tilt(v_ang) if v_ang is not None else None,
+        "hTilt": normalize_tilt(h_ang) if h_ang is not None else None,
+    }
 
 
 def _match_feature_pairs(g1: np.ndarray, g2: np.ndarray) -> tuple[list[Any], list[Any], list[Any]]:
@@ -671,7 +724,9 @@ def project_view_from_reference(
     new_tilt = base_tilt
     new_crop, h_view, fw_cur, fh_cur = _project_for_tilt(new_tilt)
     if cur_view.auto_level:
-        lvl = estimate_auto_level_tilt(cur_raw, crop=new_crop, rotate=cur_view.rotate)
+        lvl = estimate_auto_level_tilt(
+            cur_raw, crop=new_crop, rotate=cur_view.rotate, axis=cur_view.auto_level_axis
+        )
         if lvl.get("ok"):
             new_tilt = normalize_tilt(lvl["tilt"])
             new_crop, h_view, fw_cur, fh_cur = _project_for_tilt(new_tilt)
@@ -1000,6 +1055,7 @@ class CameraConfig:
     rotate: int = 0
     tilt: float = 0.0
     auto_level: bool = False
+    auto_level_axis: str = "both"
     source_slug: str = ""
 
     def effective_roi(self) -> tuple[float, float, float, float]:
@@ -1021,6 +1077,7 @@ class CameraConfig:
             "rotate": self.rotate,
             "tilt": self.tilt,
             "autoLevel": self.auto_level,
+            "autoLevelAxis": self.auto_level_axis,
             "sourceSlug": self.source_slug,
         }
 
@@ -1727,6 +1784,11 @@ class ArmoryCamService:
             rotate = normalize_rotate(item["rotate"]) if "rotate" in item else (old.rotate if old else 0)
             tilt = normalize_tilt(item["tilt"]) if "tilt" in item else (old.tilt if old else 0.0)
             auto_level = bool(item["autoLevel"]) if "autoLevel" in item else (old.auto_level if old else False)
+            auto_level_axis = (
+                normalize_auto_level_axis(item["autoLevelAxis"])
+                if "autoLevelAxis" in item
+                else (old.auto_level_axis if old else "both")
+            )
             cams.append(
                 CameraConfig(
                     name=name,
@@ -1741,6 +1803,7 @@ class ArmoryCamService:
                     rotate=rotate,
                     tilt=tilt,
                     auto_level=auto_level,
+                    auto_level_axis=auto_level_axis,
                     source_slug=src_slug,
                 )
             )
@@ -3485,6 +3548,7 @@ class ArmoryCamService:
                     "rotate": v.rotate,
                     "tilt": v.tilt,
                     "autoLevel": v.auto_level,
+                    "autoLevelAxis": v.auto_level_axis,
                     "crop": list(v.crop),
                     "exclusions": [[[pt[0], pt[1]] for pt in q] for q in v.exclusions],
                 }
@@ -3529,6 +3593,7 @@ class ArmoryCamService:
         camera_name: str,
         crop_override: tuple[float, float, float, float] | None = None,
         rotate_override: int | None = None,
+        axis_override: str | None = None,
     ) -> dict[str, Any]:
         """Run OpenCV structural line auto-leveling inside a view's crop box."""
         with self.lock:
@@ -3538,10 +3603,11 @@ class ArmoryCamService:
             src_slug = self._source_slug_for(cam)
             eff_crop = normalize_crop(crop_override) if crop_override is not None else cam.crop
             eff_rot = normalize_rotate(rotate_override) if rotate_override is not None else cam.rotate
+            eff_axis = normalize_auto_level_axis(axis_override) if axis_override is not None else cam.auto_level_axis
         raw_bgr = self._get_raw_frame_bgr(src_slug)
         if raw_bgr is None:
             return {"ok": False, "error": "Camera frame unavailable"}
-        res = estimate_auto_level_tilt(raw_bgr, crop=eff_crop, rotate=eff_rot)
+        res = estimate_auto_level_tilt(raw_bgr, crop=eff_crop, rotate=eff_rot, axis=eff_axis)
         return {**res, "camera": cam.name, "slug": cam.slug}
 
     def alignment_snapshot(self) -> dict[str, Any]:
@@ -3916,6 +3982,7 @@ DASHBOARD_HTML = """<!doctype html>
   .level-grid{position:absolute;inset:0;pointer-events:none;z-index:4;opacity:0;transition:opacity .12s ease;background-image:linear-gradient(to right,rgba(124,196,255,.32) 1px,transparent 1px),linear-gradient(to bottom,rgba(124,196,255,.32) 1px,transparent 1px);background-size:12.5% 12.5%;}
   .stage.leveling .level-grid{opacity:1}
   .tilt-num{width:58px!important;padding:4px 6px!important;font-size:12px!important;text-align:right;font-variant-numeric:tabular-nums}
+  .axis-sel{width:auto!important;padding:4px 6px!important;font-size:12px!important;font-weight:700;border-radius:8px!important}
   .crop-layer{position:absolute;inset:0;pointer-events:auto}
   .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none;z-index:1}
   .crop-box{position:absolute;z-index:2;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
@@ -4126,6 +4193,11 @@ DASHBOARD_HTML = """<!doctype html>
       <button class="btn sec sm" id="mmTiltReset" type="button" title="Reset angle to 0°">0°</button>
       <button class="btn sec sm" id="mmGridBtn" type="button" title="Toggle plumb alignment grid (G)">Grid</button>
       <button class="btn sec sm" id="mmAutoLvlBtn" type="button" title="Detect structural upright/horizontal tilt inside crop">Auto-Level: OFF</button>
+      <select class="axis-sel" id="mmAutoAxisSel" aria-label="Full-screen auto-level reference lines" title="Reference lines for Auto-Level">
+        <option value="both">Both</option>
+        <option value="vertical">Vert</option>
+        <option value="horizontal">Horiz</option>
+      </select>
     </div>
     <div class="mm-sep"></div>
     <div class="mm-bar-grp">
@@ -4649,6 +4721,8 @@ function syncCropOverlay(idx) {
     autoBtn.classList.toggle('on', !!cam.autoLevel);
     autoBtn.textContent = `Auto-Level: ${cam.autoLevel ? 'ON' : 'OFF'}`;
   }
+  const axisSel = $(`autoAxis-${idx}`);
+  if (axisSel) axisSel.value = cam.autoLevelAxis || 'both';
   const prevBtn = $(`prevBtn-${idx}`);
   if (prevBtn) prevBtn.classList.toggle('on', !!previewCropped[idx]);
   const rotBtn = $(`rotBtn-${idx}`);
@@ -4945,6 +5019,7 @@ function renderMaskModal() {
     $('mmAutoLvlBtn').classList.toggle('on', !!cam.autoLevel);
     $('mmAutoLvlBtn').textContent = `Auto-Level: ${cam.autoLevel ? 'ON' : 'OFF'}`;
   }
+  if ($('mmAutoAxisSel')) $('mmAutoAxisSel').value = cam.autoLevelAxis || 'both';
   syncAlignmentUI();
 
   const lock = aspectLock[mmState.camIdx] || null;
@@ -5390,6 +5465,13 @@ function wireMaskModal() {
     renderMaskModal();
   };
   $('mmAutoLvlBtn').onclick = () => toggleAutoLevelView(mmState.camIdx, $('mmAutoLvlBtn'));
+  $('mmAutoAxisSel').onchange = (e) => {
+    const cam = cfg?.cameras?.[mmState.camIdx];
+    if (!cam) return;
+    cam.autoLevelAxis = e.target.value || 'both';
+    markDirty();
+    applyAutoLevelView(mmState.camIdx, $('mmAutoLvlBtn'));
+  };
   $('mmRealignModeBtn').onclick = () => toggleAlignmentPref('realignMode', $('mmRealignModeBtn'));
   $('mmRealignNowBtn').onclick = () => {
     const cam = cfg?.cameras?.[mmState.camIdx];
@@ -5585,6 +5667,11 @@ function renderCameras() {
         <input type="number" class="tilt-num" id="tiltNum-${idx}" min="-45" max="45" step="0.1" value="${normTilt(c.tilt || 0).toFixed(1)}" aria-label="Custom rotate angle in degrees">
         <button class="btn sec sm" type="button" data-tiltreset="${idx}" title="Reset angle to 0°">0°</button>
         <button class="btn sec sm${c.autoLevel ? ' on' : ''}" type="button" data-autolevel="${idx}" id="autoLvl-${idx}" title="Detect upright/horizontal tilt inside crop">Auto-Level: ${c.autoLevel ? 'ON' : 'OFF'}</button>
+        <select class="axis-sel" id="autoAxis-${idx}" aria-label="Auto-level reference lines" title="Reference lines for Auto-Level">
+          <option value="both"${(c.autoLevelAxis || 'both') === 'both' ? ' selected' : ''}>Both</option>
+          <option value="vertical"${c.autoLevelAxis === 'vertical' ? ' selected' : ''}>Vert</option>
+          <option value="horizontal"${c.autoLevelAxis === 'horizontal' ? ' selected' : ''}>Horiz</option>
+        </select>
       </div>
       <div class="ctrl-row">
         <span style="font-size:12px;color:var(--mut)">Box Ratio:</span>
@@ -5643,6 +5730,14 @@ function renderCameras() {
         showLevel(false);
         tiltNum.value = normTilt(cfg.cameras[idx].tilt || 0).toFixed(1);
       });
+    }
+    const autoAxis = $(`autoAxis-${idx}`);
+    if (autoAxis) {
+      autoAxis.onchange = (e) => {
+        cfg.cameras[idx].autoLevelAxis = e.target.value || 'both';
+        markDirty();
+        applyAutoLevelView(idx, $(`autoLvl-${idx}`));
+      };
     }
     $(`thresh-${idx}`).oninput = (e) => {
       const th = Number(e.target.value) || 2.2;
@@ -5747,29 +5842,25 @@ function syncAlignmentUI() {
   }
 }
 
-async function toggleAutoLevelView(idx, triggerBtn = null) {
+async function applyAutoLevelView(idx, triggerBtn = null) {
   if (!cfg || !cfg.cameras || !cfg.cameras[idx]) return;
   const cam = cfg.cameras[idx];
-  const nextOn = !cam.autoLevel;
-  cam.autoLevel = nextOn;
+  const axis = cam.autoLevelAxis || 'both';
+  cam.autoLevel = true;
   syncCropOverlay(idx);
   if (mmState.open && mmState.camIdx === idx) renderMaskModal();
-  if (!nextOn) {
-    markDirty();
-    showToast(`Auto-Level OFF (${cam.name})`, 'ok');
-    return;
-  }
   if (triggerBtn) triggerBtn.disabled = true;
   try {
     const resp = await fetch('/api/camera/auto-level', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ camera: cam.name, crop: cam.crop, rotate: cam.rotate || 0 }),
+      body: JSON.stringify({ camera: cam.name, crop: cam.crop, rotate: cam.rotate || 0, axis }),
     });
     const res = await resp.json();
     if (!resp.ok || !res || !res.ok) throw new Error(res?.error || 'Auto-level failed');
     setViewTilt(idx, res.tilt, true, false);
-    showToast(`✓ Auto-Level (${cam.name}): ${res.tilt >= 0 ? '+' : ''}${Number(res.tilt).toFixed(1)}° (${res.lines} lines)`, 'ok');
+    const axLbl = axis === 'vertical' ? 'Vert' : (axis === 'horizontal' ? 'Horiz' : 'Both');
+    showToast(`✓ Auto-Level (${axLbl}): ${res.tilt >= 0 ? '+' : ''}${Number(res.tilt).toFixed(1)}° (${res.lines} lines)`, 'ok');
   } catch (err) {
     cam.autoLevel = false;
     syncCropOverlay(idx);
@@ -5778,6 +5869,20 @@ async function toggleAutoLevelView(idx, triggerBtn = null) {
   } finally {
     if (triggerBtn) triggerBtn.disabled = false;
   }
+}
+
+async function toggleAutoLevelView(idx, triggerBtn = null) {
+  if (!cfg || !cfg.cameras || !cfg.cameras[idx]) return;
+  const cam = cfg.cameras[idx];
+  if (cam.autoLevel) {
+    cam.autoLevel = false;
+    markDirty();
+    syncCropOverlay(idx);
+    if (mmState.open && mmState.camIdx === idx) renderMaskModal();
+    showToast(`Auto-Level OFF (${cam.name})`, 'ok');
+    return;
+  }
+  await applyAutoLevelView(idx, triggerBtn);
 }
 
 async function toggleAlignmentPref(field) {
@@ -5923,6 +6028,7 @@ $('camGrid').addEventListener('click', async (e) => {
       rotate: parent.rotate || 0,
       tilt: 0,
       autoLevel: false,
+      autoLevelAxis: 'both',
     });
     renderCameras();
     await saveConfig(null);
@@ -6049,6 +6155,7 @@ async function saveConfig(triggerBtn = null) {
       motionThreshold: $(`thresh-${idx}`) ? (Number($(`thresh-${idx}`).value) || 2.2) : c.motionThreshold,
       tilt: normTilt(c.tilt || 0),
       autoLevel: !!c.autoLevel,
+      autoLevelAxis: c.autoLevelAxis || 'both',
       enabled: $(`en-${idx}`) ? ($(`en-${idx}`).value === '1') : !!c.enabled,
     };
   });
@@ -6361,7 +6468,10 @@ def create_app(service: ArmoryCamService) -> Flask:
         cam_name = str(body.get("camera") or "").strip()
         crop_ov = normalize_crop(body["crop"]) if "crop" in body else None
         rot_ov = normalize_rotate(body["rotate"]) if "rotate" in body else None
-        res = service.auto_level_camera(cam_name, crop_override=crop_ov, rotate_override=rot_ov)
+        axis_ov = normalize_auto_level_axis(body["axis"]) if "axis" in body else None
+        res = service.auto_level_camera(
+            cam_name, crop_override=crop_ov, rotate_override=rot_ov, axis_override=axis_ov
+        )
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.post("/api/camera/reference")

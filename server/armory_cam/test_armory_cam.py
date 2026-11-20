@@ -1213,6 +1213,20 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertTrue(lvl_res["ok"], lvl_res)
         self.assertAlmostEqual(lvl_res["tilt"], -6.0, delta=0.6)
 
+        # Verify vertical vs horizontal vs balanced both axis estimation under perspective skew
+        v_only = np.full((h, w, 3), 24, dtype=np.uint8)
+        for x in range(110, 540, 70):
+            cv2.line(v_only, (x, 30), (x, 330), (225, 225, 225), 4)
+        h_only = np.full((h, w, 3), 24, dtype=np.uint8)
+        for y in range(60, 310, 60):
+            cv2.line(h_only, (80, y), (560, y), (205, 205, 205), 4)
+        v_skew = cv2.warpAffine(v_only, cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -6.0, 1.0), (w, h), borderValue=(24, 24, 24))
+        h_skew = cv2.warpAffine(h_only, cv2.getRotationMatrix2D((w / 2.0, h / 2.0), 4.0, 1.0), (w, h), borderValue=(24, 24, 24))
+        skew_img = np.maximum(v_skew, h_skew)
+        self.assertAlmostEqual(ac.estimate_auto_level_tilt(skew_img, crop=(0.1, 0.1, 0.9, 0.9), axis="vertical")["tilt"], -6.0, delta=0.6)
+        self.assertAlmostEqual(ac.estimate_auto_level_tilt(skew_img, crop=(0.1, 0.1, 0.9, 0.9), axis="horizontal")["tilt"], 4.0, delta=0.6)
+        self.assertAlmostEqual(ac.estimate_auto_level_tilt(skew_img, crop=(0.1, 0.1, 0.9, 0.9), axis="both")["tilt"], -1.0, delta=0.6)
+
         tmp = Path(tempfile.mkdtemp(prefix="armory_cam_align_"))
         try:
             svc = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestDriftTopic")
@@ -1222,7 +1236,9 @@ class ArmoryCamTests(unittest.TestCase):
             dash_html = client.get("/").get_data(as_text=True)
             for marker in (
                 "autoLvl-",
+                "autoAxis-",
                 "mmAutoLvlBtn",
+                "mmAutoAxisSel",
                 "realignModeBtn",
                 "realignNowBtn",
                 "driftNtfyBtn",
@@ -1251,6 +1267,7 @@ class ArmoryCamTests(unittest.TestCase):
                             "rotate": 0,
                             "tilt": 0.0,
                             "autoLevel": False,
+                            "autoLevelAxis": "horizontal",
                         },
                         {
                             "name": "Fly Machine Cam",
@@ -1263,6 +1280,7 @@ class ArmoryCamTests(unittest.TestCase):
                             "rotate": 0,
                             "tilt": 0.0,
                             "autoLevel": True,
+                            "autoLevelAxis": "vertical",
                         },
                     ],
                 },
@@ -1271,7 +1289,9 @@ class ArmoryCamTests(unittest.TestCase):
             got_cfg = client.get("/api/config").get_json()
             self.assertEqual(got_cfg["realignMode"], "manual")
             self.assertTrue(got_cfg["driftAlertNtfy"])
+            self.assertEqual(got_cfg["cameras"][0]["autoLevelAxis"], "horizontal")
             self.assertTrue(got_cfg["cameras"][1]["autoLevel"])
+            self.assertEqual(got_cfg["cameras"][1]["autoLevelAxis"], "vertical")
 
             # Write clean baseline TS segment and pin reference
             ring_rack = svc.ring_root / "rack_cam"
@@ -1299,10 +1319,12 @@ class ArmoryCamTests(unittest.TestCase):
             svc.cam_connected["rack_cam"] = True
             svc.ring_segments["rack_cam"] = [ac.SegmentInfo(path=ref_seg, start_ms=t0_ms, end_ms=t0_ms + 1200, energy=0.0, camera="Rack Cam")]
 
-            # Test /api/camera/auto-level endpoint directly on current Rack Cam frame
-            al_res = client.post("/api/camera/auto-level", json={"camera": "Rack Cam"})
+            # Test /api/camera/auto-level endpoint directly on current Rack Cam frame with axis overrides
+            al_res = client.post("/api/camera/auto-level", json={"camera": "Rack Cam", "axis": "vertical"})
             self.assertEqual(al_res.status_code, 200)
-            self.assertTrue(al_res.get_json()["ok"])
+            al_json = al_res.get_json()
+            self.assertTrue(al_json["ok"])
+            self.assertEqual(al_json["axis"], "vertical")
 
             # Pin reference baseline
             pin_res = client.post("/api/camera/reference", json={"camera": "Rack Cam"})
