@@ -19,6 +19,7 @@ from datetime import datetime
 import glob
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -351,13 +352,36 @@ def normalize_rotate(raw: Any) -> int:
         return 0
 
 
+def normalize_tilt(raw: Any) -> float:
+    try:
+        v = float(raw)
+    except Exception:
+        return 0.0
+    if not math.isfinite(v):
+        return 0.0
+    v = max(-45.0, min(45.0, round(v, 1)))
+    return 0.0 if abs(v) < 0.05 else v
+
+
+def tilted_frame_size(w: int, h: int, tilt: float) -> tuple[int, int]:
+    t = normalize_tilt(tilt)
+    if t == 0.0:
+        return w, h
+    rad = math.radians(t)
+    ca, sa = abs(math.cos(rad)), abs(math.sin(rad))
+    nw = max(2, int((w * ca + h * sa) // 2) * 2)
+    nh = max(2, int((w * sa + h * ca) // 2) * 2)
+    return nw, nh
+
+
 def build_ffmpeg_vf(
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
     rotate: int = 0,
     scale_w: int | None = None,
     fps: int | None = None,
+    tilt: float = 0.0,
 ) -> str | None:
-    """Build ordered FFmpeg `-vf` chain (rotate -> even-pixel crop -> optional fps/scale)."""
+    """Build ordered FFmpeg `-vf` chain (rotate -> tilt -> even-pixel crop -> optional fps/scale)."""
     parts: list[str] = []
     rot = normalize_rotate(rotate)
     if rot == 90:
@@ -366,6 +390,16 @@ def build_ffmpeg_vf(
         parts.append("hflip,vflip")
     elif rot == 270:
         parts.append("transpose=2")
+
+    tlt = normalize_tilt(tilt)
+    if tlt != 0.0:
+        rad = math.radians(tlt)
+        parts.append(
+            f"rotate={rad:.6f}:"
+            f"ow=max(2\\,trunc(rotw({rad:.6f})/2)*2):"
+            f"oh=max(2\\,trunc(roth({rad:.6f})/2)*2):"
+            "fillcolor=black"
+        )
 
     x0, y0, x1, y1 = normalize_crop(crop)
     if (x0, y0, x1, y1) != (0.0, 0.0, 1.0, 1.0):
@@ -388,8 +422,9 @@ def apply_frame_transform(
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
     rotate: int = 0,
     apply_crop: bool = True,
+    tilt: float = 0.0,
 ) -> np.ndarray:
-    """Apply OpenCV rotation + optional normalized crop matching `build_ffmpeg_vf`."""
+    """Apply OpenCV rotation + fine tilt + optional normalized crop matching `build_ffmpeg_vf`."""
     if frame is None or frame.size == 0:
         return frame
     out = frame
@@ -401,15 +436,26 @@ def apply_frame_transform(
     elif rot == 270:
         out = cv2.rotate(out, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
+    tlt = normalize_tilt(tilt)
+    if tlt != 0.0:
+        h0, w0 = out.shape[:2]
+        nw, nh = tilted_frame_size(w0, h0, tlt)
+        mat = cv2.getRotationMatrix2D((w0 / 2.0, h0 / 2.0), -tlt, 1.0)
+        mat[0, 2] += (nw - w0) / 2.0
+        mat[1, 2] += (nh - h0) / 2.0
+        out = cv2.warpAffine(out, mat, (nw, nh), flags=cv2.INTER_LINEAR, borderValue=(0, 0, 0))
+
     if apply_crop:
         x0, y0, x1, y1 = normalize_crop(crop)
         if (x0, y0, x1, y1) != (0.0, 0.0, 1.0, 1.0):
             h, w = out.shape[:2]
-            cx0 = max(0, min(w - 2, int(round(x0 * w))))
-            cy0 = max(0, min(h - 2, int(round(y0 * h))))
-            cx1 = max(cx0 + 2, min(w, int(round(x1 * w))))
-            cy1 = max(cy0 + 2, min(h, int(round(y1 * h))))
-            out = out[cy0:cy1, cx0:cx1]
+            span_w = max(MIN_CROP_SPAN, x1 - x0)
+            span_h = max(MIN_CROP_SPAN, y1 - y0)
+            cw = max(2, min(w, int((w * span_w) // 2) * 2))
+            ch = max(2, min(h, int((h * span_h) // 2) * 2))
+            cx0 = max(0, min(w - cw, int((w * x0) // 2) * 2))
+            cy0 = max(0, min(h - ch, int((h * y0) // 2) * 2))
+            out = out[cy0 : cy0 + ch, cx0 : cx0 + cw]
     return out
 
 
@@ -520,13 +566,15 @@ def analyze_ts_segment(
     exclusions: Sequence[Any] = (),
     rotate: int = 0,
     fallback_dur_ms: int = 2000,
+    tilt: float = 0.0,
 ) -> tuple[int, float]:
     """Read sampled frames from an MPEG-TS segment to get `(duration_ms, motion_energy)`."""
     dur_ms, raw_frames = extract_ts_sampled_frames(seg_path, fallback_dur_ms=fallback_dur_ms)
     if not raw_frames:
         return dur_ms, 0.0
     rot = normalize_rotate(rotate)
-    frames = [apply_frame_transform(frm, rotate=rot, apply_crop=False) for frm in raw_frames]
+    tlt = normalize_tilt(tilt)
+    frames = [apply_frame_transform(frm, rotate=rot, tilt=tlt, apply_crop=False) for frm in raw_frames]
     score = compute_motion_energy_from_frames(frames, roi=roi, exclusions=exclusions)
     return dur_ms, score
 
@@ -720,6 +768,7 @@ class CameraConfig:
     exclusions: list[Quad] = field(default_factory=list)
     crop: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0)
     rotate: int = 0
+    tilt: float = 0.0
     source_slug: str = ""
 
     def effective_roi(self) -> tuple[float, float, float, float]:
@@ -739,6 +788,7 @@ class CameraConfig:
             "exclusions": [[[pt[0], pt[1]] for pt in q] for q in self.exclusions],
             "crop": list(self.crop),
             "rotate": self.rotate,
+            "tilt": self.tilt,
             "sourceSlug": self.source_slug,
         }
 
@@ -1435,6 +1485,7 @@ class ArmoryCamService:
             )
             crop = normalize_crop(item["crop"]) if "crop" in item else (old.crop if old else (0.0, 0.0, 1.0, 1.0))
             rotate = normalize_rotate(item["rotate"]) if "rotate" in item else (old.rotate if old else 0)
+            tilt = normalize_tilt(item["tilt"]) if "tilt" in item else (old.tilt if old else 0.0)
             cams.append(
                 CameraConfig(
                     name=name,
@@ -1447,6 +1498,7 @@ class ArmoryCamService:
                     exclusions=exclusions,
                     crop=crop,
                     rotate=rotate,
+                    tilt=tilt,
                     source_slug=src_slug,
                 )
             )
@@ -1893,22 +1945,25 @@ class ArmoryCamService:
                 continue
 
             dur_ms, raw_frames = extract_ts_sampled_frames(p)
-            rot_cache: dict[int, list[np.ndarray]] = {}
+            rot_cache: dict[tuple[int, float], list[np.ndarray]] = {}
             first_raw = raw_frames[0] if raw_frames else None
             view_results: list[tuple[CameraConfig, SegmentInfo]] = []
             for v in views:
-                rot = normalize_rotate(v.rotate)
-                if rot not in rot_cache:
-                    rot_cache[rot] = (
-                        [apply_frame_transform(frm, rotate=rot, apply_crop=False) for frm in raw_frames]
-                        if rot != 0
+                tkey = (normalize_rotate(v.rotate), normalize_tilt(v.tilt))
+                if tkey not in rot_cache:
+                    rot_cache[tkey] = (
+                        [
+                            apply_frame_transform(frm, rotate=tkey[0], tilt=tkey[1], apply_crop=False)
+                            for frm in raw_frames
+                        ]
+                        if tkey != (0, 0.0)
                         else raw_frames
                     )
                 energy = (
                     compute_motion_energy_from_frames(
-                        rot_cache[rot], roi=v.effective_roi(), exclusions=v.exclusions
+                        rot_cache[tkey], roi=v.effective_roi(), exclusions=v.exclusions
                     )
-                    if rot_cache[rot]
+                    if rot_cache[tkey]
                     else 0.0
                 )
                 try:
@@ -2311,10 +2366,12 @@ class ArmoryCamService:
     @staticmethod
     def _crop_cache_key(cam: CameraConfig) -> str:
         x0, y0, x1, y1 = cam.crop
-        return (
+        base = (
             f"r{cam.rotate}_{int(round(x0 * 1000))}_{int(round(y0 * 1000))}_"
             f"{int(round(x1 * 1000))}_{int(round(y1 * 1000))}"
         )
+        tlt = normalize_tilt(cam.tilt)
+        return f"{base}_t{int(round(tlt * 10))}" if tlt != 0.0 else base
 
     def _render_segment_thumb_jpeg(
         self,
@@ -2341,7 +2398,7 @@ class ArmoryCamService:
         if frm is None:
             return None
         if cam:
-            frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
+            frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True, tilt=cam.tilt)
         h, w = frm.shape[:2]
         tw = max(180, min(720, int(max_w)))
         if w > tw:
@@ -2462,7 +2519,7 @@ class ArmoryCamService:
                         frm = f_later
 
             if cam:
-                frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True)
+                frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=True, tilt=cam.tilt)
             h, w = frm.shape[:2]
             tw = max(180, min(720, int(max_w)))
             if w > tw:
@@ -2603,10 +2660,19 @@ class ArmoryCamService:
             return ""
         return "data:image/jpeg;base64," + base64.b64encode(jpg).decode("ascii")
 
-    def get_snapshot_jpeg(self, camera_name: str | None = None, raw: bool = False, hires: bool = False) -> bytes | None:
+    def get_snapshot_jpeg(
+        self,
+        camera_name: str | None = None,
+        raw: bool = False,
+        hires: bool = False,
+        rotate_override: int | None = None,
+        tilt_override: float | None = None,
+    ) -> bytes | None:
         cam = self._find_camera(camera_name)
         if not cam:
             return None
+        eff_rot = normalize_rotate(rotate_override) if rotate_override is not None else cam.rotate
+        eff_tilt = normalize_tilt(tilt_override) if tilt_override is not None else cam.tilt
         media_slug = self._source_slug_for(cam)
         src_cam = self._source_camera(cam)
 
@@ -2626,24 +2692,26 @@ class ArmoryCamService:
                             ok, frm = cap.read()
                         cap.release()
                         if ok and frm is not None:
-                            frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=not raw)
+                            frm = apply_frame_transform(
+                                frm, cam.crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
+                            )
                             ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
                             if ok_jpg:
                                 return buf.tobytes()
 
         live_jpg = self.live_hub.recent_frame(media_slug, max_age_sec=2.0)
         if live_jpg:
-            if not raw and (cam.rotate != 0 or cam.crop != (0.0, 0.0, 1.0, 1.0)):
+            if not raw and (eff_rot != 0 or eff_tilt != 0.0 or cam.crop != (0.0, 0.0, 1.0, 1.0)):
                 img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    img = apply_frame_transform(img, cam.crop, cam.rotate, apply_crop=True)
+                    img = apply_frame_transform(img, cam.crop, eff_rot, apply_crop=True, tilt=eff_tilt)
                     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                     if ok:
                         return buf.tobytes()
-            elif cam.rotate != 0:
+            elif eff_rot != 0 or eff_tilt != 0.0:
                 img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    img = apply_frame_transform(img, cam.crop, cam.rotate, apply_crop=False)
+                    img = apply_frame_transform(img, cam.crop, eff_rot, apply_crop=False, tilt=eff_tilt)
                     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                     if ok:
                         return buf.tobytes()
@@ -2658,7 +2726,9 @@ class ArmoryCamService:
                     ok, frm = cap.read()
                     cap.release()
                     if ok and frm is not None:
-                        frm = apply_frame_transform(frm, cam.crop, cam.rotate, apply_crop=not raw)
+                        frm = apply_frame_transform(
+                            frm, cam.crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
+                        )
                         ok_jpg, buf = cv2.imencode(".jpg", frm, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                         if ok_jpg:
                             return buf.tobytes()
@@ -2686,7 +2756,9 @@ class ArmoryCamService:
                 if res.returncode == 0 and res.stdout.startswith(b"\xff\xd8"):
                     img = cv2.imdecode(np.frombuffer(res.stdout, np.uint8), cv2.IMREAD_COLOR)
                     if img is not None:
-                        img = apply_frame_transform(img, cam.crop, cam.rotate, apply_crop=not raw)
+                        img = apply_frame_transform(
+                            img, cam.crop, eff_rot, apply_crop=not raw, tilt=eff_tilt
+                        )
                         ok_jpg, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                         if ok_jpg:
                             return buf.tobytes()
@@ -2706,7 +2778,7 @@ class ArmoryCamService:
         if not segs:
             return False
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        vf = build_ffmpeg_vf(cam_cfg.crop, cam_cfg.rotate) if cam_cfg else None
+        vf = build_ffmpeg_vf(cam_cfg.crop, cam_cfg.rotate, tilt=cam_cfg.tilt) if cam_cfg else None
         first_start_ms = segs[0].start_ms
         ss_sec = max(0.0, (start_ms - first_start_ms) / 1000.0)
         dur_sec = max(0.5, (end_ms - start_ms) / 1000.0)
@@ -3214,6 +3286,9 @@ DASHBOARD_HTML = """<!doctype html>
   .stage{position:relative;width:100%;aspect-ratio:16/9;background:#06090d;border-radius:10px;border:1px solid var(--line);overflow:hidden;user-select:none;touch-action:none}
   .stage.rot90,.stage.rot270{width:auto;height:480px;max-width:100%;aspect-ratio:9/16;margin:0 auto}
   .stage img.stream,.stage canvas.stream{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none}
+  .level-grid{position:absolute;inset:0;pointer-events:none;z-index:4;opacity:0;transition:opacity .12s ease;background-image:linear-gradient(to right,rgba(124,196,255,.32) 1px,transparent 1px),linear-gradient(to bottom,rgba(124,196,255,.32) 1px,transparent 1px);background-size:12.5% 12.5%;}
+  .stage.leveling .level-grid{opacity:1}
+  .tilt-num{width:58px!important;padding:4px 6px!important;font-size:12px!important;text-align:right;font-variant-numeric:tabular-nums}
   .crop-layer{position:absolute;inset:0;pointer-events:auto}
   .scrim{position:absolute;background:rgba(4,7,11,.62);pointer-events:none}
   .crop-box{position:absolute;border:2px solid var(--blue);box-shadow:0 0 0 1px rgba(0,0,0,.6);cursor:move;touch-action:none}
@@ -3487,6 +3562,14 @@ function syncRawFeeds() {
     const setSrc = () => {
       img.src = `/api/stream?camera=${encodeURIComponent(phys.name)}&raw=1&t=${Date.now()}`;
     };
+    img.onload = () => {
+      img._sized = true;
+      if (cfg && cfg.cameras) {
+        cfg.cameras.forEach((cam, idx) => {
+          if (sourceSlugOf(cam) === slug) syncCropOverlay(idx);
+        });
+      }
+    };
     img.onerror = () => setTimeout(() => {
       if (img.isConnected && rawFeedUrls[slug]) setSrc();
     }, 2500);
@@ -3495,19 +3578,49 @@ function syncRawFeeds() {
   }
 }
 
-function drawFeedToCanvas(canvas, rawImg, rot, crop, applyCrop) {
+function normTilt(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 0;
+  const c = clamp(Math.round(n * 10) / 10, -45, 45);
+  return Math.abs(c) < 0.05 ? 0 : c;
+}
+
+function tiltedSize(w, h, tilt) {
+  const t = normTilt(tilt);
+  if (t === 0) return [w, h];
+  const rad = t * Math.PI / 180;
+  const ca = Math.abs(Math.cos(rad));
+  const sa = Math.abs(Math.sin(rad));
+  const nw = Math.max(2, Math.floor((w * ca + h * sa) / 2) * 2);
+  const nh = Math.max(2, Math.floor((w * sa + h * ca) / 2) * 2);
+  return [nw, nh];
+}
+
+function viewFullDims(cam) {
+  const rot = cam ? (cam.rotate || 0) : 0;
+  const rawImg = cam ? $(`rawFeed-${sourceSlugOf(cam)}`) : null;
+  const sw = (rawImg && rawImg.naturalWidth > 0) ? rawImg.naturalWidth : 1920;
+  const sh = (rawImg && rawImg.naturalHeight > 0) ? rawImg.naturalHeight : 1080;
+  const rw = (rot === 90 || rot === 270) ? sh : sw;
+  const rh = (rot === 90 || rot === 270) ? sw : sh;
+  return tiltedSize(rw, rh, cam ? (cam.tilt || 0) : 0);
+}
+
+function drawFeedToCanvas(canvas, rawImg, rot, tilt, crop, applyCrop) {
   if (!canvas || !rawImg || !rawImg.complete || rawImg.naturalWidth <= 0 || rawImg.naturalHeight <= 0) return;
   const sw = rawImg.naturalWidth;
   const sh = rawImg.naturalHeight;
   const r = ((rot % 360) + 360) % 360;
+  const t = normTilt(tilt);
   const rw = (r === 90 || r === 270) ? sh : sw;
   const rh = (r === 90 || r === 270) ? sw : sh;
-  let sx = 0, sy = 0, cw = rw, ch = rh;
+  const [fw, fh] = tiltedSize(rw, rh, t);
+  let sx = 0, sy = 0, cw = fw, ch = fh;
   if (applyCrop && Array.isArray(crop) && crop.length === 4) {
-    sx = clamp(crop[0], 0, 0.95) * rw;
-    sy = clamp(crop[1], 0, 0.95) * rh;
-    cw = Math.max(2, (clamp(crop[2], 0.05, 1) - clamp(crop[0], 0, 0.95)) * rw);
-    ch = Math.max(2, (clamp(crop[3], 0.05, 1) - clamp(crop[1], 0, 0.95)) * rh);
+    sx = clamp(crop[0], 0, 0.95) * fw;
+    sy = clamp(crop[1], 0, 0.95) * fh;
+    cw = Math.max(2, (clamp(crop[2], 0.05, 1) - clamp(crop[0], 0, 0.95)) * fw);
+    ch = Math.max(2, (clamp(crop[3], 0.05, 1) - clamp(crop[1], 0, 0.95)) * fh);
   }
   const tw = Math.max(2, Math.round(cw));
   const th = Math.max(2, Math.round(ch));
@@ -3516,8 +3629,14 @@ function drawFeedToCanvas(canvas, rawImg, rot, crop, applyCrop) {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
   ctx.save();
-  ctx.clearRect(0, 0, tw, th);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, tw, th);
   ctx.translate(-sx, -sy);
+  if (t !== 0) {
+    ctx.translate(fw / 2, fh / 2);
+    ctx.rotate(t * Math.PI / 180);
+    ctx.translate(-rw / 2, -rh / 2);
+  }
   if (r === 90) {
     ctx.translate(rw, 0);
     ctx.rotate(Math.PI / 2);
@@ -3536,9 +3655,13 @@ function drawAllCanvases() {
   if (!cfg || !cfg.cameras) return;
   cfg.cameras.forEach((c, idx) => {
     const rawImg = $(`rawFeed-${sourceSlugOf(c)}`);
+    if (rawImg && !rawImg._sized && rawImg.naturalWidth > 0) {
+      rawImg._sized = true;
+      syncCropOverlay(idx);
+    }
     const canvas = $(`stream-${idx}`);
     if (canvas && rawImg) {
-      drawFeedToCanvas(canvas, rawImg, c.rotate || 0, c.crop, !!previewCropped[idx]);
+      drawFeedToCanvas(canvas, rawImg, c.rotate || 0, c.tilt || 0, c.crop, !!previewCropped[idx]);
     }
   });
   if (mmState.open && !mmState.hires) {
@@ -3551,7 +3674,7 @@ function drawAllCanvases() {
         if ((cam.exclusions || []).length) fitMaskInModal();
         else fitCropInModal();
       }
-      drawFeedToCanvas(mmCanvas, rawImg, cam.rotate || 0, [0, 0, 1, 1], false);
+      drawFeedToCanvas(mmCanvas, rawImg, cam.rotate || 0, cam.tilt || 0, [0, 0, 1, 1], false);
     }
   }
 }
@@ -3706,12 +3829,16 @@ function syncCropOverlay(idx) {
     editTarget[idx] = 'crop';
   }
   const rot = cam.rotate || 0;
+  const tilt = normTilt(cam.tilt || 0);
   const stage = $(`stage-${idx}`);
   const layer = $(`layer-${idx}`);
   if (!stage || !layer) return;
-  stage.className = 'stage' + (rot === 90 ? ' rot90' : rot === 270 ? ' rot270' : '');
+  stage.classList.toggle('rot90', rot === 90);
+  stage.classList.toggle('rot270', rot === 270);
 
+  const [stageFw, stageFh] = viewFullDims(cam);
   const showEditor = !previewCropped[idx];
+  stage.style.aspectRatio = showEditor ? `${stageFw} / ${stageFh}` : '';
   layer.hidden = !showEditor;
 
   const isFullCrop = c[0] <= 0.001 && c[1] <= 0.001 && c[2] >= 0.999 && c[3] >= 0.999;
@@ -3740,14 +3867,19 @@ function syncCropOverlay(idx) {
   const z = Math.min(3.5, Math.max(1.0, cropZoomFactor(c)));
   const slider = $(`zoom-${idx}`);
   if (slider) slider.value = z.toFixed(2);
-  const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
-  const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
+  const [srcW, srcH] = viewFullDims(cam);
   const outW = Math.round((c[2] - c[0]) * srcW);
   const outH = Math.round((c[3] - c[1]) * srcH);
   const maskLabel = excls.length ? `${excls.length} mirror mask${excls.length === 1 ? '' : 's'} (Red)` : 'No mirror masks';
+  const tiltTag = tilt !== 0 ? `${tilt > 0 ? '+' : ''}${tilt.toFixed(1)}°` : '';
+  const rotLabel = tilt === 0 ? `Rotate ${rot}°` : (rot === 0 ? `Angle ${tiltTag}` : `Rotate ${rot}° (${tiltTag})`);
   $(`cropInfo-${idx}`).textContent = isFullCrop
-    ? `Full frame · ${srcW}×${srcH} · Rotate ${rot}° · ${maskLabel}`
-    : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · Rotate ${rot}° · ${maskLabel}`;
+    ? `Full frame · ${srcW}×${srcH} · ${rotLabel} · ${maskLabel}`
+    : `Zoom ${z.toFixed(2)}× · ~${outW}×${outH} · ${rotLabel} · ${maskLabel}`;
+  const tiltSlider = $(`tilt-${idx}`);
+  if (tiltSlider) tiltSlider.value = String(tilt);
+  const tiltNum = $(`tiltNum-${idx}`);
+  if (tiltNum && document.activeElement !== tiltNum) tiltNum.value = tilt.toFixed(1);
   const prevBtn = $(`prevBtn-${idx}`);
   if (prevBtn) prevBtn.classList.toggle('on', !!previewCropped[idx]);
   const rotBtn = $(`rotBtn-${idx}`);
@@ -3855,9 +3987,7 @@ function wireCropDrag(idx) {
 
       const lock = aspectLock[idx];
       if (lock) {
-        const rot = cfg.cameras[idx].rotate || 0;
-        const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
-        const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
+        const [srcW, srcH] = viewFullDims(cfg.cameras[idx]);
         const targetNormRatio = lock * (srcH / srcW);
         let nw = x1 - x0;
         let nh = nw / targetNormRatio;
@@ -3888,16 +4018,18 @@ function modalBaseMetrics() {
   const img = $('mmStream');
   const cam = cfg?.cameras?.[mmState.camIdx];
   const rot = cam ? (cam.rotate || 0) : 0;
+  const tilt = cam ? normTilt(cam.tilt || 0) : 0;
   const rawImg = cam ? $(`rawFeed-${sourceSlugOf(cam)}`) : null;
   const vw = Math.max(120, vp ? vp.clientWidth : 800);
   const vh = Math.max(120, vp ? vp.clientHeight : 500);
-  let ratio = (rot === 90 || rot === 270) ? (9 / 16) : (16 / 9);
+  const rawW = (rawImg && rawImg.naturalWidth > 0) ? rawImg.naturalWidth : 1920;
+  const rawH = (rawImg && rawImg.naturalHeight > 0) ? rawImg.naturalHeight : 1080;
+  const rw = (rot === 90 || rot === 270) ? rawH : rawW;
+  const rh = (rot === 90 || rot === 270) ? rawW : rawH;
+  const [fw, fh] = tiltedSize(rw, rh, tilt);
+  let ratio = fw / fh;
   if (mmState.hires && img && img.naturalWidth > 0 && img.naturalHeight > 0) {
     ratio = img.naturalWidth / img.naturalHeight;
-  } else if (!mmState.hires && rawImg && rawImg.naturalWidth > 0 && rawImg.naturalHeight > 0) {
-    ratio = (rot === 90 || rot === 270)
-      ? (rawImg.naturalHeight / rawImg.naturalWidth)
-      : (rawImg.naturalWidth / rawImg.naturalHeight);
   }
   const maxW = Math.max(100, vw - 24);
   const maxH = Math.max(100, vh - 24);
@@ -3997,7 +4129,7 @@ function updateModalMediaSrc() {
   if (mmState.hires) {
     liveCvs.hidden = true;
     img.hidden = false;
-    img.src = `/api/snapshot?camera=${encodeURIComponent(cam.name)}&raw=1&hires=1&t=${Date.now()}`;
+    img.src = `/api/snapshot?camera=${encodeURIComponent(cam.name)}&raw=1&hires=1&rotate=${cam.rotate || 0}&tilt=${normTilt(cam.tilt || 0)}&t=${Date.now()}`;
   } else {
     img.hidden = true;
     img.removeAttribute('src');
@@ -4071,9 +4203,7 @@ function renderMaskModal() {
       hint.innerHTML = `<span style="color:var(--amber);font-weight:800">Corners crossed on Mask ${mmState.activeMask + 1} — drag dots to uncross</span>`;
     } else if (mmState.dragDot && excls[mmState.dragDot.ei]) {
       const pt = excls[mmState.dragDot.ei][mmState.dragDot.ci];
-      const rot = cam.rotate || 0;
-      const srcW = (rot === 90 || rot === 270) ? 1080 : 1920;
-      const srcH = (rot === 90 || rot === 270) ? 1920 : 1080;
+      const [srcW, srcH] = viewFullDims(cam);
       hint.textContent = `Mask ${mmState.dragDot.ei + 1} · Corner ${mmState.dragDot.ci + 1} · px (${Math.round(pt[0] * srcW)}, ${Math.round(pt[1] * srcH)})`;
     } else {
       hint.textContent = 'Drag 4 dots onto mirror corners · Drag mask to slide · Wheel/pinch or drag background to pan';
@@ -4382,6 +4512,7 @@ function renderCameras() {
       </h2>
       <div class="stage" id="stage-${idx}">
         <canvas class="stream" id="stream-${idx}"></canvas>
+        <div class="level-grid"></div>
         <div class="crop-layer" id="layer-${idx}">
           <div class="scrim" id="scT-${idx}"></div>
           <div class="scrim" id="scB-${idx}"></div>
@@ -4423,6 +4554,14 @@ function renderCameras() {
         <button class="btn sec sm" type="button" data-rot="${idx}" id="rotBtn-${idx}">Rotate 0°</button>
         <button class="btn sec sm" type="button" data-prev="${idx}" id="prevBtn-${idx}">Preview Crop</button>
       </div>
+      <div class="ctrl-row" id="tiltRow-${idx}">
+        <span style="font-size:12px;color:var(--mut)">Angle</span>
+        <button class="btn sec sm" type="button" data-tiltstep="${idx}:-0.5" title="Rotate counter-clockwise 0.5°">−0.5°</button>
+        <input type="range" id="tilt-${idx}" min="-45" max="45" step="0.5" value="${normTilt(c.tilt || 0)}">
+        <button class="btn sec sm" type="button" data-tiltstep="${idx}:0.5" title="Rotate clockwise 0.5°">+0.5°</button>
+        <input type="number" class="tilt-num" id="tiltNum-${idx}" min="-45" max="45" step="0.1" value="${normTilt(c.tilt || 0).toFixed(1)}" aria-label="Custom rotate angle in degrees">
+        <button class="btn sec sm" type="button" data-tiltreset="${idx}" title="Reset angle to 0°">0°</button>
+      </div>
       <div class="ctrl-row">
         <span style="font-size:12px;color:var(--mut)">Box Ratio:</span>
         <button class="btn sec sm on" type="button" data-asp="${idx}:free">Free</button>
@@ -4453,6 +4592,34 @@ function renderCameras() {
     syncCropOverlay(idx);
     wireCropDrag(idx);
     $(`zoom-${idx}`).oninput = (e) => setZoomAroundCenter(idx, Number(e.target.value));
+    const stageEl = $(`stage-${idx}`);
+    const tiltSlider = $(`tilt-${idx}`);
+    const tiltNum = $(`tiltNum-${idx}`);
+    const showLevel = (on) => { if (stageEl) stageEl.classList.toggle('leveling', on); };
+    if (tiltSlider) {
+      tiltSlider.oninput = (e) => setViewTilt(idx, e.target.value, false);
+      tiltSlider.addEventListener('pointerdown', () => showLevel(true));
+      tiltSlider.addEventListener('focus', () => showLevel(true));
+      tiltSlider.addEventListener('pointerup', () => showLevel(false));
+      tiltSlider.addEventListener('pointercancel', () => showLevel(false));
+      tiltSlider.addEventListener('blur', () => showLevel(false));
+    }
+    if (tiltNum) {
+      tiltNum.oninput = (e) => {
+        const raw = String(e.target.value || '').trim();
+        if (raw === '' || raw === '-' || raw === '.' || raw === '-.') return;
+        setViewTilt(idx, raw, false);
+      };
+      tiltNum.onchange = () => {
+        setViewTilt(idx, tiltNum.value, false);
+        tiltNum.value = normTilt(cfg.cameras[idx].tilt || 0).toFixed(1);
+      };
+      tiltNum.addEventListener('focus', () => showLevel(true));
+      tiltNum.addEventListener('blur', () => {
+        showLevel(false);
+        tiltNum.value = normTilt(cfg.cameras[idx].tilt || 0).toFixed(1);
+      });
+    }
     $(`thresh-${idx}`).oninput = (e) => {
       const th = Number(e.target.value) || 2.2;
       cfg.cameras[idx].motionThreshold = th;
@@ -4480,6 +4647,24 @@ function renderCameras() {
   drawAllCanvases();
 }
 
+const levelTimers = new Map();
+function setViewTilt(idx, val, flashGrid = false) {
+  if (!cfg || !cfg.cameras || !cfg.cameras[idx]) return;
+  cfg.cameras[idx].tilt = normTilt(val);
+  markDirty();
+  syncCropOverlay(idx);
+  drawAllCanvases();
+  if (flashGrid) {
+    const st = $(`stage-${idx}`);
+    if (st) {
+      st.classList.add('leveling');
+      const old = levelTimers.get(idx);
+      if (old) clearTimeout(old);
+      levelTimers.set(idx, setTimeout(() => { st.classList.remove('leveling'); }, 900));
+    }
+  }
+}
+
 $('camGrid').addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
@@ -4505,6 +4690,7 @@ $('camGrid').addEventListener('click', async (e) => {
       exclusions: [],
       crop: [0, 0, 1, 1],
       rotate: parent.rotate || 0,
+      tilt: 0,
     });
     renderCameras();
     await saveConfig(null);
@@ -4538,6 +4724,18 @@ $('camGrid').addEventListener('click', async (e) => {
     syncCropOverlay(idx);
     drawAllCanvases();
     if (previewCropped[idx]) saveConfig();
+    return;
+  }
+  if (b.dataset.tiltstep !== undefined) {
+    const [iStr, dStr] = b.dataset.tiltstep.split(':');
+    const idx = Number(iStr);
+    const delta = Number(dStr) || 0;
+    setViewTilt(idx, (cfg.cameras[idx].tilt || 0) + delta, true);
+    return;
+  }
+  if (b.dataset.tiltreset !== undefined) {
+    const idx = Number(b.dataset.tiltreset);
+    setViewTilt(idx, 0, true);
     return;
   }
   if (b.dataset.prev !== undefined) {
@@ -4614,6 +4812,7 @@ async function saveConfig(triggerBtn = null) {
       rtspUrl: sourceSlug ? '' : ($(`rtsp-${idx}`) ? $(`rtsp-${idx}`).value.trim() : c.rtspUrl),
       primary: $(`prim-${idx}`) ? ($(`prim-${idx}`).value === '1') : (c.primary !== false),
       motionThreshold: $(`thresh-${idx}`) ? (Number($(`thresh-${idx}`).value) || 2.2) : c.motionThreshold,
+      tilt: normTilt(c.tilt || 0),
       enabled: $(`en-${idx}`) ? ($(`en-${idx}`).value === '1') : !!c.enabled,
     };
   });
@@ -5079,7 +5278,21 @@ def create_app(service: ArmoryCamService) -> Flask:
         cam = request.args.get("camera")
         raw = request.args.get("raw") in ("1", "true", "yes")
         hires = request.args.get("hires") in ("1", "true", "yes")
-        jpg = service.get_snapshot_jpeg(cam, raw=raw, hires=hires)
+        rot_arg = request.args.get("rotate")
+        tilt_arg = request.args.get("tilt")
+        rot_ov: int | None = None
+        if rot_arg is not None:
+            rot_ov = normalize_rotate(rot_arg)
+        tilt_ov: float | None = None
+        if tilt_arg is not None:
+            tilt_ov = normalize_tilt(tilt_arg)
+        jpg = service.get_snapshot_jpeg(
+            cam,
+            raw=raw,
+            hires=hires,
+            rotate_override=rot_ov,
+            tilt_override=tilt_ov,
+        )
         if not jpg:
             return Response(status=404)
         resp = Response(jpg, mimetype="image/jpeg")
@@ -5124,11 +5337,12 @@ def create_app(service: ArmoryCamService) -> Flask:
                     with service.lock:
                         cur = service._find_camera(slug) or cam
                         rot = cur.rotate
+                        tilt = cur.tilt
                         crop = cur.crop
-                    if rot != 0 or (cropped and crop != (0.0, 0.0, 1.0, 1.0)):
+                    if rot != 0 or tilt != 0.0 or (cropped and crop != (0.0, 0.0, 1.0, 1.0)):
                         img = cv2.imdecode(np.frombuffer(raw_jpg, np.uint8), cv2.IMREAD_COLOR)
                         if img is not None:
-                            img = apply_frame_transform(img, crop, rot, apply_crop=cropped)
+                            img = apply_frame_transform(img, crop, rot, apply_crop=cropped, tilt=tilt)
                             ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 78])
                             if ok:
                                 payload = buf.tobytes()

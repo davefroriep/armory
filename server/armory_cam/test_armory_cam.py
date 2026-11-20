@@ -13,6 +13,9 @@ import tempfile
 import time
 import unittest
 
+import cv2
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import armory_cam_server as ac  # noqa: E402
@@ -991,6 +994,178 @@ class ArmoryCamTests(unittest.TestCase):
             )
             self.assertEqual(prev_res.status_code, 200)
             self.assertEqual(prev_res.get_json()["camera"], "Smith Wide")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_tilt_normalization_vf_and_frame_parity(self) -> None:
+        self.assertEqual(ac.normalize_tilt(None), 0.0)
+        self.assertEqual(ac.normalize_tilt("nan"), 0.0)
+        self.assertEqual(ac.normalize_tilt(0.02), 0.0)
+        self.assertEqual(ac.normalize_tilt(-60), -45.0)
+        self.assertEqual(ac.normalize_tilt(12.34), 12.3)
+        self.assertEqual(ac.normalize_tilt(-3.5), -3.5)
+
+        self.assertIsNone(ac.build_ffmpeg_vf((0.0, 0.0, 1.0, 1.0), rotate=0, tilt=0.0))
+        vf = ac.build_ffmpeg_vf((0.1, 0.1, 0.9, 0.9), rotate=0, tilt=6.5)
+        self.assertIsNotNone(vf)
+        self.assertIn("rotate=", vf)
+        self.assertIn("crop=", vf)
+        self.assertLess(vf.index("rotate="), vf.index("crop="))
+
+        w, h = 320, 180
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        cv2.rectangle(img, (24, 24), (296, 156), (180, 110, 60), 4)
+        cv2.line(img, (160, 0), (160, 180), (50, 210, 90), 3)
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_tilt_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            inp = tmp / "in.png"
+            outp = tmp / "out.png"
+            cv2.imwrite(str(inp), img)
+
+            # Exact pixel & shape parity across rotate + tilt before crop
+            for rot_deg, tlt_deg in ((0, -8.5), (90, 12.5)):
+                cv_rot = ac.apply_frame_transform(img, crop=(0.0, 0.0, 1.0, 1.0), rotate=rot_deg, apply_crop=False, tilt=tlt_deg)
+                vf_rot = ac.build_ffmpeg_vf(crop=(0.0, 0.0, 1.0, 1.0), rotate=rot_deg, tilt=tlt_deg)
+                self.assertIsNotNone(vf_rot)
+                subprocess.run(
+                    [svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(inp), "-vf", vf_rot, "-frames:v", "1", str(outp)],
+                    check=True,
+                )
+                ff_rot = cv2.imread(str(outp))
+                self.assertEqual(cv_rot.shape, ff_rot.shape)
+                mad = float(np.mean(np.abs(cv_rot.astype(float) - ff_rot.astype(float))))
+                self.assertLess(mad, 1.5)
+
+            # Combined rotate + tilt + crop stays aligned within <=2px even-truncation tolerance
+            crop = (0.1, 0.1, 0.9, 0.9)
+            cv_crop = ac.apply_frame_transform(img, crop=crop, rotate=90, apply_crop=True, tilt=6.5)
+            vf_crop = ac.build_ffmpeg_vf(crop=crop, rotate=90, tilt=6.5)
+            self.assertIsNotNone(vf_crop)
+            self.assertLess(vf_crop.index("transpose=1"), vf_crop.index("rotate="))
+            self.assertLess(vf_crop.index("rotate="), vf_crop.index("crop="))
+            subprocess.run(
+                [svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(inp), "-vf", vf_crop, "-frames:v", "1", str(outp)],
+                check=True,
+            )
+            ff_crop = cv2.imread(str(outp))
+            self.assertEqual(cv_crop.shape, ff_crop.shape)
+            self.assertLess(float(np.mean(np.abs(cv_crop.astype(float) - ff_crop.astype(float)))), 1.5)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_virtual_views_independent_tilt_config_cache_and_clip_encode(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_virt_tilt_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash_html = client.get("/").get_data(as_text=True)
+            self.assertIn("data-tiltstep", dash_html)
+            self.assertIn("data-tiltreset", dash_html)
+            self.assertIn("level-grid", dash_html)
+
+            cfg_res = client.post(
+                "/api/config",
+                json={
+                    "cameras": [
+                        {
+                            "name": "Rack Cam",
+                            "slug": "rack_cam",
+                            "rtspUrl": "rtsp://127.0.0.1:554/rack",
+                            "enabled": True,
+                            "primary": True,
+                            "motionThreshold": 2.2,
+                            "crop": [0.0, 0.0, 1.0, 1.0],
+                            "rotate": 0,
+                            "tilt": -2.5,
+                        },
+                        {
+                            "name": "Fly Machine Cam",
+                            "slug": "fly_machine_cam",
+                            "sourceSlug": "rack_cam",
+                            "rtspUrl": "",
+                            "enabled": True,
+                            "primary": False,
+                            "motionThreshold": 2.2,
+                            "crop": [0.0, 0.1, 0.45, 0.9],
+                            "rotate": 0,
+                            "tilt": 6.0,
+                        },
+                    ]
+                },
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            cfg_data = client.get("/api/config").get_json()
+            by_slug = {c["slug"]: c for c in cfg_data["cameras"]}
+            self.assertAlmostEqual(by_slug["rack_cam"]["tilt"], -2.5, places=1)
+            self.assertAlmostEqual(by_slug["fly_machine_cam"]["tilt"], 6.0, places=1)
+
+            cam_zero = ac.CameraConfig(name="Z", slug="z", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=0.0)
+            cam_tilted = ac.CameraConfig(name="T", slug="t", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=6.0)
+            self.assertEqual(svc._crop_cache_key(cam_zero), "r0_0_0_1000_1000")
+            self.assertEqual(svc._crop_cache_key(cam_tilted), "r0_0_0_1000_1000_t60")
+
+            self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-tilt", "name": "Tilt Lift"}).status_code, 200)
+            t0_dt = datetime(2026, 11, 19, 15, 0, 0)
+            t0_ms = int(t0_dt.timestamp() * 1000)
+            ring_rack = svc.ring_root / "rack_cam"
+            ring_rack.mkdir(parents=True, exist_ok=True)
+            for i in range(2):
+                seg_dt = datetime.fromtimestamp((t0_ms + i * 2000) / 1000.0)
+                seg_path = ring_rack / f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                vf_src = "color=c=black:s=320x240:r=20:d=2,drawbox=x=10:y=20:w=110:h=180:color=white@1.0:t=fill:enable='gte(n,2)'"
+                subprocess.run(
+                    [
+                        svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", vf_src,
+                        "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                    ],
+                    check=True,
+                )
+                old_m = time.time() - 5.0
+                os.utime(seg_path, (old_m, old_m))
+
+            svc._ingest_closed_segments(svc._find_camera("Rack Cam"), time.time())
+            self.assertGreater(svc.latest_energy["fly_machine_cam"], 5.0)
+
+            snap = client.get("/api/snapshot?camera=Fly%20Machine%20Cam&raw=1&hires=1&tilt=4.5")
+            self.assertEqual(snap.status_code, 200)
+            snap_img = cv2.imdecode(np.frombuffer(snap.data, np.uint8), cv2.IMREAD_COLOR)
+            self.assertIsNotNone(snap_img)
+            exp_w, exp_h = ac.tilted_frame_size(320, 240, 4.5)
+            self.assertEqual((snap_img.shape[1], snap_img.shape[0]), (exp_w, exp_h))
+
+            clip_res = client.post(
+                "/api/clip",
+                json={
+                    "sessionId": "sess-tilt",
+                    "exName": "Chest Fly Machine",
+                    "startMs": t0_ms,
+                    "endMs": t0_ms + 3500,
+                    "camera": "Fly Machine Cam",
+                },
+            )
+            self.assertEqual(clip_res.status_code, 200)
+            clip_data = clip_res.get_json()
+            out_file = svc.clips_root / clip_data["lanUrl"].removeprefix("/clips/")
+            self.assertTrue(out_file.is_file())
+            self.assertGreater(out_file.stat().st_size, 1000)
+            probe_out = subprocess.check_output(
+                [
+                    svc.ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height",
+                    "-of", "csv=p=0:s=x", str(out_file),
+                ],
+                text=True,
+            ).strip()
+            pw, ph = (int(x) for x in probe_out.split("x"))
+            self.assertGreater(pw, 0)
+            self.assertGreater(ph, 0)
+            self.assertEqual(pw % 2, 0)
+            self.assertEqual(ph % 2, 0)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
