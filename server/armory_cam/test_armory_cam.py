@@ -20,6 +20,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import armory_cam_server as ac  # noqa: E402
+import room_voice as rv  # noqa: E402
 
 
 class ArmoryCamTests(unittest.TestCase):
@@ -1487,6 +1488,104 @@ class ArmoryCamTests(unittest.TestCase):
                 status_json = client.get("/api/status").get_json()
                 self.assertEqual(status_json["preview"]["driveUrl"], f"https://drive.google.com/file/d/{fake_fid}/view")
                 self.assertIsNotNone(status_json["preview"]["updatedMs"])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_room_voice_helpers_config_sse_and_ack(self) -> None:
+        # Pure helpers: wake matching, hallucination guard, host API priority, and prompt seeding
+        self.assertTrue(rv.matches_wake_word("Armory 225 for 8"))
+        self.assertTrue(rv.matches_wake_word("Hey army, check"))
+        self.assertFalse(rv.matches_wake_word("just chatting between sets"))
+        self.assertTrue(rv.has_command_tail("Armory 225 for 8"))
+        self.assertFalse(rv.has_command_tail("Armory"))
+        self.assertTrue(rv.is_hallucination("Thank you."))
+        self.assertTrue(rv.is_hallucination("..."))
+        self.assertFalse(rv.is_hallucination("Armory check"))
+
+        prompt, hotwords = rv.build_whisper_prompt("armory", ["Barbell Bench Press", "Smith Machine Row"])
+        self.assertIn("Barbell Bench Press", prompt)
+        self.assertIn("Smith Machine Row", hotwords)
+
+        fake_devs = {
+            "inputs": [
+                {"index": 11, "name": "Anker PowerConf S330 (Anker PowerConf S330)", "hostApi": "Windows WDM-KS", "channels": 2, "sampleRate": 48000},
+                {"index": 15, "name": "Anker PowerConf S330 (Anker PowerConf S330)", "hostApi": "Windows WASAPI", "channels": 2, "sampleRate": 48000},
+            ],
+            "outputs": [
+                {"index": 10, "name": "Speakers (Anker PowerConf S330)", "hostApi": "Windows WDM-KS", "channels": 2, "sampleRate": 48000},
+            ],
+        }
+        picked_in = rv.resolve_audio_device("in", "PowerConf S330", fake_devs)
+        self.assertIsNotNone(picked_in)
+        self.assertEqual(picked_in["hostApi"], "Windows WASAPI")
+        picked_out = rv.resolve_audio_device("out", "PowerConf S330", fake_devs)
+        self.assertIsNotNone(picked_out)
+        self.assertEqual(picked_out["hostApi"], "Windows WDM-KS")
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_voice_test_"))
+        spoken: list[str] = []
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.voice._speak_fn = lambda txt: (spoken.append(txt), True)[1]
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash = client.get("/").get_data(as_text=True)
+            self.assertIn("Room Voice Mic (PowerConf S330)", dash)
+            self.assertIn("vxTestBtn", dash)
+            self.assertIn("vxSpeakBtn", dash)
+            self.assertIn("vxSaveBtn", dash)
+
+            ping = client.get("/api/ping").get_json()
+            self.assertIn("voice", ping)
+            self.assertTrue(ping["voice"]["enabled"])
+            self.assertFalse(ping["voice"]["listening"])
+
+            # Config update persists across service reload
+            cfg_res = client.post(
+                "/api/voice/config",
+                json={"listenMode": "always", "modelSize": "tiny.en", "vadThreshold": 0.55},
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            self.assertEqual(cfg_res.get_json()["config"]["listenMode"], "always")
+
+            svc_reload = ac.ArmoryCamService(root_dir=tmp)
+            self.assertEqual(svc_reload.voice_cfg.listen_mode, "always")
+            self.assertEqual(svc_reload.voice_cfg.model_size, "tiny.en")
+            self.assertAlmostEqual(svc_reload.voice_cfg.vad_threshold, 0.55)
+
+            # Context update + SSE stream + inject + ack
+            ctx_res = client.post(
+                "/api/voice/context",
+                json={"active": True, "wakeWord": "armory", "biasPhrases": ["Low Bar Squat"], "readback": True},
+            )
+            self.assertEqual(ctx_res.status_code, 200)
+            self.assertTrue(ctx_res.get_json()["status"]["contextActive"])
+
+            svc.voice._stop_event.clear()
+            stream = svc.voice.subscribe_sse()
+            first_frame = next(stream).decode("utf-8")
+            self.assertIn('"type":"status"', first_frame)
+
+            inj_res = client.post("/api/voice/inject", json={"transcript": "Armory 225 for 8"})
+            self.assertEqual(inj_res.status_code, 200)
+            self.assertTrue(inj_res.get_json()["entry"]["emitted"])
+
+            second_frame = next(stream).decode("utf-8")
+            self.assertIn('"type":"transcript"', second_frame)
+            self.assertIn("Armory 225 for 8", second_frame)
+            stream.close()
+
+            ack_res = client.post(
+                "/api/voice/ack",
+                json={"armed": False, "speech": "225 for 8, got it", "text": "✓ 1 Low Bar Squat · 225 lb × 8"},
+            )
+            self.assertEqual(ack_res.status_code, 200)
+            self.assertTrue(ack_res.get_json()["spoke"])
+            self.assertEqual(spoken, ["225 for 8, got it"])
+
+            st = client.get("/api/voice/status").get_json()
+            self.assertEqual(st["recent"][0]["ackText"], "✓ 1 Low Bar Squat · 225 lb × 8")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

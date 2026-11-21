@@ -70,7 +70,7 @@ export interface NativeVoiceEvent {
   transcript: string;
   candidates?: string[];
   isFinal: boolean;
-  source: 'mic' | 'lan';
+  source: 'mic' | 'lan' | 'room';
   state: string;
   error?: string;
 }

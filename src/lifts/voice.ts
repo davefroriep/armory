@@ -74,6 +74,12 @@ class VoiceController {
   armedUntilMs = 0;
   listening = false;
   granted = false;
+  roomOnline = false;
+  roomListening = false;
+  roomReady = false;
+  roomDevice = '';
+  roomError: string | null = null;
+  lastSource: NativeVoiceEvent['source'] | null = null;
   lastHeard = '';
   lastError: string | null = null;
   lastAction: VoiceActionNotice | null = null;
@@ -96,9 +102,18 @@ class VoiceController {
   private nativeDesired = false;
   private webRec: WebSpeechRec | null = null;
   private armTimer: ReturnType<typeof setTimeout> | null = null;
+  private roomEs: EventSource | null = null;
+  private roomRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private roomRetryMs = 2000;
+  private lastRoomEventId = 0;
+  private lastRoomCfgSig = '';
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
+  }
+
+  isAnyListening(): boolean {
+    return this.listening || this.roomListening;
   }
 
   init(): void {
@@ -109,6 +124,11 @@ class VoiceController {
     settingsChanged.on(() => {
       this.syncSessionFromSettings();
     });
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && this.liftScreenMounted) this.ensureRoomConnected();
+      });
+    }
     this.syncSessionFromSettings();
   }
 
@@ -153,6 +173,71 @@ class VoiceController {
     if (this.listening && isNative()) {
       void setNativeVoiceListening(true, this.biasPhrases(), false);
     }
+    if (this.roomOnline && this.liftScreenMounted && getSettings().voiceRoomEnabled) {
+      void this.pushRoomContext(true);
+    }
+  }
+
+  setRoomEnabled(on: boolean): void {
+    updateSettings({ voiceRoomEnabled: on });
+  }
+
+  ensureRoomConnected(): void {
+    const s = getSettings();
+    const want = this.liftScreenMounted && s.voiceRoomEnabled && s.gymCamEnabled && typeof EventSource !== 'undefined';
+    if (!want) return;
+    if (!this.roomEs || this.roomEs.readyState === 2) {
+      if (this.roomRetryTimer) { clearTimeout(this.roomRetryTimer); this.roomRetryTimer = null; }
+      this.openRoomEs();
+    } else if (this.roomEs.readyState === 1) {
+      void this.pushRoomContext(true);
+    }
+  }
+
+  reconnectRoom(): void {
+    this.closeRoomEs(false);
+    this.roomRetryMs = 2000;
+    this.syncRoomStream();
+  }
+
+  async refreshRoomStatus(): Promise<void> {
+    const s = getSettings();
+    if (!s.gymCamEnabled || typeof fetch === 'undefined' || typeof AbortController === 'undefined') {
+      this.roomOnline = false;
+      this.roomListening = false;
+      this.roomReady = false;
+      this.changed.emit();
+      return;
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1500);
+    try {
+      const res = await fetch(`${this.roomBaseUrl()}/api/voice/status`, { signal: ctrl.signal, cache: 'no-store' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const d = (await res.json()) as {
+        ready?: boolean;
+        listening?: boolean;
+        device?: string;
+        error?: string | null;
+      };
+      this.roomOnline = true;
+      this.roomReady = !!d.ready;
+      this.roomListening = !!d.listening;
+      this.roomDevice = d.device || '';
+      this.roomError = d.error ?? null;
+    } catch {
+      this.roomOnline = false;
+      this.roomListening = false;
+      this.roomReady = false;
+    } finally {
+      clearTimeout(timer);
+      this.changed.emit();
+    }
+  }
+
+  /** Receives an external voice event (used by Room Mic SSE and tests). */
+  receiveExternalEvent(ev: NativeVoiceEvent): void {
+    this.handleEvent(ev);
   }
 
   async setEnabled(on: boolean): Promise<boolean> {
@@ -252,6 +337,169 @@ class VoiceController {
     } else if (!want && (this.listening || this.webRec || (isNative() && this.nativeDesired))) {
       void this.applyListening(false);
     }
+    this.syncRoomStream();
+  }
+
+  private roomBaseUrl(): string {
+    return (getSettings().gymCamUrl || 'http://192.168.1.152:8766').trim().replace(/\/+$/, '');
+  }
+
+  private syncRoomStream(): void {
+    const s = getSettings();
+    const want = this.liftScreenMounted && s.voiceRoomEnabled && s.gymCamEnabled && typeof EventSource !== 'undefined';
+    const cfgSig = `${this.roomBaseUrl()}|${s.voiceWakeWord}|${s.voiceReadback}`;
+    if (!want) {
+      if (this.roomEs || this.roomRetryTimer || this.roomOnline || this.roomListening) {
+        this.closeRoomEs(true);
+      }
+      this.lastRoomCfgSig = '';
+      return;
+    }
+    if (this.lastRoomCfgSig && this.lastRoomCfgSig !== cfgSig) {
+      this.closeRoomEs(false);
+      this.roomRetryMs = 2000;
+    }
+    this.lastRoomCfgSig = cfgSig;
+    if (!this.roomEs && !this.roomRetryTimer) {
+      this.openRoomEs();
+    } else if (this.roomEs?.readyState === 1) {
+      void this.pushRoomContext(true);
+    }
+  }
+
+  private openRoomEs(): void {
+    const s = getSettings();
+    const wake = encodeURIComponent((s.voiceWakeWord || 'armory').trim() || 'armory');
+    const url = `${this.roomBaseUrl()}/api/voice/events?wake=${wake}${this.lastRoomEventId ? `&afterId=${this.lastRoomEventId}` : ''}`;
+    try {
+      const es = new EventSource(url);
+      this.roomEs = es;
+      es.onopen = () => {
+        if (this.roomEs !== es) return;
+        this.roomRetryMs = 2000;
+        this.roomOnline = true;
+        this.roomError = null;
+        void this.pushRoomContext(true);
+        this.changed.emit();
+      };
+      es.onmessage = (msg) => {
+        if (this.roomEs !== es) return;
+        try {
+          const d = JSON.parse(msg.data) as {
+            type?: string;
+            id?: number;
+            transcript?: string;
+            candidates?: string[];
+            ready?: boolean;
+            listening?: boolean;
+            device?: string;
+            error?: string | null;
+          };
+          if (d.type === 'status') {
+            this.roomOnline = true;
+            this.roomReady = !!d.ready;
+            this.roomListening = !!d.listening;
+            this.roomDevice = d.device || '';
+            this.roomError = d.error ?? null;
+            this.changed.emit();
+            return;
+          }
+          if (d.type === 'transcript' && d.transcript) {
+            const evId = Number(d.id || 0);
+            if (evId > 0) {
+              if (evId <= this.lastRoomEventId) return;
+              this.lastRoomEventId = evId;
+            }
+            this.handleEvent({
+              transcript: d.transcript,
+              candidates: Array.isArray(d.candidates) ? d.candidates : [d.transcript],
+              isFinal: true,
+              source: 'room',
+              state: 'room',
+            });
+          }
+        } catch {
+          /* ignore malformed SSE frame */
+        }
+      };
+      es.onerror = () => {
+        if (this.roomEs !== es) return;
+        try { es.close(); } catch { /* ignore */ }
+        this.roomEs = null;
+        this.roomOnline = false;
+        this.roomListening = false;
+        this.changed.emit();
+        if (this.liftScreenMounted && getSettings().voiceRoomEnabled && getSettings().gymCamEnabled) {
+          if (this.roomRetryTimer) clearTimeout(this.roomRetryTimer);
+          const delay = this.roomRetryMs;
+          this.roomRetryMs = Math.min(15_000, Math.round(this.roomRetryMs * 1.8));
+          this.roomRetryTimer = setTimeout(() => {
+            this.roomRetryTimer = null;
+            this.syncRoomStream();
+          }, delay);
+        }
+      };
+    } catch {
+      this.roomOnline = false;
+      this.roomListening = false;
+      this.changed.emit();
+    }
+  }
+
+  private closeRoomEs(notifyInactive: boolean): void {
+    if (this.roomRetryTimer) {
+      clearTimeout(this.roomRetryTimer);
+      this.roomRetryTimer = null;
+    }
+    if (this.roomEs) {
+      const old = this.roomEs;
+      this.roomEs = null;
+      try { old.close(); } catch { /* ignore */ }
+    }
+    this.roomListening = false;
+    this.roomOnline = false;
+    if (notifyInactive) void this.pushRoomContext(false);
+    this.changed.emit();
+  }
+
+  private async postRoomJson<T>(path: string, body: unknown, timeoutMs = 1500): Promise<T | null> {
+    if (typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${this.roomBaseUrl()}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      if (!res.ok) return null;
+      return (await res.json()) as T;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async pushRoomContext(activeNow: boolean): Promise<void> {
+    const s = getSettings();
+    await this.postRoomJson('/api/voice/context', {
+      active: activeNow,
+      wakeWord: (s.voiceWakeWord || 'armory').trim() || 'armory',
+      biasPhrases: activeNow ? this.biasPhrases() : [],
+      readback: s.voiceReadback,
+    });
+  }
+
+  private async ackRoom(payload: {
+    armed: boolean;
+    speech: string;
+    text: string;
+    kind: VoiceActionNotice['kind'];
+  }): Promise<boolean> {
+    const res = await this.postRoomJson<{ ok?: boolean; spoke?: boolean }>('/api/voice/ack', payload, 1500);
+    return !!res?.spoke;
   }
 
   private async applyListening(on: boolean, forceRestart = false): Promise<boolean> {
@@ -341,27 +589,29 @@ class VoiceController {
   }
 
   private handleEvent(ev: NativeVoiceEvent): void {
-    if (ev.state === 'paused_bg' || ev.state === 'stopped') {
-      this.listening = false;
-      this.armedUntilMs = 0;
-      this.changed.emit();
-      return;
-    }
-    if (ev.state === 'recovering') {
-      this.listening = false;
-      this.lastError = ev.error ?? 'Recovering mic…';
-      this.changed.emit();
-      return;
-    }
-    if (ev.state === 'error') {
-      this.listening = false;
-      this.lastError = ev.error ?? 'Voice recognition error';
-      this.changed.emit();
-      return;
-    }
-    if (ev.state === 'listening') {
-      this.listening = true;
-      this.lastError = null;
+    if (ev.source === 'mic') {
+      if (ev.state === 'paused_bg' || ev.state === 'stopped') {
+        this.listening = false;
+        this.armedUntilMs = 0;
+        this.changed.emit();
+        return;
+      }
+      if (ev.state === 'recovering') {
+        this.listening = false;
+        this.lastError = ev.error ?? 'Recovering mic…';
+        this.changed.emit();
+        return;
+      }
+      if (ev.state === 'error') {
+        this.listening = false;
+        this.lastError = ev.error ?? 'Voice recognition error';
+        this.changed.emit();
+        return;
+      }
+      if (ev.state === 'listening') {
+        this.listening = true;
+        this.lastError = null;
+      }
     }
 
     const txt = (ev.transcript ?? '').trim();
@@ -374,7 +624,7 @@ class VoiceController {
     }
 
     const wakeWord = getSettings().voiceWakeWord;
-    if (!ev.isFinal && ev.source !== 'lan') {
+    if (!ev.isFinal && ev.source !== 'lan' && ev.source !== 'room') {
       this.lastHeard = pool[0];
       if (!this.isArmed() && pool.some((c) => hasWakeWord(c, wakeWord))) {
         this.armNow();
@@ -386,9 +636,11 @@ class VoiceController {
 
     const now = Date.now();
     const sig = pool[0].toLowerCase();
-    if (sig === this.lastFinalSig && now - this.lastFinalAt < 450) return;
+    const dedupMs = ev.source !== this.lastSource ? 2200 : 450;
+    if (sig === this.lastFinalSig && now - this.lastFinalAt < dedupMs) return;
     this.lastFinalSig = sig;
     this.lastFinalAt = now;
+    this.lastSource = ev.source;
 
     const armed = this.isArmed();
     const customAliases = getSettings().voiceCustomAliases;
@@ -406,14 +658,34 @@ class VoiceController {
     if (!intent) {
       if (hasCommandTailAfterWake(pool[0], wakeWord, armed)) {
         this.armedUntilMs = 0;
-        this.notice(`Didn’t catch “${pool[0]}”`, 'warn', true, "Didn't catch that");
-        this.speak("Didn't catch that");
+        const n = this.notice(`Didn’t catch “${pool[0]}”`, 'warn', true, "Didn't catch that");
+        this.speakWithSource("Didn't catch that", ev.source, n);
       } else {
         this.changed.emit();
       }
       return;
     }
-    this.executeIntent(intent, true);
+    this.executeIntent(intent, true, ev.source);
+  }
+
+  private speakWithSource(
+    speech: string | null | undefined,
+    source: NativeVoiceEvent['source'],
+    notice: VoiceActionNotice,
+  ): void {
+    const cleanSpeech = getSettings().voiceReadback && speech ? speech.trim() : '';
+    if (source === 'room') {
+      void this.ackRoom({
+        armed: this.isArmed(),
+        speech: cleanSpeech,
+        text: notice.text,
+        kind: notice.kind,
+      }).then((spoke) => {
+        if (cleanSpeech && !spoke) this.speak(cleanSpeech);
+      });
+      return;
+    }
+    if (cleanSpeech) this.speak(cleanSpeech);
   }
 
   private notice(
@@ -429,9 +701,17 @@ class VoiceController {
     return n;
   }
 
-  private executeIntent(intent: VoiceIntent, speakIt = false): VoiceActionNotice {
+  private executeIntent(
+    intent: VoiceIntent,
+    speakIt = false,
+    source: NativeVoiceEvent['source'] = 'mic',
+  ): VoiceActionNotice {
     const n = this.runIntent(intent);
-    if (speakIt && n.speech) this.speak(n.speech);
+    if (source === 'room') {
+      this.speakWithSource(speakIt ? (n.speech ?? null) : null, 'room', n);
+    } else if (speakIt && n.speech) {
+      this.speak(n.speech);
+    }
     return n;
   }
 

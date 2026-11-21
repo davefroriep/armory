@@ -192,7 +192,7 @@ export interface WallboardState {
 
 export interface WallboardBuildInput {
   now: number;
-  settings: Pick<Settings, 'hrMax' | 'recoveryHrPct' | 'voiceEnabled' | 'voiceWakeWord' | 'queue'>;
+  settings: Pick<Settings, 'hrMax' | 'recoveryHrPct' | 'voiceEnabled' | 'voiceWakeWord' | 'queue'> & { voiceRoomEnabled?: boolean };
   unit: 'lb' | 'kg';
   hr: { bpm: number; fresh: boolean; recentPoints: { at: number; hr: number }[] };
   voice: { listening: boolean; armed: boolean; banner: WallboardVoiceBanner | null; cursor: CursorRef | null };
@@ -284,7 +284,7 @@ function buildVoiceHint(
   activeSet: LiftSet,
   curPtr: SetPointer,
   rx: CoachPrescription,
-  st: Pick<Settings, 'voiceEnabled' | 'voiceWakeWord'>,
+  st: Pick<Settings, 'voiceEnabled' | 'voiceWakeWord'> & { voiceRoomEnabled?: boolean },
   voice: { listening: boolean; armed: boolean },
 ): WallboardVoiceHint {
   const wakeRaw = (st.voiceWakeWord || 'armory').trim() || 'armory';
@@ -294,7 +294,7 @@ function buildVoiceHint(
     ? 'armed'
     : voice.listening
       ? 'ready'
-      : st.voiceEnabled
+      : (st.voiceEnabled || st.voiceRoomEnabled)
         ? 'standby'
         : 'off';
 
@@ -489,7 +489,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
   else if (fresh && bpm > 0) readiness = bpm <= readyLimitBpm ? 'ready' : 'recovering';
 
   const voiceState = {
-    enabled: st.voiceEnabled,
+    enabled: st.voiceEnabled || (!!st.voiceRoomEnabled && inp.voice.listening),
     listening: inp.voice.listening,
     armed: inp.voice.armed,
     wakeWord: st.voiceWakeWord || 'armory',

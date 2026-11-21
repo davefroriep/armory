@@ -12,6 +12,7 @@ Tracked upcoming hardware, telemetry, and programming milestones for **Armory Fi
 3. **Spin Bike (`Bowflex C7 + SS2K`) Calibration**
    - Calibrate resistance steps against Dave's power pedals (`128–130 W @ 82–88 RPM` Zone 2) and wire the interactive `#/spin` ERG / Zone 2 HUD alongside MyWhoosh reconciliation.
 
-4. **Armory Live Wall Display / Wallboard Stream & Voice Commands *(Framework Shipped `v0.38` — Hardware Placement Pending See [ARMORY_AV_TECH_SETUP.md](./ARMORY_AV_TECH_SETUP.md))***
-   - `v0.38` ships the Pixel APK's built-in **Smart TV Wallboard Server** (`http://<pixel-ip>:8765`, HTTP + SSE + `/api/voice`), **superset-interleaved execution cursor**, and **foreground-scoped Voice Command framework** (`"Armory — 225 for 8"`, `"Armory — check"`, `"Armory — next exercise"`).
-   - Pending physical check: 19" monitor video inputs / spare 32" TV availability / Denon HDMI Out 2 routing, plus optional LAN external mic relay (`POST /api/voice`) via OptiPlex if room speakers overpower the Pixel mic.
+4. **Armory Live Wall Display / Wallboard Stream & Voice Commands *(Wallboard & PowerConf S330 Room Mic Relay Shipped `v0.80` — TV Mount Pending See [ARMORY_AV_TECH_SETUP.md](./ARMORY_AV_TECH_SETUP.md))***
+   - `v0.38`–`v0.61` shipped the Pixel Wallboard Server (`:8765`), **OptiPlex `:8766/wallboard` relay + Fire TV ADB auto-wake**, **superset-interleaved execution cursor**, and **Voice Command parser**.
+   - `v0.80` shipped the live **OptiPlex PowerConf S330 Room Mic Relay** (`faster-whisper` `base.en` + Silero VAD + S330 speaker confirmation readback via `:8766/api/voice/*` SSE, Pixel phone mic OFF by default) + Windows `Win + H` Voice Typing readiness.
+   - Pending physical check: mounting the 32" Fire TV & final ceiling placement of the Anker PowerConf S330 behind the walking desk (plus checking pickup sensitivity once mounted).

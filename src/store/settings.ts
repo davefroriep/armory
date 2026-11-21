@@ -58,6 +58,8 @@ export interface Settings {
   wallboardRelayEnabled: boolean;
   /** Foreground-only hands-free voice command listener ("armory ..."). */
   voiceEnabled: boolean;
+  /** OptiPlex Room Mic (Anker PowerConf S330 via :8766 SSE) during active Strength workouts on home Wi-Fi. */
+  voiceRoomEnabled: boolean;
   voiceWakeWord: string;
   /** Speak short confirmation readbacks ("For 10, got it" / "Didn't catch that") after voice commands. */
   voiceReadback: boolean;
@@ -78,6 +80,7 @@ export interface Settings {
 }
 
 const KEY = 'armory.settings.v1';
+export const ROOM_VOICE_MIG_KEY = 'armory.mig.room_voice_default.v1';
 const BAKED_KEY = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_INTERVALS_API_KEY ?? '').trim();
 const BAKED_PREVIEW_URL = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_GYM_CAM_PREVIEW_URL ?? '').trim();
 
@@ -114,6 +117,7 @@ export const DEFAULTS: Settings = {
   wallboardPort: 8765,
   wallboardRelayEnabled: true,
   voiceEnabled: false,
+  voiceRoomEnabled: true,
   voiceWakeWord: 'armory',
   voiceReadback: true,
   voiceCustomAliases: {},
@@ -137,15 +141,36 @@ function sanitizeAliases(raw: unknown): CustomVoiceAliases {
   return out;
 }
 
+export function migrateRoomVoiceDefault(
+  settings: Settings,
+  storage?: Pick<Storage, 'getItem' | 'setItem'> | null,
+): { settings: Settings; migrated: boolean } {
+  if (!storage) return { settings, migrated: false };
+  try {
+    if (storage.getItem(ROOM_VOICE_MIG_KEY)) return { settings, migrated: false };
+    const next: Settings = {
+      ...settings,
+      voiceEnabled: false,
+      voiceRoomEnabled: true,
+    };
+    storage.setItem(KEY, JSON.stringify(next));
+    storage.setItem(ROOM_VOICE_MIG_KEY, '1');
+    return { settings: next, migrated: true };
+  } catch {
+    return { settings, migrated: false };
+  }
+}
+
 function load(): Settings {
   try {
     const parsed = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<Settings>;
     const defQ = defaultQueueState();
     const q = parsed.queue && typeof parsed.queue === 'object' ? { ...defQ, ...parsed.queue } : defQ;
-    return {
+    const base: Settings = {
       ...DEFAULTS,
       ...parsed,
       apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
+      voiceRoomEnabled: typeof parsed.voiceRoomEnabled === 'boolean' ? parsed.voiceRoomEnabled : DEFAULTS.voiceRoomEnabled,
       voiceReadback: typeof parsed.voiceReadback === 'boolean' ? parsed.voiceReadback : DEFAULTS.voiceReadback,
       gymCamBuddyMode: typeof parsed.gymCamBuddyMode === 'boolean' ? parsed.gymCamBuddyMode : DEFAULTS.gymCamBuddyMode,
       gymCamPreviewUrl: typeof parsed.gymCamPreviewUrl === 'string' && parsed.gymCamPreviewUrl.trim() ? parsed.gymCamPreviewUrl.trim() : DEFAULTS.gymCamPreviewUrl,
@@ -153,6 +178,7 @@ function load(): Settings {
       voiceCustomAliases: sanitizeAliases(parsed.voiceCustomAliases),
       queue: q,
     };
+    return typeof localStorage !== 'undefined' ? migrateRoomVoiceDefault(base, localStorage).settings : base;
   } catch {
     return { ...DEFAULTS, queue: defaultQueueState() };
   }

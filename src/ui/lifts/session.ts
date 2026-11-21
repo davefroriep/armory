@@ -251,24 +251,30 @@ function build(root: HTMLElement, id?: string): () => void {
     const btn = root.querySelector<HTMLElement>('#smic');
     if (!btn) return;
     const lbl = btn.querySelector<HTMLElement>('#smicLbl');
-    const on = getSettings().voiceEnabled;
+    const st = getSettings();
+    const roomLive = st.voiceRoomEnabled && voice.roomListening;
+    const phoneLive = st.voiceEnabled && voice.listening;
+    const anyLive = roomLive || phoneLive;
+    const waiting = st.voiceEnabled && !voice.listening && !roomLive;
     const armed = voice.isArmed();
-    const liveMic = on && voice.listening;
-    const waiting = on && !voice.listening;
-    btn.classList.toggle('on', liveMic && !armed);
-    btn.classList.toggle('armed', on && armed);
+    btn.classList.toggle('on', anyLive && !armed);
+    btn.classList.toggle('armed', (anyLive || st.voiceEnabled || st.voiceRoomEnabled) && armed);
     btn.classList.toggle('warn', waiting);
     if (lbl) {
-      lbl.textContent = !on ? '' : armed ? 'ARMED' : liveMic ? 'MIC' : 'MIC …';
+      lbl.textContent = !anyLive && !waiting ? '' : armed ? 'ARMED' : phoneLive ? 'MIC' : roomLive ? 'ROOM' : 'MIC …';
     }
-    btn.setAttribute('aria-pressed', String(on));
+    btn.setAttribute('aria-pressed', String(st.voiceRoomEnabled || st.voiceEnabled));
     btn.title = armed
       ? 'Listening for command…'
-      : liveMic
-        ? `Mic live — say "${getSettings().voiceWakeWord || 'armory'} …"`
-        : waiting
-          ? 'Voice paused or recovering — tap to restart mic'
-          : 'Enable hands-free voice logging';
+      : roomLive && !phoneLive
+        ? `Room Mic live (${voice.roomDevice || 'PowerConf S330'}) — say "${st.voiceWakeWord || 'armory'} …"`
+        : phoneLive
+          ? `Mic live — say "${st.voiceWakeWord || 'armory'} …"`
+          : waiting
+            ? 'Phone mic recovering — tap for Voice Input'
+            : st.voiceRoomEnabled
+              ? 'Room Mic standby / offline — tap for Voice Input'
+              : 'Enable hands-free voice logging';
   };
 
   const paint = (): void => {
@@ -1137,16 +1143,84 @@ function build(root: HTMLElement, id?: string): () => void {
     }
     if (act === 'voice') {
       if (!edit) {
-        if (getSettings().voiceEnabled && !voice.listening) {
-          void voice.restart().then(() => paintMic());
-        } else {
-          const next = !getSettings().voiceEnabled;
-          void voice.setEnabled(next).then((ok) => {
-            paintMic();
-            if (next && ok) toast(`Voice on — say "${getSettings().voiceWakeWord || 'armory'} …"`);
-            else if (!next) toast('Voice commands off');
-          });
-        }
+        let offSheetVoice = () => {};
+        let offSheetSet = () => {};
+        const sh = openSheet('<div id="vxSheetBody"></div>', {
+          onClose: () => {
+            offSheetVoice();
+            offSheetSet();
+          },
+        });
+        const renderVoiceSheet = (): void => {
+          const st = getSettings();
+          const roomSub = !st.voiceRoomEnabled
+            ? 'Off · tap to use OptiPlex PowerConf S330 on Armory Wi-Fi'
+            : voice.roomListening
+              ? `● Listening on ${voice.roomDevice || 'PowerConf S330'}`
+              : voice.roomOnline
+                ? (voice.roomError ? `Connected · ${voice.roomError}` : `Connected (${voice.roomReady ? 'ready' : 'loading model…'})`)
+                : 'Offline — away from Armory Wi-Fi';
+          const phoneSub = !st.voiceEnabled
+            ? 'Off by default · optional fallback when away from home Wi-Fi'
+            : voice.listening
+              ? '● Listening on Pixel on-device mic'
+              : (voice.lastError || 'Starting / recovering Pixel mic…');
+          const lastTxt = voice.lastAction
+            ? `Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`
+            : voice.lastHeard
+              ? `Heard “${esc(voice.lastHeard)}”`
+              : `Say “${esc(st.voiceWakeWord || 'armory')} 225 for 8” or “check”`;
+          sh.body.querySelector('#vxSheetBody')!.innerHTML = `
+            <h3 class="sh-title">Voice Input</h3>
+            <p class="sh-text">${lastTxt}</p>
+            <button class="aitem${st.voiceRoomEnabled ? ' on' : ''}" type="button" data-vxact="room" style="margin:6px 0">
+              <b>Room Mic · PowerConf S330: ${st.voiceRoomEnabled ? 'ON' : 'OFF'}</b>
+              <small>${esc(roomSub)}</small>
+            </button>
+            <button class="aitem${st.voiceEnabled ? ' on' : ''}" type="button" data-vxact="phone" style="margin:6px 0">
+              <b>Phone Mic (Pixel On-Device): ${st.voiceEnabled ? 'ON' : 'OFF'}</b>
+              <small>${esc(phoneSub)}</small>
+            </button>
+            <button class="aitem${st.voiceReadback ? ' on' : ''}" type="button" data-vxact="readback" style="margin:6px 0">
+              <b>Spoken Readback: ${st.voiceReadback ? 'ON' : 'OFF'}</b>
+              <small>Plays confirmations on PowerConf S330 speaker (or Pixel when away)</small>
+            </button>
+            <div class="vp-foot-row" style="margin-top:8px">
+              ${st.voiceRoomEnabled ? '<button class="btn sm" type="button" data-vxact="reconnect">Reconnect Room Mic</button>' : ''}
+              ${st.voiceEnabled ? '<button class="btn sm" type="button" data-vxact="restartPhone">Restart Phone Mic</button>' : ''}
+            </div>
+            <button class="btn big" type="button" data-vxact="close" style="margin-top:8px">Close</button>`;
+        };
+        offSheetVoice = voice.changed.on(renderVoiceSheet);
+        offSheetSet = settingsChanged.on(renderVoiceSheet);
+        renderVoiceSheet();
+        if (getSettings().voiceRoomEnabled && !voice.roomOnline) void voice.refreshRoomStatus();
+        sh.body.addEventListener('click', (ev) => {
+          const actEl = (ev.target as HTMLElement).closest<HTMLElement>('[data-vxact]');
+          if (!actEl) return;
+          const kind = actEl.dataset.vxact;
+          if (kind === 'close') { sh.close(); return; }
+          if (kind === 'room') {
+            const next = !getSettings().voiceRoomEnabled;
+            voice.setRoomEnabled(next);
+            toast(next ? 'Room Mic enabled (PowerConf S330)' : 'Room Mic off');
+          } else if (kind === 'phone') {
+            const next = !getSettings().voiceEnabled;
+            void voice.setEnabled(next).then((ok) => {
+              paintMic();
+              if (next && ok) toast(`Phone mic on — say "${getSettings().voiceWakeWord || 'armory'} …"`);
+              else if (!next) toast('Phone mic off');
+            });
+          } else if (kind === 'readback') {
+            updateSettings({ voiceReadback: !getSettings().voiceReadback });
+            voice.refreshBiasPhrases();
+          } else if (kind === 'reconnect') {
+            voice.reconnectRoom();
+            toast('Reconnecting Room Mic…');
+          } else if (kind === 'restartPhone') {
+            void voice.restart().then(() => paintMic());
+          }
+        });
       }
       return;
     }
@@ -1263,6 +1337,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (!document.hidden && !dead && !edit) {
       void setKeepScreenOn(true);
       probeAndEnterCam();
+      voice.ensureRoomConnected();
     }
   };
   if (!edit) {

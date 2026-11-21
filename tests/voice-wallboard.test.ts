@@ -3,7 +3,7 @@ import { parentHash } from '../src/nav';
 import { LIBRARY_BY_ID } from '../src/lifts/library';
 import { PHASE1_ROUTINES } from '../src/lifts/seed';
 import { defaultQueueState } from '../src/domain/plan';
-import { DEFAULTS } from '../src/store/settings';
+import { DEFAULTS, ROOM_VOICE_MIG_KEY, migrateRoomVoiceDefault } from '../src/store/settings';
 import { KG_PER_LB } from '../src/lifts/settings';
 import {
   advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
@@ -832,5 +832,70 @@ describe('wallboard snapshot & routing', () => {
     expect(defaultReadbackForIntent({ kind: 'buddy_mode', on: true })).toBe('Buddy mode on');
     expect(defaultReadbackForIntent({ kind: 'buddy_mode', on: false })).toBe('Buddy mode off');
     expect(defaultReadbackForIntent({ kind: 'buddy_mode' })).toBe('Buddy mode toggled');
+  });
+
+  it('defaults to Room Mic ON + Phone Mic OFF, runs one-time migration cleanly, and reflects Room Mic ready on Wallboard', () => {
+    expect(DEFAULTS.voiceRoomEnabled).toBe(true);
+    expect(DEFAULTS.voiceEnabled).toBe(false);
+
+    const store = new Map<string, string>();
+    const memStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+    };
+
+    const existing = { ...DEFAULTS, voiceEnabled: true, voiceRoomEnabled: false };
+    const first = migrateRoomVoiceDefault(existing, memStorage);
+    expect(first.migrated).toBe(true);
+    expect(first.settings.voiceEnabled).toBe(false);
+    expect(first.settings.voiceRoomEnabled).toBe(true);
+    expect(memStorage.getItem(ROOM_VOICE_MIG_KEY)).toBe('1');
+
+    // Subsequent launches do NOT override explicit user toggle once migration key is set
+    const reEnabled = { ...first.settings, voiceEnabled: true };
+    const second = migrateRoomVoiceDefault(reEnabled, memStorage);
+    expect(second.migrated).toBe(false);
+    expect(second.settings.voiceEnabled).toBe(true);
+
+    const now = 5_000_000;
+    const roomSess: LiftSession = {
+      id: 's_room',
+      name: 'Upper 1',
+      routineId: null,
+      eventId: null,
+      startMs: now - 60_000,
+      endMs: null,
+      status: 'active',
+      started: true,
+      exs: mkUpper1(),
+      rpe: null,
+      bwKg: 88.5,
+    };
+    const wbRoom = buildWallboardSnapshot({
+      now,
+      settings: {
+        hrMax: 180,
+        recoveryHrPct: 72,
+        voiceEnabled: false,
+        voiceRoomEnabled: true,
+        voiceWakeWord: 'armory',
+        queue: defaultQueueState(),
+      },
+      unit: 'lb',
+      hr: { bpm: 112, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: roomSess,
+      elapsedSec: 60,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(wbRoom.voice.enabled).toBe(true);
+    expect(wbRoom.voice.listening).toBe(true);
+    expect(wbRoom.lift!.stage!.stations[0].voiceHint!.micState).toBe('ready');
   });
 });

@@ -45,7 +45,7 @@ export function buildWallboardState(now = Date.now()): WallboardState {
     unit: liftSettings().unit,
     hr: { bpm: live.hr, fresh: hrFresh(now), recentPoints: recentHrPoints(60_000, now) },
     voice: {
-      listening: voice.listening,
+      listening: voice.isAnyListening(),
       armed: voice.isArmed(now),
       banner: voice.lastAction,
       cursor: voice.cursor,

@@ -8,7 +8,7 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so A
 
 - **Primary Training Controller:** **Armory Fit** runs strictly as a native Android APK (`com.froriep.armoryfit`) on Dave's **Google Pixel**.
 - **Gym Wi-Fi & Static/Reserved Hosts:**
-  - `192.168.1.152` — **Dell OptiPlex** (`i7-4790` / `GTX 1650`, `S:\` `500 GB`, Windows daily driver, **never sleeps**). Runs `ArmoryCamDVR` on port `8766` (scheduled logon task, zero UAC). Connected locally to Hisense HDMI 1 + desk keyboard/mouse.
+  - `192.168.1.152` — **Dell OptiPlex** (`i7-4790` / `GTX 1650`, `S:\` `500 GB`, Windows daily driver, **never sleeps**). Runs `ArmoryCamDVR` on port `8766` (scheduled logon task, zero UAC). Connected locally to Hisense HDMI 1 + desk keyboard/mouse + **Anker PowerConf S330** USB speakerphone (`Room Voice Mic` + Windows dictation).
   - `192.168.1.15` — **Denon AVR-3313CI** on wired Ethernet (Telnet `:23`, HTTP `:80`, UPnP `:8080`).
   - `192.168.1.13` — **Armory-Rack** Wyze Cam v3 (`Thingino` open firmware, `1920×1080 H.264 @ 25 fps + AAC`, `rtsp://.../ch0`).
   - `192.168.1.14` — **Armory-Smith** Wyze Cam v3 (`Thingino` open firmware, `1920×1080 H.264 @ 25 fps + AAC`, `rtsp://.../ch0`).
@@ -22,7 +22,8 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so A
 [ OptiPlex 192.168.1.152 ] ───HDMI──────────────────────────────────────▶ [ Hisense 43" 43E6QF (HDMI 1) ]
   │ (ArmoryCamDVR :8766)                                                           ▲
   │  ├── Dual Wyze Cam v3 (.13 Rack / .14 Smith) ──RTSP──▶ 24/7 Ring + Clips       │ HDMI Out 1 (4K/1080p)
-  │  └── /wallboard Relay + ADB over Wi-Fi ──▶ [ 32" Fire TV (Wi-Fi Silk) ]        │
+  │  ├── /wallboard Relay + ADB over Wi-Fi ──▶ [ 32" Fire TV (Wi-Fi Silk) ]        │
+  │  └── [ Anker PowerConf S330 (USB) ] ──▶ Room Mic SSE (/api/voice/*) + Win+H    │
                                                                                    │
 [ Fire TV Cube ] ──HDMI──▶ [ Denon AVR-3313CI (192.168.1.15, Multi-Ch Stereo) ] ───┴──▶ HDMI Out 2: [ TCL Roku TV (1080p) ]
                                     │
@@ -53,7 +54,19 @@ Instead of pointing the 32" TV at the Pixel's changing DHCP IP (`:8765`), the 32
 
 ---
 
-## 4. Active BLE Cardio & Strength Sensors
+## 4. Room Voice Mic Relay & Windows Voice Typing (Anker PowerConf S330)
+
+- **Hardware:** **Anker PowerConf S330** connected over USB to OptiPlex (`192.168.1.152`). Currently positioned on the treadmill walking desk (and planned for overhead ceiling placement behind the walking desk).
+- **Armory Fit Room Voice Engine (`server/armory_cam/room_voice.py` on `:8766`):**
+  - Captures audio via **WASAPI Shared Mode** (automatic `Windows WDM-KS` fallback during RDP sessions), runs Silero VAD (`silero_vad_v6.onnx`) + `faster-whisper` (`base.en` `int8` CPU, ~`1.1–1.4 s`), and broadcasts wake-word-gated commands (`"Armory …"`) over `GET /api/voice/events` SSE directly to the Pixel APK (`voiceRoomEnabled` default `true`, Pixel phone mic `voiceEnabled` default `false`).
+  - Spoken confirmations (`"225 for 8, got it"`) route directly back out of the **PowerConf S330 speaker** (`POST /api/voice/ack`) while muting capture over the playback window so the speaker never self-triggers; falls back to Pixel TTS if off-LAN.
+  - **Shared-Mode Coexistence (`listenMode = "workout"` default):** OptiPlex keeps the S330 microphone closed while idle and opens it ONLY when an active Strength workout (or dashboard 60 s mic test) is running, so **Windows 11 Voice Typing (`Win + H`)** works cleanly anytime at the walking desk.
+- **Ceiling vs. Walking Desk Acoustics Notes:**
+  - Moving the S330 from desk height to the ceiling behind the walking desk adds path distance (~2–4 ft → ~7–9 ft), puts the treadmill deck/motor fan closer to the bottom/rear boundary, and shifts speech slightly off-axis when facing the Hisense monitor. The S330's 4-mic omni array handles 10–15 ft rooms well; if ceiling height picks up extra motor hum or misses quiet commands, check the **Room Voice Mic** live meter at `http://192.168.1.152:8766/`, trim `vadThreshold` (`0.45 -> 0.35`), and for Windows dictation (`Win + H`) disable AGC/boost only if treadmill noise causes false starts.
+
+---
+
+## 5. Active BLE Cardio & Strength Sensors
 
 - **Polar H10** chest strap (`0x180D` / `0x2A37`, Dual-BLE enabled).
 - **Assault AirBike Elite** (`AssaultBike` XIAO ESP32-C6, 5 Hz NUS + passive FTMS, `ratio=11.1100`).

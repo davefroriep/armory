@@ -40,6 +40,11 @@ from flask import Flask, Response, jsonify, request
 import numpy as np
 from werkzeug.serving import make_server
 
+try:
+    from .room_voice import RoomVoiceConfig, RoomVoiceService
+except ImportError:
+    from room_voice import RoomVoiceConfig, RoomVoiceService
+
 DEFAULT_PORT = 8766
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_PRE_ROLL_SEC = 120
@@ -1665,6 +1670,7 @@ class ArmoryCamService:
         adb_controller: FireTvAdbController | None = None,
         drive_backup_dir: str | Path | None = None,
         ntfy_topic: str | None = None,
+        voice_autostart: bool | None = None,
     ) -> None:
         self.root = (root_dir or default_root_dir()).resolve()
         self.ring_root = self.root / "ring"
@@ -1697,6 +1703,13 @@ class ArmoryCamService:
         self.wallboard_cfg = WallboardConfig()
         self.wallboard = WallboardRelay(self.root)
         self.adb = adb_controller or FireTvAdbController()
+        self._voice_autostart = (root_dir is None) if voice_autostart is None else bool(voice_autostart)
+        self.voice_cfg = RoomVoiceConfig()
+        self.voice = RoomVoiceService(
+            config=self.voice_cfg,
+            on_fallback_transcript=self._forward_voice_to_wallboard_source,
+            allow_hardware_audio=self._voice_autostart,
+        )
 
         self.lock = threading.RLock()
         self.port = DEFAULT_PORT
@@ -1882,6 +1895,8 @@ class ArmoryCamService:
         if not self.config_path.exists():
             self.cameras = default_cams
             self.wallboard_cfg = WallboardConfig()
+            self.voice_cfg = RoomVoiceConfig()
+            self.voice.update_config(self.voice_cfg.to_dict())
             self.save_config()
             return
         try:
@@ -1896,6 +1911,8 @@ class ArmoryCamService:
             )
             self.drift_alert_ntfy = bool(raw.get("driftAlertNtfy", False))
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
+            self.voice_cfg = RoomVoiceConfig.from_dict(raw.get("voice"))
+            self.voice.update_config(self.voice_cfg.to_dict())
             raw_cams = [item for item in raw.get("cameras", []) if isinstance(item, dict) and str(item.get("name", "")).strip()]
             loaded = self._build_camera_configs(raw_cams) if raw_cams else []
             self.cameras = loaded or default_cams
@@ -1913,10 +1930,31 @@ class ArmoryCamService:
             "driftAlertNtfy": self.drift_alert_ntfy,
             "cameras": [c.to_dict() for c in self.cameras],
             "wallboard": self.wallboard_cfg.to_dict(),
+            "voice": self.voice_cfg.to_dict(),
         }
         tmp = self.config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.config_path)
+
+    def _forward_voice_to_wallboard_source(self, transcript: str) -> None:
+        clean = str(transcript or "").strip()
+        if not clean:
+            return
+        with self.wallboard.cond:
+            target_base = self.wallboard.source_url
+        if not target_base:
+            return
+        req = urllib.request.Request(
+            f"{target_base}/api/voice",
+            data=json.dumps({"transcript": clean}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=2.0):
+                pass
+        except Exception:
+            pass
 
     def effective_wallboard_url(self) -> str:
         with self.lock:
@@ -1975,6 +2013,8 @@ class ArmoryCamService:
             if isinstance(raw.get("wallboard"), dict):
                 merged = {**self.wallboard_cfg.to_dict(), **raw["wallboard"]}
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
+            if isinstance(raw.get("voice"), dict):
+                self.voice_cfg = self.voice.update_config(raw["voice"])
             if isinstance(raw.get("cameras"), list):
                 next_cams = self._build_camera_configs(raw["cameras"], prev_by_slug=prev_by_slug)
                 if next_cams:
@@ -2052,9 +2092,12 @@ class ArmoryCamService:
             backfill_t = threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True)
             backfill_t.start()
             self._worker_threads.append(backfill_t)
+            if self._voice_autostart:
+                self.voice.start()
 
     def stop_background(self) -> None:
         self._stop_event.set()
+        self.voice.stop()
         self.live_hub.stop_all()
         with self.lock:
             for slug in list(self._procs.keys()):
@@ -4178,6 +4221,7 @@ class ArmoryCamService:
                 "preview": self.preview_drive_info(),
                 "cameras": cams,
                 "wallboard": wb_status,
+                "voice": self.voice.status_dict(),
             }
 
 
@@ -4374,6 +4418,49 @@ DASHBOARD_HTML = """<!doctype html>
       <button class="btn sec" id="wbSleepBtn" type="button">Sleep TV Now</button>
       <span id="wbOut" style="color:var(--mut);font-size:12px"></span>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>
+      <span>Room Voice Mic (PowerConf S330)</span>
+      <span id="vxBadge" class="pill">CHECKING</span>
+    </h2>
+    <div id="vxMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">WASAPI Shared Mode opens automatically only during active Strength workouts so Windows Voice Typing (<code>Win + H</code>) works anytime.</div>
+    <div class="mbar-wrap" style="margin-bottom:8px"><div id="vxMeter" class="mbar-fill"></div></div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+      <div>
+        <label>Room Mic Relay</label>
+        <select id="vxEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select>
+      </div>
+      <div>
+        <label>Listen Mode</label>
+        <select id="vxMode"><option value="workout">Active Lift Workout</option><option value="always">Always Listening</option></select>
+      </div>
+      <div>
+        <label>Input Microphone</label>
+        <select id="vxDevice"><option value="PowerConf S330">PowerConf S330 (Auto)</option></select>
+      </div>
+      <div>
+        <label>Spoken Readback (S330 Speaker)</label>
+        <select id="vxReadback"><option value="1">Yes (Speak on S330)</option><option value="0">No (Pixel Only)</option></select>
+      </div>
+      <div>
+        <label>Whisper Model (CPU int8)</label>
+        <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (most accurate)</option></select>
+      </div>
+      <div>
+        <label>VAD Threshold (0.15–0.90)</label>
+        <input id="vxVad" type="number" min="0.15" max="0.90" step="0.05" value="0.45">
+      </div>
+    </div>
+    <div class="ctrl-row" style="margin-top:10px">
+      <button class="btn" id="vxSaveBtn" type="button">Save Voice</button>
+      <button class="btn ok" id="vxTestBtn" type="button">Test Mic (60s)</button>
+      <button class="btn sec" id="vxSpeakBtn" type="button">Test Speaker</button>
+      <button class="btn sec" id="vxInjectBtn" type="button">Send &ldquo;Armory check&rdquo;</button>
+      <span id="vxOut" style="color:var(--mut);font-size:12px"></span>
+    </div>
+    <div id="vxRecent" style="margin-top:10px;color:var(--mut);font-size:12px">No voice utterances captured yet.</div>
   </div>
 
   <div class="card" style="margin-top:14px">
@@ -6432,6 +6519,108 @@ async function saveConfig(triggerBtn = null) {
   }
 }
 
+function syncVoiceUI(vx) {
+  if (!vx) return;
+  const badge = $('vxBadge');
+  if (badge) {
+    let lbl = 'OFF';
+    let cls = 'pill';
+    if (!vx.enabled) { lbl = 'OFF'; cls = 'pill'; }
+    else if (vx.error) { lbl = 'ERROR'; cls = 'pill'; }
+    else if (vx.armed) { lbl = 'ARMED'; cls = 'pill ok'; }
+    else if (vx.listening) { lbl = 'LISTENING'; cls = 'pill ok'; }
+    else if (vx.loading) { lbl = 'LOADING…'; cls = 'pill live'; }
+    else { lbl = vx.ready ? 'STANDBY' : 'INIT…'; cls = 'pill live'; }
+    badge.textContent = lbl;
+    badge.className = cls;
+  }
+  const meter = $('vxMeter');
+  if (meter) {
+    const pct = clamp((Number(vx.rms || 0) / 0.08) * 100, 0, 100);
+    meter.style.width = pct.toFixed(1) + '%';
+    meter.classList.toggle('hot', Number(vx.vad || 0) >= Number((vx.config && vx.config.vadThreshold) || 0.45));
+  }
+  const testBtn = $('vxTestBtn');
+  if (testBtn) {
+    testBtn.textContent = vx.testRemainingSec > 0 ? `Stop Test (${vx.testRemainingSec}s)` : 'Test Mic (60s)';
+    testBtn.dataset.testing = vx.testRemainingSec > 0 ? '1' : '0';
+  }
+  const msgEl = $('vxMsg');
+  if (msgEl) {
+    const parts = [
+      `Mic: <b>${vx.device || 'PowerConf S330'}</b>${vx.hostApi ? ` (${vx.hostApi})` : ''}`,
+      `Model: <b>${vx.modelSize || 'base.en'}</b>`,
+      `SSE: <b>${vx.sseClients || 0}</b>`,
+    ];
+    if (vx.error) parts.push(`<span style="color:var(--amber)">${vx.error}</span>`);
+    else if (!vx.listening && vx.enabled) parts.push('Shared mic closed until active Lift workout');
+    msgEl.innerHTML = parts.join(' · ');
+  }
+  const recEl = $('vxRecent');
+  if (recEl) {
+    const rows = Array.isArray(vx.recent) ? vx.recent : [];
+    if (!rows.length) {
+      recEl.textContent = 'No voice utterances captured yet.';
+    } else {
+      recEl.innerHTML = `<table><thead><tr><th>Time</th><th>Heard</th><th>Wake</th><th>ASR</th><th>Pixel Ack</th></tr></thead><tbody>` +
+        rows.map(r => {
+          const ts = new Date(r.tsMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          return `<tr><td>${ts}</td><td>${r.transcript}</td><td>${r.emitted ? '<span class="pill ok">SENT</span>' : '<span class="pill">IGNORED</span>'}</td><td>${r.latencyMs} ms</td><td>${r.ackText || '—'}</td></tr>`;
+        }).join('') +
+        `</tbody></table>`;
+    }
+  }
+}
+
+async function pollVoiceStatus() {
+  try {
+    const vx = await fetch('/api/voice/status').then(r => r.json());
+    if (vx.devices && Array.isArray(vx.devices.inputs)) {
+      const sel = $('vxDevice');
+      if (sel) {
+        const cur = (vx.config && vx.config.deviceMatch) || sel.value || 'PowerConf S330';
+        const seen = new Set(['PowerConf S330']);
+        const opts = ['<option value="PowerConf S330">PowerConf S330 (Auto)</option>'];
+        vx.devices.inputs.forEach(d => {
+          if (d.name && !seen.has(d.name)) {
+            seen.add(d.name);
+            opts.push(`<option value="${d.name.replace(/"/g, '&quot;')}">${d.name} (${d.hostApi})</option>`);
+          }
+        });
+        if (cur && !seen.has(cur)) opts.push(`<option value="${cur.replace(/"/g, '&quot;')}">${cur}</option>`);
+        if (document.activeElement !== sel) {
+          sel.innerHTML = opts.join('');
+          sel.value = cur;
+        }
+      }
+    }
+    if (vx.config && cfg) cfg.voice = vx.config;
+    syncVoiceUI(vx);
+  } catch {}
+}
+
+async function saveVoiceConfig(triggerBtn) {
+  const body = {
+    enabled: $('vxEnabled').value === '1',
+    listenMode: $('vxMode').value || 'workout',
+    deviceMatch: $('vxDevice').value || 'PowerConf S330',
+    speakerReadback: $('vxReadback').value === '1',
+    modelSize: $('vxModel').value || 'base.en',
+    vadThreshold: Number($('vxVad').value) || 0.45,
+  };
+  try {
+    const r = await fetch('/api/voice/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    if (!r || !r.ok) throw new Error('Rejected');
+    if (cfg) cfg.voice = r.config;
+    syncVoiceUI(r.status);
+    $('vxOut').textContent = 'Voice settings saved!';
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2000);
+  } catch {
+    $('vxOut').textContent = 'Save failed';
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Failed', 2500);
+  }
+}
+
 async function pollStatus() {
   try {
     const st = await fetch('/api/status').then(r => r.json());
@@ -6496,6 +6685,9 @@ async function pollStatus() {
       cfg.alignment = st.alignment;
       syncAlignmentUI();
     }
+    if (st.voice) {
+      syncVoiceUI(st.voice);
+    }
   } catch {}
 }
 
@@ -6527,12 +6719,19 @@ async function init() {
   $('wbIdleMin').value = Math.max(1, Math.round((wb.idleSleepSec || 600) / 60));
   $('wbWake').value = wb.wakeOnStart === false ? '0' : '1';
   $('wbSleep').value = wb.sleepOnStop === false ? '0' : '1';
+  const vx = cfg.voice || {};
+  $('vxEnabled').value = vx.enabled === false ? '0' : '1';
+  $('vxMode').value = vx.listenMode === 'always' ? 'always' : 'workout';
+  $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
+  $('vxModel').value = vx.modelSize || 'base.en';
+  $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
   renderCameras();
   syncAlignmentUI();
   wireMaskModal();
   setInterval(drawAllCanvases, 100);
-  await Promise.all([pollStatus(), pollClips()]);
+  await Promise.all([pollStatus(), pollVoiceStatus(), pollClips()]);
   setInterval(pollStatus, 1000);
+  setInterval(pollVoiceStatus, 3000);
   setInterval(pollClips, 6000);
 }
 
@@ -6571,6 +6770,24 @@ $('wbSleepBtn').onclick = async () => {
   $('wbOut').textContent = 'Sleeping TV…';
   const r = await fetch('/api/wallboard/sleep', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ reason: 'manual', delaySec: 0, sync: true }) }).then(x => x.json());
   $('wbOut').textContent = (r.adb && r.adb.message) || 'Sent sleep';
+};
+$('vxSaveBtn').onclick = () => saveVoiceConfig($('vxSaveBtn'));
+$('vxTestBtn').onclick = async () => {
+  const testing = $('vxTestBtn').dataset.testing === '1';
+  const sec = testing ? 0 : 60;
+  const r = await fetch('/api/voice/test-listen', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ seconds: sec }) }).then(x => x.json());
+  syncVoiceUI(r.status);
+  $('vxOut').textContent = sec > 0 ? 'Test mic opened for 60s — say "Armory 225 for 8"' : 'Test mic closed';
+};
+$('vxSpeakBtn').onclick = async () => {
+  $('vxOut').textContent = 'Testing PowerConf S330 speaker…';
+  const r = await fetch('/api/voice/test-speak', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ text: 'Armory room mic ready' }) }).then(x => x.json());
+  $('vxOut').textContent = r.spoke ? '✓ Played on PowerConf S330' : 'Speaker device unavailable';
+};
+$('vxInjectBtn').onclick = async () => {
+  const r = await fetch('/api/voice/inject', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ transcript: 'Armory check' }) }).then(x => x.json());
+  $('vxOut').textContent = r.ok ? 'Sent "Armory check" to Pixel SSE stream' : 'Failed';
+  await pollVoiceStatus();
 };
 init();
 </script>
@@ -6643,6 +6860,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             paused = service.paused
             ret_days = service.retention_days
         prev = service.preview_drive_info()
+        vx = service.voice.status_dict()
         payload: dict[str, Any] = {
             "service": "armory-cam",
             "serverEpochMs": int(time.time() * 1000),
@@ -6650,6 +6868,12 @@ def create_app(service: ArmoryCamService) -> Flask:
             "paused": paused,
             "retentionDays": ret_days,
             "cameras": cams,
+            "voice": {
+                "enabled": vx["enabled"],
+                "ready": vx["ready"],
+                "listening": vx["listening"],
+                "device": vx["device"],
+            },
         }
         if prev.get("driveUrl"):
             payload["previewDriveUrl"] = prev["driveUrl"]
@@ -6697,6 +6921,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "alignment": service.alignment_snapshot(),
                 "cameras": cams,
                 "wallboard": service.wallboard_cfg.to_dict(),
+                "voice": service.voice_cfg.to_dict(),
                 "disk": service.disk_stats(),
             }
         return jsonify(payload)
@@ -6817,6 +7042,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         workout_active = bool(body.get("workoutActive", False))
         source_url = str(body.get("sourceUrl") or "")
         service.wallboard.update_state(state_obj, workout_active=workout_active, source_url=source_url)
+        service.voice.set_wallboard_active(bool(workout_active and isinstance(state_obj, dict) and state_obj.get("mode") == "lift"))
         with service.lock:
             cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
         if workout_active:
@@ -6841,6 +7067,8 @@ def create_app(service: ArmoryCamService) -> Flask:
         force = bool(body.get("force", False))
         sync_flag = bool(body.get("sync", False))
         service.wallboard.mark_active_wake(state_obj=state_obj, source_url=source_url)
+        if isinstance(state_obj, dict):
+            service.voice.set_wallboard_active(state_obj.get("mode") == "lift")
         with service.lock:
             cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
             url = service.effective_wallboard_url()
@@ -6868,6 +7096,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         delay_sec = max(0.0, float(body.get("delaySec", 0) or 0))
         sync_flag = bool(body.get("sync", False))
         service.wallboard.update_state(state_obj, workout_active=False)
+        service.voice.set_wallboard_active(False)
         with service.lock:
             cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
         if reason != "manual" and not cfg.sleep_on_stop:
@@ -6893,6 +7122,83 @@ def create_app(service: ArmoryCamService) -> Flask:
             cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
         res = service.adb.connect_and_probe(cfg)
         return jsonify(res)
+
+    @app.get("/api/voice/status")
+    def api_voice_status() -> Response:
+        resp = jsonify(service.voice.status_dict(include_devices=True))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/voice/events")
+    def api_voice_events() -> Response:
+        wake_arg = request.args.get("wake")
+        if wake_arg is not None and str(wake_arg).strip():
+            service.voice.set_context(wake_word=str(wake_arg).strip())
+        after_raw = request.args.get("afterId")
+        after_id = int(after_raw) if after_raw and after_raw.isdigit() else None
+        resp = Response(service.voice.subscribe_sse(after_id=after_id), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
+    @app.post("/api/voice/context")
+    def api_voice_context() -> Response:
+        body = request.get_json(silent=True) or {}
+        active_arg = bool(body["active"]) if "active" in body else None
+        wake_arg = str(body["wakeWord"]) if "wakeWord" in body else None
+        bias_arg = body.get("biasPhrases") if isinstance(body.get("biasPhrases"), list) else None
+        rb_arg = bool(body["readback"]) if "readback" in body else None
+        st = service.voice.set_context(
+            active=active_arg,
+            wake_word=wake_arg,
+            bias_phrases=bias_arg,
+            readback=rb_arg,
+        )
+        return jsonify({"ok": True, "status": st})
+
+    @app.post("/api/voice/ack")
+    def api_voice_ack() -> Response:
+        body = request.get_json(silent=True) or {}
+        armed_arg = bool(body["armed"]) if "armed" in body and body["armed"] is not None else None
+        speech_arg = str(body.get("speech") or "")
+        text_arg = str(body.get("text") or "")
+        res = service.voice.handle_ack(armed=armed_arg, speech=speech_arg, text=text_arg)
+        return jsonify(res)
+
+    @app.post("/api/voice/config")
+    def api_voice_config() -> Response:
+        body = request.get_json(silent=True) or {}
+        with service.lock:
+            service.voice_cfg = service.voice.update_config(body)
+            service.save_config()
+            cfg_dict = service.voice_cfg.to_dict()
+        return jsonify({"ok": True, "config": cfg_dict, "status": service.voice.status_dict()})
+
+    @app.post("/api/voice/test-listen")
+    def api_voice_test_listen() -> Response:
+        body = request.get_json(silent=True) or {}
+        if body.get("active") is False:
+            sec = 0.0
+        else:
+            sec = float(body.get("seconds", 60) or 0)
+        st = service.voice.start_test_listen(sec)
+        return jsonify({"ok": True, "status": st})
+
+    @app.post("/api/voice/test-speak")
+    def api_voice_test_speak() -> Response:
+        body = request.get_json(silent=True) or {}
+        text = str(body.get("text") or "Armory room mic ready").strip()
+        spoke = service.voice.speak_confirmation(text)
+        return jsonify({"ok": True, "spoke": spoke, "text": text})
+
+    @app.post("/api/voice/inject")
+    def api_voice_inject() -> Response:
+        body = request.get_json(silent=True) or {}
+        transcript = str(body.get("transcript") or "").strip()
+        if not transcript:
+            return jsonify({"ok": False, "error": "Empty transcript"}), 400
+        entry = service.voice.inject_transcript(transcript)
+        return jsonify({"ok": True, "entry": entry})
 
     @app.get("/api/clips")
     def api_clips() -> Response:

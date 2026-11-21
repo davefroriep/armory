@@ -77,8 +77,9 @@ export function settingsScreen(root: HTMLElement): () => void {
 
     <h2 class="sec">VOICE COMMANDS</h2>
     <section class="card">
-      <div class="line"><span>Hands-Free Voice Commands<small>Strength workouts only · listens while an active lift is open</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
-      <div class="line"><span>Spoken Voice Readback<small>Says “For 10, got it” or “Didn’t catch that” after commands</small></span>${tog('voiceReadback', s.voiceReadback)}</div>
+      <div class="line"><span>Room Mic (OptiPlex PowerConf S330)<small>Default on Armory Wi-Fi · listens on OptiPlex during active Strength workouts</small></span>${tog('voiceRoomEnabled', s.voiceRoomEnabled)}</div>
+      <div class="line"><span>Phone Mic (Pixel On-Device)<small>Off by default · optional fallback when away from home Wi-Fi</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
+      <div class="line"><span>Spoken Voice Readback<small>Plays confirmations on PowerConf S330 speaker (or Pixel when away)</small></span>${tog('voiceReadback', s.voiceReadback)}</div>
       <label class="field">Wake word<input id="vxWake" value="${esc(s.voiceWakeWord || 'armory')}" placeholder="armory" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
       <div class="hint" id="vxStatus"></div>
       <div class="row" style="margin-top:4px">
@@ -193,6 +194,11 @@ export function settingsScreen(root: HTMLElement): () => void {
       ? `<b>TV URL (OptiPlex):</b> <code>${esc(wallboard.relayUrl())}</code> · ${localTxt}`
       : localTxt;
 
+    const vxRoomTog = root.querySelector<HTMLElement>('[data-tog="voiceRoomEnabled"]');
+    if (vxRoomTog) {
+      vxRoomTog.classList.toggle('on', cur.voiceRoomEnabled);
+      vxRoomTog.setAttribute('aria-checked', String(cur.voiceRoomEnabled));
+    }
     const vxTog = $<HTMLElement>('#vxTog', root);
     vxTog.classList.toggle('on', cur.voiceEnabled);
     vxTog.setAttribute('aria-checked', String(cur.voiceEnabled));
@@ -202,9 +208,19 @@ export function settingsScreen(root: HTMLElement): () => void {
       vxRb.setAttribute('aria-checked', String(cur.voiceReadback));
     }
     const vxEl = $('#vxStatus', root);
-    if (voice.lastError) vxEl.innerHTML = `<span style="color:#fca5a5">${esc(voice.lastError)}</span>`;
-    else if (voice.lastAction) vxEl.innerHTML = `Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
-    else vxEl.textContent = cur.voiceEnabled ? `${voice.listening ? `● Listening for “${cur.voiceWakeWord || 'armory'}”` : 'Ready while Armory Fit is open'}${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}` : 'Off';
+    const roomPart = !cur.voiceRoomEnabled
+      ? 'Room Mic off'
+      : voice.roomListening
+        ? `● Room Mic listening (${esc(voice.roomDevice || 'PowerConf S330')})`
+        : voice.roomOnline
+          ? `✓ Room Mic ready (${esc(voice.roomDevice || 'PowerConf S330')})`
+          : 'Room Mic offline (away from Armory Wi-Fi)';
+    const phonePart = cur.voiceEnabled
+      ? (voice.listening ? '● Pixel mic listening' : 'Pixel mic ready on workout')
+      : 'Pixel mic off';
+    if (voice.lastError) vxEl.innerHTML = `${roomPart} · <span style="color:#fca5a5">${esc(voice.lastError)}</span>`;
+    else if (voice.lastAction) vxEl.innerHTML = `${roomPart} · Last: <b>${esc(voice.lastAction.text)}</b>${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
+    else vxEl.innerHTML = `${roomPart} · ${phonePart}${voice.lastHeard ? ` · Heard “${esc(voice.lastHeard)}”` : ''}`;
 
     const aliasListEl = root.querySelector<HTMLElement>('#vxAliasList');
     const aliases = cur.voiceCustomAliases ?? {};
@@ -295,6 +311,7 @@ export function settingsScreen(root: HTMLElement): () => void {
   const offVx = voice.changed.on(paintFtpBox);
   const offCam = gymCam.changed.on(paintFtpBox);
   void wallboard.refreshStatus();
+  void voice.refreshRoomStatus();
   if (hasKey()) void syncAthleteFtp(false).catch(() => {});
 
   const onClick = (e: Event) => {
@@ -307,13 +324,14 @@ export function settingsScreen(root: HTMLElement): () => void {
     }
     const tg = t.closest<HTMLElement>('[data-tog]');
     if (tg) {
-      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'gymCamBuddyMode' | 'wallboardRelayEnabled' | 'voiceReadback';
+      const name = tg.dataset.tog as 'ftpAutoSync' | 'metroAutoMute' | 'chime' | 'haptics' | 'simulator' | 'gymCamEnabled' | 'gymCamAutoPr' | 'gymCamBuddyMode' | 'wallboardRelayEnabled' | 'voiceRoomEnabled' | 'voiceReadback';
       const on = !getSettings()[name];
       updateSettings({ [name]: on });
       tg.classList.toggle('on', on);
       tg.setAttribute('aria-checked', String(on));
       if (name === 'ftpAutoSync' && on) void syncAthleteFtp(true).catch(() => {});
       if (name === 'gymCamEnabled') void runCamProbe(false);
+      if (name === 'voiceRoomEnabled') void voice.refreshRoomStatus();
       if (name === 'gymCamBuddyMode' && lifts.active) {
         lifts.active.buddyMode = on;
         lifts.saveSession(lifts.active, true);
