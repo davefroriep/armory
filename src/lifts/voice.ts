@@ -156,6 +156,9 @@ class VoiceController {
   private abExecAtMs = 0;
   private abExecSource: NativeVoiceEvent['source'] | null = null;
   private lastConfirmTag: string | null = null;
+  private partialCommitTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastPartialCommitKey = '';
+  private lastPartialCommitAt = 0;
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
@@ -252,6 +255,7 @@ class VoiceController {
         return false;
       }
     }
+    this.cancelPartialCommit();
     this.shootoutListener = cb;
     this.shootoutActive = true;
     this.syncSessionFromSettings();
@@ -261,10 +265,18 @@ class VoiceController {
 
   stopShootout(): void {
     if (!this.shootoutActive && !this.shootoutListener) return;
+    this.cancelPartialCommit();
     this.shootoutActive = false;
     this.shootoutListener = null;
     this.syncSessionFromSettings();
     this.changed.emit();
+  }
+
+  private cancelPartialCommit(): void {
+    if (this.partialCommitTimer) {
+      clearTimeout(this.partialCommitTimer);
+      this.partialCommitTimer = null;
+    }
   }
 
   async fetchAbSummary(): Promise<AbSummary | null> {
@@ -637,6 +649,7 @@ class VoiceController {
   }
 
   private async applyListening(on: boolean, forceRestart = false): Promise<boolean> {
+    if (!on) this.cancelPartialCommit();
     if (isNative()) {
       this.nativeDesired = on;
       const res = await setNativeVoiceListening(on, on ? this.biasPhrases() : [], forceRestart);
@@ -725,18 +738,21 @@ class VoiceController {
   private handleEvent(ev: NativeVoiceEvent): void {
     if (ev.source === 'mic') {
       if (ev.state === 'paused_bg' || ev.state === 'stopped') {
+        this.cancelPartialCommit();
         this.listening = false;
         this.armedUntilMs = 0;
         this.changed.emit();
         return;
       }
       if (ev.state === 'recovering') {
+        this.cancelPartialCommit();
         this.listening = false;
         this.lastError = ev.error ?? 'Recovering mic…';
         this.changed.emit();
         return;
       }
       if (ev.state === 'error') {
+        this.cancelPartialCommit();
         this.listening = false;
         this.lastError = ev.error ?? 'Voice recognition error';
         this.changed.emit();
@@ -765,9 +781,46 @@ class VoiceController {
         this.armNow();
         buzz(20);
       }
+      if (!this.shootoutActive && ev.source === 'mic') {
+        this.cancelPartialCommit();
+        let candHit: string | null = null;
+        let intentHit: VoiceIntent | null = null;
+        for (const cand of pool) {
+          const hit = parseVoiceTranscript(cand, {
+            wakeWord,
+            armed: this.isArmed(),
+            customAliases: s.voiceCustomAliases,
+          });
+          if (hit && hit.kind !== 'arm_wake') {
+            candHit = cand;
+            intentHit = hit;
+            break;
+          }
+        }
+        if (candHit && intentHit) {
+          const candSnap = candHit;
+          const poolSnap = [...pool];
+          const keySnap = voiceIntentKey(intentHit);
+          this.partialCommitTimer = setTimeout(() => {
+            this.partialCommitTimer = null;
+            if (this.shootoutActive) return;
+            this.handleEvent({
+              transcript: candSnap,
+              candidates: poolSnap,
+              isFinal: true,
+              source: 'mic',
+              state: 'listening',
+            });
+            this.lastPartialCommitKey = keySnap;
+            this.lastPartialCommitAt = Date.now();
+          }, 650);
+        }
+      }
       this.changed.emit();
       return;
     }
+
+    if (ev.source === 'mic') this.cancelPartialCommit();
 
     const now = Date.now();
     const sig = pool[0].toLowerCase();
@@ -824,6 +877,18 @@ class VoiceController {
     }
     const heard = matchedCand ?? pool[0];
     this.lastHeard = heard;
+
+    if (
+      ev.source === 'mic' &&
+      intent &&
+      intent.kind !== 'arm_wake' &&
+      this.lastPartialCommitAt > 0 &&
+      now - this.lastPartialCommitAt < 3000 &&
+      voiceIntentKey(intent) === this.lastPartialCommitKey
+    ) {
+      this.changed.emit();
+      return;
+    }
 
     if (abActive) {
       const matchedCmd = !!intent && intent.kind !== 'arm_wake';

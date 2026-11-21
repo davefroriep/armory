@@ -17,6 +17,40 @@ export interface SetPointer {
   isWarmup: boolean;
 }
 
+function groupSetSequence(exs: SessionEx[], g: { start: number; end: number }): { exIdx: number; setIdx: number }[] {
+  const out: { exIdx: number; setIdx: number }[] = [];
+  const warms: number[][] = [];
+  const works: number[][] = [];
+  let maxWarm = 0;
+  let maxWork = 0;
+  for (let k = g.start; k <= g.end; k++) {
+    const se = exs[k];
+    const wIdx: number[] = [];
+    const nIdx: number[] = [];
+    se.sets.forEach((s, si) => {
+      if (s.kind === 'w') wIdx.push(si);
+      else nIdx.push(si);
+    });
+    warms.push(wIdx);
+    works.push(nIdx);
+    maxWarm = Math.max(maxWarm, wIdx.length);
+    maxWork = Math.max(maxWork, nIdx.length);
+  }
+  for (let r = 0; r < maxWarm; r++) {
+    for (let off = 0; off < warms.length; off++) {
+      const si = warms[off][r];
+      if (si != null) out.push({ exIdx: g.start + off, setIdx: si });
+    }
+  }
+  for (let r = 0; r < maxWork; r++) {
+    for (let off = 0; off < works.length; off++) {
+      const si = works[off][r];
+      if (si != null) out.push({ exIdx: g.start + off, setIdx: si });
+    }
+  }
+  return out;
+}
+
 /**
  * Planned execution sequence across all exercises, interleaving superset rounds (`1A[0], 1B[0], 1A[1], 1B[1]...`)
  * with warm-up rounds first and working rounds after within each superset group.
@@ -24,35 +58,7 @@ export interface SetPointer {
 export function plannedSetSequence(exs: SessionEx[]): { exIdx: number; setIdx: number }[] {
   const out: { exIdx: number; setIdx: number }[] = [];
   for (const g of supersetGroups(exs)) {
-    const warms: number[][] = [];
-    const works: number[][] = [];
-    let maxWarm = 0;
-    let maxWork = 0;
-    for (let k = g.start; k <= g.end; k++) {
-      const se = exs[k];
-      const wIdx: number[] = [];
-      const nIdx: number[] = [];
-      se.sets.forEach((s, si) => {
-        if (s.kind === 'w') wIdx.push(si);
-        else nIdx.push(si);
-      });
-      warms.push(wIdx);
-      works.push(nIdx);
-      maxWarm = Math.max(maxWarm, wIdx.length);
-      maxWork = Math.max(maxWork, nIdx.length);
-    }
-    for (let r = 0; r < maxWarm; r++) {
-      for (let off = 0; off < warms.length; off++) {
-        const si = warms[off][r];
-        if (si != null) out.push({ exIdx: g.start + off, setIdx: si });
-      }
-    }
-    for (let r = 0; r < maxWork; r++) {
-      for (let off = 0; off < works.length; off++) {
-        const si = works[off][r];
-        if (si != null) out.push({ exIdx: g.start + off, setIdx: si });
-      }
-    }
+    out.push(...groupSetSequence(exs, g));
   }
   return out;
 }
@@ -104,18 +110,42 @@ export function resolveTargetSet(exs: SessionEx[], cursor?: CursorRef | null): S
   return null;
 }
 
-/** Advances the cursor cleanly through superset alternation after a set is logged. */
+/**
+ * Advances the cursor after logging a set:
+ * stays within the current exercise (or current superset pair) until all of its sets are complete,
+ * then moves to the next unlogged exercise/superset group.
+ */
 export function advanceCursorAfterLog(exs: SessionEx[], justLogged: { exIdx: number; setIdx: number }): CursorRef | null {
-  const seq = plannedSetSequence(exs);
-  if (!seq.length) return null;
-  const pos = seq.findIndex((p) => p.exIdx === justLogged.exIdx && p.setIdx === justLogged.setIdx);
+  const groups = supersetGroups(exs);
+  if (!groups.length) return null;
+  const curGroupIdx = groups.findIndex((g) => justLogged.exIdx >= g.start && justLogged.exIdx <= g.end);
+  if (curGroupIdx < 0) {
+    const seq = plannedSetSequence(exs);
+    const step = seq.find((p) => !exs[p.exIdx]?.sets[p.setIdx]?.done);
+    return step ? { exUid: exs[step.exIdx].uid, setId: exs[step.exIdx].sets[step.setIdx].id } : null;
+  }
+
+  const curGroup = groups[curGroupIdx];
+  const curSeq = groupSetSequence(exs, curGroup);
+  const pos = curSeq.findIndex((p) => p.exIdx === justLogged.exIdx && p.setIdx === justLogged.setIdx);
   const start = pos >= 0 ? pos : -1;
-  for (let offset = 1; offset <= seq.length; offset++) {
-    const step = seq[(start + offset) % seq.length];
+  for (let offset = 1; offset <= curSeq.length; offset++) {
+    const step = curSeq[(start + offset) % curSeq.length];
     const se = exs[step.exIdx];
     const set = se?.sets[step.setIdx];
     if (se && set && !set.done && !(step.exIdx === justLogged.exIdx && step.setIdx === justLogged.setIdx)) {
       return { exUid: se.uid, setId: set.id };
+    }
+  }
+
+  for (let goff = 1; goff < groups.length; goff++) {
+    const g = groups[(curGroupIdx + goff) % groups.length];
+    for (const step of groupSetSequence(exs, g)) {
+      const se = exs[step.exIdx];
+      const set = se?.sets[step.setIdx];
+      if (se && set && !set.done) {
+        return { exUid: se.uid, setId: set.id };
+      }
     }
   }
   return null;

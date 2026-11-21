@@ -526,7 +526,8 @@ function build(root: HTMLElement, id?: string): () => void {
     const t = e.target as HTMLInputElement;
     if (e.key !== 'Enter' || !t.closest?.('.srow')) return;
     e.preventDefault();
-    const inputs = [...root.querySelectorAll<HTMLInputElement>('.srow input')];
+    const cardEl = t.closest<HTMLElement>('.xcard');
+    const inputs = cardEl ? [...cardEl.querySelectorAll<HTMLInputElement>('.srow input')] : [];
     const nxt = inputs[inputs.indexOf(t) + 1];
     if (nxt) nxt.focus(); else t.blur();
   });
@@ -1303,7 +1304,11 @@ function build(root: HTMLElement, id?: string): () => void {
       return;
     }
     if (act === 'addset') {
-      addSet(se, lifts.previous(se.exId, s.startMs, s.id));
+      const added = addSet(se, lifts.previous(se.exId, s.startMs, s.id));
+      if (!edit) {
+        const focusSet = se.sets.find((x) => !x.done) ?? added;
+        voice.setCursor({ exUid: se.uid, setId: focusSet.id });
+      }
       save(); paint();
       return;
     }

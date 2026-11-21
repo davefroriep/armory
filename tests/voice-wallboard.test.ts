@@ -151,6 +151,31 @@ describe('superset cursor & alternation', () => {
     expect(exs.some((e) => e.uid === 'u_ohp')).toBe(false);
     expect(resolveTargetSet(exs, rDropAll.cursor)!.exUid).toBe('u_pull');
   });
+
+  it('keeps straight-set cursor on current exercise (e.g. Deadlifts) until every set is done before moving to Bulgarians', () => {
+    const lower2: SessionEx[] = [
+      { uid: 'u_dl', exId: 'deadlift', sets: [mkSet(135, 10), mkSet(225, 10), mkSet(225, 10)] },
+      { uid: 'u_bss', exId: 'bulgarian-split-squat', sets: [mkSet(30, 10), mkSet(30, 10), mkSet(30, 10)] },
+      { uid: 'u_calf', exId: 'standing-calf-raise', ss: true, sets: [mkSet(140, 12), mkSet(140, 12)] },
+      { uid: 'u_crunch', exId: 'cable-crunch', sets: [mkSet(80, 15), mkSet(80, 15)] },
+    ];
+    // Even if Set 3 on Deadlift is checked while Set 1 or Set 2 is still open, cursor stays on Deadlift (NOT Bulgarians!)
+    lower2[0].sets[0].done = true;
+    lower2[0].sets[2].done = true;
+    const stayOnDl = advanceCursorAfterLog(lower2, { exIdx: 0, setIdx: 2 });
+    const dlPtr = resolveTargetSet(lower2, stayOnDl)!;
+    expect(dlPtr.exUid).toBe('u_dl');
+    expect(dlPtr.setId).toBe(lower2[0].sets[1].id);
+    expect(dlPtr.label).toBe('1');
+
+    // Once all 3 Deadlift sets are done, cursor moves to Bulgarian Split Squat Set 1
+    lower2[0].sets[1].done = true;
+    const moveToBss = advanceCursorAfterLog(lower2, { exIdx: 0, setIdx: 1 });
+    const bssPtr = resolveTargetSet(lower2, moveToBss)!;
+    expect(bssPtr.exUid).toBe('u_bss');
+    expect(bssPtr.label).toBe('2');
+    expect(bssPtr.setNumber).toBe(1);
+  });
 });
 
 describe('voice transcript parser', () => {
@@ -230,6 +255,17 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('Armory nailed it')).toEqual({ kind: 'log_current' });
     expect(parseVoiceTranscript('Armory good set')).toEqual({ kind: 'log_current' });
     expect(parseVoiceTranscript('Armory boom')).toEqual({ kind: 'log_current' });
+
+    // Punctuated Whisper transcripts & trailing TV/music bleed under noisy gym rooms
+    expect(parseVoiceTranscript('Armory, 225 for five.')).toEqual({ kind: 'log_current', weight: 225, reps: 5 });
+    expect(parseVoiceTranscript('Armory. 135. For ten!')).toEqual({ kind: 'log_current', weight: 135, reps: 10 });
+    expect(parseVoiceTranscript('Armory, 22.5 for 8 rpe 8.5.')).toEqual({ kind: 'log_current', weight: 22.5, reps: 8, rpe: 8.5 });
+    expect(parseVoiceTranscript('Armory 225 for 10 see you on the screen')).toEqual({ kind: 'log_current', weight: 225, reps: 10 });
+    expect(parseVoiceTranscript('Armory skip rest please')).toEqual({ kind: 'rest_skip' });
+    expect(parseVoiceTranscript('Armory please check thanks')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armory done alright guys')).toEqual({ kind: 'log_current' });
+    expect(parseVoiceTranscript('Armery 185 for 8')).toEqual({ kind: 'log_current', weight: 185, reps: 8 });
+    expect(parseVoiceTranscript('Armory purple banana')).toBeNull();
 
     // Custom user variations
     const customAliases = {

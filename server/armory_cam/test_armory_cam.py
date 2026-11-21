@@ -1701,7 +1701,37 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertFalse(rv.has_command_tail("Armory"))
         self.assertTrue(rv.is_hallucination("Thank you."))
         self.assertTrue(rv.is_hallucination("..."))
+        self.assertTrue(rv.is_hallucination("back, back, back, back, back, back, back"))
         self.assertFalse(rv.is_hallucination("Armory check"))
+        self.assertTrue(rv.matches_wake_word("Armery 225 for 10"))
+
+        t_asr = np.linspace(0.0, 0.25, 4_000, endpoint=False, dtype=np.float32)
+        quiet_tone = (0.08 * np.sin(2.0 * np.pi * 400.0 * t_asr)).astype(np.float32)
+        boosted_tone = rv.prepare_asr_audio(quiet_tone)
+        self.assertGreaterEqual(float(np.max(np.abs(boosted_tone))), 0.65)
+        self.assertLessEqual(float(np.max(np.abs(boosted_tone))), 0.80)
+        near_silence = (0.001 * np.sin(2.0 * np.pi * 400.0 * t_asr)).astype(np.float32)
+        self.assertLess(float(np.max(np.abs(rv.prepare_asr_audio(near_silence)))), 0.01)
+
+        # Forced max_frames flush keeps trailing PRE_ROLL_FRAMES and does not reset VAD LSTM state
+        class _AlwaysSpeechVad:
+            def __init__(self) -> None:
+                self.resets = 0
+
+            def reset(self) -> None:
+                self.resets += 1
+
+            def score_frame(self, _frame: np.ndarray, rms_gate: float = 0.0025) -> float:
+                return 0.9
+
+        fake_vad = _AlwaysSpeechVad()
+        det = rv.UtteranceDetector(vad=fake_vad, min_speech_ms=64, end_silence_ms=160, max_utterance_sec=0.70, rms_gate=0.0025)
+        resets_before = fake_vad.resets
+        speech_chunk = np.full(rv.VAD_FRAME_SAMPLES * 25, 0.05, dtype=np.float32)
+        utts = det.push_samples(speech_chunk)
+        self.assertEqual(len(utts), 1)
+        self.assertEqual(len(det._pre_roll), rv.PRE_ROLL_FRAMES)
+        self.assertEqual(fake_vad.resets, resets_before)
 
         prompt, hotwords = rv.build_whisper_prompt("armory", ["Barbell Bench Press", "Smith Machine Row"])
         self.assertIn("Barbell Bench Press", prompt)

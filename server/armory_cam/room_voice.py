@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 import ctypes
 from dataclasses import dataclass
 import hashlib
@@ -30,13 +30,13 @@ from typing import Any, Callable, Sequence
 import wave
 
 import numpy as np
-from scipy.signal import resample_poly
+from scipy.signal import lfilter, resample_poly
 import sounddevice as sd
 
 SAMPLE_RATE_16K = 16_000
 VAD_FRAME_SAMPLES = 512  # 32 ms @ 16 kHz (native Silero VAD window)
 VAD_CONTEXT_SAMPLES = 64
-PRE_ROLL_FRAMES = 14     # ~448 ms pre-roll so "Armory" onset is never clipped
+PRE_ROLL_FRAMES = 18     # ~576 ms pre-roll so far-field "Ar-" onset of "Armory" is never clipped
 ARM_WINDOW_MS = 7_000
 MAX_RECENT_TRANSCRIPTS = 12
 HOST_API_PREFERENCE = (
@@ -113,7 +113,7 @@ def _no_window_kwargs() -> dict[str, Any]:
 
 
 def is_hallucination(text: str) -> bool:
-    """Reject known Whisper silence/noise hallucinations and punctuation-only strings."""
+    """Reject known Whisper silence/noise hallucinations, repetition loops, and punctuation-only strings."""
     cleaned = re.sub(r"[^a-z0-9\s]", "", text.lower()).strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     if not cleaned:
@@ -123,6 +123,10 @@ def is_hallucination(text: str) -> bool:
     words = cleaned.split()
     if len(words) >= 3 and len(set(words)) == 1 and words[0] in {"you", "the", "a", "uh", "um", "bye"}:
         return True
+    if len(words) >= 6:
+        top_count = Counter(words).most_common(1)[0][1]
+        if top_count * 5 >= len(words) * 3:
+            return True
     return False
 
 
@@ -149,6 +153,12 @@ def _wake_regex(wake_word: str) -> re.Pattern[str]:
             "army",
             "arm re",
             "arm ree",
+            "armery",
+            "armary",
+            "ormory",
+            "armorie",
+            "armor",
+            "armored",
         ]
     else:
         alts = [wake_raw]
@@ -182,21 +192,15 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
     wake = (wake_word or "armory").strip() or "armory"
     core = [
         wake,
-        "225 for 8",
-        "135 for 10",
+        "225 for 10",
+        "135 for 8",
         "check",
         "done",
-        "for 10",
-        "by 8",
-        "rpe 8",
         "rpe 8.5",
         "next exercise",
-        "previous exercise",
         "add set",
         "skip rest",
-        "add 30 seconds",
         "record rack",
-        "record smith",
         "clip that",
         "replay slow",
         "buddy mode",
@@ -205,33 +209,20 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "close the gym",
         "SmartSpin TV",
         "wallboard",
-        "all TVs",
         "play music",
         "pause music",
         "next song",
-        "skip song",
         "Matt just hit a PR",
         "Matt PR'd",
         "I PR'd",
-        "hit a PR",
-        "new PR",
         "Matt just got here",
-        "Matt is here",
-        "Matt is in the gym",
         "Ryder is here",
-        "Ryder debut",
         "Gabe is here",
         "Josh is here",
         "Jared and Mark",
         "stop show",
-        "stop",
-        "enough",
-        "end",
-        "cancel",
         "rack lights",
         "smith lights",
-        "lights on",
-        "lights off",
     ]
     seen = {x.lower() for x in core}
     extras: list[str] = []
@@ -241,11 +232,15 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
             continue
         seen.add(clean.lower())
         extras.append(clean)
-        if len(extras) >= 24:
+        if len(extras) >= 12:
             break
     all_terms = core + extras
     prompt = ", ".join(all_terms) + "."
-    hotwords = ", ".join([wake, "check", "rpe", "smith", "rack", "replay", "buddy", *extras[:12]])
+    hotwords = ", ".join([
+        wake, "check", "done", "skip rest", "next exercise", "add set", "undo",
+        "rack", "smith", "replay", "play music", "lights", "PR",
+        *extras[:6],
+    ])
     return prompt, hotwords
 
 
@@ -259,11 +254,11 @@ class RoomVoiceConfig:
     wake_word: str = "armory"
     speaker_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
-    vad_threshold: float = 0.45
+    vad_threshold: float = 0.42
     min_speech_ms: int = 280
-    end_silence_ms: int = 620
-    max_utterance_sec: float = 7.5
-    rms_gate: float = 0.004
+    end_silence_ms: int = 520
+    max_utterance_sec: float = 4.8
+    rms_gate: float = 0.0025
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -303,11 +298,11 @@ class RoomVoiceConfig:
             wake_word=wake,
             speaker_readback=bool(raw.get("speakerReadback", True)),
             tts_voice=tts_voice,
-            vad_threshold=_clamp(float(raw.get("vadThreshold", 0.45) or 0.45), 0.15, 0.90),
+            vad_threshold=_clamp(float(raw.get("vadThreshold", 0.42) or 0.42), 0.15, 0.90),
             min_speech_ms=max(160, min(1200, int(raw.get("minSpeechMs", 280) or 280))),
-            end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 620) or 620))),
-            max_utterance_sec=_clamp(float(raw.get("maxUtteranceSec", 7.5) or 7.5), 2.5, 15.0),
-            rms_gate=_clamp(float(raw.get("rmsGate", 0.004) or 0.004), 0.0005, 0.05),
+            end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 520) or 520))),
+            max_utterance_sec=_clamp(float(raw.get("maxUtteranceSec", 4.8) or 4.8), 2.5, 15.0),
+            rms_gate=_clamp(float(raw.get("rmsGate", 0.0025) or 0.0025), 0.0005, 0.05),
         )
 
 
@@ -675,6 +670,21 @@ def resample_from_to(pcm: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return resample_poly(arr, int(dst_sr) // g, int(src_sr) // g).astype(np.float32)
 
 
+def prepare_asr_audio(audio16: np.ndarray) -> np.ndarray:
+    """High-pass (~85 Hz) and normalize quiet far-field speech before Whisper decoding."""
+    arr = np.asarray(audio16, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return arr
+    b = np.array([1.0, -1.0], dtype=np.float32)
+    a = np.array([1.0, -0.967], dtype=np.float32)
+    hp = lfilter(b, a, arr).astype(np.float32)
+    peak = float(np.max(np.abs(hp)))
+    if peak >= 0.008:
+        gain = min(10.0, 0.75 / peak)
+        hp = np.clip(hp * gain, -0.98, 0.98).astype(np.float32)
+    return np.ascontiguousarray(hp, dtype=np.float32)
+
+
 class SileroStreamingVad:
     """Stateful streaming wrapper over `faster-whisper`'s bundled `silero_vad_v6.onnx`."""
 
@@ -721,11 +731,11 @@ class UtteranceDetector:
     def __init__(
         self,
         vad: SileroStreamingVad | None = None,
-        vad_threshold: float = 0.45,
+        vad_threshold: float = 0.42,
         min_speech_ms: int = 280,
-        end_silence_ms: int = 620,
-        max_utterance_sec: float = 7.5,
-        rms_gate: float = 0.004,
+        end_silence_ms: int = 520,
+        max_utterance_sec: float = 4.8,
+        rms_gate: float = 0.0025,
     ) -> None:
         self.vad = vad or SileroStreamingVad()
         self.vad_threshold = vad_threshold
@@ -780,9 +790,8 @@ class UtteranceDetector:
 
             rms = float(np.sqrt(np.mean(frame * frame)))
             self.latest_rms = rms
-            if rms < self.rms_gate and not self._in_speech:
+            if rms < self.rms_gate * 0.25 and not self._in_speech:
                 prob = 0.0
-                self.vad.reset()
             else:
                 prob = self.vad.score_frame(frame, rms_gate=self.rms_gate)
             self.latest_vad = prob
@@ -810,15 +819,23 @@ class UtteranceDetector:
                     self._silence_streak += 1
 
                 if self._silence_streak >= self.end_silence_frames or len(self._collected) >= self.max_frames:
+                    clean_silence_end = self._silence_streak >= self.end_silence_frames
                     if self._speech_frames >= self.min_speech_frames:
                         completed.append(np.concatenate(self._collected).astype(np.float32))
-                    self._collected.clear()
-                    self._pre_roll.clear()
+                    if clean_silence_end:
+                        self._collected.clear()
+                        self._pre_roll.clear()
+                        self.vad.reset()
+                    else:
+                        tail = self._collected[-PRE_ROLL_FRAMES:]
+                        self._collected.clear()
+                        self._pre_roll.clear()
+                        for f in tail:
+                            self._pre_roll.append(f)
                     self._in_speech = False
                     self._onset_streak = 0
                     self._silence_streak = 0
                     self._speech_frames = 0
-                    self.vad.reset()
 
         return completed
 
@@ -1406,7 +1423,7 @@ class RoomVoiceService:
         self._started = False
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
-        self._utt_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=4)
+        self._utt_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=6)
         self._speaker_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=16)
 
         self._model: Any = None
@@ -2156,16 +2173,20 @@ class RoomVoiceService:
             return str(fn(audio16, prompt, hotwords) or "").strip()
         if model is None:
             return ""
+        prepared = prepare_asr_audio(audio16)
         segs, _info = model.transcribe(
-            audio16,
+            prepared,
             language="en",
-            beam_size=2,
+            beam_size=1,
             best_of=1,
             temperature=0.0,
             condition_on_previous_text=False,
             vad_filter=False,
-            no_speech_threshold=0.65,
-            log_prob_threshold=-1.0,
+            no_speech_threshold=0.72,
+            log_prob_threshold=-1.2,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            max_new_tokens=36,
             initial_prompt=prompt,
             hotwords=hotwords,
         )

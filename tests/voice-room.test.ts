@@ -247,4 +247,36 @@ describe('VoiceController room source relay', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('commits stable phone mic partial transcripts after 650ms under background noise and dedups late isFinal', () => {
+    const sess = makeBenchSession('sess_partial_commit');
+    mockState.activeSess = sess;
+    vi.useFakeTimers();
+    try {
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 8',
+        isFinal: false,
+        source: 'mic',
+        state: 'listening',
+      });
+      expect(sess.exs[0].sets[0].done).toBe(false);
+
+      vi.advanceTimersByTime(700);
+      expect(sess.exs[0].sets[0].done).toBe(true);
+      expect(Math.round((sess.exs[0].sets[0].w ?? 0) / KG_PER_LB)).toBe(225);
+      expect(sess.exs[0].sets[0].r).toBe(8);
+      expect(mockState.saveCalls).toBe(1);
+
+      // Late final arrival for the same command must not double-log Set 2
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 8 please',
+        isFinal: true,
+        source: 'mic',
+        state: 'listening',
+      });
+      expect(sess.exs[0].sets[1].done).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

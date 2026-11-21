@@ -58,6 +58,7 @@ final class VoiceRecognitionManager {
     private static long lastCallbackElapsedMs = 0L;
     private static long lastSpeechElapsedMs = 0L;
     private static String lastPartial = "";
+    private static ArrayList<String> lastPartialCands = null;
     private static Runnable pendingRestart;
     private static Runnable watchdogRunnable;
 
@@ -209,6 +210,7 @@ final class VoiceRecognitionManager {
                     startListeningCycle(app, true);
                 } else if (listeningInProgress && (now - listenStartedElapsedMs > SESSION_MAX_IDLE_MS) && (now - lastSpeechElapsedMs > 6_000L)) {
                     Log.w(TAG, "Watchdog: idle cycle > 38s, refreshing recognizer");
+                    flushPartialAsFinalIfAny();
                     startListeningCycle(app, true);
                 }
                 if (desiredEnabled && appVisible) {
@@ -217,6 +219,20 @@ final class VoiceRecognitionManager {
             }
         };
         MAIN.postDelayed(watchdogRunnable, WATCHDOG_PERIOD_MS);
+    }
+
+    private static void flushPartialAsFinalIfAny() {
+        String pending = lastPartial == null ? "" : lastPartial.trim();
+        ArrayList<String> cands = lastPartialCands != null ? new ArrayList<>(lastPartialCands) : null;
+        lastPartial = "";
+        lastPartialCands = null;
+        if (pending.isEmpty()) return;
+        if (cands == null || cands.isEmpty()) {
+            cands = new ArrayList<>();
+            cands.add(pending);
+        }
+        Log.i(TAG, "Flushing partial as final: cands=" + cands);
+        WorkoutServicePlugin.deliverVoiceEvent(pending, cands, true, "mic", "listening", null);
     }
 
     private static void escalateRecognizerMode(String reason) {
@@ -246,6 +262,7 @@ final class VoiceRecognitionManager {
         listeningInProgress = false;
         readyReceived = false;
         lastPartial = "";
+        lastPartialCands = null;
         if (recognizer != null) {
             try { recognizer.cancel(); } catch (Exception ignored) {}
             try { recognizer.destroy(); } catch (Exception ignored) {}
@@ -364,6 +381,7 @@ final class VoiceRecognitionManager {
                 }
 
                 if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                    if (wasReady) flushPartialAsFinalIfAny();
                     if (!wasReady) {
                         consecutiveDeadRestarts++;
                         if (consecutiveDeadRestarts >= 2) {
@@ -399,6 +417,7 @@ final class VoiceRecognitionManager {
                 ArrayList<String> cands = extractCandidates(results, false);
                 String text = cands.isEmpty() ? "" : cands.get(0);
                 lastPartial = "";
+                lastPartialCands = null;
                 Log.i(TAG, "onResults cands=" + cands);
                 if (!text.isEmpty()) {
                     WorkoutServicePlugin.deliverVoiceEvent(text, cands, true, "mic", "listening", null);
@@ -420,6 +439,7 @@ final class VoiceRecognitionManager {
                 ArrayList<String> cands = extractCandidates(segmentResults, false);
                 String text = cands.isEmpty() ? "" : cands.get(0);
                 lastPartial = "";
+                lastPartialCands = null;
                 Log.i(TAG, "onSegmentResults cands=" + cands);
                 if (!text.isEmpty()) {
                     WorkoutServicePlugin.deliverVoiceEvent(text, cands, true, "mic", "listening", null);
@@ -449,6 +469,7 @@ final class VoiceRecognitionManager {
                 String text = cands.isEmpty() ? "" : cands.get(0);
                 if (!text.isEmpty() && !text.equals(lastPartial)) {
                     lastPartial = text;
+                    lastPartialCands = new ArrayList<>(cands);
                     Log.i(TAG, "onPartialResults cands=" + cands);
                     WorkoutServicePlugin.deliverVoiceEvent(text, cands, false, "mic", "listening", null);
                 }
@@ -473,6 +494,7 @@ final class VoiceRecognitionManager {
 
         final Intent intent = buildIntent();
         lastPartial = "";
+        lastPartialCands = null;
         readyReceived = false;
         listeningInProgress = true;
         listenStartedElapsedMs = SystemClock.elapsedRealtime();

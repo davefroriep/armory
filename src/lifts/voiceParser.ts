@@ -191,8 +191,10 @@ function parseSpokenNumberTokens(toks: string[], start: number): { value: number
 
 /** Normalizes spoken numbers (`"two twenty five"`, `"eight point five"`) and Gym STT homophones (`"four 8"`, `"for ate"`). */
 export function normalizeVoiceText(raw: string): string {
+  // Preserve decimals like 8.5 / 22.5, strip stray sentence punctuation that would fuse tokens (e.g. "135. for" or "five.")
   let s = raw.toLowerCase()
-    .replace(/[—–\-/,]+/g, ' ')
+    .replace(/[—–\-/,?!:;]+/g, ' ')
+    .replace(/(?<!\d)\.|\.(?!\d)/g, ' ')
     .replace(/['’]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -318,8 +320,86 @@ function matchCustomVoiceAlias(
   return null;
 }
 
+function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
+  const rpeOpt = (rawRpe?: string): { rpe?: number } => {
+    if (rawRpe != null) {
+      const v = Number(rawRpe);
+      if (v >= 6 && v <= 10) return { rpe: Math.round(v * 2) / 2 };
+    }
+    return rpe != null ? { rpe } : {};
+  };
+
+  const wrLead = tail.match(
+    /^(\d+(?:\.\d+)?)\s*(?:lb|lbs|pound|pounds|kg|kgs|kilo|kilos)?\s*(?:for|by|x|times)\s+(\d+)(?:\s*reps?)?(?:\s+(?:@|at\s+)?rpe\s*(\d+(?:\.\d+)?))?\b/,
+  );
+  if (wrLead) {
+    return { kind: 'log_current', weight: Number(wrLead[1]), reps: Number(wrLead[2]), ...rpeOpt(wrLead[3]) };
+  }
+
+  const bwLead = tail.match(
+    /^(?:body\s*weight|bw)\s*(?:for|by|x|times)\s*(\d+)(?:\s*reps?)?(?:\s+(?:@|at\s+)?rpe\s*(\d+(?:\.\d+)?))?\b/,
+  );
+  if (bwLead) {
+    return { kind: 'log_current', bodyweight: true, weight: 0, reps: Number(bwLead[1]), ...rpeOpt(bwLead[2]) };
+  }
+
+  const rLead = tail.match(
+    /^(?:for|by|x|times|did|got|hit)\s+(\d+)(?:\s*reps?)?(?:\s+(?:@|at\s+)?rpe\s*(\d+(?:\.\d+)?))?\b/,
+  );
+  if (rLead) {
+    return { kind: 'log_current', reps: Number(rLead[1]), ...rpeOpt(rLead[2]) };
+  }
+
+  if (/^(?:skip|clear|end|stop)\s+rest\b/.test(tail)) return { kind: 'rest_skip' };
+  if (/^more\s+rest\b/.test(tail)) return { kind: 'rest_add', deltaSec: 30 };
+  if (/^next\s+exercise\b/.test(tail)) return { kind: 'next_ex' };
+  if (/^(?:prev|previous)\s+exercise\b/.test(tail)) return { kind: 'prev_ex' };
+  if (/^(?:add(?:\s+a|\s+1|\s+another)?\s+set|(?:1|one|another|extra)\s+(?:more\s+)?set)\s+(?:(?:to|on|of|for)\s+)?(?:the\s+)?(?:last|previous|prev|prior)\s+exercise\b/.test(tail)) {
+    return { kind: 'add_set_prev_ex' };
+  }
+  if (/^(?:add(?:\s+a|\s+1|\s+another)?\s+set|one\s+more\s+set)\b/.test(tail)) return { kind: 'add_set' };
+  if (/^(?:delete|remove|drop|clear)\s+(?:all\s+|the\s+)?(?:empty|unlogged|unfinished|remaining)\s+sets?\b/.test(tail)) {
+    return { kind: 'delete_empty_sets' };
+  }
+  if (/^pause\s+workout\b/.test(tail)) return { kind: 'pause_workout' };
+  if (/^resume\s+workout\b/.test(tail)) return { kind: 'resume_workout' };
+  if (/^(?:finish|end|complete)\s+workout\b/.test(tail)) return { kind: 'finish_workout' };
+  if (/^clip\s+that\b/.test(tail)) return { kind: 'cam_clip_last' };
+
+  const recCam = tail.match(/^record\s+(?:the\s+)?(rack|smith\s+wide|smith|fly\s+machine|fly|leg\s+machine|leg)\b/);
+  if (recCam) {
+    const k = recCam[1].replace(/\s+/g, ' ');
+    const camMap: Record<string, string> = {
+      rack: 'Rack Cam',
+      smith: 'Smith Cam',
+      'smith wide': 'Smith Wide',
+      fly: 'Fly Machine Cam',
+      'fly machine': 'Fly Machine Cam',
+      leg: 'Leg Machine Cam',
+      'leg machine': 'Leg Machine Cam',
+    };
+    return camMap[k] ? { kind: 'cam_arm', camera: camMap[k] } : { kind: 'cam_arm' };
+  }
+
+  const buddyLead = tail.match(/^buddy\s+mode\s+(on|off)\b/);
+  if (buddyLead) return { kind: 'buddy_mode', on: buddyLead[1] === 'on' };
+  if (/^close\s+(?:the\s+)?(?:replay|video|clip|tv)\b/.test(tail)) return { kind: 'wb_close_replay' };
+  if (/^replay\s+slow\b/.test(tail)) return { kind: 'wb_replay', slow: true };
+  if (/^(?:instant\s+)?replay\b/.test(tail)) return { kind: 'wb_replay' };
+  if (/^undo\b/.test(tail)) return { kind: 'undo' };
+  if (/^(?:check|done|logged)\s+\S/.test(tail)) return { kind: 'log_current', ...(rpe != null ? { rpe } : {}) };
+  return null;
+}
+
 function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): VoiceIntent | null {
-  const tail = tailRaw.trim().replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '');
+  let tail = tailRaw.trim().replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '');
+  if (!tail) return { kind: 'arm_wake' };
+
+  // Strip harmless conversational prefixes & politeness suffixes around commands
+  tail = tail
+    .replace(/^(?:please|uh|um|hey|ok|okay|alright|go\s+ahead(?:\s+and)?)\s+/i, '')
+    .replace(/\s+(?:please|thanks|thank\s+you|now|alright|okay|ok|yeah|yep)$/i, '')
+    .trim();
   if (!tail) return { kind: 'arm_wake' };
 
   // Non-destructively extract optional trailing/embedded RPE ("... rpe 8.5") for logging aliases & set commands
@@ -501,13 +581,17 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): Voi
     return { kind: 'log_current', reps: Number(rOnlyM[1]), ...(rpe != null ? { rpe } : {}) };
   }
 
-  return null;
+  return parseLeadingNoisyTail(tail, rpe);
 }
 
 function buildWakeRegex(wakeWord?: string): RegExp {
   const wakeRaw = (wakeWord ?? 'armory').trim().toLowerCase() || 'armory';
   const wakeAlts = wakeRaw === 'armory'
-    ? ['armory', 'armoury', 'armorys', 'armourys', 'armory fit', 'armoryfit', 'amory', 'emory', 'army', 'arm re', 'arm ree']
+    ? [
+        'armory', 'armoury', 'armorys', 'armourys', 'armory fit', 'armoryfit',
+        'amory', 'emory', 'army', 'arm re', 'arm ree',
+        'armery', 'armary', 'ormory', 'armorie', 'armor', 'armored',
+      ]
     : [wakeRaw];
   return new RegExp(`\\b(?:hey\\s+|ok\\s+|okay\\s+)?(?:${wakeAlts.map(escapeRe).join('|')})\\b`, 'gi');
 }
