@@ -51,6 +51,7 @@ VALID_DEMO_STYLES = ("anthem", "boombap", "thunder_only", "hype")
 RYDER_ENTRANCE_URL = "https://www.youtube.com/watch?v=05vwKMySzKw"
 DEFAULT_ANNOUNCER_VOICE = "kokoro:onyx_fenrir_epic"
 DEFAULT_KOKORO_MODELS_DIR = Path(r"S:\ArmoryCam\models\kokoro")
+DEFAULT_STUDIO_FX_DIR = Path(r"S:\ArmoryCam\shows\fx")
 BANNED_ROBOTIC_VOICES = frozenset({"en-US-ChristopherNeural", "sapi"})
 
 EPIC_VOICE_PRESETS: dict[str, dict[str, Any]] = {
@@ -722,6 +723,56 @@ def mix_into(dst: np.ndarray, src: np.ndarray, offset_samples: int, gain: float 
     dst[start : start + avail] += src[:avail] * float(gain)
 
 
+def load_studio_fx_stereo(
+    fx_dir: Path | None,
+    filename: str,
+    dur_sec: float,
+    *,
+    allow_default_fallback: bool = True,
+    swell_sec: float = 0.25,
+    fade_out_sec: float = 1.2,
+    sr: int = SHOW_SR,
+) -> np.ndarray | None:
+    """Load real studio CC0 WAV from `shows/fx/`, trimming/crossfade-looping to exact duration."""
+    candidates: list[Path] = []
+    if fx_dir is not None:
+        candidates.append(Path(fx_dir) / filename)
+    if allow_default_fallback and (fx_dir is None or Path(fx_dir) != DEFAULT_STUDIO_FX_DIR):
+        candidates.append(DEFAULT_STUDIO_FX_DIR / filename)
+    src_path = next((p for p in candidates if p.is_file() and p.stat().st_size > 200), None)
+    if src_path is None:
+        return None
+    pcm = read_wav_stereo_float(src_path, target_sr=sr)
+    if pcm.shape[0] < 16:
+        return None
+
+    target_n = max(16, int(round(max(0.4, dur_sec) * sr)))
+    if pcm.shape[0] < target_n:
+        # Smooth 200ms crossfade loop if clip is shorter than requested bed
+        xf_n = min(pcm.shape[0] // 4, int(round(0.20 * sr)))
+        out = np.zeros((target_n, 2), dtype=np.float32)
+        pos = 0
+        while pos < target_n:
+            rem = target_n - pos
+            take = min(pcm.shape[0], rem)
+            seg = pcm[:take].copy()
+            if pos > 0 and xf_n > 8 and take > xf_n:
+                seg[:xf_n] *= np.linspace(0.0, 1.0, xf_n, dtype=np.float32)[:, None]
+                out[pos : pos + xf_n] *= np.linspace(1.0, 0.0, xf_n, dtype=np.float32)[:, None]
+            out[pos : pos + take] += seg
+            step = max(16, take - xf_n)
+            pos += step
+        pcm = out
+    else:
+        pcm = pcm[:target_n].copy()
+
+    atk = min(pcm.shape[0] // 3, max(0, int(round(swell_sec * sr))))
+    if atk > 12:
+        in_env = np.sin(0.5 * np.pi * np.linspace(0.0, 1.0, atk, dtype=np.float32))
+        pcm[:atk] *= in_env[:, None]
+    return apply_fade_out_stereo(pcm, sr=sr, fade_out_sec=min(fade_out_sec, max(0.2, float(pcm.shape[0]) / float(sr) * 0.5)))
+
+
 def synth_crowd_cheer_stereo(
     dur_sec: float,
     sr: int = SHOW_SR,
@@ -1326,9 +1377,10 @@ class ShowDirector:
         self.shows_dir = self.root_dir / "shows"
         self.sources_dir = self.shows_dir / "sources"
         self.rendered_dir = self.shows_dir / "rendered"
+        self.fx_dir = self.shows_dir / "fx"
         self.models_dir = self.root_dir / "models" / "kokoro"
         self.config_path = self.root_dir / "shows.json"
-        for d in (self.shows_dir, self.sources_dir, self.rendered_dir):
+        for d in (self.shows_dir, self.sources_dir, self.rendered_dir, self.fx_dir):
             d.mkdir(parents=True, exist_ok=True)
 
         self.house_audio = house_audio
@@ -1703,12 +1755,22 @@ class ShowDirector:
             if spec.add_cheer:
                 c_start = min(max(0, int(round(spec.cheer_delay_sec * SHOW_SR))), max(0, total_n - int(1.5 * SHOW_SR)))
                 c_len = max(1.5, float(total_n - c_start) / float(SHOW_SR))
-                cheer = synth_crowd_cheer_stereo(
+                cheer = load_studio_fx_stereo(
+                    self.fx_dir,
+                    "stadium_crowd.wav",
                     c_len,
-                    sr=SHOW_SR,
+                    allow_default_fallback=self.allow_network,
                     swell_sec=min(1.4, c_len * 0.35),
                     fade_out_sec=min(spec.fade_out_sec + 0.3, c_len * 0.6),
+                    sr=SHOW_SR,
                 )
+                if cheer is None:
+                    cheer = synth_crowd_cheer_stereo(
+                        c_len,
+                        sr=SHOW_SR,
+                        swell_sec=min(1.4, c_len * 0.35),
+                        fade_out_sec=min(spec.fade_out_sec + 0.3, c_len * 0.6),
+                    )
                 mix_into(mix, cheer, c_start, gain=0.68)
             mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(spec.fade_out_sec, 3.0))
 
@@ -1719,32 +1781,65 @@ class ShowDirector:
             pre_thunder_n = int(round(2.3 * SHOW_SR))
             post_tail_n = int(round(1.6 * SHOW_SR))
             total_n = pre_thunder_n + ann_pcm.shape[0] + post_tail_n
-            thunder_raw = synth_thunder_rumble_stereo(
-                float(total_n) / float(SHOW_SR),
+            total_sec = float(total_n) / float(SHOW_SR)
+            thunder_raw = load_studio_fx_stereo(
+                self.fx_dir,
+                "thunder_rumble.wav",
+                total_sec,
+                allow_default_fallback=self.allow_network,
+                swell_sec=0.15,
+                fade_out_sec=1.1,
                 sr=SHOW_SR,
-                crack_at_sec=spec.lightning_flash_sec or 0.75,
             )
+            if thunder_raw is None:
+                thunder_raw = synth_thunder_rumble_stereo(
+                    total_sec,
+                    sr=SHOW_SR,
+                    crack_at_sec=spec.lightning_flash_sec or 0.75,
+                )
+            crack_pcm = load_studio_fx_stereo(
+                self.fx_dir,
+                "thunder_crack.wav",
+                min(4.0, total_sec),
+                allow_default_fallback=self.allow_network,
+                swell_sec=0.02,
+                fade_out_sec=1.2,
+                sr=SHOW_SR,
+            )
+            if crack_pcm is not None:
+                crack_off = int(round((spec.lightning_flash_sec or 0.75) * SHOW_SR))
+                mix_into(thunder_raw, crack_pcm, crack_off, gain=0.82)
             bed = duck_bed_under_speech(
                 thunder_raw,
                 ann_pcm,
                 pre_thunder_n,
                 sr=SHOW_SR,
-                duck_gain=0.16,
-                base_gain=0.86,
+                duck_gain=0.14,
+                base_gain=0.88,
             )
             if spec.add_cheer:
                 cheer_full = np.zeros((total_n, 2), dtype=np.float32)
                 c_start = pre_thunder_n + int(ann_pcm.shape[0] * 0.52)
                 c_len = max(1.5, float(total_n - c_start) / float(SHOW_SR))
-                cheer = synth_crowd_cheer_stereo(c_len, sr=SHOW_SR, swell_sec=0.8, fade_out_sec=1.3)
-                mix_into(cheer_full, cheer, c_start, gain=0.72)
+                cheer = load_studio_fx_stereo(
+                    self.fx_dir,
+                    "stadium_crowd.wav",
+                    c_len,
+                    allow_default_fallback=self.allow_network,
+                    swell_sec=0.8,
+                    fade_out_sec=1.3,
+                    sr=SHOW_SR,
+                )
+                if cheer is None:
+                    cheer = synth_crowd_cheer_stereo(c_len, sr=SHOW_SR, swell_sec=0.8, fade_out_sec=1.3)
+                mix_into(cheer_full, cheer, c_start, gain=0.82)
                 bed += duck_bed_under_speech(
                     cheer_full,
                     ann_pcm,
                     pre_thunder_n,
                     sr=SHOW_SR,
-                    duck_gain=0.18,
-                    base_gain=0.90,
+                    duck_gain=0.16,
+                    base_gain=0.92,
                 )
             mix = bed
             mix_into(mix, ann_pcm, pre_thunder_n, gain=1.0)
@@ -1763,13 +1858,24 @@ class ShowDirector:
             total_n = max(SHOW_SR, song_off + song_n)
             mix = np.zeros((total_n, 2), dtype=np.float32)
             if spec.add_cheer and ann_n > 0:
-                cheer_bed = synth_crowd_cheer_stereo(
-                    float(ann_n) / SHOW_SR + 1.5,
-                    sr=SHOW_SR,
+                c_dur = float(ann_n) / SHOW_SR + 1.5
+                cheer_bed = load_studio_fx_stereo(
+                    self.fx_dir,
+                    "stadium_crowd.wav",
+                    c_dur,
+                    allow_default_fallback=self.allow_network,
                     swell_sec=0.5,
                     fade_out_sec=1.4,
+                    sr=SHOW_SR,
                 )
-                mix_into(mix, cheer_bed, 0, gain=0.22)
+                if cheer_bed is None:
+                    cheer_bed = synth_crowd_cheer_stereo(
+                        c_dur,
+                        sr=SHOW_SR,
+                        swell_sec=0.5,
+                        fade_out_sec=1.4,
+                    )
+                mix_into(mix, cheer_bed, 0, gain=0.26)
             if ann_pcm is not None:
                 mix_into(mix, ann_pcm, 0, gain=1.0)
             if music_pcm is not None:

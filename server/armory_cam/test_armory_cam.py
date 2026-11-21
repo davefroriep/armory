@@ -2748,6 +2748,33 @@ class ShowDirectorTests(unittest.TestCase):
             mastered = sd.master_announcer_stereo(raw_sig, 24000, boost_db=5.0)
             self.assertLessEqual(float(np.max(np.abs(mastered))), 0.92)
 
+            # Real studio SFX WAV hooks: HouseAudio pr_fanfare uses sfx/pr_bell_crowd.wav when present
+            sent_bodies: list[bytes] = []
+            (tmp / "sfx").mkdir(parents=True, exist_ok=True)
+            bell_wav = sd.encode_stereo_pcm16_wav(
+                np.ones((4800, 2), dtype=np.float32) * 0.25, sr=48000
+            )
+            (tmp / "sfx" / "pr_bell_crowd.wav").write_bytes(bell_wav)
+            ham_bell = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(cube_enabled=True, cube_host="192.168.1.151"),
+                allow_network=False,
+                cube_http_post=lambda _u, body, _h, _t: (sent_bodies.append(body), (200, b'{"ok":true}'))[1],
+            )
+            tp = ham_bell.test_play(kind="pr_fanfare", target="cube")
+            self.assertTrue(tp["ok"])
+            self.assertEqual(sent_bodies[0], bell_wav)
+            self.assertGreater(len(ha.synth_pr_fanfare()), 1000)
+
+            # ShowDirector loads shows/fx/{thunder_rumble,thunder_crack,stadium_crowd}.wav when present
+            fx_dir = tmp / "shows" / "fx"
+            fx_dir.mkdir(parents=True, exist_ok=True)
+            for fn in ("thunder_rumble.wav", "thunder_crack.wav", "stadium_crowd.wav"):
+                marker = np.ones((sd.SHOW_SR * 2, 2), dtype=np.float32) * 0.20
+                (fx_dir / fn).write_bytes(sd.encode_stereo_pcm16_wav(marker, sr=sd.SHOW_SR))
+            rb = svc.shows.build_show_preview("ryder_walkin", force=True)
+            self.assertTrue(rb["ok"])
+
             lst = client.get("/api/shows")
             self.assertEqual(lst.status_code, 200)
             j_lst = lst.get_json()

@@ -4890,8 +4890,8 @@ DASHBOARD_HTML = """<!doctype html>
         <button class="btn sec sm" type="button" data-hatest="tts:takeover">TTS Takeover</button>
         <button class="btn sec sm" type="button" data-hatest="chime:overlay">Chime Overlay</button>
         <button class="btn sec sm" type="button" data-hatest="rest_done:overlay">Rest Done</button>
-        <button class="btn ok sm" type="button" data-hatest="pr_fanfare:takeover">PR Fanfare Takeover</button>
-        <button class="btn sec sm" type="button" data-hatest="pr_fanfare:duck">PR Fanfare Duck</button>
+        <button class="btn ok sm" type="button" data-hatest="pr_fanfare:takeover">PR Bell + Crowd (Takeover)</button>
+        <button class="btn sec sm" type="button" data-hatest="pr_fanfare:duck">PR Bell + Crowd (Duck)</button>
         <button class="btn sec sm" type="button" id="haSfxPlayBtn">Play Custom SFX</button>
         <button class="btn red sm" type="button" id="haStopBtn">Stop</button>
         <span id="haTestOut" style="color:var(--mut);font-size:12px"></span>

@@ -458,14 +458,16 @@ def synth_rest_done(sr: int = 48_000) -> bytes:
 
 
 def synth_pr_fanfare(sr: int = 48_000) -> bytes:
-    """~3.2s punchy ascending triad + stadium horn hit WAV for testing 1RM / walk-in hype modes."""
-    gap = np.zeros(int(sr * 0.04), dtype=np.float32)
-    n1 = _tone_segment([261.63, 392.00], 0.24, sr=sr, amp=0.76)
-    n2 = _tone_segment([329.63, 523.25], 0.24, sr=sr, amp=0.80)
-    n3 = _tone_segment([392.00, 659.25], 0.28, sr=sr, amp=0.84)
-    hit1 = _tone_segment([261.63, 523.25, 659.25, 783.99], 0.42, sr=sr, amp=0.90)
-    finale = _tone_segment([261.63, 523.25, 659.25, 783.99, 1046.50], 1.75, sr=sr, amp=0.92)
-    pcm = np.concatenate([n1, gap, n2, gap, n3, gap, hit1, gap, finale])
+    """Offline fallback cue: dark 1.4s cinematic sub-bass impact drop (no MIDI fanfare triads)."""
+    n = max(1, int(round(1.4 * sr)))
+    t = np.linspace(0.0, 1.4, n, endpoint=False, dtype=np.float32)
+    freq = 32.0 + 48.0 * np.exp(-t / 0.16)
+    phase = 2.0 * np.pi * np.cumsum(freq) / float(sr)
+    sub = np.sin(phase) * np.exp(-t / 0.52)
+    transient = np.sin(2.0 * np.pi * 140.0 * t) * np.exp(-t / 0.035) * 0.45
+    pcm = np.tanh(1.35 * (sub + transient)).astype(np.float32)
+    rel = min(n // 2, int(0.18 * sr))
+    pcm[-rel:] *= np.linspace(1.0, 0.0, rel, dtype=np.float32)
     return encode_mono_pcm_to_wav(pcm, sr)
 
 
@@ -1033,7 +1035,13 @@ class HouseAudioManager:
         elif kind_clean == "rest_done":
             payload_bytes = synth_rest_done()
         elif kind_clean == "pr_fanfare":
-            payload_bytes = synth_pr_fanfare()
+            candidates: list[Path] = []
+            if self.sfx_dir is not None:
+                candidates.append(self.sfx_dir / "pr_bell_crowd.wav")
+            if self.allow_network:
+                candidates.append(Path(r"S:\ArmoryCam\sfx\pr_bell_crowd.wav"))
+            bell_path = next((p for p in candidates if p.is_file() and p.stat().st_size > 1000), None)
+            payload_bytes = bell_path.read_bytes() if bell_path is not None else synth_pr_fanfare()
         elif kind_clean == "tts":
             clean_txt = str(text or "225 for 8, got it").strip()
             if synthesize_tts_fn is not None:
