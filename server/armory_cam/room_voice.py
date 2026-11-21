@@ -194,6 +194,9 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "replay slow",
         "buddy mode",
         "undo",
+        "primary display",
+        "spin TV",
+        "wallboard",
     ]
     seen = {x.lower() for x in core}
     extras: list[str] = []
@@ -1068,6 +1071,7 @@ class RoomVoiceService:
         allow_hardware_audio: bool = True,
         root_dir: Path | None = None,
         house_audio_router: Callable[..., dict[str, Any] | None] | None = None,
+        local_command_handler: Callable[[str], dict[str, Any] | None] | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
@@ -1076,6 +1080,7 @@ class RoomVoiceService:
         self._speak_fn = speak_fn
         self._allow_hardware_audio = allow_hardware_audio
         self._house_audio_router = house_audio_router
+        self._local_command_handler = local_command_handler
 
         self.log = logging.getLogger("armory-voice")
         self.lock = threading.RLock()
@@ -1337,7 +1342,40 @@ class RoomVoiceService:
             was_armed = now_ms < self.armed_until_ms
             has_wake = matches_wake_word(clean, wake)
             emitted = bool(clean) and (force_emit or has_wake or was_armed)
+            local_handler = self._local_command_handler if emitted else None
 
+        local_res: dict[str, Any] | None = None
+        if local_handler is not None:
+            try:
+                local_res = local_handler(clean)
+            except Exception as exc:
+                self.log.debug("Local voice command handler error: %s", exc)
+                local_res = None
+
+        if isinstance(local_res, dict) and local_res.get("handled"):
+            speech_txt = str(local_res.get("speech") or "").strip()
+            ack_txt = str(local_res.get("ackText") or speech_txt or "Done").strip()
+            with self.lock:
+                self.armed_until_ms = 0
+                self.event_seq += 1
+                ev_id = self.event_seq
+                entry = {
+                    "id": ev_id,
+                    "tsMs": now_ms,
+                    "transcript": clean,
+                    "wakeMatched": has_wake,
+                    "emitted": True,
+                    "localHandled": True,
+                    "latencyMs": int(latency_ms),
+                    "ackText": ack_txt,
+                }
+                self.recent_transcripts.appendleft(entry)
+                do_readback = bool(self.cfg.speaker_readback and self.context_readback)
+            if do_readback and speech_txt:
+                self.speak_confirmation(speech_txt)
+            return entry
+
+        with self.lock:
             if emitted:
                 if has_wake and not has_command_tail(clean, wake):
                     self.armed_until_ms = now_ms + ARM_WINDOW_MS

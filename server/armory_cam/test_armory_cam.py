@@ -20,6 +20,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import armory_cam_server as ac  # noqa: E402
+import display_control as dc  # noqa: E402
 import house_audio as ha  # noqa: E402
 import room_voice as rv  # noqa: E402
 
@@ -2010,6 +2011,151 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIn(bad1.status_code, (400, 404))
             bad2 = client.get("/api/audio/sfx/%2e%2e%2fconfig.json")
             self.assertIn(bad2.status_code, (400, 404))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_display_voice_parser_controller_and_flask_endpoints(self) -> None:
+        # 1. Lifting/cardio phrases must NEVER trigger display commands
+        for phrase in ("Armory 225 for 8", "Armory check", "Armory skip rest", "Armory replay", "Armory add 10 pounds"):
+            self.assertIsNone(dc.parse_display_voice_command(phrase), msg=phrase)
+
+        self.assertEqual(dc.parse_display_voice_command("Armory turn on primary display")["target"], "primary")
+        self.assertEqual(dc.parse_display_voice_command("Armory turn on primary display")["action"], "on")
+        self.assertEqual(dc.parse_display_voice_command("Armory turn off hisense")["action"], "off")
+        self.assertEqual(dc.parse_display_voice_command("Armory switch primary to PC")["action"], "hdmi1")
+        self.assertEqual(dc.parse_display_voice_command("Armory switch TV to Fire TV")["action"], "hdmi2")
+        self.assertEqual(dc.parse_display_voice_command("Armory turn on spin TV"), {"target": "spin", "action": "on", "speech": "SmartSpin display on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory sleep wallboard"), {"target": "wallboard", "action": "off", "speech": "Wallboard off"})
+        self.assertEqual(dc.parse_display_voice_command("Armory turn off denon")["target"], "avr")
+        self.assertEqual(dc.parse_display_voice_command("Armory gym off"), {"target": "gym", "action": "off", "speech": "Gym displays off"})
+
+        # 2. Controller: Primary ADB discrete keyevents + Roku ECP + Denon VSMONIAUTO/VSMONI1 + Wallboard
+        adb_cmds: list[list[str]] = []
+
+        def fake_runner(cmd: list[str], _timeout: float) -> tuple[int, str, str]:
+            adb_cmds.append(cmd)
+            if "devices" in cmd:
+                return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n", ""
+            return 0, "connected", ""
+
+        fake_adb = ac.FireTvAdbController(adb_bin="adb", runner=fake_runner, settle_sec=0.0)
+        denon_cmds: list[str] = []
+
+        def fake_denon_get(url: str, _to: float) -> tuple[int, bytes]:
+            if "formiPhoneAppDirect.xml?" in url:
+                denon_cmds.append(url.split("?", 1)[1])
+                return 200, b""
+            return 404, b""
+
+        roku_posts: list[str] = []
+        denon_posts: list[tuple[str, bytes]] = []
+        mock_denon_video = {"serve_html": False}
+
+        def fake_ctrl_get(url: str, _to: float) -> tuple[int, bytes]:
+            if mock_denon_video["serve_html"] and "d_video.asp" in url:
+                return 200, b'<FORM name="video"><INPUT type="radio" name="radioMonitorOut" value="AUTO" checked><INPUT type="radio" name="radioVideoConvMode" value="OFF" checked></FORM>'
+            return 404, b""
+
+        def fake_ctrl_post(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+            if "192.168.1.88:8060" in url:
+                roku_posts.append(url)
+            else:
+                denon_posts.append((url, body))
+            return 200, b""
+
+        wb_calls: list[str] = []
+        ha_cfg = ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15")
+        denon_cli = ha.DenonAvrClient(lambda: ha_cfg, http_get=fake_denon_get, sleep_fn=lambda _s: None)
+        ctrl = dc.GymDisplayController(
+            config=dc.GymDisplaysConfig(
+                primary=dc.PrimaryDisplayConfig(host="192.168.1.230", mac="bc:09:b9:e7:35:26"),
+                spin=dc.SpinDisplayConfig(host="192.168.1.88", auto_denon_dual=True),
+            ),
+            adb_controller=fake_adb,
+            denon_client=denon_cli,
+            wake_wallboard_fn=lambda force=True: (wb_calls.append("wake"), {"ok": True, "message": "Wallboard on"})[1],
+            sleep_wallboard_fn=lambda: (wb_calls.append("sleep"), {"ok": True, "message": "Wallboard off"})[1],
+            http_get=fake_ctrl_get,
+            http_post=fake_ctrl_post,
+            sleep_fn=lambda _s: None,
+            allow_network=False,
+        )
+
+        self.assertTrue(ctrl.execute("primary", "on")["ok"])
+        self.assertTrue(any(c[-3:] == ["input", "keyevent", "224"] for c in adb_cmds))
+        self.assertTrue(ctrl.execute("primary", "off")["ok"])
+        self.assertTrue(any(c[-3:] == ["input", "keyevent", "223"] for c in adb_cmds))
+        self.assertTrue(ctrl.execute("primary", "hdmi1")["ok"])
+        self.assertTrue(any("android.media.tv/passthrough/" in " ".join(c) for c in adb_cmds))
+
+        # Test Roku ECP + Denon VSMONIAUTO / VSMONI1 fallback
+        self.assertTrue(ctrl.execute("spin", "on")["ok"])
+        self.assertEqual(roku_posts, ["http://192.168.1.88:8060/keypress/PowerOn", "http://192.168.1.88:8060/keypress/InputHDMI1"])
+        self.assertIn("VSMONIAUTO", denon_cmds)
+
+        self.assertTrue(ctrl.execute("spin", "off")["ok"])
+        self.assertEqual(roku_posts[-1], "http://192.168.1.88:8060/keypress/PowerOff")
+        self.assertIn("VSMONI1", denon_cmds)
+
+        # Also verify Denon AVR-3313CI s_video.asp read-before-write preserves unrelated fields
+        mock_denon_video["serve_html"] = True
+        m_res = ctrl.execute("avr", "monitor1")
+        self.assertTrue(m_res["ok"])
+        self.assertEqual(m_res["via"], "s_video.asp")
+        self.assertEqual(len(denon_posts), 1)
+        self.assertIn(b"radioMonitorOut=1", denon_posts[0][1])
+        self.assertIn(b"radioVideoConvMode=OFF", denon_posts[0][1])
+
+        self.assertTrue(ctrl.execute("wallboard", "on")["ok"])
+        self.assertTrue(ctrl.execute("wallboard", "off")["ok"])
+        self.assertEqual(wb_calls, ["wake", "sleep"])
+
+        # 3. RoomVoiceService local command interception + Flask display endpoints
+        tmp = Path(tempfile.mkdtemp(prefix="armory_disp_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp, adb_controller=fake_adb)
+            svc.displays = ctrl
+            svc.voice._speak_fn = lambda _txt: True
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash = client.get("/").get_data(as_text=True)
+            self.assertIn("Gym Displays &amp; Discrete Power Control", dash)
+            self.assertIn("dpPrimHost", dash)
+            self.assertIn("dpSpinHost", dash)
+
+            svc.voice._stop_event.clear()
+            stream = svc.voice.subscribe_sse()
+            _init_frame = next(stream)
+
+            # Display voice command handled locally — must NOT emit to Pixel SSE
+            disp_evt = svc.voice.inject_transcript("Armory turn on spin TV")
+            self.assertTrue(disp_evt["localHandled"])
+            self.assertIn("SmartSpin display on", disp_evt["ackText"])
+
+            # Normal lifting command still emits over Pixel SSE
+            lift_evt = svc.voice.inject_transcript("Armory 225 for 8")
+            self.assertTrue(lift_evt["emitted"])
+            self.assertFalse(lift_evt.get("localHandled", False))
+            sse_frame = next(stream).decode("utf-8")
+            self.assertIn("Armory 225 for 8", sse_frame)
+            self.assertNotIn("spin TV", sse_frame)
+            stream.close()
+
+            cfg_res = client.post(
+                "/api/displays/config",
+                json={"spin": {"host": "192.168.1.77", "mac": "aa:bb:cc:dd:ee:ff"}},
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            self.assertEqual(cfg_res.get_json()["config"]["spin"]["host"], "192.168.1.77")
+
+            st_res = client.get("/api/displays/status")
+            self.assertEqual(st_res.status_code, 200)
+            self.assertEqual(st_res.get_json()["config"]["primary"]["host"], "192.168.1.230")
+
+            act_res = client.post("/api/displays/action", json={"target": "primary", "action": "on"})
+            self.assertEqual(act_res.status_code, 200)
+            self.assertTrue(act_res.get_json()["ok"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

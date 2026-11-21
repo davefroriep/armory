@@ -50,6 +50,11 @@ try:
 except ImportError:
     from house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
 
+try:
+    from .display_control import GymDisplayController, GymDisplaysConfig, parse_display_voice_command
+except ImportError:
+    from display_control import GymDisplayController, GymDisplaysConfig, parse_display_voice_command
+
 DEFAULT_PORT = 8766
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_PRE_ROLL_SEC = 120
@@ -1823,6 +1828,16 @@ class ArmoryCamService:
             adb_controller=self.adb,
             allow_network=self._voice_autostart,
         )
+        self.displays_cfg = GymDisplaysConfig()
+        self.displays = GymDisplayController(
+            config=self.displays_cfg,
+            adb_controller=self.adb,
+            denon_client=self.house_audio.denon,
+            wake_wallboard_fn=self._wake_wallboard_sync,
+            sleep_wallboard_fn=self._sleep_wallboard_sync,
+            wol_sender=send_wol_magic_packet if self._voice_autostart else None,
+            allow_network=self._voice_autostart,
+        )
         self.voice_cfg = RoomVoiceConfig()
         self.voice = RoomVoiceService(
             config=self.voice_cfg,
@@ -1830,6 +1845,7 @@ class ArmoryCamService:
             allow_hardware_audio=self._voice_autostart,
             root_dir=self.root,
             house_audio_router=self.house_audio.try_route_voice_pcm,
+            local_command_handler=self._handle_local_voice_command,
         )
 
         self.lock = threading.RLock()
@@ -2019,6 +2035,7 @@ class ArmoryCamService:
             self.voice_cfg = RoomVoiceConfig()
             self.voice.update_config(self.voice_cfg.to_dict())
             self.house_audio_cfg = self.house_audio.update_config({})
+            self.displays_cfg = self.displays.update_config({})
             self.save_config()
             return
         try:
@@ -2037,6 +2054,8 @@ class ArmoryCamService:
             self.voice.update_config(self.voice_cfg.to_dict())
             ha_raw = raw.get("houseAudio") if isinstance(raw.get("houseAudio"), dict) else {}
             self.house_audio_cfg = self.house_audio.update_config(ha_raw)
+            disp_raw = raw.get("displays") if isinstance(raw.get("displays"), dict) else {}
+            self.displays_cfg = self.displays.update_config(disp_raw)
             raw_cams = [item for item in raw.get("cameras", []) if isinstance(item, dict) and str(item.get("name", "")).strip()]
             loaded = self._build_camera_configs(raw_cams) if raw_cams else []
             self.cameras = loaded or default_cams
@@ -2056,6 +2075,7 @@ class ArmoryCamService:
             "wallboard": self.wallboard_cfg.to_dict(),
             "voice": self.voice_cfg.to_dict(),
             "houseAudio": self.house_audio_cfg.to_dict(),
+            "displays": self.displays_cfg.to_dict(),
         }
         tmp = self.config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -2142,6 +2162,8 @@ class ArmoryCamService:
                 self.voice_cfg = self.voice.update_config(raw["voice"])
             if isinstance(raw.get("houseAudio"), dict):
                 self.house_audio_cfg = self.house_audio.update_config(raw["houseAudio"])
+            if isinstance(raw.get("displays"), dict):
+                self.displays_cfg = self.displays.update_config(raw["displays"])
             if isinstance(raw.get("cameras"), list):
                 next_cams = self._build_camera_configs(raw["cameras"], prev_by_slug=prev_by_slug)
                 if next_cams:
@@ -4350,7 +4372,35 @@ class ArmoryCamService:
                 "wallboard": wb_status,
                 "voice": self.voice.status_dict(),
                 "houseAudio": self.house_audio.status_dict(live_probe=False),
+                "displays": self.displays.status_dict(live_probe=False),
             }
+
+    def _wake_wallboard_sync(self, force: bool = True) -> dict[str, Any]:
+        with self.lock:
+            cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
+            url = self.effective_wallboard_url()
+        return self.adb.wake_and_launch(cfg, url, force=force)
+
+    def _sleep_wallboard_sync(self) -> dict[str, Any]:
+        with self.lock:
+            cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
+        return self.adb.schedule_sleep(cfg, delay_sec=0.0, reason="display_off")
+
+    def _handle_local_voice_command(self, transcript: str) -> dict[str, Any] | None:
+        parsed = parse_display_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
+        if not parsed:
+            return None
+        res = self.displays.execute(parsed["target"], parsed["action"])
+        speech = parsed["speech"] if res.get("ok") else (res.get("error") or "Display command failed")
+        return {
+            "handled": True,
+            "ok": bool(res.get("ok")),
+            "target": parsed["target"],
+            "action": parsed["action"],
+            "speech": speech,
+            "ackText": f"✓ {parsed['speech']}" if res.get("ok") else f"✗ {speech}",
+            "result": res,
+        }
 
     def play_house_audio_test(self, params: dict[str, Any]) -> dict[str, Any]:
         """Execute an explicit House Audio / Mode Test Bench cue with direct S330 fallback support."""
@@ -4791,6 +4841,51 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div id="haMatrixTable" style="color:var(--mut);font-size:12px">Loading compatibility matrix…</div>
     </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>
+      <span>Gym Displays &amp; Discrete Power Control</span>
+      <span id="dpBadge" class="pill">READY</span>
+    </h2>
+    <div id="dpMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
+      Discrete IP power &amp; input commands (never toggles). Voice ready whenever mic is open: <code>&ldquo;Armory turn on primary display&rdquo;</code>, <code>&ldquo;Armory turn on spin TV&rdquo;</code>, <code>&ldquo;Armory turn off wallboard&rdquo;</code>, <code>&ldquo;Armory switch primary to PC&rdquo;</code>, <code>&ldquo;Armory gym off&rdquo;</code>.
+    </div>
+    <div class="ctrl-row" style="margin-top:0;margin-bottom:10px">
+      <button class="btn ok sm" type="button" data-dpact="primary:on">Primary ON</button>
+      <button class="btn sec sm" type="button" data-dpact="primary:off">Primary OFF</button>
+      <button class="btn sec sm" type="button" data-dpact="primary:hdmi1">Primary PC (HDMI 1)</button>
+      <button class="btn sec sm" type="button" data-dpact="primary:hdmi2">Primary Fire TV (HDMI 2)</button>
+      <button class="btn ok sm" type="button" data-dpact="spin:on">SmartSpin ON</button>
+      <button class="btn sec sm" type="button" data-dpact="spin:off">SmartSpin OFF</button>
+      <button class="btn ok sm" type="button" data-dpact="wallboard:on">Wallboard ON</button>
+      <button class="btn sec sm" type="button" data-dpact="wallboard:off">Wallboard OFF</button>
+      <button class="btn ok sm" type="button" data-dpact="avr:on">Denon ON</button>
+      <button class="btn sec sm" type="button" data-dpact="avr:off">Denon OFF</button>
+      <button class="btn sec sm" type="button" data-dpact="avr:mch_stereo">Denon Multi-Ch</button>
+      <button class="btn ok sm" type="button" data-dpact="gym:on">Gym ON</button>
+      <button class="btn red sm" type="button" data-dpact="gym:off">Gym OFF</button>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+      <div><label>Armory Primary IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
+      <div><label>Primary Wi-Fi MAC</label><input id="dpPrimMac" type="text" value="bc:09:b9:e7:35:26"></div>
+      <div><label>Primary PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="com.mediatek.tis/.HdmiInputService/HW2"></div>
+      <div><label>Primary Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="com.mediatek.tis/.HdmiInputService/HW3"></div>
+      <div><label>SmartSpin Roku IP (TCL)</label><input id="dpSpinHost" type="text" placeholder="192.168.1.xxx"></div>
+      <div><label>SmartSpin MAC</label><input id="dpSpinMac" type="text" placeholder="xx:xx:xx:xx:xx:xx"></div>
+      <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
+      <div>
+        <label>Auto Denon Monitor 1 / Dual</label>
+        <select id="dpSpinDual"><option value="1">Yes (Single Sink when Spin OFF)</option><option value="0">No (Leave Denon Auto)</option></select>
+      </div>
+    </div>
+    <div class="ctrl-row" style="margin-top:10px">
+      <button class="btn" id="dpSaveBtn" type="button">Save Displays</button>
+      <button class="btn sec" id="dpProbePrimBtn" type="button">Probe Primary ADB</button>
+      <button class="btn sec" id="dpFindRokuBtn" type="button">Find Roku TVs</button>
+      <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
+    </div>
+    <div id="dpRokuList" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
   </div>
 
   <div class="card" style="margin-top:14px">
@@ -7087,6 +7182,9 @@ async function pollStatus() {
     if (st.houseAudio) {
       syncHouseAudioUI(st.houseAudio);
     }
+    if (st.displays) {
+      syncDisplaysUI(st.displays);
+    }
   } catch {}
 }
 
@@ -7257,6 +7355,89 @@ async function runHouseAudioTest(kind, mode, sfxFile = '') {
   }
 }
 
+function populateDisplaysInputs(dc) {
+  if (!dc) return;
+  const p = dc.primary || {};
+  const s = dc.spin || {};
+  $('dpPrimHost').value = p.host || '192.168.1.230';
+  $('dpPrimMac').value = p.mac || 'bc:09:b9:e7:35:26';
+  $('dpPrimHdmi1').value = p.hdmiOptiplexInput || 'com.mediatek.tis/.HdmiInputService/HW2';
+  $('dpPrimHdmi2').value = p.hdmiDenonInput || 'com.mediatek.tis/.HdmiInputService/HW3';
+  $('dpSpinHost').value = s.host || '';
+  $('dpSpinMac').value = s.mac || '';
+  $('dpSpinHdmi').value = s.hdmiInput || 'InputHDMI1';
+  $('dpSpinDual').value = s.autoDenonDual === false ? '0' : '1';
+}
+
+function syncDisplaysUI(ds) {
+  if (!ds) return;
+  const spin = ds.spin || {};
+  const prim = (ds.primary && ds.primary.probe) || {};
+  const badge = $('dpBadge');
+  if (badge) {
+    if (spin.ok) {
+      badge.textContent = `PRIMARY · SPIN ${spin.powerMode === 'PowerOn' ? 'ON' : 'READY'}`;
+      badge.className = 'pill ok';
+    } else if (prim.ok) {
+      badge.textContent = `PRIMARY ${prim.displayPower || 'OK'}`;
+      badge.className = 'pill ok';
+    } else {
+      badge.textContent = 'PRIMARY READY';
+      badge.className = 'pill live';
+    }
+  }
+}
+
+async function saveDisplaysConfig(triggerBtn) {
+  const body = {
+    primary: {
+      host: $('dpPrimHost').value.trim(),
+      mac: $('dpPrimMac').value.trim(),
+      hdmiOptiplexInput: $('dpPrimHdmi1').value.trim(),
+      hdmiDenonInput: $('dpPrimHdmi2').value.trim(),
+    },
+    spin: {
+      host: $('dpSpinHost').value.trim(),
+      mac: $('dpSpinMac').value.trim(),
+      hdmiInput: $('dpSpinHdmi').value.trim() || 'InputHDMI1',
+      autoDenonDual: $('dpSpinDual').value === '1',
+    },
+  };
+  try {
+    const r = await fetch('/api/displays/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    if (!r || !r.ok) throw new Error('Rejected');
+    if (cfg) cfg.displays = r.config;
+    populateDisplaysInputs(r.config);
+    syncDisplaysUI(r.status);
+    $('dpOut').textContent = 'Display settings saved!';
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2000);
+  } catch {
+    $('dpOut').textContent = 'Save failed';
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Failed', 2500);
+  }
+}
+
+async function runDisplayAction(target, action) {
+  $('dpOut').textContent = `Running ${target} ${action}…`;
+  try {
+    const r = await fetch('/api/displays/action', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ target, action }),
+    }).then(x => x.json());
+    $('dpOut').textContent = r.ok ? `✓ ${r.message || 'Done'}` : `✗ ${r.error || r.message || 'Failed'}`;
+    if (target === 'avr' || target === 'gym' || target === 'spin') await pollAudioStatus();
+  } catch {
+    $('dpOut').textContent = '✗ Display command failed';
+  }
+}
+
+function pickDiscoveredRoku(host, mac) {
+  $('dpSpinHost').value = host;
+  if (mac) $('dpSpinMac').value = mac;
+  saveDisplaysConfig($('dpSaveBtn'));
+}
+
 async function pollClips() {
   try {
     const clips = await fetch('/api/clips').then(r => r.json());
@@ -7294,6 +7475,7 @@ async function init() {
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
   populateHouseAudioInputs(cfg.houseAudio || {});
+  populateDisplaysInputs(cfg.displays || {});
   renderCameras();
   syncAlignmentUI();
   wireMaskModal();
@@ -7445,6 +7627,44 @@ $('haMatrixTable').addEventListener('click', (ev) => {
   $('haMxApp').value = td.dataset.mxapp;
   $('haMxMode').value = td.dataset.mxmode;
 });
+document.querySelectorAll('[data-dpact]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const [target, action] = btn.dataset.dpact.split(':');
+    runDisplayAction(target, action);
+  });
+});
+$('dpSaveBtn').onclick = () => saveDisplaysConfig($('dpSaveBtn'));
+$('dpProbePrimBtn').onclick = async () => {
+  await saveDisplaysConfig();
+  $('dpOut').textContent = 'Probing Primary Display ADB…';
+  try {
+    const r = await fetch('/api/displays/status?probe=1').then(x => x.json());
+    const p = (r.primary && r.primary.probe) || {};
+    $('dpOut').textContent = p.ok ? `✓ ${p.message}` : (p.message || 'Offline');
+    syncDisplaysUI(r);
+  } catch {
+    $('dpOut').textContent = 'Probe failed';
+  }
+};
+$('dpFindRokuBtn').onclick = async () => {
+  $('dpOut').textContent = 'Scanning LAN for Roku TVs…';
+  try {
+    const r = await fetch('/api/displays/discover-roku', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+    const box = $('dpRokuList');
+    const items = Array.isArray(r.devices) ? r.devices : [];
+    $('dpOut').textContent = items.length ? `Found ${items.length} Roku device(s)` : 'No Roku TVs responded on :8060';
+    if (box) {
+      if (!items.length) {
+        box.hidden = true;
+      } else {
+        box.hidden = false;
+        box.innerHTML = items.map(d => `<div style="margin-top:4px"><code>${escHtml(d.host)}</code> · <b>${escHtml(d.name || d.model || 'Roku')}</b> (${escHtml(d.location || 'No location')}, ${escHtml(d.powerMode || '')}, MAC ${escHtml(d.mac || '')}) <button class="btn ok sm" type="button" onclick="pickDiscoveredRoku('${escHtml(d.host)}','${escHtml(d.mac || '')}')">Use as SmartSpin</button></div>`).join('');
+      }
+    }
+  } catch {
+    $('dpOut').textContent = 'Roku discovery failed';
+  }
+};
 init();
 </script>
 </body>
@@ -7579,6 +7799,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "wallboard": service.wallboard_cfg.to_dict(),
                 "voice": service.voice_cfg.to_dict(),
                 "houseAudio": service.house_audio_cfg.to_dict(),
+                "displays": service.displays_cfg.to_dict(),
                 "disk": service.disk_stats(),
             }
         return jsonify(payload)
@@ -8016,6 +8237,41 @@ def create_app(service: ArmoryCamService) -> Flask:
             return jsonify({"ok": True, "matrix": snap})
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.get("/api/displays/status")
+    def api_displays_status() -> Response:
+        probe_flag = request.args.get("probe") in ("1", "true", "yes")
+        if probe_flag:
+            service.displays.probe_primary()
+        resp = jsonify(service.displays.status_dict(live_probe=probe_flag))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/displays/config")
+    def api_displays_config() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid display config"}), 400
+        with service.lock:
+            service.displays_cfg = service.displays.update_config(body)
+            service.save_config()
+            cfg_dict = service.displays_cfg.to_dict()
+        return jsonify({"ok": True, "config": cfg_dict, "status": service.displays.status_dict(live_probe=False)})
+
+    @app.post("/api/displays/action")
+    def api_displays_action() -> Response:
+        body = request.get_json(silent=True) or {}
+        target = str(body.get("target") or "").strip()
+        action = str(body.get("action") or "").strip()
+        if not target or not action:
+            return jsonify({"ok": False, "error": "Provide target and action"}), 400
+        res = service.displays.execute(target, action)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/displays/discover-roku")
+    def api_displays_discover_roku() -> Response:
+        devices = service.displays.discover_roku_tvs()
+        return jsonify({"ok": True, "devices": devices})
 
     @app.get("/api/clips")
     def api_clips() -> Response:
