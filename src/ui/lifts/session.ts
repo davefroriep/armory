@@ -154,7 +154,7 @@ function build(root: HTMLElement, id?: string): () => void {
       <input class="sw${set.wAuto ? ' auto' : ''}" inputmode="decimal" enterkeyhint="next" autocomplete="off" value="${wShow}" placeholder="${ex.type === 'weight' ? '–' : 'BW'}" aria-label="Weight">
       <input class="sr${set.rAuto ? ' auto' : ''}" inputmode="numeric" enterkeyhint="next" autocomplete="off" value="${set.r ?? ''}" placeholder="${isTime ? 'sec' : '–'}" aria-label="${isTime ? 'Seconds' : 'Reps'}">
       ${holdBtn}
-      <button class="svid${isRec ? ' rec' : isSaving ? ' saving' : hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${isSaving ? 'Saving clip…' : isRec ? 'Stop camera recording' : hasVid ? 'Play clip' : 'Arm camera or link video'}">${LI.video}</button>
+      <button class="svid${isRec ? ' rec' : isSaving ? ' saving' : hasVid ? ' on' : ''}" type="button" data-act="vid" aria-label="${isSaving ? 'Saving clip…' : isRec ? 'Stop camera recording' : hasVid ? 'Play clip' : 'Record set'}">${LI.video}</button>
       <button class="schk${set.done ? ' on' : ''}" type="button" data-act="done" aria-label="Log set"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 12.5l5 5L19.5 7.5"/></svg></button>
     </div>`;
   };
@@ -848,17 +848,20 @@ function build(root: HTMLElement, id?: string): () => void {
     const set = se.sets[i];
     const ex = exOf(se.exId);
     const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
+    const setLabel = set.kind === 'w' ? 'Warm-up' : `Set ${n}`;
+    const canCustomCam = !edit && gymCam.online && !set.done && !gymCam.isArmed(set.id) && !gymCam.isSaving(set.id);
     const vids = (): string => (set.vids ?? []).map((v) => lifts.videos.get(v)).filter(Boolean)
       .map((v) => `<button class="vthumb" data-play="${v!.id}" style="${v!.thumb ? `background-image:url(${v!.thumb})` : ''}"><i>▶</i></button>`).join('');
     let sh!: Sheet;
     let resolveClosed: () => void = () => {};
     const closed = new Promise<void>((res) => { resolveClosed = res; });
     sh = openSheet(`
-      <h3 class="sh-title">${esc(ex.name)} · ${set.kind === 'w' ? 'Warm-up' : `Set ${n}`}</h3>
+      <h3 class="sh-title">${esc(ex.name)} · ${setLabel}</h3>
       <div class="fl">SET TYPE</div><div class="seg" id="sk"></div>
       <div class="fl">EFFORT <small>RPE</small></div><div class="chips-row wrap" id="sr"></div>
       <div class="fl">VIDEO</div>
       <div class="vrow"><div id="sv" class="vthumbs">${vids()}</div></div>
+      ${canCustomCam ? '<button class="btn big" type="button" data-vcustom>Record Custom Camera…</button>' : ''}
       <button class="btn big" type="button" data-vmanage>Link or Record Video…</button>
       <button class="btn danger big" data-del ${se.sets.length <= 1 ? 'disabled' : ''}>Delete set</button>
       <button class="btn primary big" data-ok>Done</button>`, { onClose: resolveClosed });
@@ -877,12 +880,32 @@ function build(root: HTMLElement, id?: string): () => void {
       if (k) { set.kind = k.dataset.k as SetKind; draw(); }
       else if (r) { const v = Number(r.dataset.r); if (v) set.rpe = v; else delete set.rpe; draw(); }
       else if (p) { await playVideo(p.dataset.play!); draw(); }
-      else if (t.closest('[data-vmanage]')) {
+      else if (t.closest('[data-vcustom]')) {
+        sh.close();
+        const choice = await pickRecordCameraSheet(ex.name, setLabel, camsForEx(se), !!s.buddyMode);
+        if (dead || choice.kind === 'cancel') return;
+        if (choice.kind === 'cam') {
+          active.ensureStarted(s, true);
+          paintClock();
+          const effCams = choice.cameras.length ? choice.cameras : camsForEx(se);
+          se.cams = [...effCams];
+          delete se.camPref;
+          save();
+          gymCam.armSet(s, se, set, effCams);
+          buzz(25);
+          syncVisibleCards();
+          const camLbl = effCams.map(shortCamLabel).join(' + ');
+          toast(`Recording ${camLbl} · ${setLabel} — tap red camera or ✓ to stop`);
+        } else if (choice.kind === 'link') {
+          await openSetVideoSheet({ session: s, se, set }, setLabel);
+          if (!dead) { save(); paint(); }
+        }
+      } else if (t.closest('[data-vmanage]')) {
         if (!edit) {
           active.ensureStarted(s, true);
           paintClock();
         }
-        await openSetVideoSheet({ session: s, se, set }, set.kind === 'w' ? 'Warm-up' : `Set ${n}`);
+        await openSetVideoSheet({ session: s, se, set }, setLabel);
         draw();
       } else if (t.closest('[data-del]')) {
         const snap = snapshot();
@@ -1356,22 +1379,15 @@ function build(root: HTMLElement, id?: string): () => void {
           return;
         }
         if (gymCam.online && !set.done) {
-          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel, camsForEx(se), !!s.buddyMode);
-          if (dead || choice.kind === 'cancel') return;
-          if (choice.kind === 'cam') {
-            active.ensureStarted(s, true);
-            paintClock();
-            const effCams = choice.cameras.length ? choice.cameras : camsForEx(se);
-            se.cams = [...effCams];
-            delete se.camPref;
-            save();
-            gymCam.armSet(s, se, set, effCams);
-            buzz(25);
-            syncVisibleCards();
-            const camLbl = effCams.map(shortCamLabel).join(' + ');
-            toast(`Recording ${camLbl} · ${setLabel} — tap ✓ or red camera to stop`);
-            return;
-          }
+          active.ensureStarted(s, true);
+          paintClock();
+          const effCams = camsForEx(se);
+          gymCam.armSet(s, se, set, effCams);
+          buzz(25);
+          syncVisibleCards();
+          const camLbl = effCams.map(shortCamLabel).join(' + ');
+          toast(`Recording ${camLbl} · ${setLabel} — tap red camera or ✓ to stop`);
+          return;
         }
       }
       await openSetVideoSheet({ session: s, se, set }, setLabel);

@@ -292,6 +292,7 @@ describe('voice transcript parser', () => {
     expect(defaultReadbackForIntent({ kind: 'log_current' }, 'check')).toBe('Set checked');
     expect(defaultReadbackForIntent({ kind: 'undo' })).toBe('Undid last');
 
+    expect([...SET_CONFIRM_TAGS]).toEqual(['check', 'got it']);
     let prevTag: string | null = null;
     for (let i = 0; i < 20; i++) {
       const next = pickSetConfirmTag(prevTag);

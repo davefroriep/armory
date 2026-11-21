@@ -623,16 +623,8 @@ export function hasCommandTailAfterWake(raw: string, wakeWord?: string, armed = 
 }
 
 export const SET_CONFIRM_TAGS = [
-  'got it',
   'check',
-  'done',
-  'logged',
-  'locked in',
-  'banked',
-  'solid',
-  'clean',
-  'on the board',
-  'in the books',
+  'got it',
 ] as const;
 
 /** Picks a punchy set-logged confirmation tag at random without repeating `prevTag` back-to-back. */

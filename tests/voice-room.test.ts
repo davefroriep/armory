@@ -110,9 +110,12 @@ describe('VoiceController room source relay', () => {
     mockState.speakCalls.length = 0;
     mockState.saveCalls = 0;
     voice.listening = false;
+    voice.roomOnline = false;
     voice.armedUntilMs = 0;
     voice.lastAction = null;
     voice.lastHeard = '';
+    (voice as unknown as { lastSpokenText: string; lastSpokenAt: number }).lastSpokenText = '';
+    (voice as unknown as { lastSpokenText: string; lastSpokenAt: number }).lastSpokenAt = 0;
   });
 
   it('logs set from room source without turning on phone listening, deduplicates, and skips Pixel TTS when OptiPlex ack speaks', async () => {
@@ -277,6 +280,44 @@ describe('VoiceController room source relay', () => {
       expect(sess.exs[0].sets[1].done).toBe(false);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('routes phone-mic readback to OptiPlex Andrew speaker when room stream is online and deduplicates identical speech within 2.5s', async () => {
+    const sess = makeBenchSession('sess_unified_voice');
+    mockState.activeSess = sess;
+    voice.roomOnline = true;
+    updateSettings({ voiceRoomEnabled: true, gymCamEnabled: true });
+    const ackBodies: { speech?: string }[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/voice/ack') && init?.body) {
+        ackBodies.push(JSON.parse(String(init.body)) as { speech?: string });
+        return { ok: true, json: async () => ({ ok: true, spoke: true }) };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 5',
+        isFinal: true,
+        source: 'mic',
+        state: 'listening',
+      });
+      await new Promise((r) => setTimeout(r, 15));
+
+      expect(sess.exs[0].sets[0].done).toBe(true);
+      expect(ackBodies).toHaveLength(1);
+      expect(ackBodies[0].speech).toMatch(new RegExp(`^225 for 5, (${SET_CONFIRM_TAGS.join('|')})$`));
+      expect(mockState.speakCalls).toEqual([]);
+
+      // Repeating identical confirmation text within 2.5s via direct mic fallback does not double-speak
+      voice.roomOnline = false;
+      (voice as unknown as { speakWithSource: (s: string | null, src: 'mic' | 'room', n: { text: string; kind: 'ok'; atMs: number }) => void })
+        .speakWithSource(ackBodies[0].speech!, 'mic', { text: 'dup', kind: 'ok', atMs: Date.now() });
+      expect(mockState.speakCalls).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
     }
   });
 });

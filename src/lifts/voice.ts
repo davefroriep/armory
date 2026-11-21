@@ -159,6 +159,8 @@ class VoiceController {
   private partialCommitTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPartialCommitKey = '';
   private lastPartialCommitAt = 0;
+  private lastSpokenText = '';
+  private lastSpokenAt = 0;
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
@@ -644,7 +646,7 @@ class VoiceController {
     text: string;
     kind: VoiceActionNotice['kind'];
   }): Promise<boolean> {
-    const res = await this.postRoomJson<{ ok?: boolean; spoke?: boolean }>('/api/voice/ack', payload, 1500);
+    const res = await this.postRoomJson<{ ok?: boolean; spoke?: boolean }>('/api/voice/ack', payload, 4000);
     return !!res?.spoke;
   }
 
@@ -939,16 +941,31 @@ class VoiceController {
     source: NativeVoiceEvent['source'],
     notice: VoiceActionNotice,
   ): void {
-    const cleanSpeech = getSettings().voiceReadback && speech ? speech.trim() : '';
-    if (source === 'room') {
-      void this.ackRoom({
-        armed: this.isArmed(),
-        speech: cleanSpeech,
-        text: notice.text,
-        kind: notice.kind,
-      }).then((spoke) => {
-        if (cleanSpeech && !spoke) this.speak(cleanSpeech);
-      });
+    const rawSpeech = getSettings().voiceReadback && speech ? speech.trim() : '';
+    const now = Date.now();
+    let cleanSpeech = rawSpeech;
+    if (cleanSpeech) {
+      const norm = cleanSpeech.toLowerCase();
+      if (norm === this.lastSpokenText && now - this.lastSpokenAt < 2500) {
+        cleanSpeech = '';
+      } else {
+        this.lastSpokenText = norm;
+        this.lastSpokenAt = now;
+      }
+    }
+    const s = getSettings();
+    const useRoomSpeaker = source === 'room' || (this.roomOnline && s.voiceRoomEnabled && s.gymCamEnabled);
+    if (useRoomSpeaker) {
+      if (source === 'room' || cleanSpeech) {
+        void this.ackRoom({
+          armed: this.isArmed(),
+          speech: cleanSpeech,
+          text: notice.text,
+          kind: notice.kind,
+        }).then((spoke) => {
+          if (cleanSpeech && !spoke) this.speak(cleanSpeech);
+        });
+      }
       return;
     }
     if (cleanSpeech) this.speak(cleanSpeech);
@@ -973,10 +990,8 @@ class VoiceController {
     source: NativeVoiceEvent['source'] = 'mic',
   ): VoiceActionNotice {
     const n = this.runIntent(intent);
-    if (source === 'room') {
-      this.speakWithSource(speakIt ? (n.speech ?? null) : null, 'room', n);
-    } else if (speakIt && n.speech) {
-      this.speak(n.speech);
+    if (source === 'room' || (speakIt && n.speech)) {
+      this.speakWithSource(speakIt ? (n.speech ?? null) : null, source, n);
     }
     return n;
   }

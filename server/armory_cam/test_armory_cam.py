@@ -3953,6 +3953,129 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_ring_disk_fallback_cuts_full_clip_despite_ingest_backlog(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_ring_fallback_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            client.post(
+                "/api/config",
+                json={
+                    "cameras": [
+                        {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "crop": [0.0, 0.0, 1.0, 1.0], "defish": False},
+                    ]
+                },
+            )
+            client.post("/api/session/start", json={"sessionId": "sess-lag", "name": "Deadlift Day"})
+
+            ff = shutil.which("ffmpeg") or svc.ffmpeg
+            base_dt = datetime(2026, 11, 21, 14, 34, 18)
+            base_ms = int(base_dt.timestamp() * 1000)
+            ring_dir = svc.ring_root / "rack_cam"
+            ring_dir.mkdir(parents=True, exist_ok=True)
+
+            # Write three 3-second segments ONLY to ring_root on disk without running _ingest_closed_segments
+            for i in range(4):
+                seg_dt = datetime.fromtimestamp((base_ms + i * 3000) / 1000.0)
+                seg_path = ring_dir / f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                subprocess.run(
+                    [
+                        ff, "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=20:d=3",
+                        "-c:v", "libx264", "-g", "15", "-bf", "0", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                    ],
+                    check=True,
+                )
+
+            found = svc.find_segments("Rack Cam", "sess-lag", base_ms + 2000, base_ms + 11000)
+            self.assertEqual(len(found), 4)
+            self.assertEqual(found[0].end_ms - found[0].start_ms, 3000)
+
+            clip_res = client.post(
+                "/api/clip",
+                json={
+                    "sessionId": "sess-lag",
+                    "exName": "Deadlift",
+                    "startMs": base_ms + 2000,
+                    "endMs": base_ms + 11000,
+                    "camera": "Rack Cam",
+                },
+            )
+            self.assertEqual(clip_res.status_code, 200)
+            clip_data = clip_res.get_json()
+            self.assertTrue(clip_data["ok"])
+            self.assertGreaterEqual(clip_data["durationSec"], 8)
+            out_file = svc.clips_root / clip_data["lanUrl"].removeprefix("/clips/")
+            dur_txt = subprocess.check_output(
+                [svc.ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(out_file)],
+                text=True,
+            ).strip()
+            self.assertGreaterEqual(float(dur_txt), 8.0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_room_voice_speak_dedup_and_worker_coalescing(self) -> None:
+        spoken_direct: list[str] = []
+        v1 = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(enabled=True),
+            speak_fn=lambda txt: spoken_direct.append(txt) or True,
+            allow_hardware_audio=False,
+        )
+        self.assertTrue(v1.speak_confirmation("135 for 10, check"))
+        self.assertTrue(v1.speak_confirmation("135 for 10, check"))
+        self.assertTrue(v1.speak_confirmation("135 for 10, got it"))
+        self.assertEqual(spoken_direct, ["135 for 10, check", "135 for 10, got it"])
+
+        played: list[str] = []
+        gate = threading.Event()
+        done_all = threading.Event()
+
+        class FakeTts:
+            def synthesize(self, text: str, voice: str | None = None):
+                return np.ones(1600, dtype=np.float32), 16_000
+
+        v2 = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(enabled=True, tts_voice="en-US-AndrewMultilingualNeural"),
+            allow_hardware_audio=False,
+        )
+        v2._tts = FakeTts()
+
+        def fake_play(pcm, sr, **kwargs):
+            played.append("played")
+            if len(played) == 1:
+                gate.wait(timeout=2.0)
+            else:
+                done_all.set()
+            return True
+
+        synthesized_texts: list[str] = []
+        orig_synth = v2._tts.synthesize
+
+        def tracked_synth(text: str, voice: str | None = None):
+            synthesized_texts.append(text)
+            return orig_synth(text, voice=voice)
+
+        v2._tts.synthesize = tracked_synth
+        v2._play_pcm_blocking = fake_play
+        v2._started = True
+        worker = threading.Thread(target=v2._speaker_worker_loop, daemon=True)
+        worker.start()
+        try:
+            v2._speaker_queue.put_nowait(("tts", ("first", "v")))
+            time.sleep(0.05)
+            v2._speaker_queue.put_nowait(("tts", ("stale-2", "v")))
+            v2._speaker_queue.put_nowait(("tts", ("stale-3", "v")))
+            v2._speaker_queue.put_nowait(("tts", ("latest-4", "v")))
+            gate.set()
+            self.assertTrue(done_all.wait(timeout=2.0))
+            self.assertEqual(synthesized_texts, ["first", "latest-4"])
+        finally:
+            v2._stop_event.set()
+            v2._speaker_queue.put_nowait(("stop", None))
+            worker.join(timeout=1.5)
+
 
 if __name__ == "__main__":
     unittest.main()

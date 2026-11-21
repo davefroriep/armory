@@ -3011,7 +3011,6 @@ class ArmoryCamService:
 
             dur_ms, raw_frames = extract_ts_sampled_frames(p)
             rot_cache: dict[tuple[int, float], list[np.ndarray]] = {}
-            first_raw = raw_frames[0] if raw_frames else None
             view_results: list[tuple[CameraConfig, SegmentInfo]] = []
             for v in views:
                 tkey = (normalize_rotate(v.rotate), normalize_tilt(v.tilt))
@@ -3031,15 +3030,6 @@ class ArmoryCamService:
                     if rot_cache[tkey]
                     else 0.0
                 )
-                try:
-                    self._get_or_create_seg_thumb(
-                        v,
-                        p,
-                        max_w=DEFAULT_SCRUB_THUMB_W,
-                        predecoded_frame=first_raw,
-                    )
-                except Exception:
-                    pass
                 info = SegmentInfo(
                     path=p,
                     start_ms=start_ms,
@@ -3243,6 +3233,71 @@ class ArmoryCamService:
         samples.sort(key=lambda x: int(x["startMs"]))
         return samples
 
+    def _scan_ring_disk_segments(
+        self,
+        media_slug: str,
+        slug: str,
+        canon_name: str,
+        by_name: dict[str, SegmentInfo],
+    ) -> set[str]:
+        """Scan raw ring `.ts` files on disk so clip cutting never waits on ingest backlog."""
+        inferred: set[str] = set()
+        ring_dirs = [self.ring_root / media_slug]
+        if slug != media_slug:
+            ring_dirs.append(self.ring_root / slug)
+        for ring_dir in ring_dirs:
+            if not ring_dir.exists():
+                continue
+            for p in sorted(ring_dir.glob("seg_*.ts")):
+                if p.name in by_name:
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                if st.st_size < 1024:
+                    continue
+                s_ms = parse_segment_start_ms(p.name)
+                if s_ms is None:
+                    s_ms = int(st.st_mtime * 1000) - 3000
+                e_ms = max(s_ms + 3500, min(s_ms + 10_000, int(st.st_mtime * 1000)))
+                by_name[p.name] = SegmentInfo(
+                    path=p,
+                    start_ms=s_ms,
+                    end_ms=e_ms,
+                    energy=0.0,
+                    camera=canon_name,
+                )
+                inferred.add(p.name)
+        return inferred
+
+    @staticmethod
+    def _reconcile_inferred_segments(
+        ordered: list[SegmentInfo],
+        inferred_names: set[str],
+    ) -> list[SegmentInfo]:
+        if not inferred_names or len(ordered) < 2:
+            return ordered
+        out: list[SegmentInfo] = []
+        last_idx = len(ordered) - 1
+        for idx, seg in enumerate(ordered):
+            if idx < last_idx and seg.path.name in inferred_names:
+                next_start = ordered[idx + 1].start_ms
+                gap = next_start - seg.start_ms
+                if 500 <= gap <= 12_000:
+                    out.append(
+                        SegmentInfo(
+                            path=seg.path,
+                            start_ms=seg.start_ms,
+                            end_ms=next_start,
+                            energy=seg.energy,
+                            camera=seg.camera,
+                        )
+                    )
+                    continue
+            out.append(seg)
+        return out
+
     def find_segments(self, camera_name: str, session_id: str, start_ms: int, end_ms: int) -> list[SegmentInfo]:
         cam = self._find_camera(camera_name)
         slug = cam.slug if cam else safe_slug(camera_name.lower(), "rack_cam")
@@ -3251,6 +3306,7 @@ class ArmoryCamService:
         clean_id = safe_slug(session_id, "session") if session_id else ""
 
         by_name: dict[str, SegmentInfo] = {}
+        inferred_names: set[str] = set()
         motion_map: dict[str, tuple[int, int, float]] = {}
         if clean_id:
             motion_file = self.tapes_root / clean_id / "motion.jsonl"
@@ -3277,9 +3333,11 @@ class ArmoryCamService:
                             continue
                         m = motion_map.get(p.name)
                         s_ms = m[0] if m else (parse_segment_start_ms(p.name) or 0)
-                        e_ms = m[1] if m else (s_ms + 2000)
+                        e_ms = m[1] if m else (s_ms + 3000)
                         eng = m[2] if m else 0.0
                         by_name[p.name] = SegmentInfo(path=p, start_ms=s_ms, end_ms=e_ms, energy=eng, camera=canon_name)
+                        if not m:
+                            inferred_names.add(p.name)
 
         with self.lock:
             for info in self.ring_segments.get(slug, []):
@@ -3296,7 +3354,8 @@ class ArmoryCamService:
                             camera=canon_name,
                         )
 
-        ordered = sorted(by_name.values(), key=lambda s: s.start_ms)
+        inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_name))
+        ordered = self._reconcile_inferred_segments(sorted(by_name.values(), key=lambda s: s.start_ms), inferred_names)
         return [s for s in ordered if s.end_ms >= start_ms - 2500 and s.start_ms <= end_ms + 2500]
 
     def _find_camera(self, name_or_slug: str | None) -> CameraConfig | None:
@@ -3328,6 +3387,7 @@ class ArmoryCamService:
         canon_name = cam.name if cam else camera_name
         clean_id = safe_slug(session_id, "session") if session_id else ""
         by_name: dict[str, SegmentInfo] = {}
+        inferred_names: set[str] = set()
 
         if clean_id:
             tape_dirs = [self.tapes_root / clean_id / media_slug]
@@ -3341,16 +3401,17 @@ class ArmoryCamService:
                         s_ms = parse_segment_start_ms(p.name)
                         if s_ms is None:
                             try:
-                                s_ms = int(p.stat().st_mtime * 1000) - 2000
+                                s_ms = int(p.stat().st_mtime * 1000) - 3000
                             except OSError:
                                 continue
                         by_name[p.name] = SegmentInfo(
                             path=p,
                             start_ms=s_ms,
-                            end_ms=s_ms + 2000,
+                            end_ms=s_ms + 3000,
                             energy=0.0,
                             camera=canon_name,
                         )
+                        inferred_names.add(p.name)
 
         with self.lock:
             for info in self.ring_segments.get(slug, []):
@@ -3367,7 +3428,8 @@ class ArmoryCamService:
                             camera=canon_name,
                         )
 
-        return sorted(by_name.values(), key=lambda s: s.start_ms)
+        inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_name))
+        return self._reconcile_inferred_segments(sorted(by_name.values(), key=lambda s: s.start_ms), inferred_names)
 
     def tape_timeline(self, camera_name: str, session_id: str, buckets: int = 80) -> dict[str, Any]:
         cam = self._find_camera(camera_name)
@@ -4059,7 +4121,38 @@ class ArmoryCamService:
             preferred_camera=camera_override,
             fallback_camera=fallback_cam,
         )
+        call_now_ms = int(time.time() * 1000)
+        cam_cfg_probe = self._find_camera(chosen_cam)
+        media_slug_probe = (
+            self._source_slug_for(cam_cfg_probe)
+            if cam_cfg_probe
+            else safe_slug(chosen_cam.lower(), "rack_cam")
+        )
+        with self.lock:
+            proc = self._procs.get(media_slug_probe)
+            is_capturing = bool(proc is not None and proc.poll() is None)
+
         segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
+        if is_capturing and int(end_ms) >= call_now_ms - 5000:
+            wait_target_ms = min(int(end_ms), call_now_ms)
+            deadline = time.monotonic() + 4.2
+            while time.monotonic() < deadline:
+                segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
+                ready = False
+                if segs:
+                    last_seg = segs[-1]
+                    if last_seg.start_ms >= wait_target_ms:
+                        ready = True
+                    elif last_seg.end_ms >= wait_target_ms:
+                        try:
+                            ready = (time.time() - last_seg.path.stat().st_mtime) >= 0.6
+                        except OSError:
+                            ready = False
+                if ready:
+                    break
+                if self._stop_event.wait(0.35):
+                    break
+
         if not segs and not camera_override:
             for alt in self.cameras:
                 if alt.name != chosen_cam:

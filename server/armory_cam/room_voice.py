@@ -58,7 +58,9 @@ _LEGACY_TTS_VOICE_MAP = {
 PREWARM_TTS_PHRASES = (
     "Armory room mic ready",
     "Armory mic on",
+    "225 for 8, check",
     "225 for 8, got it",
+    "Set checked",
     "Checked, got it",
     "Didn't catch that",
     "Rest skipped",
@@ -1460,6 +1462,8 @@ class RoomVoiceService:
         self.last_client_seen_mono = 0.0
         self.armed_until_ms = 0
         self._mute_until_mono = 0.0
+        self._last_spoken_text: str = ""
+        self._last_spoken_mono: float = 0.0
 
         self.seq = 0
         self.event_seq = 0
@@ -1942,6 +1946,19 @@ class RoomVoiceService:
                         pcm, sr, lead_ms=lead_ms, tail_ms=tail_ms, target_peak=target_peak, kind="chime"
                     )
                 elif kind == "tts":
+                    stop_now = False
+                    while not self._stop_event.is_set():
+                        try:
+                            nxt_kind, nxt_data = self._speaker_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if nxt_kind == "stop":
+                            stop_now = True
+                            break
+                        if nxt_kind == "tts":
+                            data = nxt_data
+                    if stop_now or self._stop_event.is_set():
+                        break
                     text, voice = data
                     rendered = self._tts.synthesize(text, voice=voice)
                     if rendered:
@@ -1995,6 +2012,13 @@ class RoomVoiceService:
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
             return False
+        now_mono = time.monotonic()
+        norm = clean.lower()
+        with self.lock:
+            if norm == self._last_spoken_text and (now_mono - self._last_spoken_mono) < 3.0:
+                return True
+            self._last_spoken_text = norm
+            self._last_spoken_mono = now_mono
         if self._speak_fn is not None:
             return bool(self._speak_fn(clean))
         if not self._allow_hardware_audio and self._house_audio_router is None:
