@@ -5412,10 +5412,20 @@ DASHBOARD_HTML = """<!doctype html>
         <select id="vxReadback"><option value="1">Yes (Speak on S330)</option><option value="0">No (Pixel Only)</option></select>
       </div>
       <div>
+        <label>Set Confirmation</label>
+        <select id="vxSetCommitMode">
+          <option value="voice">Voice (+10% Speed — Default)</option>
+          <option value="chime">Commit Chime Only (Fast Bing)</option>
+        </select>
+      </div>
+      <div>
         <label>Speaker Voice</label>
         <select id="vxTtsVoice">
-          <option value="en-US-AndrewMultilingualNeural">Andrew (Warm Male — Default)</option>
-          <option value="en-US-AvaMultilingualNeural">Ava (Crisp Female)</option>
+          <option value="kokoro:am_michael">Michael (Local GPU — Fastest)</option>
+          <option value="kokoro:am_onyx">Onyx (Local GPU Deep Male)</option>
+          <option value="kokoro:am_fenrir">Fenrir (Local GPU Bold Male)</option>
+          <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural — Legacy Default)</option>
+          <option value="en-US-AvaMultilingualNeural">Ava (Cloud Neural Female)</option>
           <option value="sapi">Windows Offline SAPI</option>
         </select>
       </div>
@@ -7770,6 +7780,7 @@ async function saveVoiceConfig(triggerBtn) {
     listenMode: $('vxMode').value || 'workout',
     deviceMatch: $('vxDevice').value || 'PowerConf S330',
     speakerReadback: $('vxReadback').value === '1',
+    setCommitMode: $('vxSetCommitMode').value || 'voice',
     ttsVoice: $('vxTtsVoice').value || 'en-US-AndrewMultilingualNeural',
     modelSize: $('vxModel').value || 'base.en',
     vadThreshold: Number($('vxVad').value) || 0.45,
@@ -8228,6 +8239,7 @@ async function init() {
   $('vxEnabled').value = vx.enabled === false ? '0' : '1';
   $('vxMode').value = vx.listenMode === 'always' ? 'always' : 'workout';
   $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
+  $('vxSetCommitMode').value = vx.setCommitMode === 'chime' ? 'chime' : 'voice';
   $('vxTtsVoice').value = vx.ttsVoice || 'en-US-AndrewMultilingualNeural';
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
@@ -9934,7 +9946,14 @@ def create_app(service: ArmoryCamService) -> Flask:
         speech_arg = str(body.get("speech") or "")
         text_arg = str(body.get("text") or "")
         kind_arg = str(body.get("kind") or "")
-        res = service.voice.handle_ack(armed=armed_arg, speech=speech_arg, text=text_arg, kind=kind_arg)
+        commit_mode_arg = str(body.get("setCommitMode") or "").strip().lower() or None
+        res = service.voice.handle_ack(
+            armed=armed_arg,
+            speech=speech_arg,
+            text=text_arg,
+            kind=kind_arg,
+            set_commit_mode=commit_mode_arg,
+        )
         return jsonify(res)
 
     @app.post("/api/voice/config")

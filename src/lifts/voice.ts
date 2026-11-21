@@ -161,6 +161,7 @@ class VoiceController {
   private lastPartialCommitAt = 0;
   private lastSpokenText = '';
   private lastSpokenAt = 0;
+  private lastCommitModeLocalAt = 0;
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
@@ -234,6 +235,15 @@ class VoiceController {
 
   setRoomEnabled(on: boolean): void {
     updateSettings({ voiceRoomEnabled: on });
+  }
+
+  setCommitMode(mode: 'voice' | 'chime'): void {
+    const clean = mode === 'chime' ? 'chime' : 'voice';
+    this.lastCommitModeLocalAt = Date.now();
+    updateSettings({ voiceSetCommitMode: clean });
+    if (getSettings().gymCamEnabled) {
+      void this.postRoomJson('/api/voice/config', { setCommitMode: clean }, 2500);
+    }
   }
 
   async setAbCompare(on: boolean): Promise<boolean> {
@@ -542,6 +552,7 @@ class VoiceController {
             listening?: boolean;
             device?: string;
             error?: string | null;
+            setCommitMode?: string;
           };
           if (d.type === 'status') {
             this.roomOnline = true;
@@ -549,6 +560,13 @@ class VoiceController {
             this.roomListening = !!d.listening;
             this.roomDevice = d.device || '';
             this.roomError = d.error ?? null;
+            if (
+              (d.setCommitMode === 'voice' || d.setCommitMode === 'chime') &&
+              Date.now() - this.lastCommitModeLocalAt > 2500 &&
+              getSettings().voiceSetCommitMode !== d.setCommitMode
+            ) {
+              updateSettings({ voiceSetCommitMode: d.setCommitMode });
+            }
             this.changed.emit();
             return;
           }
@@ -645,6 +663,7 @@ class VoiceController {
     speech: string;
     text: string;
     kind: VoiceActionNotice['kind'];
+    setCommitMode?: 'voice' | 'chime';
   }): Promise<boolean> {
     const res = await this.postRoomJson<{ ok?: boolean; spoke?: boolean }>('/api/voice/ack', payload, 4000);
     return !!res?.spoke;
@@ -941,7 +960,13 @@ class VoiceController {
     source: NativeVoiceEvent['source'],
     notice: VoiceActionNotice,
   ): void {
-    const rawSpeech = getSettings().voiceReadback && speech ? speech.trim() : '';
+    const s = getSettings();
+    const commitMode: 'voice' | 'chime' = s.voiceSetCommitMode === 'chime' ? 'chime' : 'voice';
+    const isSetCommit =
+      notice.kind === 'ok' &&
+      (notice.text.startsWith('✓') || /(?:,\s*(?:check|got it)|^set checked)$/i.test(speech ?? ''));
+    const suppressSpokenForCommit = isSetCommit && commitMode === 'chime';
+    const rawSpeech = s.voiceReadback && !suppressSpokenForCommit && speech ? speech.trim() : '';
     const now = Date.now();
     let cleanSpeech = rawSpeech;
     if (cleanSpeech) {
@@ -953,22 +978,23 @@ class VoiceController {
         this.lastSpokenAt = now;
       }
     }
-    const s = getSettings();
     const useRoomSpeaker = source === 'room' || (this.roomOnline && s.voiceRoomEnabled && s.gymCamEnabled);
     if (useRoomSpeaker) {
-      if (source === 'room' || cleanSpeech) {
+      const roomSpeech = cleanSpeech || (suppressSpokenForCommit && s.voiceReadback && speech ? speech.trim() : '');
+      if (source === 'room' || roomSpeech) {
         void this.ackRoom({
           armed: this.isArmed(),
-          speech: cleanSpeech,
+          speech: roomSpeech,
           text: notice.text,
           kind: notice.kind,
+          setCommitMode: commitMode,
         }).then((spoke) => {
-          if (cleanSpeech && !spoke) this.speak(cleanSpeech);
+          if (cleanSpeech && !spoke && !suppressSpokenForCommit) this.speak(cleanSpeech);
         });
       }
       return;
     }
-    if (cleanSpeech) this.speak(cleanSpeech);
+    if (cleanSpeech && !suppressSpokenForCommit) this.speak(cleanSpeech);
   }
 
   private notice(

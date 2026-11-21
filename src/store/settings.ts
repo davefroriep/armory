@@ -65,6 +65,8 @@ export interface Settings {
   voiceWakeWord: string;
   /** Speak short confirmation readbacks ("For 10, got it" / "Didn't catch that") after voice commands. */
   voiceReadback: boolean;
+  /** How logged strength sets confirm: fast +10% voice readback vs crisp commit chime only. */
+  voiceSetCommitMode: 'voice' | 'chime';
   /** User-added phrase aliases keyed by command action slot. */
   voiceCustomAliases: CustomVoiceAliases;
   /** OptiPlex Gym Camera LAN DVR integration (probes silently; hidden off home Wi-Fi). */
@@ -123,6 +125,7 @@ export const DEFAULTS: Settings = {
   voiceAbCompare: false,
   voiceWakeWord: 'armory',
   voiceReadback: true,
+  voiceSetCommitMode: 'voice',
   voiceCustomAliases: {},
   gymCamEnabled: true,
   gymCamUrl: 'http://192.168.1.152:8766',
@@ -176,6 +179,7 @@ function load(): Settings {
       voiceRoomEnabled: typeof parsed.voiceRoomEnabled === 'boolean' ? parsed.voiceRoomEnabled : DEFAULTS.voiceRoomEnabled,
       voiceAbCompare: typeof parsed.voiceAbCompare === 'boolean' ? parsed.voiceAbCompare : DEFAULTS.voiceAbCompare,
       voiceReadback: typeof parsed.voiceReadback === 'boolean' ? parsed.voiceReadback : DEFAULTS.voiceReadback,
+      voiceSetCommitMode: parsed.voiceSetCommitMode === 'chime' ? 'chime' : 'voice',
       gymCamBuddyMode: typeof parsed.gymCamBuddyMode === 'boolean' ? parsed.gymCamBuddyMode : DEFAULTS.gymCamBuddyMode,
       gymCamPreviewUrl: typeof parsed.gymCamPreviewUrl === 'string' && parsed.gymCamPreviewUrl.trim() ? parsed.gymCamPreviewUrl.trim() : DEFAULTS.gymCamPreviewUrl,
       gymCamPreviewUpdatedMs: typeof parsed.gymCamPreviewUpdatedMs === 'number' && Number.isFinite(parsed.gymCamPreviewUpdatedMs) ? parsed.gymCamPreviewUpdatedMs : null,

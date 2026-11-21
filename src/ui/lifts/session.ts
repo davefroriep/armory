@@ -1247,6 +1247,10 @@ function build(root: HTMLElement, id?: string): () => void {
               <b>Spoken Readback: ${st.voiceReadback ? 'ON' : 'OFF'}</b>
               <small>Plays confirmations on PowerConf S330 speaker (or Pixel when away)</small>
             </button>
+            <button class="aitem${st.voiceSetCommitMode === 'chime' ? '' : ' on'}" type="button" data-vxact="commit_mode" style="margin:6px 0">
+              <b>Set Confirmation: ${st.voiceSetCommitMode === 'chime' ? 'Commit Chime' : 'Voice (+10% Speed)'}</b>
+              <small>${st.voiceSetCommitMode === 'chime' ? 'Plays crisp ding on set log instead of speaking weight × reps' : 'Fast local GPU voice reads back weight × reps at +10% speed'}</small>
+            </button>
             <button class="aitem${st.voiceAbCompare ? ' on' : ''}" type="button" data-vxact="ab" style="margin:6px 0">
               <b>Dual-Mic A/B Benchmark: ${st.voiceAbCompare ? 'ON' : 'OFF'}</b>
               <small>${esc(abSub)}</small>
@@ -1282,6 +1286,10 @@ function build(root: HTMLElement, id?: string): () => void {
           } else if (kind === 'readback') {
             updateSettings({ voiceReadback: !getSettings().voiceReadback });
             voice.refreshBiasPhrases();
+          } else if (kind === 'commit_mode') {
+            const nextMode = getSettings().voiceSetCommitMode === 'chime' ? 'voice' : 'chime';
+            voice.setCommitMode(nextMode);
+            toast(nextMode === 'chime' ? 'Set Confirmation: Commit Chime' : 'Set Confirmation: Voice (+10% Speed)');
           } else if (kind === 'ab') {
             const next = !getSettings().voiceAbCompare;
             void voice.setAbCompare(next).then((ok) => {

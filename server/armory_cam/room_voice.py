@@ -49,6 +49,9 @@ HOST_API_PREFERENCE = (
 )
 DEFAULT_TTS_VOICE = "en-US-AndrewMultilingualNeural"
 TTS_VOICES = (
+    "kokoro:am_michael",
+    "kokoro:am_onyx",
+    "kokoro:am_fenrir",
     "en-US-AndrewMultilingualNeural",
     "en-US-AvaMultilingualNeural",
     "sapi",
@@ -271,7 +274,7 @@ class RoomVoiceConfig:
     wake_word: str = "armory"
     speaker_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
-    set_commit_mode: str = "chime"  # "chime" | "voice"
+    set_commit_mode: str = "voice"  # "voice" | "chime"
     vad_threshold: float = 0.42
     min_speech_ms: int = 280
     end_silence_ms: int = 380
@@ -308,8 +311,8 @@ class RoomVoiceConfig:
         tts_raw = str(raw.get("ttsVoice") or DEFAULT_TTS_VOICE).strip()
         tts_raw = _LEGACY_TTS_VOICE_MAP.get(tts_raw, tts_raw)
         tts_voice = tts_raw if tts_raw in TTS_VOICES else DEFAULT_TTS_VOICE
-        commit_raw = str(raw.get("setCommitMode", "chime")).strip().lower()
-        set_commit_mode = "voice" if commit_raw == "voice" else "chime"
+        commit_raw = str(raw.get("setCommitMode", "voice")).strip().lower()
+        set_commit_mode = "chime" if commit_raw == "chime" else "voice"
         return cls(
             enabled=bool(raw.get("enabled", True)),
             device_match=str(raw.get("deviceMatch", "PowerConf S330") or "").strip(),
@@ -1154,28 +1157,55 @@ class _NeuralTtsSynthesizer:
         cache_dir: Path | None = None,
         sapi_fallback: _SapiSynthesizer | None = None,
         max_cache: int = 64,
+        models_dir: Path | None = None,
     ) -> None:
         self.cache_dir = cache_dir
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.models_dir = Path(models_dir) if models_dir is not None else None
         self._sapi = sapi_fallback or _SapiSynthesizer()
         self._lock = threading.Lock()
+        self._kokoro_lock = threading.Lock()
+        self._kokoro: Any = None
+        self._kokoro_device: str = ""
+        self._kokoro_error: str | None = None
         self._cache: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
         self._max_cache = max_cache
 
+    @property
+    def kokoro_device(self) -> str:
+        return self._kokoro_device
+
+    @staticmethod
+    def is_kokoro_voice(voice: str) -> bool:
+        return str(voice or "").strip().lower().startswith("kokoro:")
+
+    @staticmethod
+    def kokoro_speaker_name(voice: str) -> str:
+        raw = str(voice or "").strip()
+        if ":" in raw:
+            raw = raw.split(":", 1)[1].strip()
+        return raw or "am_michael"
+
     def close(self) -> None:
+        with self._kokoro_lock:
+            self._kokoro = None
+            self._kokoro_device = ""
         self._sapi.close()
 
     @staticmethod
-    def _cache_key(text: str, voice: str) -> str:
+    def _cache_key(text: str, voice: str, speed: float = 1.0) -> str:
         clean = re.sub(r"\s+", " ", text or "").strip().lower()
+        sp = round(float(speed or 1.0), 2)
+        if abs(sp - 1.0) >= 0.01:
+            return hashlib.sha1(f"{voice}|@{sp:.2f}|{clean}".encode("utf-8")).hexdigest()
         return hashlib.sha1(f"{voice}|{clean}".encode("utf-8")).hexdigest()
 
-    def get_cached(self, text: str, voice: str) -> tuple[np.ndarray, int] | None:
+    def get_cached(self, text: str, voice: str, speed: float = 1.0) -> tuple[np.ndarray, int] | None:
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean or voice == "sapi":
             return None
-        key = self._cache_key(clean, voice)
+        key = self._cache_key(clean, voice, speed=speed)
         with self._lock:
             mem = self._cache.get(key)
             if mem is not None:
@@ -1197,8 +1227,8 @@ class _NeuralTtsSynthesizer:
                     pass
         return None
 
-    def _put_cached(self, text: str, voice: str, pcm: np.ndarray, sr: int) -> None:
-        key = self._cache_key(text, voice)
+    def _put_cached(self, text: str, voice: str, pcm: np.ndarray, sr: int, speed: float = 1.0) -> None:
+        key = self._cache_key(text, voice, speed=speed)
         with self._lock:
             self._cache[key] = (pcm, sr)
             while len(self._cache) > self._max_cache:
@@ -1217,13 +1247,63 @@ class _NeuralTtsSynthesizer:
             except Exception:
                 pass
 
+    def _ensure_kokoro(self) -> Any:
+        with self._kokoro_lock:
+            if self._kokoro is not None:
+                return self._kokoro
+            try:
+                if self.models_dir is None:
+                    raise FileNotFoundError("Kokoro models_dir not configured")
+                model_p = self.models_dir / "kokoro" / "kokoro-v1.0.onnx"
+                voices_p = self.models_dir / "kokoro" / "voices-v1.0.bin"
+                if not model_p.is_file() or not voices_p.is_file():
+                    raise FileNotFoundError(f"Kokoro model files not found under {self.models_dir / 'kokoro'}")
+                _register_cuda_dll_dirs()
+                import onnxruntime as ort
+                from kokoro_onnx import Kokoro
+
+                so = ort.SessionOptions()
+                so.log_severity_level = 3
+                sess = ort.InferenceSession(
+                    str(model_p),
+                    sess_options=so,
+                    providers=[
+                        ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+                        "CPUExecutionProvider",
+                    ],
+                )
+                active = list(sess.get_providers())
+                dev = "cuda" if "CUDAExecutionProvider" in active else "cpu"
+                kokoro = Kokoro.from_session(sess, str(voices_p))
+                kokoro.create("50 for 10, check", voice="am_michael", speed=1.10, lang="en-us")
+                self._kokoro = kokoro
+                self._kokoro_device = dev
+                self._kokoro_error = None
+                return kokoro
+            except Exception as exc:
+                self._kokoro_error = str(exc)
+                raise
+
+    def _synth_kokoro_pcm(self, text: str, voice: str, speed: float = 1.0) -> tuple[np.ndarray, int]:
+        kokoro = self._ensure_kokoro()
+        speaker = self.kokoro_speaker_name(voice)
+        eff_speed = max(0.7, min(1.5, float(speed or 1.0)))
+        pcm, sr = kokoro.create(text, voice=speaker, speed=eff_speed, lang="en-us")
+        arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            raise RuntimeError("Empty kokoro-onnx audio")
+        return arr, int(sr)
+
     @staticmethod
-    def _synth_edge_pcm(text: str, voice: str, attempts: int = 2) -> tuple[np.ndarray, int]:
+    def _synth_edge_pcm(text: str, voice: str, attempts: int = 2, speed: float = 1.0) -> tuple[np.ndarray, int]:
         import av
         import edge_tts
 
+        sp = float(speed or 1.0)
+        rate_str = f"{int(round((sp - 1.0) * 100.0)):+d}%" if abs(sp - 1.0) >= 0.01 else "+0%"
+
         async def _fetch() -> bytes:
-            comm = edge_tts.Communicate(text, voice=voice, rate="+0%")
+            comm = edge_tts.Communicate(text, voice=voice, rate=rate_str)
             chunks: list[bytes] = []
             async for chunk in comm.stream():
                 if chunk.get("type") == "audio":
@@ -1258,18 +1338,35 @@ class _NeuralTtsSynthesizer:
             raise RuntimeError("Decoded 0 audio frames")
         return np.concatenate(parts).astype(np.float32), 24_000
 
-    def synthesize(self, text: str, voice: str = DEFAULT_TTS_VOICE) -> tuple[np.ndarray, int] | None:
+    def synthesize(
+        self,
+        text: str,
+        voice: str = DEFAULT_TTS_VOICE,
+        speed: float = 1.0,
+    ) -> tuple[np.ndarray, int] | None:
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
             return None
         if voice == "sapi":
             return self._sapi.synthesize(clean)
-        cached = self.get_cached(clean, voice)
+        cached = self.get_cached(clean, voice, speed=speed)
         if cached is not None:
             return cached
+        if self.is_kokoro_voice(voice):
+            try:
+                pcm, sr = self._synth_kokoro_pcm(clean, voice, speed=speed)
+                self._put_cached(clean, voice, pcm, sr, speed=speed)
+                return pcm, sr
+            except Exception:
+                try:
+                    pcm, sr = self._synth_edge_pcm(clean, DEFAULT_TTS_VOICE, speed=speed)
+                    self._put_cached(clean, DEFAULT_TTS_VOICE, pcm, sr, speed=speed)
+                    return pcm, sr
+                except Exception:
+                    return self._sapi.synthesize(clean)
         try:
-            pcm, sr = self._synth_edge_pcm(clean, voice)
-            self._put_cached(clean, voice, pcm, sr)
+            pcm, sr = self._synth_edge_pcm(clean, voice, speed=speed)
+            self._put_cached(clean, voice, pcm, sr, speed=speed)
             return pcm, sr
         except Exception:
             return self._sapi.synthesize(clean)
@@ -1624,7 +1721,8 @@ class RoomVoiceService:
         )
         self._sapi = _SapiSynthesizer()
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
-        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, sapi_fallback=self._sapi)
+        models_dir = (root_dir / "models") if root_dir is not None else None
+        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, sapi_fallback=self._sapi, models_dir=models_dir)
         self._winmm_player = _WinMmSpeakerPlayer() if sys.platform == "win32" else None
         self.ab = VoiceAbTracker(root_dir=root_dir)
 
@@ -1696,6 +1794,7 @@ class RoomVoiceService:
             next_cfg = RoomVoiceConfig.from_dict(merged)
             dev_changed = next_cfg.device_match != self.cfg.device_match
             model_changed = next_cfg.model_size != self.cfg.model_size
+            tts_changed = next_cfg.tts_voice != self.cfg.tts_voice
             self.cfg = next_cfg
             self.context_wake_word = next_cfg.wake_word
             self._detector.configure(next_cfg)
@@ -1705,6 +1804,14 @@ class RoomVoiceService:
                 self._model_device = ""
             if self._started and next_cfg.enabled:
                 self._ensure_model_loading_locked()
+            if (
+                tts_changed
+                and self._started
+                and self._allow_hardware_audio
+                and next_cfg.speaker_readback
+                and next_cfg.tts_voice != "sapi"
+            ):
+                threading.Thread(target=self._prewarm_tts_worker, name="armory-voice-ttswarm", daemon=True).start()
             self._bump_status_locked()
         if dev_changed or not next_cfg.enabled:
             self._close_stream()
@@ -1840,6 +1947,8 @@ class RoomVoiceService:
                 "speaker": out_dev["name"] if out_dev else self.cfg.speaker_match,
                 "speakerReadback": bool(self.cfg.speaker_readback),
                 "ttsVoice": self.cfg.tts_voice,
+                "ttsDevice": getattr(self._tts, "kokoro_device", ""),
+                "setCommitMode": self.cfg.set_commit_mode,
                 "sseClients": self.sse_clients,
                 "contextActive": self.context_active,
                 "wallboardActive": self.wallboard_active,
@@ -1952,6 +2061,7 @@ class RoomVoiceService:
         speech: str | None = None,
         text: str | None = None,
         kind: str | None = None,
+        set_commit_mode: str | None = None,
     ) -> dict[str, Any]:
         now_ms = int(time.time() * 1000)
         with self.lock:
@@ -1965,15 +2075,19 @@ class RoomVoiceService:
                         item["ackText"] = str(text)
                         break
             do_readback = bool(self.cfg.speaker_readback and self.context_readback)
-            commit_mode = self.cfg.set_commit_mode
+            override_mode = str(set_commit_mode or "").strip().lower()
+            commit_mode = override_mode if override_mode in ("chime", "voice") else self.cfg.set_commit_mode
 
         spoke = False
         chime_played = False
         clean_speech = str(speech or "").strip()
         if do_readback:
-            if commit_mode == "chime" and is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
-                chime_played = self.play_commit_chime()
-                spoke = bool(chime_played)
+            if is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
+                if commit_mode == "chime":
+                    chime_played = self.play_commit_chime()
+                    spoke = bool(chime_played)
+                elif clean_speech:
+                    spoke = self.speak_confirmation(clean_speech, speed=1.10)
             elif clean_speech:
                 spoke = self.speak_confirmation(clean_speech)
             elif armed is True:
@@ -1993,6 +2107,7 @@ class RoomVoiceService:
             yield f"data: {init_payload}\n\n".encode("utf-8")
             prev_listening = self.listening
             prev_ready = self.is_ready()
+            prev_commit_mode = self.cfg.set_commit_mode
 
             while not self._stop_event.is_set():
                 to_send: list[str] = []
@@ -2009,9 +2124,11 @@ class RoomVoiceService:
                                 to_send.append(json.dumps(ev, separators=(",", ":")))
                         cur_listening = self.listening
                         cur_ready = self._asr_transcribe_fn is not None or self._model is not None
-                        if cur_listening != prev_listening or cur_ready != prev_ready:
+                        cur_commit_mode = self.cfg.set_commit_mode
+                        if cur_listening != prev_listening or cur_ready != prev_ready or cur_commit_mode != prev_commit_mode:
                             prev_listening = cur_listening
                             prev_ready = cur_ready
+                            prev_commit_mode = cur_commit_mode
                             to_send.append(json.dumps({"type": "status", **self.status_dict()}, separators=(",", ":")))
 
                 if to_send:
@@ -2117,6 +2234,14 @@ class RoomVoiceService:
             self.log.debug("Speaker playback failed on %s: %s", (out_dev or {}).get("name", self.cfg.speaker_match), exc)
             return False
 
+    def _call_tts_synthesize(self, text: str, voice: str, speed: float = 1.0) -> tuple[np.ndarray, int] | None:
+        if abs(float(speed or 1.0) - 1.0) >= 0.01:
+            try:
+                return self._tts.synthesize(text, voice=voice, speed=float(speed))
+            except TypeError:
+                pass
+        return self._tts.synthesize(text, voice=voice)
+
     def _speaker_worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -2145,11 +2270,15 @@ class RoomVoiceService:
                             data = nxt_data
                     if stop_now or self._stop_event.is_set():
                         break
-                    text, voice = data
-                    rendered = self._tts.synthesize(text, voice=voice)
+                    if len(data) >= 3:
+                        text, voice, speed = data[0], data[1], float(data[2])
+                    else:
+                        text, voice = data[0], data[1]
+                        speed = 1.0
+                    rendered = self._call_tts_synthesize(text, voice=voice, speed=speed)
                     if rendered:
                         pcm, sr = rendered
-                        self._play_pcm_blocking(pcm, sr, lead_ms=220, tail_ms=180, target_peak=0.84, kind="tts")
+                        self._play_pcm_blocking(pcm, sr, lead_ms=160, tail_ms=120, target_peak=0.84, kind="tts")
             except Exception as exc:
                 self.log.debug("Speaker worker error: %s", exc)
 
@@ -2157,6 +2286,13 @@ class RoomVoiceService:
         voice = self.cfg.tts_voice
         if voice == "sapi":
             return
+        if getattr(self._tts, "is_kokoro_voice", lambda _v: False)(voice):
+            try:
+                self._tts._ensure_kokoro()
+                with self.lock:
+                    self._bump_status_locked()
+            except Exception as exc:
+                self.log.warning("Kokoro GPU warmup failed (falling back if needed): %s", exc)
         for phrase in PREWARM_TTS_PHRASES:
             if self._stop_event.is_set():
                 return
@@ -2166,7 +2302,7 @@ class RoomVoiceService:
                 self._tts.synthesize(phrase, voice=voice)
             except Exception:
                 pass
-            if self._stop_event.wait(0.15):
+            if self._stop_event.wait(0.10):
                 return
 
     def play_ready_chime(self) -> bool:
@@ -2222,7 +2358,7 @@ class RoomVoiceService:
                 return False
         return self._play_pcm_blocking(pcm, sr, lead_ms=140, tail_ms=80, target_peak=0.72, kind="chime")
 
-    def speak_confirmation(self, text: str) -> bool:
+    def speak_confirmation(self, text: str, *, speed: float = 1.0) -> bool:
         """Synthesize natural neural confirmation speech and queue padded playback to House Audio / S330."""
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
@@ -2241,18 +2377,20 @@ class RoomVoiceService:
         if self._resolve_speaker() is None and self._house_audio_router is None:
             return False
         voice = self.cfg.tts_voice
+        eff_speed = float(speed or 1.0)
         if self._started:
             try:
                 self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 2.4)
-                self._speaker_queue.put_nowait(("tts", (clean, voice)))
+                item: tuple[Any, ...] = (clean, voice, eff_speed) if abs(eff_speed - 1.0) >= 0.01 else (clean, voice)
+                self._speaker_queue.put_nowait(("tts", item))
                 return True
             except queue.Full:
                 return False
-        rendered = self._tts.synthesize(clean, voice=voice)
+        rendered = self._call_tts_synthesize(clean, voice=voice, speed=eff_speed)
         if not rendered:
             return False
         pcm, sr = rendered
-        return self._play_pcm_blocking(pcm, sr, lead_ms=220, tail_ms=180, target_peak=0.84, kind="tts")
+        return self._play_pcm_blocking(pcm, sr, lead_ms=160, tail_ms=120, target_peak=0.84, kind="tts")
 
     # ---------- capture & ASR loops ----------
 

@@ -78,7 +78,7 @@ vi.mock('../src/lifts/gymCam', async () => {
   };
 });
 
-import { updateSettings } from '../src/store/settings';
+import { getSettings, updateSettings } from '../src/store/settings';
 import { voice, type AbMicSample } from '../src/lifts/voice';
 import { SET_CONFIRM_TAGS } from '../src/lifts/voiceParser';
 
@@ -116,6 +116,8 @@ describe('VoiceController room source relay', () => {
     voice.lastHeard = '';
     (voice as unknown as { lastSpokenText: string; lastSpokenAt: number }).lastSpokenText = '';
     (voice as unknown as { lastSpokenText: string; lastSpokenAt: number }).lastSpokenAt = 0;
+    (voice as unknown as { lastCommitModeLocalAt: number }).lastCommitModeLocalAt = 0;
+    updateSettings({ voiceSetCommitMode: 'voice' });
   });
 
   it('logs set from room source without turning on phone listening, deduplicates, and skips Pixel TTS when OptiPlex ack speaks', async () => {
@@ -288,10 +290,10 @@ describe('VoiceController room source relay', () => {
     mockState.activeSess = sess;
     voice.roomOnline = true;
     updateSettings({ voiceRoomEnabled: true, gymCamEnabled: true });
-    const ackBodies: { speech?: string }[] = [];
+    const ackBodies: { speech?: string; setCommitMode?: string }[] = [];
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       if (String(url).includes('/api/voice/ack') && init?.body) {
-        ackBodies.push(JSON.parse(String(init.body)) as { speech?: string });
+        ackBodies.push(JSON.parse(String(init.body)) as { speech?: string; setCommitMode?: string });
         return { ok: true, json: async () => ({ ok: true, spoke: true }) };
       }
       return { ok: true, json: async () => ({ ok: true }) };
@@ -309,6 +311,7 @@ describe('VoiceController room source relay', () => {
       expect(sess.exs[0].sets[0].done).toBe(true);
       expect(ackBodies).toHaveLength(1);
       expect(ackBodies[0].speech).toMatch(new RegExp(`^225 for 5, (${SET_CONFIRM_TAGS.join('|')})$`));
+      expect(ackBodies[0].setCommitMode).toBe('voice');
       expect(mockState.speakCalls).toEqual([]);
 
       // Repeating identical confirmation text within 2.5s via direct mic fallback does not double-speak
@@ -316,6 +319,66 @@ describe('VoiceController room source relay', () => {
       (voice as unknown as { speakWithSource: (s: string | null, src: 'mic' | 'room', n: { text: string; kind: 'ok'; atMs: number }) => void })
         .speakWithSource(ackBodies[0].speech!, 'mic', { text: 'dup', kind: 'ok', atMs: Date.now() });
       expect(mockState.speakCalls).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('syncs setCommitMode to /api/voice/config, forwards setCommitMode in /api/voice/ack, and skips Pixel TTS on logged sets when chime mode is active offline', async () => {
+    const sess = makeBenchSession('sess_commit_mode');
+    mockState.activeSess = sess;
+    updateSettings({ voiceRoomEnabled: true, gymCamEnabled: true, voiceReadback: true });
+    const configBodies: { setCommitMode?: string }[] = [];
+    const ackBodies: { speech?: string; text?: string; kind?: string; setCommitMode?: string }[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/voice/config') && init?.body) {
+        configBodies.push(JSON.parse(String(init.body)) as { setCommitMode?: string });
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      if (String(url).includes('/api/voice/ack') && init?.body) {
+        ackBodies.push(JSON.parse(String(init.body)) as { speech?: string; text?: string; kind?: string; setCommitMode?: string });
+        return { ok: true, json: async () => ({ ok: true, spoke: false }) };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      voice.setCommitMode('chime');
+      await new Promise((r) => setTimeout(r, 15));
+      expect(getSettings().voiceSetCommitMode).toBe('chime');
+      expect(configBodies).toEqual([{ setCommitMode: 'chime' }]);
+
+      // Online room set log forwards setCommitMode:'chime' and does NOT fall back to Pixel TTS even if spoke=false
+      voice.roomOnline = true;
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 6',
+        isFinal: true,
+        source: 'mic',
+        state: 'listening',
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(ackBodies).toHaveLength(1);
+      expect(ackBodies[0].setCommitMode).toBe('chime');
+      expect(mockState.speakCalls).toEqual([]);
+
+      // Offline logged set in chime mode skips Pixel TTS; switching back to voice enables spoken readback
+      voice.roomOnline = false;
+      (voice as unknown as { lastSpokenText: string; lastSpokenAt: number }).lastSpokenAt = 0;
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 7',
+        isFinal: true,
+        source: 'mic',
+        state: 'listening',
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(sess.exs[0].sets[1].done).toBe(true);
+      expect(mockState.speakCalls).toEqual([]);
+
+      voice.setCommitMode('voice');
+      expect(getSettings().voiceSetCommitMode).toBe('voice');
+      (voice as unknown as { speakWithSource: (s: string | null, src: 'mic' | 'room', n: { text: string; kind: 'ok'; atMs: number }) => void })
+        .speakWithSource('225 for 9, check', 'mic', { text: '✓ 2 Barbell Bench Press · 225 lb × 9', kind: 'ok', atMs: Date.now() });
+      expect(mockState.speakCalls).toEqual(['225 for 9, check']);
     } finally {
       vi.unstubAllGlobals();
     }
