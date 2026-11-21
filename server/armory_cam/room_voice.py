@@ -198,9 +198,11 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "replay slow",
         "buddy mode",
         "undo",
-        "primary display",
-        "spin TV",
+        "open the gym",
+        "close the gym",
+        "SmartSpin TV",
         "wallboard",
+        "all TVs",
     ]
     seen = {x.lower() for x in core}
     extras: list[str] = []

@@ -4390,12 +4390,17 @@ class ArmoryCamService:
         parsed = parse_display_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
         if not parsed:
             return None
-        res = self.displays.execute(parsed["target"], parsed["action"])
+        targets = parsed.get("targets") or [parsed["target"]]
+        if parsed["target"] == "multi" and isinstance(targets, list) and len(targets) > 1:
+            res = self.displays.execute_many(targets, parsed["action"])
+        else:
+            res = self.displays.execute(parsed["target"], parsed["action"])
         speech = parsed["speech"] if res.get("ok") else (res.get("error") or "Display command failed")
         return {
             "handled": True,
             "ok": bool(res.get("ok")),
             "target": parsed["target"],
+            "targets": targets,
             "action": parsed["action"],
             "speech": speech,
             "ackText": f"✓ {parsed['speech']}" if res.get("ok") else f"✗ {speech}",
@@ -4847,39 +4852,48 @@ DASHBOARD_HTML = """<!doctype html>
       <span id="dpBadge" class="pill">READY</span>
     </h2>
     <div id="dpMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
-      Discrete IP power &amp; input commands (never toggles). Voice ready whenever mic is open: <code>&ldquo;Armory turn on primary display&rdquo;</code>, <code>&ldquo;Armory turn on spin TV&rdquo;</code>, <code>&ldquo;Armory turn off wallboard&rdquo;</code>, <code>&ldquo;Armory switch primary to PC&rdquo;</code>, <code>&ldquo;Armory gym off&rdquo;</code>.
+      Discrete IP power &amp; input commands (never toggles). Displays: <strong>TV</strong> (Hisense), <strong>Wallboard</strong>, and <strong>SmartSpin TV</strong>. Voice: <code>&ldquo;Armory, open the gym&rdquo;</code>, <code>&ldquo;Armory, close the gym&rdquo;</code>, <code>&ldquo;Armory, turn on TV and wallboard&rdquo;</code>, <code>&ldquo;Armory, turn on all TVs&rdquo;</code>, <code>&ldquo;Armory, switch TV to PC&rdquo;</code>.
     </div>
     <div class="ctrl-row" style="margin-top:0;margin-bottom:10px">
-      <button class="btn ok sm" type="button" data-dpact="primary:on">Primary ON</button>
-      <button class="btn sec sm" type="button" data-dpact="primary:off">Primary OFF</button>
-      <button class="btn sec sm" type="button" data-dpact="primary:hdmi1">Primary PC (HDMI 1)</button>
-      <button class="btn sec sm" type="button" data-dpact="primary:hdmi2">Primary Fire TV (HDMI 2)</button>
+      <button class="btn ok sm" type="button" data-dpact="open_gym:run">Open Gym</button>
+      <button class="btn red sm" type="button" data-dpact="close_gym:run">Close Gym</button>
+      <button class="btn ok sm" type="button" data-dpact="tv:on">TV ON</button>
+      <button class="btn sec sm" type="button" data-dpact="tv:off">TV OFF</button>
+      <button class="btn sec sm" type="button" data-dpact="tv:hdmi1">TV PC (HDMI 1)</button>
+      <button class="btn sec sm" type="button" data-dpact="tv:hdmi2">TV Fire TV (HDMI 2)</button>
       <button class="btn ok sm" type="button" data-dpact="spin:on">SmartSpin ON</button>
       <button class="btn sec sm" type="button" data-dpact="spin:off">SmartSpin OFF</button>
       <button class="btn ok sm" type="button" data-dpact="wallboard:on">Wallboard ON</button>
       <button class="btn sec sm" type="button" data-dpact="wallboard:off">Wallboard OFF</button>
+      <button class="btn ok sm" type="button" data-dpact="all_tvs:on">All TVs ON</button>
+      <button class="btn sec sm" type="button" data-dpact="all_tvs:off">All TVs OFF</button>
       <button class="btn ok sm" type="button" data-dpact="avr:on">Denon ON</button>
       <button class="btn sec sm" type="button" data-dpact="avr:off">Denon OFF</button>
       <button class="btn sec sm" type="button" data-dpact="avr:mch_stereo">Denon Multi-Ch</button>
-      <button class="btn ok sm" type="button" data-dpact="gym:on">Gym ON</button>
-      <button class="btn red sm" type="button" data-dpact="gym:off">Gym OFF</button>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
-      <div><label>Armory Primary IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
-      <div><label>Primary Wi-Fi MAC</label><input id="dpPrimMac" type="text" value="bc:09:b9:e7:35:26"></div>
-      <div><label>Primary PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="com.mediatek.tis/.HdmiInputService/HW2"></div>
-      <div><label>Primary Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="com.mediatek.tis/.HdmiInputService/HW3"></div>
-      <div><label>SmartSpin Roku IP (TCL)</label><input id="dpSpinHost" type="text" placeholder="192.168.1.xxx"></div>
+      <div><label>TV IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
+      <div><label>TV Wi-Fi MAC</label><input id="dpPrimMac" type="text" value="bc:09:b9:e7:35:26"></div>
+      <div><label>TV PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="com.mediatek.tis/.HdmiInputService/HW2"></div>
+      <div><label>TV Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="com.mediatek.tis/.HdmiInputService/HW3"></div>
+      <div><label>SmartSpin TV IP (TCL)</label><input id="dpSpinHost" type="text" placeholder="192.168.1.xxx"></div>
       <div><label>SmartSpin MAC</label><input id="dpSpinMac" type="text" placeholder="xx:xx:xx:xx:xx:xx"></div>
       <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
       <div>
         <label>Auto Denon Monitor 1 / Dual</label>
         <select id="dpSpinDual"><option value="0">No (Keep Denon on Auto Dual)</option><option value="1">Yes (Single Sink when Spin OFF)</option></select>
       </div>
+      <div>
+        <label>Open Gym Music (Cube)</label>
+        <select id="dpOpenMusic"><option value="1">Yes (Launch YouTube Music)</option><option value="0">No</option></select>
+      </div>
+      <div><label>Fire TV Cube IP</label><input id="dpCubeHost" type="text" value="192.168.1.151"></div>
+      <div><label>YouTube Music Playlist/Mix URL</label><input id="dpMusicUrl" type="text" placeholder="https://music.youtube.com/playlist?list=..."></div>
+      <div><label>YouTube Music Search Fallback</label><input id="dpMusicQuery" type="text" value="workout music mix"></div>
     </div>
     <div class="ctrl-row" style="margin-top:10px">
       <button class="btn" id="dpSaveBtn" type="button">Save Displays</button>
-      <button class="btn sec" id="dpProbePrimBtn" type="button">Probe Primary ADB</button>
+      <button class="btn sec" id="dpProbePrimBtn" type="button">Probe TV ADB</button>
       <button class="btn sec" id="dpFindRokuBtn" type="button">Find Roku TVs</button>
       <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
     </div>
@@ -7365,6 +7379,10 @@ function populateDisplaysInputs(dc) {
   $('dpSpinMac').value = s.mac || '';
   $('dpSpinHdmi').value = s.hdmiInput || 'InputHDMI1';
   $('dpSpinDual').value = s.autoDenonDual === true ? '1' : '0';
+  if ($('dpOpenMusic')) $('dpOpenMusic').value = dc.openGymPlayMusic === false ? '0' : '1';
+  if ($('dpCubeHost')) $('dpCubeHost').value = dc.cubeHost || '192.168.1.151';
+  if ($('dpMusicUrl')) $('dpMusicUrl').value = dc.openGymMusicUrl || '';
+  if ($('dpMusicQuery')) $('dpMusicQuery').value = dc.openGymMusicQuery || 'workout music mix';
 }
 
 function syncDisplaysUI(ds) {
@@ -7374,13 +7392,13 @@ function syncDisplaysUI(ds) {
   const badge = $('dpBadge');
   if (badge) {
     if (spin.ok) {
-      badge.textContent = `PRIMARY · SPIN ${spin.powerMode === 'PowerOn' ? 'ON' : 'READY'}`;
+      badge.textContent = `TV · SMARTSPIN ${spin.powerMode === 'PowerOn' ? 'ON' : 'READY'}`;
       badge.className = 'pill ok';
     } else if (prim.ok) {
-      badge.textContent = `PRIMARY ${prim.displayPower || 'OK'}`;
+      badge.textContent = `TV ${prim.displayPower || 'OK'}`;
       badge.className = 'pill ok';
     } else {
-      badge.textContent = 'PRIMARY READY';
+      badge.textContent = 'TV READY';
       badge.className = 'pill live';
     }
   }
@@ -7400,6 +7418,10 @@ async function saveDisplaysConfig(triggerBtn) {
       hdmiInput: $('dpSpinHdmi').value.trim() || 'InputHDMI1',
       autoDenonDual: $('dpSpinDual').value === '1',
     },
+    cubeHost: ($('dpCubeHost') ? $('dpCubeHost').value.trim() : '') || '192.168.1.151',
+    openGymPlayMusic: $('dpOpenMusic') ? ($('dpOpenMusic').value !== '0') : true,
+    openGymMusicUrl: $('dpMusicUrl') ? $('dpMusicUrl').value.trim() : '',
+    openGymMusicQuery: ($('dpMusicQuery') ? $('dpMusicQuery').value.trim() : '') || 'workout music mix',
   };
   try {
     const r = await fetch('/api/displays/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
@@ -7424,7 +7446,7 @@ async function runDisplayAction(target, action) {
       body: JSON.stringify({ target, action }),
     }).then(x => x.json());
     $('dpOut').textContent = r.ok ? `✓ ${r.message || 'Done'}` : `✗ ${r.error || r.message || 'Failed'}`;
-    if (target === 'avr' || target === 'gym' || target === 'spin') await pollAudioStatus();
+    if (target === 'avr' || target === 'gym' || target === 'open_gym' || target === 'close_gym' || target === 'spin') await pollAudioStatus();
   } catch {
     $('dpOut').textContent = '✗ Display command failed';
   }
@@ -8259,8 +8281,14 @@ def create_app(service: ArmoryCamService) -> Flask:
     @app.post("/api/displays/action")
     def api_displays_action() -> Response:
         body = request.get_json(silent=True) or {}
-        target = str(body.get("target") or "").strip()
         action = str(body.get("action") or "").strip()
+        targets = body.get("targets")
+        target = str(body.get("target") or "").strip()
+        if isinstance(targets, list) and targets:
+            if not action:
+                return jsonify({"ok": False, "error": "Provide action"}), 400
+            res = service.displays.execute_many([str(t) for t in targets], action)
+            return jsonify(res), (200 if res.get("ok") else 400)
         if not target or not action:
             return jsonify({"ok": False, "error": "Provide target and action"}), 400
         res = service.displays.execute(target, action)

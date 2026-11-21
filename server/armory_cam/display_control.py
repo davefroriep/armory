@@ -1,10 +1,11 @@
-"""Unified discrete IP & voice controller for The Armory gym displays and Denon AVR.
+"""Unified discrete IP & voice controller for The Armory gym displays, Denon AVR, and Cube YouTube Music.
 
 Controls:
-  - Armory Primary Display (Hisense 43E6QF Fire TV, ADB + discrete KEYCODE_WAKEUP/SLEEP + HDMI intents)
-  - SmartSpin Display (TCL Roku TV, discrete ECP PowerOn/PowerOff + auto Denon Monitor 1/Dual coordination)
-  - Armory Wallboard (32" Fire TV Edition, delegated to FireTvAdbController)
-  - Denon AVR-3313CI (discrete PWON / PWSTANDBY / Monitor Out 1 vs Auto Dual)
+  - TV / Main TV (Hisense 43E6QF Fire TV, ADB + discrete KEYCODE_WAKEUP/SLEEP + HDMI intents)
+  - Wallboard (32" Fire TV Edition, delegated to FireTvAdbController)
+  - SmartSpin TV (TCL Roku TV, discrete ECP PowerOn/PowerOff)
+  - Denon AVR-3313CI (discrete PWON / PWSTANDBY / Multi-Ch Stereo)
+  - Fire TV Cube (YouTube Music launch on Open Gym + media pause on Close Gym)
 """
 
 from __future__ import annotations
@@ -12,10 +13,11 @@ from __future__ import annotations
 import concurrent.futures
 from dataclasses import dataclass, field
 import re
+import shlex
 import socket
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -25,11 +27,13 @@ DEFAULT_PRIMARY_HOST = "192.168.1.230"
 DEFAULT_PRIMARY_MAC = "bc:09:b9:e7:35:26"
 DEFAULT_HDMI_OPTIPLEX_INPUT = "com.mediatek.tis/.HdmiInputService/HW2"
 DEFAULT_HDMI_DENON_INPUT = "com.mediatek.tis/.HdmiInputService/HW3"
+DEFAULT_CUBE_HOST = "192.168.1.151"
+DEFAULT_OPEN_GYM_MUSIC_QUERY = "workout music mix"
 
 
 @dataclass
 class PrimaryDisplayConfig:
-    """Configuration for Armory Primary Display (Hisense 43E6QF Fire TV)."""
+    """Configuration for Main TV / Armory Primary Display (Hisense 43E6QF Fire TV)."""
 
     enabled: bool = True
     host: str = DEFAULT_PRIMARY_HOST
@@ -68,7 +72,7 @@ class PrimaryDisplayConfig:
 
 @dataclass
 class SpinDisplayConfig:
-    """Configuration for SmartSpin Display (TCL Roku TV)."""
+    """Configuration for SmartSpin TV (TCL Roku TV)."""
 
     enabled: bool = True
     host: str = ""
@@ -107,25 +111,54 @@ class SpinDisplayConfig:
 
 @dataclass
 class GymDisplaysConfig:
-    """Persistent configuration for Armory Primary & SmartSpin gym displays."""
+    """Persistent configuration for Main TV, SmartSpin TV, and Open/Close Gym macro settings."""
 
     primary: PrimaryDisplayConfig = field(default_factory=PrimaryDisplayConfig)
     spin: SpinDisplayConfig = field(default_factory=SpinDisplayConfig)
+    cube_host: str = DEFAULT_CUBE_HOST
+    cube_adb_port: int = 5555
+    open_gym_play_music: bool = True
+    open_gym_music_url: str = ""
+    open_gym_music_query: str = DEFAULT_OPEN_GYM_MUSIC_QUERY
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "primary": self.primary.to_dict(),
             "spin": self.spin.to_dict(),
+            "cubeHost": self.cube_host,
+            "cubeAdbPort": int(self.cube_adb_port),
+            "openGymPlayMusic": bool(self.open_gym_play_music),
+            "openGymMusicUrl": self.open_gym_music_url,
+            "openGymMusicQuery": self.open_gym_music_query,
         }
 
     @classmethod
     def from_dict(cls, raw: Any) -> "GymDisplaysConfig":
         if not isinstance(raw, dict):
             return cls()
+        try:
+            cube_adb_port = max(1, min(65535, int(raw.get("cubeAdbPort", 5555))))
+        except (TypeError, ValueError):
+            cube_adb_port = 5555
+        query_raw = raw.get("openGymMusicQuery", DEFAULT_OPEN_GYM_MUSIC_QUERY)
+        query_clean = str(DEFAULT_OPEN_GYM_MUSIC_QUERY if query_raw is None else query_raw).strip()
         return cls(
             primary=PrimaryDisplayConfig.from_dict(raw.get("primary")),
             spin=SpinDisplayConfig.from_dict(raw.get("spin")),
+            cube_host=str(raw.get("cubeHost", DEFAULT_CUBE_HOST) or "").strip(),
+            cube_adb_port=cube_adb_port,
+            open_gym_play_music=bool(raw.get("openGymPlayMusic", True)),
+            open_gym_music_url=str(raw.get("openGymMusicUrl", "") or "").strip(),
+            open_gym_music_query=query_clean or DEFAULT_OPEN_GYM_MUSIC_QUERY,
         )
+
+
+def normalize_youtube_tv_url(url: str) -> str:
+    """Convert `music.youtube.com` links to `www.youtube.com` for Fire TV YouTube app intents."""
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"^https?://music\.youtube\.com\b", "https://www.youtube.com", raw, flags=re.I)
 
 
 def _default_http_get(url: str, timeout: float = 1.5) -> tuple[int, bytes]:
@@ -211,35 +244,76 @@ def _strip_wake_prefix(text: str, wake_word: str = "armory") -> str:
     return re.sub(pat, "", s).strip()
 
 
-def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> dict[str, str] | None:
-    """Parse natural-language display/TV/AVR/HDMI voice commands without matching gym lift logs."""
+_DISPLAY_SPEECH_LABELS = {
+    "tv": "TV",
+    "wallboard": "Wallboard",
+    "spin": "SmartSpin TV",
+    "avr": "Denon",
+}
+
+
+def _format_multi_speech(targets: Sequence[str], action: str) -> str:
+    verb = "on" if action == "on" else "off"
+    names = [_DISPLAY_SPEECH_LABELS.get(t, t) for t in targets]
+    if not names:
+        return f"Display {verb}"
+    if len(names) == 1:
+        return f"{names[0]} {verb}"
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]} {verb}"
+    return f"{', '.join(names[:-1])} and {names[-1]} {verb}"
+
+
+def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> dict[str, Any] | None:
+    """Parse natural-language TV, Wallboard, SmartSpin, Denon, Open/Close Gym commands."""
     cmd = _strip_wake_prefix(transcript, wake_word=wake_word)
     if not cmd:
         return None
 
+    # 1. Open / Close Gym macros
+    if re.search(r"\bopen\s+(?:the\s+)?gym\b", cmd):
+        return {
+            "target": "open_gym",
+            "targets": ["open_gym"],
+            "action": "run",
+            "speech": "Opening the gym",
+        }
+    if re.search(
+        r"\b(?:close|shut\s*(?:down|off)|turn\s+off)\s+(?:the\s+)?gym\b|\bgym\s+off$",
+        cmd,
+    ):
+        return {
+            "target": "close_gym",
+            "targets": ["close_gym"],
+            "action": "run",
+            "speech": "Closing the gym",
+        }
+
     # Ignore lifting/cardio cues outright if there are no display/TV/AVR/HDMI words
     if not re.search(
-        r"\b(display|tv|tvs|screen|screens|hisense|primary|spin|smartspin|smart\s+spin|tcl|roku|bike|wallboard|wall\s+board|toshiba|denon|avr|stereo|receiver|speakers|hdmi|optiplex|pc|computer|desktop|fire\s*tv|cube|gym|everything)\b",
+        r"\b(display|tv|tvs|screen|screens|hisense|primary|spin|smartspin|smart\s+spin|tcl|roku|bike|wallboard|wall\s+board|toshiba|denon|avr|stereo|receiver|speakers|hdmi|optiplex|pc|computer|desktop|fire\s*tv|cube|everything)\b",
         cmd,
     ):
         return None
 
-    # 1. Explicit HDMI / input switching on Primary Display (Hisense)
+    # 2. Explicit HDMI / input switching on Main TV (Hisense)
     if re.search(r"\b(hdmi\s*1|hdmi\s*one|optiplex|pc|computer|desktop)\b", cmd) and re.search(
-        r"\b(switch|set|change|put|show|go|to|input|hdmi|primary|hisense|tv|display)\b", cmd
+        r"\b(switch|set|change|put|show|go|to|input|hdmi|main|primary|hisense|tv|display)\b", cmd
     ):
-        return {"target": "primary", "action": "hdmi1", "speech": "Primary display on PC"}
+        return {"target": "tv", "targets": ["tv"], "action": "hdmi1", "speech": "TV on PC"}
 
     if re.search(r"\b(hdmi\s*2|hdmi\s*two|fire\s*tv|cube|denon)\b", cmd) and re.search(
         r"\b(switch|set|change|put|show|go|to|input|hdmi)\b", cmd
     ):
-        return {"target": "primary", "action": "hdmi2", "speech": "Primary display on Fire TV"}
+        return {"target": "tv", "targets": ["tv"], "action": "hdmi2", "speech": "TV on Fire TV"}
 
-    # 2. Denon Multi-Ch Stereo command
-    if re.search(r"\b(denon|avr|receiver|stereo)\b", cmd) and re.search(r"\b(multi\s*channel|multi\s*ch|all\s*speakers)\b", cmd):
-        return {"target": "avr", "action": "mch_stereo", "speech": "Denon multi channel stereo"}
+    # 3. Denon Multi-Ch Stereo command
+    if re.search(r"\b(denon|avr|receiver|stereo)\b", cmd) and re.search(
+        r"\b(multi\s*channel|multi\s*ch|all\s*speakers)\b", cmd
+    ):
+        return {"target": "avr", "targets": ["avr"], "action": "mch_stereo", "speech": "Denon multi channel stereo"}
 
-    # 3. Determine power action (on vs off)
+    # 4. Determine power action (on vs off)
     action: str | None = None
     if re.search(r"\b(turn\s+on|power\s+on|switch\s+on|wake(?:\s+up)?|boot(?:\s+up)?|start)\b", cmd) or re.search(
         r"\bon$", cmd
@@ -253,42 +327,60 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
     if action is None:
         return None
 
-    # 4. Determine display target
-    if re.search(r"\b(all\s+(?:tvs|displays|screens)|armory\s+tvs|gym|everything)\b", cmd):
+    # 5. All TVs / Everything
+    if re.search(r"\b(all\s+(?:(?:three|3)\s+)?(?:tvs|displays|screens)|armory\s+tvs|everything)\b", cmd):
         return {
-            "target": "gym",
+            "target": "all_tvs",
+            "targets": ["tv", "wallboard", "spin"],
             "action": action,
-            "speech": "Gym displays on" if action == "on" else "Gym displays off",
+            "speech": "All TVs on" if action == "on" else "All TVs off",
         }
-    if re.search(r"\b(wall\s*board|32\s*(?:inch)?\s*tv|toshiba)\b", cmd):
-        return {
-            "target": "wallboard",
-            "action": action,
-            "speech": "Wallboard on" if action == "on" else "Wallboard off",
-        }
-    if re.search(r"\b(smart\s*spin|spin(?:\s+bike)?(?:\s+(?:tv|display|screen))?|tcl|roku|bike\s+(?:tv|display|screen))\b", cmd):
-        return {
-            "target": "spin",
-            "action": action,
-            "speech": "SmartSpin display on" if action == "on" else "SmartSpin display off",
-        }
-    if re.search(r"\b(denon|avr|stereo|receiver|speakers)\b", cmd):
-        return {
-            "target": "avr",
-            "action": action,
-            "speech": "Denon on" if action == "on" else "Denon off",
-        }
-    if re.search(r"\b(primary(?:\s+(?:display|tv|screen))?|hisense|main\s+(?:tv|display|screen)|(?:the\s+)?tv)\b", cmd):
-        return {
-            "target": "primary",
-            "action": action,
-            "speech": "Primary display on" if action == "on" else "Primary display off",
-        }
-    return None
+
+    # 6. Compound or single targets matched specific-first, blanking matched spans so "SmartSpin TV" != "TV"
+    working = cmd
+    found: list[tuple[int, str]] = []
+    target_patterns = [
+        (
+            "spin",
+            r"\b(?:smart\s*spin(?:\s+(?:tv|display|screen))?|spin(?:\s+bike)?(?:\s+(?:tv|display|screen))?|tcl(?:\s+tv)?|roku(?:\s+tv)?|bike\s+(?:tv|display|screen))\b",
+        ),
+        (
+            "wallboard",
+            r"\b(?:wall\s*board(?:\s+(?:tv|display|screen))?|32\s*(?:inch)?\s*tv|toshiba(?:\s+tv)?)\b",
+        ),
+        (
+            "avr",
+            r"\b(?:denon|avr|stereo|receiver|speakers)\b",
+        ),
+        (
+            "tv",
+            r"\b(?:(?:main|primary)\s+(?:tv|display|screen)|primary|hisense(?:\s+tv)?|tv)\b",
+        ),
+    ]
+    for tgt_id, pat in target_patterns:
+        for m in re.finditer(pat, working):
+            found.append((m.start(), tgt_id))
+        working = re.sub(pat, lambda m: " " * len(m.group(0)), working)
+
+    if not found:
+        return None
+
+    found.sort(key=lambda pair: pair[0])
+    ordered: list[str] = []
+    for _pos, tgt_id in found:
+        if tgt_id not in ordered:
+            ordered.append(tgt_id)
+
+    return {
+        "target": ordered[0] if len(ordered) == 1 else "multi",
+        "targets": ordered,
+        "action": action,
+        "speech": _format_multi_speech(ordered, action),
+    }
 
 
 class GymDisplayController:
-    """Discrete power/input controller across Armory Primary, SmartSpin Roku, Wallboard & Denon AVR."""
+    """Discrete power/input controller across TV, SmartSpin TV, Wallboard, Denon AVR & Open/Close Gym."""
 
     def __init__(
         self,
@@ -330,6 +422,9 @@ class GymDisplayController:
                     cur["primary"] = {**cur["primary"], **raw["primary"]}
                 if isinstance(raw.get("spin"), dict):
                     cur["spin"] = {**cur["spin"], **raw["spin"]}
+                for k in ("cubeHost", "cubeAdbPort", "openGymPlayMusic", "openGymMusicUrl", "openGymMusicQuery"):
+                    if k in raw:
+                        cur[k] = raw[k]
             self.cfg = GymDisplaysConfig.from_dict(cur)
             return self.cfg
 
@@ -372,7 +467,6 @@ class GymDisplayController:
         if not dcfg.denon_enabled or not base:
             return {"ok": False, "error": "Denon disabled or unconfigured"}
 
-        # Primary: Denon AVR-3313CI web setup page preserves every unrelated field
         try:
             code, raw = self._do_get(f"{base}/SETUP/VIDEO/d_video.asp", 3.5)
             if code < 400:
@@ -391,7 +485,6 @@ class GymDisplayController:
         except Exception:
             pass
 
-        # Fallback: direct Telnet/HTTP command alias (used on AVR-X/S models or unit tests)
         cmd = "VSMONIAUTO" if m == "AUTO" else f"VSMONI{m}"
         res = self.denon.send_command(cmd)
         return {**res, "monitorOut": m, "via": "direct"}
@@ -400,7 +493,7 @@ class GymDisplayController:
         cfg = self.get_config().primary
         ser = self._adb_serial(cfg.host, cfg.adb_port)
         if not ser:
-            return {"ok": False, "state": "unconfigured", "message": "Primary Display IP not set."}
+            return {"ok": False, "state": "unconfigured", "message": "Main TV IP not set."}
         if self.adb is None:
             return {"ok": False, "state": "error", "serial": ser, "message": "ADB controller unavailable."}
         st, detail = self.adb._connect_and_status(ser)
@@ -437,10 +530,10 @@ class GymDisplayController:
     def _control_primary(self, action: str) -> dict[str, Any]:
         cfg = self.get_config().primary
         if not cfg.enabled:
-            return {"ok": False, "target": "primary", "action": action, "error": "Primary display disabled"}
+            return {"ok": False, "target": "tv", "action": action, "error": "Main TV disabled"}
         ser = self._adb_serial(cfg.host, cfg.adb_port)
         if not ser or self.adb is None:
-            return {"ok": False, "target": "primary", "action": action, "error": "Primary display IP or ADB missing"}
+            return {"ok": False, "target": "tv", "action": action, "error": "Main TV IP or ADB missing"}
 
         if action == "on":
             st, detail = self.adb._connect_and_status(ser)
@@ -449,40 +542,40 @@ class GymDisplayController:
                 self._sleep(0.8)
                 st, detail = self.adb._connect_and_status(ser)
             if st != "device":
-                return {"ok": False, "target": "primary", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+                return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
             return {
                 "ok": rc == 0,
-                "target": "primary",
+                "target": "tv",
                 "action": "on",
                 "serial": ser,
-                "message": "Primary Display woken (discrete KEYCODE_WAKEUP)" if rc == 0 else (err or out).strip(),
+                "message": "TV woken (discrete KEYCODE_WAKEUP)" if rc == 0 else (err or out).strip(),
             }
 
         if action == "off":
             st, detail = self.adb._connect_and_status(ser)
             if st != "device":
-                return {"ok": False, "target": "primary", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+                return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "223"], timeout=4.0)
             return {
                 "ok": rc == 0,
-                "target": "primary",
+                "target": "tv",
                 "action": "off",
                 "serial": ser,
-                "message": "Primary Display put to sleep (discrete KEYCODE_SLEEP)" if rc == 0 else (err or out).strip(),
+                "message": "TV put to sleep (discrete KEYCODE_SLEEP)" if rc == 0 else (err or out).strip(),
             }
 
         if action in ("hdmi1", "pc", "hdmi2", "firetv"):
             input_id = cfg.hdmi_optiplex_input if action in ("hdmi1", "pc") else cfg.hdmi_denon_input
             if not input_id:
-                return {"ok": False, "target": "primary", "action": action, "error": "HDMI input ID not configured"}
+                return {"ok": False, "target": "tv", "action": action, "error": "HDMI input ID not configured"}
             st, detail = self.adb._connect_and_status(ser)
             if st != "device" and cfg.mac and self._wol_sender is not None:
                 self._wol_sender(cfg.mac)
                 self._sleep(0.8)
                 st, detail = self.adb._connect_and_status(ser)
             if st != "device":
-                return {"ok": False, "target": "primary", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+                return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
             self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
             uri = f"content://android.media.tv/passthrough/{urllib.parse.quote(input_id, safe='')}"
             rc, out, err = self.adb._run(
@@ -491,18 +584,77 @@ class GymDisplayController:
             )
             return {
                 "ok": rc == 0,
-                "target": "primary",
+                "target": "tv",
                 "action": action,
                 "inputId": input_id,
-                "message": f"Switched Primary Display to {input_id}" if rc == 0 else (err or out).strip(),
+                "message": f"Switched TV to {input_id}" if rc == 0 else (err or out).strip(),
             }
 
-        return {"ok": False, "target": "primary", "action": action, "error": f"Unsupported action: {action}"}
+        return {"ok": False, "target": "tv", "action": action, "error": f"Unsupported action: {action}"}
+
+    def _launch_cube_youtube_music(self) -> dict[str, Any]:
+        cfg = self.get_config()
+        ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+        if not ser or self.adb is None:
+            return {"ok": False, "error": "Fire TV Cube IP or ADB missing"}
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            return {"ok": False, "state": st, "error": f"Cube ADB {st}: {detail}"}
+        self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+        if cfg.open_gym_music_url:
+            yt_url = normalize_youtube_tv_url(cfg.open_gym_music_url)
+            rc, out, err = self.adb._run(
+                ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(yt_url), "com.amazon.firetv.youtube"],
+                timeout=6.0,
+            )
+            return {
+                "ok": rc == 0,
+                "mode": "url",
+                "url": yt_url,
+                "message": f"Launched YouTube playlist on Cube" if rc == 0 else (err or out).strip(),
+            }
+        query = cfg.open_gym_music_query or DEFAULT_OPEN_GYM_MUSIC_QUERY
+        rc, out, err = self.adb._run(
+            [
+                "-s",
+                ser,
+                "shell",
+                "am",
+                "start",
+                "-a",
+                "android.media.action.MEDIA_PLAY_FROM_SEARCH",
+                "-e",
+                "query",
+                shlex.quote(query),
+                "com.amazon.firetv.youtube",
+            ],
+            timeout=6.0,
+        )
+        return {
+            "ok": rc == 0,
+            "mode": "search",
+            "query": query,
+            "message": f"Launched YouTube music ({query}) on Cube" if rc == 0 else (err or out).strip(),
+        }
+
+    def _pause_cube_media(self) -> dict[str, Any]:
+        cfg = self.get_config()
+        ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+        if not ser or self.adb is None:
+            return {"ok": False, "skipped": True, "error": "Fire TV Cube IP or ADB missing"}
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            return {"ok": False, "state": st, "error": f"Cube ADB {st}: {detail}"}
+        rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "127"], timeout=4.0)
+        return {
+            "ok": rc == 0,
+            "message": "Paused Fire TV Cube media" if rc == 0 else (err or out).strip(),
+        }
 
     def get_roku_info(self, host: str, port: int = 8060) -> dict[str, Any]:
         clean = str(host or "").strip()
         if not clean:
-            return {"ok": False, "unconfigured": True, "error": "SmartSpin Roku IP not set"}
+            return {"ok": False, "unconfigured": True, "error": "SmartSpin TV IP not set"}
         try:
             code, raw = self._do_get(f"http://{clean}:{int(port)}/query/device-info", 1.2)
             if code >= 400:
@@ -515,7 +667,7 @@ class GymDisplayController:
         return res
 
     def discover_roku_tvs(self, subnet_prefix: str = "192.168.1") -> list[dict[str, Any]]:
-        """Fast LAN scan of `:8060/query/device-info` to discover Roku TVs (e.g. SmartSpin TCL)."""
+        """Fast LAN scan of `:8060/query/device-info` to discover Roku TVs (e.g. SmartSpin TV)."""
         if not self._allow_network and self._http_get is None:
             return []
 
@@ -543,14 +695,14 @@ class GymDisplayController:
     def _control_spin(self, action: str) -> dict[str, Any]:
         cfg = self.get_config().spin
         if not cfg.enabled:
-            return {"ok": False, "target": "spin", "action": action, "error": "SmartSpin display disabled"}
+            return {"ok": False, "target": "spin", "action": action, "error": "SmartSpin TV disabled"}
         host = str(cfg.host or "").strip()
         if not host:
             return {
                 "ok": False,
                 "target": "spin",
                 "action": action,
-                "error": "SmartSpin Roku IP not configured yet. Click Find Roku on :8766/.",
+                "error": "SmartSpin TV IP not configured yet. Click Find Roku on :8766/.",
             }
         base = f"http://{host}:{int(cfg.ecp_port)}"
         if action == "on":
@@ -569,7 +721,7 @@ class GymDisplayController:
                     "target": "spin",
                     "action": "on",
                     "denonMonitor": denon_res,
-                    "message": f"SmartSpin Roku ON ({cfg.hdmi_input or 'PowerOn'})",
+                    "message": f"SmartSpin TV ON ({cfg.hdmi_input or 'PowerOn'})",
                 }
             except Exception as exc:
                 return {"ok": False, "target": "spin", "action": "on", "error": str(exc)}
@@ -585,7 +737,7 @@ class GymDisplayController:
                     "target": "spin",
                     "action": "off",
                     "denonMonitor": denon_res,
-                    "message": "SmartSpin Roku OFF",
+                    "message": "SmartSpin TV OFF",
                 }
             except Exception as exc:
                 return {"ok": False, "target": "spin", "action": "off", "error": str(exc)}
@@ -613,12 +765,39 @@ class GymDisplayController:
             return {**self.set_denon_monitor_out("AUTO"), "target": "avr", "action": "monitor_auto"}
         return {"ok": False, "target": "avr", "action": action, "error": f"Unsupported AVR action: {action}"}
 
+    def execute_many(self, targets: Sequence[str], action: str, *, skip_unconfigured_spin: bool = False) -> dict[str, Any]:
+        """Run a discrete action across multiple targets in order and aggregate results."""
+        act = str(action or "").strip().lower()
+        ordered: list[str] = []
+        for raw_t in targets:
+            t = str(raw_t or "").strip().lower()
+            if t == "primary":
+                t = "tv"
+            if t and t not in ordered:
+                ordered.append(t)
+        if not ordered:
+            return {"ok": False, "action": act, "error": "No targets specified"}
+
+        results: dict[str, Any] = {}
+        ok_any = False
+        for t in ordered:
+            if t == "spin" and skip_unconfigured_spin and not self.get_config().spin.host:
+                results["spin"] = {"ok": True, "skipped": True, "reason": "SmartSpin TV IP not set"}
+                continue
+            r = self.execute(t, act)
+            results[t] = r
+            if r.get("ok"):
+                ok_any = True
+
+        label = _format_multi_speech(ordered, act) if act in ("on", "off") else f"{', '.join(ordered)} {act}"
+        return {"ok": ok_any, "target": "multi", "targets": ordered, "action": act, "results": results, "message": label}
+
     def execute(self, target: str, action: str) -> dict[str, Any]:
-        """Run a discrete action against `primary`, `spin`, `wallboard`, `avr`, or `gym`."""
+        """Run a discrete action against `tv`/`primary`, `spin`, `wallboard`, `avr`, `all_tvs`, `open_gym`, `close_gym`, or `gym`."""
         tgt = str(target or "").strip().lower()
         act = str(action or "").strip().lower()
 
-        if tgt == "primary":
+        if tgt in ("primary", "tv"):
             return self._control_primary(act)
         if tgt == "spin":
             return self._control_spin(act)
@@ -636,22 +815,37 @@ class GymDisplayController:
                 res = self._sleep_wallboard_fn()
                 return {"ok": bool(res.get("ok", True)), "target": "wallboard", "action": "off", "adb": res, "message": res.get("message", "Wallboard sleep sent")}
             return {"ok": False, "target": "wallboard", "action": act, "error": f"Unsupported wallboard action: {act}"}
-        if tgt == "gym":
+        if tgt == "all_tvs":
+            return self.execute_many(["tv", "wallboard", "spin"], act, skip_unconfigured_spin=True)
+        if tgt == "open_gym":
+            cfg = self.get_config()
             results: dict[str, Any] = {}
+            results["tv"] = self._control_primary("hdmi2")
+            results["avr"] = self._control_avr("on")
+            if self.denon is not None:
+                results["avr_mode"] = self.denon.send_command("MSMCH STEREO")
+            if self._wake_wallboard_fn is not None:
+                results["wallboard"] = self._wake_wallboard_fn(True)
+            if cfg.open_gym_play_music:
+                results["music"] = self._launch_cube_youtube_music()
+            ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
+            return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (TV, Denon, Wallboard, YouTube Music)"}
+        if tgt == "close_gym":
+            results = {}
+            results["media_pause"] = self._pause_cube_media()
+            results["tv"] = self._control_primary("off")
+            results["avr"] = self._control_avr("off")
+            if self._sleep_wallboard_fn is not None:
+                results["wallboard"] = self._sleep_wallboard_fn()
+            if self.get_config().spin.host:
+                results["spin"] = self._control_spin("off")
+            ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict) and not r.get("skipped"))
+            return {"ok": ok, "target": "close_gym", "action": "run", "results": results, "message": "Gym closed"}
+        if tgt == "gym":
             if act == "on":
-                results["primary"] = self._control_primary("on")
-                results["avr"] = self._control_avr("on")
-                ok = bool(results["primary"].get("ok") or results["avr"].get("ok"))
-                return {"ok": ok, "target": "gym", "action": "on", "results": results, "message": "Gym Primary & Denon ON"}
+                return self.execute("open_gym", "run")
             if act == "off":
-                results["primary"] = self._control_primary("off")
-                results["avr"] = self._control_avr("off")
-                if self._sleep_wallboard_fn is not None:
-                    results["wallboard"] = self._sleep_wallboard_fn()
-                if self.get_config().spin.host:
-                    results["spin"] = self._control_spin("off")
-                ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
-                return {"ok": ok, "target": "gym", "action": "off", "results": results, "message": "Gym displays & AVR OFF"}
+                return self.execute("close_gym", "run")
             return {"ok": False, "target": "gym", "action": act, "error": f"Unsupported gym action: {act}"}
 
         return {"ok": False, "target": tgt, "action": act, "error": f"Unknown target: {tgt}"}
@@ -659,7 +853,7 @@ class GymDisplayController:
     def status_dict(self, *, live_probe: bool = False) -> dict[str, Any]:
         cfg = self.get_config()
         spin_info = self.get_roku_info(cfg.spin.host, cfg.spin.ecp_port) if (live_probe and cfg.spin.host) else (
-            {"ok": False, "unconfigured": True, "error": "SmartSpin IP not set"} if not cfg.spin.host else self.last_spin_info
+            {"ok": False, "unconfigured": True, "error": "SmartSpin TV IP not set"} if not cfg.spin.host else self.last_spin_info
         )
         return {
             "config": cfg.to_dict(),

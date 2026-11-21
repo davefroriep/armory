@@ -2033,24 +2033,28 @@ class ArmoryCamTests(unittest.TestCase):
         for phrase in ("Armory 225 for 8", "Armory check", "Armory skip rest", "Armory replay", "Armory add 10 pounds"):
             self.assertIsNone(dc.parse_display_voice_command(phrase), msg=phrase)
 
-        self.assertEqual(dc.parse_display_voice_command("Armory turn on primary display")["target"], "primary")
-        self.assertEqual(dc.parse_display_voice_command("Armory turn on primary display")["action"], "on")
+        self.assertEqual(dc.parse_display_voice_command("Armory, open the gym"), {"target": "open_gym", "targets": ["open_gym"], "action": "run", "speech": "Opening the gym"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, close the gym"), {"target": "close_gym", "targets": ["close_gym"], "action": "run", "speech": "Closing the gym"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV"), {"target": "tv", "targets": ["tv"], "action": "on", "speech": "TV on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn on SmartSpin TV"), {"target": "spin", "targets": ["spin"], "action": "on", "speech": "SmartSpin TV on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV and SmartSpin TV"), {"target": "multi", "targets": ["tv", "spin"], "action": "on", "speech": "TV and SmartSpin TV on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV and wallboard"), {"target": "multi", "targets": ["tv", "wallboard"], "action": "on", "speech": "TV and Wallboard on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn off all TVs"), {"target": "all_tvs", "targets": ["tv", "wallboard", "spin"], "action": "off", "speech": "All TVs off"})
         self.assertEqual(dc.parse_display_voice_command("Armory turn off hisense")["action"], "off")
         self.assertEqual(dc.parse_display_voice_command("Armory switch primary to PC")["action"], "hdmi1")
         self.assertEqual(dc.parse_display_voice_command("Armory switch TV to Fire TV")["action"], "hdmi2")
-        self.assertEqual(dc.parse_display_voice_command("Armory turn on spin TV"), {"target": "spin", "action": "on", "speech": "SmartSpin display on"})
-        self.assertEqual(dc.parse_display_voice_command("Armory sleep wallboard"), {"target": "wallboard", "action": "off", "speech": "Wallboard off"})
+        self.assertEqual(dc.parse_display_voice_command("Armory sleep wallboard"), {"target": "wallboard", "targets": ["wallboard"], "action": "off", "speech": "Wallboard off"})
         self.assertEqual(dc.parse_display_voice_command("Armory turn off denon")["target"], "avr")
-        self.assertEqual(dc.parse_display_voice_command("Armory gym off"), {"target": "gym", "action": "off", "speech": "Gym displays off"})
+        self.assertEqual(dc.normalize_youtube_tv_url("https://music.youtube.com/playlist?list=PL123"), "https://www.youtube.com/playlist?list=PL123")
         self.assertFalse(dc.SpinDisplayConfig().auto_denon_dual)
 
-        # 2. Controller: Primary ADB discrete keyevents + Roku ECP + Denon VSMONIAUTO/VSMONI1 + Wallboard
+        # 2. Controller: Primary ADB discrete keyevents + Roku ECP + Denon + Wallboard + Open/Close Gym
         adb_cmds: list[list[str]] = []
 
         def fake_runner(cmd: list[str], _timeout: float) -> tuple[int, str, str]:
             adb_cmds.append(cmd)
             if "devices" in cmd:
-                return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n", ""
+                return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n192.168.1.151:5555\tdevice\n", ""
             return 0, "connected", ""
 
         fake_adb = ac.FireTvAdbController(adb_bin="adb", runner=fake_runner, settle_sec=0.0)
@@ -2125,6 +2129,28 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertTrue(ctrl.execute("wallboard", "off")["ok"])
         self.assertEqual(wb_calls, ["wake", "sleep"])
 
+        # Open Gym & Close Gym macros with normalized YouTube Music playlist URL
+        ctrl.update_config({"openGymMusicUrl": "https://music.youtube.com/playlist?list=PLgym99"})
+        adb_cmds.clear()
+        denon_cmds.clear()
+        wb_calls.clear()
+        og = ctrl.execute("open_gym", "run")
+        self.assertTrue(og["ok"])
+        self.assertIn("PWON", denon_cmds)
+        self.assertIn("SIMPLAY", denon_cmds)
+        self.assertIn("MSMCH%20STEREO", denon_cmds)
+        self.assertEqual(wb_calls, ["wake"])
+        self.assertTrue(any("https://www.youtube.com/playlist?list=PLgym99" in " ".join(c) and "192.168.1.151:5555" in c for c in adb_cmds))
+
+        adb_cmds.clear()
+        denon_cmds.clear()
+        wb_calls.clear()
+        cg = ctrl.execute("close_gym", "run")
+        self.assertTrue(cg["ok"])
+        self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "127"] for c in adb_cmds))
+        self.assertIn("PWSTANDBY", denon_cmds)
+        self.assertEqual(wb_calls, ["sleep"])
+
         # 3. RoomVoiceService local command interception + Flask display endpoints
         tmp = Path(tempfile.mkdtemp(prefix="armory_disp_test_"))
         try:
@@ -2138,15 +2164,23 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIn("Gym Displays &amp; Discrete Power Control", dash)
             self.assertIn("dpPrimHost", dash)
             self.assertIn("dpSpinHost", dash)
+            self.assertIn("dpMusicUrl", dash)
 
             svc.voice._stop_event.clear()
             stream = svc.voice.subscribe_sse()
             _init_frame = next(stream)
 
             # Display voice command handled locally — must NOT emit to Pixel SSE
-            disp_evt = svc.voice.inject_transcript("Armory turn on spin TV")
+            disp_evt = svc.voice.inject_transcript("Armory, turn on SmartSpin TV")
             self.assertTrue(disp_evt["localHandled"])
-            self.assertIn("SmartSpin display on", disp_evt["ackText"])
+            self.assertIn("SmartSpin TV on", disp_evt["ackText"])
+
+            # Compound voice command handled locally
+            wb_calls.clear()
+            comp_evt = svc.voice.inject_transcript("Armory, turn on TV and wallboard")
+            self.assertTrue(comp_evt["localHandled"])
+            self.assertIn("TV and Wallboard on", comp_evt["ackText"])
+            self.assertEqual(wb_calls, ["wake"])
 
             # Normal lifting command still emits over Pixel SSE
             lift_evt = svc.voice.inject_transcript("Armory 225 for 8")
@@ -2154,7 +2188,7 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertFalse(lift_evt.get("localHandled", False))
             sse_frame = next(stream).decode("utf-8")
             self.assertIn("Armory 225 for 8", sse_frame)
-            self.assertNotIn("spin TV", sse_frame)
+            self.assertNotIn("SmartSpin", sse_frame)
             stream.close()
 
             cfg_res = client.post(
@@ -2168,9 +2202,13 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(st_res.status_code, 200)
             self.assertEqual(st_res.get_json()["config"]["primary"]["host"], "192.168.1.230")
 
-            act_res = client.post("/api/displays/action", json={"target": "primary", "action": "on"})
+            act_res = client.post("/api/displays/action", json={"target": "tv", "action": "on"})
             self.assertEqual(act_res.status_code, 200)
             self.assertTrue(act_res.get_json()["ok"])
+
+            multi_res = client.post("/api/displays/action", json={"targets": ["tv", "wallboard"], "action": "on"})
+            self.assertEqual(multi_res.status_code, 200)
+            self.assertTrue(multi_res.get_json()["ok"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
