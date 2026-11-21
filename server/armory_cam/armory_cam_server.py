@@ -1299,21 +1299,93 @@ class FireTvAdbController:
             return host
         return f"{host}:{cfg.adb_port}"
 
-    def _connect_and_status(self, serial: str) -> tuple[str, str]:
-        rc_c, out_c, err_c = self._run(["connect", serial], timeout=6.0)
-        rc_d, out_d, err_d = self._run(["devices"], timeout=5.0)
-        combined_c = f"{out_c} {err_c}".strip()
-        for line in out_d.splitlines():
-            parts = line.strip().split()
-            if len(parts) >= 2 and parts[0] == serial:
-                st = parts[1].lower()
-                if st in ("device", "unauthorized"):
-                    return st, combined_c
-                return "offline", f"{line.strip()} ({combined_c})".strip()
-        if "failed to authenticate" in combined_c.lower() or "unauthorized" in combined_c.lower():
-            return "unauthorized", combined_c
-        detail = combined_c or err_d.strip() or out_d.strip() or f"rc={rc_c}/{rc_d}"
-        return "offline", detail
+    def _evict_serial(self, serial: str) -> None:
+        if not serial:
+            return
+        self._run(["disconnect", serial], timeout=3.0)
+        self._run(["reconnect", "offline"], timeout=3.0)
+
+    def disconnect_serial(self, serial: str) -> None:
+        """Close idle ADB TCP socket cleanly so targets entering sleep do not wedge adbd."""
+        if serial:
+            self._run(["disconnect", serial], timeout=3.0)
+
+    def _probe_tcp_adbd_locked(self, serial: str) -> bool:
+        """Detect an awake Fire TV whose adbd slot is wedged (accepts TCP on :5555 then EOFs 0 bytes)."""
+        if self._runner != self._default_runner or ":" not in serial:
+            return False
+        host, _, port_s = serial.rpartition(":")
+        try:
+            port = int(port_s)
+        except ValueError:
+            return False
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(1.0)
+            sock.connect((host, port))
+            sock.settimeout(0.5)
+            return sock.recv(16) == b""
+        except Exception:
+            return False
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    def _apply_wallboard_tv_settings(self, ser: str, *, suppress_screensaver: bool) -> None:
+        """Disable Fire OS home-screen featured video/audio autoplay (and screensaver during wake)."""
+        cmds = [
+            "settings put global com.amazon.tv.settings.featured_item_video_enabled 0",
+            "settings put global com.amazon.tv.settings.featured_item_video_volume 0.0",
+        ]
+        if suppress_screensaver:
+            cmds.extend([
+                "settings put secure screensaver_enabled 0",
+                "settings put secure sleep_timeout 0",
+                "settings put global wifi_sleep_policy 2",
+            ])
+        self._run(["-s", ser, "shell", "; ".join(cmds)], timeout=6.0)
+
+    def _offline_diagnostic_message(self, ser: str, detail: str) -> str:
+        if self._probe_tcp_adbd_locked(ser):
+            return (
+                f"Wallboard TV is awake on LAN ({ser} port open) but adbd is locked on a stale "
+                "deep-sleep session — toggle ADB Debugging OFF/ON or reboot the 32\" TV once; "
+                "future wakes now auto-disconnect cleanly."
+            )
+        return f"Fire TV unreachable at {ser}: {detail}"
+
+    def _connect_and_status(self, serial: str, *, reset_offline: bool = False) -> tuple[str, str]:
+        if reset_offline:
+            self._evict_serial(serial)
+        for attempt in range(2):
+            rc_c, out_c, err_c = self._run(["connect", serial], timeout=6.0)
+            rc_d, out_d, err_d = self._run(["devices"], timeout=5.0)
+            combined_c = f"{out_c} {err_c}".strip()
+            status: str | None = None
+            detail = ""
+            for line in out_d.splitlines():
+                parts = line.strip().split()
+                if len(parts) >= 2 and parts[0] == serial:
+                    st = parts[1].lower()
+                    if st in ("device", "unauthorized"):
+                        return st, combined_c
+                    status = "offline"
+                    detail = f"{line.strip()} ({combined_c})".strip()
+                    break
+            if status is None:
+                if "failed to authenticate" in combined_c.lower() or "unauthorized" in combined_c.lower():
+                    return "unauthorized", combined_c
+                status = "offline"
+                detail = combined_c or err_d.strip() or out_d.strip() or f"rc={rc_c}/{rc_d}"
+            if attempt == 0 and not reset_offline and "already connected" in combined_c.lower():
+                self._evict_serial(serial)
+                continue
+            if rc_c == 124:
+                self._evict_serial(serial)
+            return status, detail
+        return "offline", "ADB connect retry exhausted"
 
     def connect_and_probe(self, cfg: WallboardConfig) -> dict[str, Any]:
         with self.lock:
@@ -1331,21 +1403,25 @@ class FireTvAdbController:
                 }
             st, detail = self._connect_and_status(ser)
             if st == "device":
-                rc_m, out_m, _ = self._run(["-s", ser, "shell", "getprop", "ro.product.model"], timeout=4.0)
-                model = out_m.strip().splitlines()[0] if rc_m == 0 and out_m.strip() else ""
-                self.adb_state = "ready"
-                if model:
-                    self.last_model = model
-                self.last_error = ""
-                self.last_action = f"probe ({ser})"
-                return {
-                    "ok": True,
-                    "configured": True,
-                    "state": "ready",
-                    "serial": ser,
-                    "model": self.last_model,
-                    "message": f"Connected ({self.last_model or ser})",
-                }
+                try:
+                    rc_m, out_m, _ = self._run(["-s", ser, "shell", "getprop", "ro.product.model"], timeout=4.0)
+                    model = out_m.strip().splitlines()[0] if rc_m == 0 and out_m.strip() else ""
+                    self._apply_wallboard_tv_settings(ser, suppress_screensaver=False)
+                    self.adb_state = "ready"
+                    if model:
+                        self.last_model = model
+                    self.last_error = ""
+                    self.last_action = f"probe ({ser})"
+                    return {
+                        "ok": True,
+                        "configured": True,
+                        "state": "ready",
+                        "serial": ser,
+                        "model": self.last_model,
+                        "message": f"Connected ({self.last_model or ser})",
+                    }
+                finally:
+                    self.disconnect_serial(ser)
             if st == "unauthorized":
                 self.adb_state = "unauthorized"
                 msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
@@ -1358,8 +1434,9 @@ class FireTvAdbController:
                     "model": "",
                     "message": msg,
                 }
+            self._evict_serial(ser)
             self.adb_state = "offline"
-            msg = f"Fire TV unreachable at {ser}: {detail}"
+            msg = self._offline_diagnostic_message(ser, detail)
             self.last_error = msg
             return {
                 "ok": False,
@@ -1428,7 +1505,7 @@ class FireTvAdbController:
                     for _ in range(self.wol_retries):
                         if self.wol_wait_sec > 0:
                             time.sleep(self.wol_wait_sec)
-                        st, detail = self._connect_and_status(ser)
+                        st, detail = self._connect_and_status(ser, reset_offline=True)
                         if st != "offline":
                             break
             if st == "unauthorized":
@@ -1437,52 +1514,53 @@ class FireTvAdbController:
                 self.last_error = msg
                 return {"ok": False, "configured": True, "state": "unauthorized", "serial": ser, "message": msg}
             if st != "device":
+                self._evict_serial(ser)
                 self.adb_state = "offline"
-                msg = f"Fire TV unreachable at {ser}: {detail}"
+                msg = self._offline_diagnostic_message(ser, detail)
                 self.last_error = msg
                 return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
 
-            rc_w, out_w, err_w = self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_WAKEUP"], timeout=5.0)
-            if rc_w != 0:
-                self.adb_state = "offline"
-                msg = f"Wake keyevent failed: {(err_w or out_w).strip()}"
-                self.last_error = msg
-                return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
+            try:
+                rc_w, out_w, err_w = self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_WAKEUP"], timeout=5.0)
+                if rc_w != 0:
+                    self.adb_state = "offline"
+                    msg = f"Wake keyevent failed: {(err_w or out_w).strip()}"
+                    self.last_error = msg
+                    return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
 
-            if self.settle_sec > 0:
-                time.sleep(self.settle_sec)
+                if self.settle_sec > 0:
+                    time.sleep(self.settle_sec)
 
-            if cfg.suppress_screensaver:
-                self._run(["-s", ser, "shell", "settings", "put", "secure", "screensaver_enabled", "0"], timeout=4.0)
-                self._run(["-s", ser, "shell", "settings", "put", "secure", "sleep_timeout", "0"], timeout=4.0)
-                self._run(["-s", ser, "shell", "settings", "put", "global", "wifi_sleep_policy", "2"], timeout=4.0)
+                self._apply_wallboard_tv_settings(ser, suppress_screensaver=cfg.suppress_screensaver)
 
-            rc_l, out_l, err_l = self._run(self._launch_cmd(cfg, wallboard_url, ser), timeout=8.0)
-            if cfg.display_client == "silk" and (rc_l != 0 or "Error" in f"{out_l}\n{err_l}"):
-                rc_l, out_l, err_l = self._run(
-                    ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", wallboard_url, "-p", "com.amazon.cloud9"],
-                    timeout=8.0,
-                )
+                rc_l, out_l, err_l = self._run(self._launch_cmd(cfg, wallboard_url, ser), timeout=8.0)
+                if cfg.display_client == "silk" and (rc_l != 0 or "Error" in f"{out_l}\n{err_l}"):
+                    rc_l, out_l, err_l = self._run(
+                        ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", wallboard_url, "-p", "com.amazon.cloud9"],
+                        timeout=8.0,
+                    )
 
-            if rc_l != 0:
-                self.adb_state = "ready"
-                msg = f"Awoke TV but browser launch failed: {(err_l or out_l).strip()}"
-                self.last_error = msg
-                return {"ok": False, "configured": True, "state": "ready", "serial": ser, "message": msg}
+                if rc_l != 0:
+                    self.adb_state = "ready"
+                    msg = f"Awoke TV but browser launch failed: {(err_l or out_l).strip()}"
+                    self.last_error = msg
+                    return {"ok": False, "configured": True, "state": "ready", "serial": ser, "message": msg}
 
-            self.tv_awake_requested = True
-            self.last_wake_ms = int(time.time() * 1000)
-            self.adb_state = "awake"
-            self.last_action = f"wake -> {cfg.display_client}"
-            self.last_error = ""
-            return {
-                "ok": True,
-                "configured": True,
-                "state": "awake",
-                "serial": ser,
-                "model": self.last_model,
-                "message": f"Awoke {self.last_model or ser} & opened {cfg.display_client}",
-            }
+                self.tv_awake_requested = True
+                self.last_wake_ms = int(time.time() * 1000)
+                self.adb_state = "awake"
+                self.last_action = f"wake -> {cfg.display_client}"
+                self.last_error = ""
+                return {
+                    "ok": True,
+                    "configured": True,
+                    "state": "awake",
+                    "serial": ser,
+                    "model": self.last_model,
+                    "message": f"Awoke {self.last_model or ser} & opened {cfg.display_client}",
+                }
+            finally:
+                self.disconnect_serial(ser)
 
     def schedule_sleep(self, cfg: WallboardConfig, delay_sec: float = 0.0, reason: str = "") -> dict[str, Any]:
         if delay_sec <= 0:
@@ -1515,14 +1593,25 @@ class FireTvAdbController:
                 }
             st, detail = self._connect_and_status(ser)
             if st != "device":
+                self._evict_serial(ser)
                 self.adb_state = st
-                msg = f"Sleep failed ({st}): {detail}"
+                msg = self._offline_diagnostic_message(ser, detail) if st == "offline" else f"Sleep failed ({st}): {detail}"
                 self.last_error = msg
                 return {"ok": False, "configured": True, "state": st, "serial": ser, "message": msg}
-            if cfg.suppress_screensaver:
-                self._run(["-s", ser, "shell", "settings", "put", "secure", "screensaver_enabled", "1"], timeout=4.0)
-                self._run(["-s", ser, "shell", "settings", "put", "secure", "sleep_timeout", "1200000"], timeout=4.0)
-            self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_SLEEP"], timeout=5.0)
+            try:
+                if cfg.suppress_screensaver:
+                    self._run(
+                        [
+                            "-s", ser, "shell",
+                            "settings put secure screensaver_enabled 1; settings put secure sleep_timeout 1200000",
+                        ],
+                        timeout=5.0,
+                    )
+                self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_SLEEP"], timeout=5.0)
+                if self.settle_sec > 0:
+                    time.sleep(min(0.25, self.settle_sec))
+            finally:
+                self.disconnect_serial(ser)
             self.adb_state = "asleep"
             self.last_action = f"sleep ({reason or 'manual'})"
             self.last_error = ""
@@ -4490,7 +4579,7 @@ class ArmoryCamService:
         """Execute an explicit House Audio / Mode Test Bench cue with direct S330 fallback support."""
         def _play_s330(pcm: np.ndarray, sr: int, kind: str) -> bool:
             return self.voice._play_pcm_blocking(
-                pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84, kind=kind, allow_router=False
+                pcm, sr, lead_ms=160, tail_ms=120, target_peak=0.84, kind=kind, allow_router=False
             )
 
         return self.house_audio.test_play(
@@ -7254,6 +7343,13 @@ function syncHouseAudioUI(ha) {
     }
     msgEl.innerHTML = parts.join(' · ');
   }
+  const tgtSel = $('haTestTarget');
+  if (tgtSel) {
+    const autoOpt = tgtSel.querySelector('option[value="auto"]');
+    if (autoOpt) {
+      autoOpt.textContent = `Auto Route (→ ${(ha.activeRoute || 's330').toUpperCase()})`;
+    }
+  }
   const sfxSel = $('haSfxSel');
   if (sfxSel && Array.isArray(ha.sfxFiles) && document.activeElement !== sfxSel) {
     const curSfx = sfxSel.value;
@@ -7323,7 +7419,8 @@ async function runHouseAudioTest(kind, mode, sfxFile = '') {
         withDenonDuck: $('haTestDenonDuck').checked,
       }),
     }).then(x => x.json());
-    $('haTestOut').textContent = r.ok ? `✓ Played via ${(r.route || '').toUpperCase()} (${r.mode || mode})` : `✗ ${r.error || 'Failed'}`;
+    const ms = r.timing && typeof r.timing.totalMs === 'number' ? ` · ${r.timing.totalMs} ms` : '';
+    $('haTestOut').textContent = r.ok ? `✓ Played via ${(r.route || '').toUpperCase()} (${r.mode || mode})${ms}` : `✗ ${r.error || 'Failed'}`;
   } catch {
     $('haTestOut').textContent = '✗ Request failed';
   }
@@ -7460,6 +7557,17 @@ async function init() {
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
   populateHouseAudioInputs(cfg.houseAudio || {});
+  try {
+    const savedTgt = localStorage.getItem('armory.haTestTarget');
+    if (savedTgt && ['auto', 'cube', 's330'].includes(savedTgt) && $('haTestTarget')) {
+      $('haTestTarget').value = savedTgt;
+    }
+  } catch {}
+  if ($('haTestTarget')) {
+    $('haTestTarget').addEventListener('change', () => {
+      try { localStorage.setItem('armory.haTestTarget', $('haTestTarget').value || 'auto'); } catch {}
+    });
+  }
   populateDisplaysInputs(cfg.displays || {});
   renderCameras();
   wireMaskModal();
@@ -8604,6 +8712,7 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_audio_stop() -> Response:
         cfg = service.house_audio.get_config()
         res = service.house_audio.cube.stop(cfg.cube_host, cfg.cube_port) if cfg.cube_host else {"ok": True, "stopped": False}
+        service.voice.stop_s330_playback()
         return jsonify(res)
 
     @app.get("/api/audio/sfx/<path:filename>")

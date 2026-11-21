@@ -677,6 +677,10 @@ class GymDisplayController:
             if st != "device":
                 return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "223"], timeout=4.0)
+            if rc == 0:
+                self._sleep(0.25)
+                if hasattr(self.adb, "disconnect_serial"):
+                    self.adb.disconnect_serial(ser)
             return {
                 "ok": rc == 0,
                 "target": "tv",
@@ -969,12 +973,20 @@ class GymDisplayController:
                 if self._wake_wallboard_fn is None:
                     return {"ok": False, "target": "wallboard", "action": "on", "error": "Wallboard wake unavailable"}
                 res = self._wake_wallboard_fn(True)
-                return {"ok": bool(res.get("ok", True)), "target": "wallboard", "action": "on", "adb": res, "message": res.get("message", "Wallboard wake sent")}
+                ok = bool(res.get("ok", True))
+                out = {"ok": ok, "target": "wallboard", "action": "on", "adb": res, "message": res.get("message", "Wallboard wake sent")}
+                if not ok:
+                    out["error"] = res.get("message") or res.get("error") or "Wallboard wake failed"
+                return out
             if act == "off":
                 if self._sleep_wallboard_fn is None:
                     return {"ok": False, "target": "wallboard", "action": "off", "error": "Wallboard sleep unavailable"}
                 res = self._sleep_wallboard_fn()
-                return {"ok": bool(res.get("ok", True)), "target": "wallboard", "action": "off", "adb": res, "message": res.get("message", "Wallboard sleep sent")}
+                ok = bool(res.get("ok", True))
+                out = {"ok": ok, "target": "wallboard", "action": "off", "adb": res, "message": res.get("message", "Wallboard sleep sent")}
+                if not ok:
+                    out["error"] = res.get("message") or res.get("error") or "Wallboard sleep failed"
+                return out
             return {"ok": False, "target": "wallboard", "action": act, "error": f"Unsupported wallboard action: {act}"}
         if tgt == "all_tvs":
             return self.execute_many(["tv", "wallboard", "spin"], act, skip_unconfigured_spin=True)

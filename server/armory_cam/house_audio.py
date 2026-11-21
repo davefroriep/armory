@@ -27,6 +27,7 @@ import wave
 import xml.etree.ElementTree as ET
 
 import numpy as np
+from scipy.signal import resample_poly
 
 
 VALID_OUTPUT_ROUTES = ("s330", "cube", "auto")
@@ -400,6 +401,66 @@ class DenonAvrClient:
                                     }
 
 
+def normalize_wav_for_cube(wav_bytes: bytes, target_sr: int = 48_000, target_ch: int = 2) -> bytes:
+    """Normalize PCM16 WAV bytes to uniform 48 kHz stereo PCM16 for glitch-free Fire TV HDMI output.
+
+    Returns the exact input bytes untouched (zero-copy) when already at `target_sr` & `target_ch`.
+    """
+    if not wav_bytes or len(wav_bytes) < 44 or wav_bytes[:4] != b"RIFF" or wav_bytes[8:12] != b"WAVE":
+        return wav_bytes
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            ch = int(wf.getnchannels())
+            sw = int(wf.getsampwidth())
+            sr = int(wf.getframerate())
+            comptype = wf.getcomptype()
+            if comptype != "NONE" or sw != 2 or ch not in (1, 2) or sr <= 0:
+                return wav_bytes
+            if sr == int(target_sr) and ch == int(target_ch):
+                return wav_bytes
+            raw_frames = wf.readframes(wf.getnframes())
+    except Exception:
+        return wav_bytes
+
+    if not raw_frames:
+        return wav_bytes
+
+    arr = np.frombuffer(raw_frames, dtype="<i2").astype(np.float32) / 32768.0
+    if ch == 2:
+        arr = arr.reshape(-1, 2)
+    else:
+        arr = arr.reshape(-1)
+
+    if sr != int(target_sr):
+        g = math.gcd(int(target_sr), sr)
+        up = int(target_sr) // g
+        down = sr // g
+        if arr.ndim == 2:
+            arr = resample_poly(arr, up, down, axis=0).astype(np.float32)
+        else:
+            arr = resample_poly(arr, up, down).astype(np.float32)
+
+    if int(target_ch) == 2 and arr.ndim == 1:
+        arr = np.stack([arr, arr], axis=1)
+    elif int(target_ch) == 1 and arr.ndim == 2:
+        arr = arr.mean(axis=1)
+
+    if arr.size == 0:
+        return wav_bytes
+    peak = float(np.max(np.abs(arr)))
+    if peak > 0.99:
+        arr = arr * (0.98 / peak)
+    arr = np.clip(arr, -0.99, 0.99)
+    pcm16 = np.round(arr * 32767.0).astype("<i2")
+    bio = io.BytesIO()
+    with wave.open(bio, "wb") as wf_out:
+        wf_out.setnchannels(int(target_ch))
+        wf_out.setsampwidth(2)
+        wf_out.setframerate(int(target_sr))
+        wf_out.writeframes(pcm16.tobytes())
+    return bio.getvalue()
+
+
 def encode_mono_pcm_to_wav(mono_pcm: np.ndarray, sr: int) -> bytes:
     """Convert mono float32 PCM (`-1..1`) into standard 16-bit PCM WAV bytes."""
     arr = np.asarray(mono_pcm, dtype=np.float32).reshape(-1)
@@ -545,7 +606,7 @@ class FireTvCubeAudioClient:
             self.last_health = res
             return res
         try:
-            code, raw = self._do_get(f"{base}/health", 0.9)
+            code, raw = self._do_get(f"{base}/health", 1.5)
             if code >= 400:
                 res = {"ok": False, "error": f"HTTP {code}"}
             else:
@@ -575,6 +636,8 @@ class FireTvCubeAudioClient:
         base = self._base_url(host, port)
         if not base:
             return {"ok": False, "error": "Cube IP not configured"}
+        if content_type == "audio/wav":
+            audio_bytes = normalize_wav_for_cube(audio_bytes, target_sr=48_000, target_ch=2)
         qs = urllib.parse.urlencode({
             "mode": mode if mode in VALID_MIX_MODES else "overlay",
             "usage": usage if usage in VALID_CUBE_USAGES else "media",
@@ -582,7 +645,7 @@ class FireTvCubeAudioClient:
             "maxSec": str(max(1, min(60, int(max_sec)))),
             "sync": "1" if sync else "0",
         })
-        timeout = max(3.5, float(max_sec) + 3.0) if sync else 3.0
+        timeout = max(5.0, float(max_sec) + 4.0) if sync else 5.0
         try:
             code, raw = self._do_post(
                 f"{base}/play?{qs}",
@@ -934,7 +997,13 @@ class HouseAudioManager:
             items.append({"name": valid, "bytes": int(p.stat().st_size), "ext": p.suffix.lower()})
         return items
 
-    def resolve_voice_target(self, kind: str = "tts") -> str:
+    def resolve_voice_target(
+        self,
+        kind: str = "tts",
+        *,
+        denon_status: dict[str, Any] | None = None,
+        cube_health: dict[str, Any] | None = None,
+    ) -> str:
         cfg = self.get_config()
         if cfg.output_route == "s330":
             return "s330"
@@ -944,13 +1013,13 @@ class HouseAudioManager:
             return "cube"
         # "auto": play on Cube only when Denon is ON on Media Player AND Cube :8767/health is alive
         if cfg.denon_enabled and cfg.denon_host:
-            den_st = self.denon.get_status()
+            den_st = denon_status if denon_status is not None else self.denon.get_status()
             if not den_st.get("ok") or den_st.get("power") != "ON":
                 return "s330"
             inp = str(den_st.get("input") or "").upper()
             if inp not in ("MPLAY", "MEDIA PLAYER"):
                 return "s330"
-        health = self.cube.health(cfg.cube_host, cfg.cube_port)
+        health = cube_health if cube_health is not None else self.cube.health(cfg.cube_host, cfg.cube_port)
         return "cube" if health.get("ok") else "s330"
 
     def try_route_voice_pcm(self, mono_pcm: np.ndarray, sr: int, *, kind: str = "tts") -> dict[str, Any]:
@@ -1007,6 +1076,7 @@ class HouseAudioManager:
         synthesize_tts_fn: Callable[[str], tuple[np.ndarray, int] | None] | None = None,
         play_s330_fn: Callable[[np.ndarray, int, str], bool] | None = None,
     ) -> dict[str, Any]:
+        t0 = time.perf_counter()
         cfg = self.get_config()
         kind_clean = str(kind or "chime").strip().lower()
         mode_clean = str(mode or "").strip().lower()
@@ -1112,11 +1182,25 @@ class HouseAudioManager:
                 return {"ok": ok, "route": "s330", "mode": "s330", "kind": kind_clean}
             return {"ok": False, "route": "s330", "error": "S330 playback unavailable for this file"}
 
+        t_prep_done = time.perf_counter()
         if with_denon_duck:
             with self.denon.duck_context(force=True) as duck_info:
                 out = _exec_play()
-            return {**out, "denonDuck": duck_info}
-        return _exec_play()
+            t_end = time.perf_counter()
+            timing = {
+                "prepMs": int(round((t_prep_done - t0) * 1000.0)),
+                "playMs": int(round((t_end - t_prep_done) * 1000.0)),
+                "totalMs": int(round((t_end - t0) * 1000.0)),
+            }
+            return {**out, "denonDuck": duck_info, "timing": timing}
+        out = _exec_play()
+        t_end = time.perf_counter()
+        timing = {
+            "prepMs": int(round((t_prep_done - t0) * 1000.0)),
+            "playMs": int(round((t_end - t_prep_done) * 1000.0)),
+            "totalMs": int(round((t_end - t0) * 1000.0)),
+        }
+        return {**out, "timing": timing}
 
     def status_dict(self, *, live_probe: bool = True) -> dict[str, Any]:
         cfg = self.get_config()
@@ -1134,7 +1218,7 @@ class HouseAudioManager:
             "config": cfg.to_dict(),
             "denon": denon_st,
             "cube": cube_st,
-            "activeRoute": self.resolve_voice_target(),
+            "activeRoute": self.resolve_voice_target(denon_status=denon_st, cube_health=cube_st),
             "sfxFiles": self.list_sfx_files(),
             "matrix": self.matrix.snapshot_dict(),
             "lastDuck": self.denon.last_duck_info,

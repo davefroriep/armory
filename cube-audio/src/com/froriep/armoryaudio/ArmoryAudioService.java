@@ -15,6 +15,7 @@ import android.media.MediaPlayer;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.util.Log;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -33,8 +34,11 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -47,12 +51,14 @@ import java.util.concurrent.atomic.AtomicReference;
  *   - takeover: requests AUDIOFOCUS_GAIN_TRANSIENT to pause background media, then resumes it
  */
 public class ArmoryAudioService extends Service {
+    private static final String TAG = "ArmoryAudio";
     public static final int LISTEN_PORT = 8767;
     private static final int NOTIF_ID = 1042;
     private static final String CHANNEL_ID = "armory_audio_bg";
-    private static final String APP_VERSION = "1.0";
+    private static final String APP_VERSION = "1.1";
     private static final int MAX_BODY_BYTES = 12 * 1024 * 1024;
     private static final int SOCKET_TIMEOUT_MS = 15000;
+    private static final int HDMI_TAIL_PAD_MS = 220;
 
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong playGen = new AtomicLong(0);
@@ -198,6 +204,7 @@ public class ArmoryAudioService extends Service {
     private void handleClient(Socket sock) {
         try {
             sock.setSoTimeout(SOCKET_TIMEOUT_MS);
+            sock.setTcpNoDelay(true);
             BufferedInputStream in = new BufferedInputStream(sock.getInputStream());
             OutputStream out = sock.getOutputStream();
 
@@ -276,6 +283,7 @@ public class ArmoryAudioService extends Service {
             writeJson(out, 404, "{\"ok\":false,\"error\":\"Not found\"}");
         } catch (Exception e) {
             lastError.set("HTTP client error: " + e.getMessage());
+            Log.w(TAG, "HTTP client error: " + e.getMessage());
             try {
                 writeJson(sock.getOutputStream(), 500, "{\"ok\":false,\"error\":" + jsonString(e.getMessage()) + "}");
             } catch (IOException ignored) {
@@ -302,8 +310,30 @@ public class ArmoryAudioService extends Service {
         final long myGen = playGen.incrementAndGet();
         stopActiveDrivers();
 
+        if (playExecutor == null || playExecutor.isShutdown()) {
+            writeJson(out, 500, "{\"ok\":false,\"error\":\"Playback executor unavailable\"}");
+            return;
+        }
+
         if (sync) {
-            PlayResult res = executePlayback(myGen, mode, usage, content, gain, maxSec, url, body);
+            PlayResult res;
+            try {
+                Future<PlayResult> fut = playExecutor.submit(new Callable<PlayResult>() {
+                    @Override
+                    public PlayResult call() {
+                        return executePlayback(myGen, mode, usage, content, gain, maxSec, url, body);
+                    }
+                });
+                res = fut.get((long) maxSec + 8L, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                if (playGen.get() == myGen) {
+                    playGen.incrementAndGet();
+                    stopActiveDrivers();
+                }
+                String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                writeJson(out, 500, "{\"ok\":false,\"error\":" + jsonString(msg) + "}");
+                return;
+            }
             if (!res.ok) {
                 writeJson(out, 500, "{\"ok\":false,\"error\":" + jsonString(res.error) + "}");
                 return;
@@ -313,14 +343,12 @@ public class ArmoryAudioService extends Service {
                     "{\"ok\":true,\"played\":true,\"mode\":%s,\"usage\":%s,\"durationMs\":%d,\"gen\":%d}",
                     jsonString(mode), jsonString(usage), res.durationMs, myGen));
         } else {
-            if (playExecutor != null && !playExecutor.isShutdown()) {
-                playExecutor.execute(new Runnable() {
-                    @Override
-                    public void run() {
-                        executePlayback(myGen, mode, usage, content, gain, maxSec, url, body);
-                    }
-                });
-            }
+            playExecutor.execute(new Runnable() {
+                @Override
+                public void run() {
+                    executePlayback(myGen, mode, usage, content, gain, maxSec, url, body);
+                }
+            });
             writeJson(out, 200, String.format(
                     Locale.US,
                     "{\"ok\":true,\"queued\":true,\"mode\":%s,\"usage\":%s,\"gen\":%d}",
@@ -346,6 +374,7 @@ public class ArmoryAudioService extends Service {
         PowerManager.WakeLock wl = acquirePlayWakeLock((maxSec + 5) * 1000L);
         FocusHandle focus = null;
 
+        Log.i(TAG, "play start gen=" + myGen + " mode=" + mode + " usage=" + usage + " bytes=" + (body != null ? body.length : 0));
         playing.set(true);
         activeMode.set(mode);
         try {
@@ -358,10 +387,11 @@ public class ArmoryAudioService extends Service {
                 synchronized (playbackLock) {
                     activeFocus = focus;
                 }
-                long settleMs = "takeover".equals(mode) ? 120L : 60L;
+                long settleMs = "takeover".equals(mode) ? 150L : 120L;
                 sleepInterruptibly(settleMs);
             }
             if (playGen.get() != myGen) {
+                Log.i(TAG, "play cancelled during focus settle gen=" + myGen);
                 return PlayResult.cancelled();
             }
 
@@ -371,12 +401,15 @@ public class ArmoryAudioService extends Service {
             } else {
                 playWithMediaPlayer(myGen, url, body, attrs, gain, deadlineMs);
             }
+            long elapsedMs = Math.max(0L, System.currentTimeMillis() - startMs);
             playCount.incrementAndGet();
             lastError.set("");
-            return PlayResult.success(Math.max(0L, System.currentTimeMillis() - startMs));
+            Log.i(TAG, "play finish gen=" + myGen + " elapsedMs=" + elapsedMs + " cancelled=" + (playGen.get() != myGen));
+            return PlayResult.success(elapsedMs);
         } catch (Exception e) {
             String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             lastError.set(msg);
+            Log.e(TAG, "play fail gen=" + myGen + ": " + msg, e);
             return PlayResult.fail(msg);
         } finally {
             if (focus != null && am != null) {
@@ -402,19 +435,25 @@ public class ArmoryAudioService extends Service {
             AudioAttributes attrs,
             float gain,
             long deadlineMs) {
-        byte[] pcm = new byte[wav.dataSize];
-        System.arraycopy(rawWav, wav.dataOffset, pcm, 0, wav.dataSize);
-        applyLinearEdgeFade16(pcm, wav.sampleRate, wav.channels, 6);
+        int frameBytes = wav.channels * 2;
+        byte[] audioPcm = new byte[wav.dataSize];
+        System.arraycopy(rawWav, wav.dataOffset, audioPcm, 0, wav.dataSize);
+        applyLinearEdgeFade16(audioPcm, wav.sampleRate, wav.channels, 6);
+
+        int tailFrames = Math.max(0, (wav.sampleRate * HDMI_TAIL_PAD_MS) / 1000);
+        int tailBytes = tailFrames * frameBytes;
+        byte[] pcm = new byte[wav.dataSize + tailBytes];
+        System.arraycopy(audioPcm, 0, pcm, 0, wav.dataSize);
 
         int channelMask = (wav.channels == 1)
                 ? AudioFormat.CHANNEL_OUT_MONO
                 : AudioFormat.CHANNEL_OUT_STEREO;
         int minBuf = AudioTrack.getMinBufferSize(wav.sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
-            minBuf = wav.sampleRate * wav.channels * 2 / 5;
+            minBuf = wav.sampleRate * frameBytes / 5;
         }
-        int bufSize = Math.max(minBuf * 2, (wav.sampleRate * wav.channels * 2) / 4);
-        int frameBytes = wav.channels * 2;
+        int bufSize = Math.max(minBuf * 2, (wav.sampleRate * frameBytes) / 4);
+        bufSize = ((bufSize + frameBytes - 1) / frameBytes) * frameBytes;
 
         AudioTrack track = new AudioTrack.Builder()
                 .setAudioAttributes(attrs)
@@ -437,10 +476,24 @@ public class ArmoryAudioService extends Service {
 
         try {
             track.setVolume(gain);
-            track.play();
-            long playStartMs = System.currentTimeMillis();
             int pos = 0;
             int chunkSize = 16384;
+            int prefillCap = Math.min(bufSize, pcm.length);
+            while (pos < prefillCap && playGen.get() == myGen) {
+                int len = Math.min(chunkSize, prefillCap - pos);
+                len = (len / frameBytes) * frameBytes;
+                if (len <= 0) break;
+                int wrote = track.write(pcm, pos, len, AudioTrack.WRITE_NON_BLOCKING);
+                if (wrote <= 0) {
+                    break;
+                }
+                pos += wrote;
+            }
+            if (playGen.get() != myGen) {
+                return;
+            }
+            track.play();
+            long playStartMs = System.currentTimeMillis();
             while (pos < pcm.length && playGen.get() == myGen && System.currentTimeMillis() < deadlineMs) {
                 int len = Math.min(chunkSize, pcm.length - pos);
                 len = (len / frameBytes) * frameBytes;
@@ -458,7 +511,7 @@ public class ArmoryAudioService extends Service {
             if (playGen.get() == myGen) {
                 long totalFrames = pcm.length / (long) frameBytes;
                 long expectedMs = (totalFrames * 1000L) / Math.max(1, wav.sampleRate);
-                long drainDeadline = Math.min(deadlineMs, playStartMs + expectedMs + 160L);
+                long drainDeadline = Math.min(deadlineMs, playStartMs + expectedMs + 250L);
                 while (playGen.get() == myGen && System.currentTimeMillis() < drainDeadline) {
                     if (track.getPlaybackHeadPosition() >= totalFrames) {
                         break;
@@ -467,14 +520,17 @@ public class ArmoryAudioService extends Service {
                 }
             }
         } finally {
+            boolean completedNormally = (playGen.get() == myGen);
             synchronized (playbackLock) {
                 if (activeTrack == track) {
                     activeTrack = null;
                 }
             }
             try {
-                track.pause();
-                track.flush();
+                if (!completedNormally) {
+                    track.pause();
+                    track.flush();
+                }
                 track.stop();
             } catch (Exception ignored) {
             }

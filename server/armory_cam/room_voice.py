@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import OrderedDict, deque
+import ctypes
 from dataclasses import dataclass
 import hashlib
 import io
@@ -22,6 +23,7 @@ from pathlib import Path
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -56,6 +58,7 @@ _LEGACY_TTS_VOICE_MAP = {
 PREWARM_TTS_PHRASES = (
     "Armory room mic ready",
     "Armory mic on",
+    "225 for 8, got it",
     "Checked, got it",
     "Didn't catch that",
     "Rest skipped",
@@ -296,34 +299,299 @@ class RoomVoiceConfig:
         )
 
 
-def list_audio_devices() -> dict[str, list[dict[str, Any]]]:
-    """Return sanitized audio input and output devices grouped with host API names."""
-    inputs: list[dict[str, Any]] = []
-    outputs: list[dict[str, Any]] = []
-    try:
-        devs = sd.query_devices()
-        host_cache: dict[int, str] = {}
-        for idx, d in enumerate(devs):
-            ha_idx = int(d.get("hostapi", -1))
-            if ha_idx not in host_cache:
-                try:
-                    host_cache[ha_idx] = str(sd.query_hostapis(ha_idx).get("name", ""))
-                except Exception:
-                    host_cache[ha_idx] = ""
-            host_name = host_cache[ha_idx]
-            item_base = {
-                "index": idx,
-                "name": str(d.get("name", "")),
-                "hostApi": host_name,
-                "sampleRate": int(round(float(d.get("default_samplerate") or 48000))),
+_PORTAUDIO_LOCK = threading.RLock()
+_AUDIO_DEVICES_CACHE: dict[str, list[dict[str, Any]]] | None = None
+_AUDIO_DEVICES_TS: float = 0.0
+AUDIO_DEVICES_CACHE_TTL_SEC = 15.0
+
+
+def list_audio_devices(force_refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    """Return sanitized audio input and output devices grouped with host API names (cached & locked)."""
+    global _AUDIO_DEVICES_CACHE, _AUDIO_DEVICES_TS
+    with _PORTAUDIO_LOCK:
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and _AUDIO_DEVICES_CACHE is not None
+            and (now - _AUDIO_DEVICES_TS) < AUDIO_DEVICES_CACHE_TTL_SEC
+        ):
+            return {
+                "inputs": [dict(d) for d in _AUDIO_DEVICES_CACHE["inputs"]],
+                "outputs": [dict(d) for d in _AUDIO_DEVICES_CACHE["outputs"]],
             }
-            if int(d.get("max_input_channels") or 0) > 0:
-                inputs.append({**item_base, "channels": int(d["max_input_channels"])})
-            if int(d.get("max_output_channels") or 0) > 0:
-                outputs.append({**item_base, "channels": int(d["max_output_channels"])})
+        inputs: list[dict[str, Any]] = []
+        outputs: list[dict[str, Any]] = []
+        try:
+            devs = sd.query_devices()
+            host_cache: dict[int, str] = {}
+            for idx, d in enumerate(devs):
+                ha_idx = int(d.get("hostapi", -1))
+                if ha_idx not in host_cache:
+                    try:
+                        host_cache[ha_idx] = str(sd.query_hostapis(ha_idx).get("name", ""))
+                    except Exception:
+                        host_cache[ha_idx] = ""
+                host_name = host_cache[ha_idx]
+                item_base = {
+                    "index": idx,
+                    "name": str(d.get("name", "")),
+                    "hostApi": host_name,
+                    "sampleRate": int(round(float(d.get("default_samplerate") or 48000))),
+                }
+                if int(d.get("max_input_channels") or 0) > 0:
+                    inputs.append({**item_base, "channels": int(d["max_input_channels"])})
+                if int(d.get("max_output_channels") or 0) > 0:
+                    outputs.append({**item_base, "channels": int(d["max_output_channels"])})
+        except Exception:
+            pass
+        _AUDIO_DEVICES_CACHE = {"inputs": inputs, "outputs": outputs}
+        _AUDIO_DEVICES_TS = time.monotonic()
+        return {
+            "inputs": [dict(d) for d in inputs],
+            "outputs": [dict(d) for d in outputs],
+        }
+
+
+WAVE_MAPPER_ID = 0xFFFFFFFF
+_WHDR_DONE = 0x00000001
+_WAVE_FORMAT_PCM = 1
+_CALLBACK_NULL = 0x00000000
+
+
+class _WAVEOUTCAPSW(ctypes.Structure):
+    _fields_ = [
+        ("wMid", ctypes.c_uint16),
+        ("wPid", ctypes.c_uint16),
+        ("vDriverVersion", ctypes.c_uint32),
+        ("szPname", ctypes.c_wchar * 32),
+        ("dwFormats", ctypes.c_uint32),
+        ("wChannels", ctypes.c_uint16),
+        ("wReserved1", ctypes.c_uint16),
+        ("dwSupport", ctypes.c_uint32),
+    ]
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [
+        ("wFormatTag", ctypes.c_uint16),
+        ("nChannels", ctypes.c_uint16),
+        ("nSamplesPerSec", ctypes.c_uint32),
+        ("nAvgBytesPerSec", ctypes.c_uint32),
+        ("nBlockAlign", ctypes.c_uint16),
+        ("wBitsPerSample", ctypes.c_uint16),
+        ("cbSize", ctypes.c_uint16),
+    ]
+
+
+class _WAVEHDR(ctypes.Structure):
+    _fields_ = [
+        ("lpData", ctypes.c_void_p),
+        ("dwBufferLength", ctypes.c_uint32),
+        ("dwBytesRecorded", ctypes.c_uint32),
+        ("dwUser", ctypes.c_size_t),
+        ("dwFlags", ctypes.c_uint32),
+        ("dwLoops", ctypes.c_uint32),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_size_t),
+    ]
+
+
+def _enum_winmm_output_devices() -> list[tuple[int, str]]:
+    if sys.platform != "win32":
+        return []
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        winmm.waveOutGetNumDevs.restype = ctypes.c_uint
+        winmm.waveOutGetDevCapsW.argtypes = [ctypes.c_size_t, ctypes.c_void_p, ctypes.c_uint]
+        winmm.waveOutGetDevCapsW.restype = ctypes.c_uint
+        count = int(winmm.waveOutGetNumDevs())
+        out: list[tuple[int, str]] = []
+        for idx in range(count):
+            caps = _WAVEOUTCAPSW()
+            if winmm.waveOutGetDevCapsW(idx, ctypes.byref(caps), ctypes.sizeof(caps)) == 0:
+                out.append((idx, str(caps.szPname or "")))
+        return out
     except Exception:
-        pass
-    return {"inputs": inputs, "outputs": outputs}
+        return []
+
+
+def _find_winmm_device_id(
+    match_substr: str,
+    wave_devices: Sequence[tuple[int, str]] | None = None,
+) -> int | None:
+    """Resolve Windows waveOut device ID safely handling 31-character szPname truncation."""
+    devs = list(wave_devices) if wave_devices is not None else _enum_winmm_output_devices()
+    q = re.sub(r"\s+", " ", (match_substr or "").strip().lower())
+    if not q:
+        return WAVE_MAPPER_ID if devs else None
+
+    for dev_id, name in devs:
+        if q in name.lower():
+            return dev_id
+
+    # Handle 31-char WAVEOUTCAPSW truncation (e.g. 'Speakers (2- Anker PowerConf S3')
+    tokens = [t for t in re.split(r"[\s\-_]+", q) if t]
+    for dev_id, name in devs:
+        n_low = name.lower()
+        truncated = len(name) >= 30
+        if truncated and tokens:
+            tail_words = [w for w in re.split(r"[\s\-_]+", n_low) if w]
+            last_w = tail_words[-1] if tail_words else ""
+            if all(
+                (tok in n_low) or (len(last_w) >= 2 and tok.startswith(last_w))
+                for tok in tokens
+            ):
+                return dev_id
+
+    for kw in ("powerconf", "anker"):
+        if kw in q or "s330" in q:
+            for dev_id, name in devs:
+                if kw in name.lower():
+                    return dev_id
+    return None
+
+
+class _WinMmSpeakerPlayer:
+    """Lock-free-of-PortAudio Windows `winmm.dll` waveOut speaker player with instant cancel."""
+
+    def __init__(self) -> None:
+        self._play_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._cancel_ev = threading.Event()
+        self._active_handle: ctypes.c_void_p | None = None
+        self._winmm: Any = None
+
+    def _get_winmm(self) -> Any:
+        if self._winmm is not None:
+            return self._winmm
+        if sys.platform != "win32":
+            return None
+        w = ctypes.WinDLL("winmm")
+        w.waveOutOpen.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+        ]
+        w.waveOutOpen.restype = ctypes.c_uint
+        w.waveOutPrepareHeader.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        w.waveOutPrepareHeader.restype = ctypes.c_uint
+        w.waveOutWrite.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        w.waveOutWrite.restype = ctypes.c_uint
+        w.waveOutReset.argtypes = [ctypes.c_void_p]
+        w.waveOutReset.restype = ctypes.c_uint
+        w.waveOutUnprepareHeader.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+        w.waveOutUnprepareHeader.restype = ctypes.c_uint
+        w.waveOutClose.argtypes = [ctypes.c_void_p]
+        w.waveOutClose.restype = ctypes.c_uint
+        self._winmm = w
+        return w
+
+    def stop(self) -> None:
+        self._cancel_ev.set()
+        with self._state_lock:
+            h = self._active_handle
+        if h is not None and self._winmm is not None:
+            try:
+                self._winmm.waveOutReset(h)
+            except Exception:
+                pass
+
+    def play(
+        self,
+        pcm_f32: np.ndarray,
+        sample_rate: int,
+        channels: int,
+        match_substr: str,
+    ) -> bool:
+        winmm = self._get_winmm()
+        if winmm is None:
+            return False
+        dev_id = _find_winmm_device_id(match_substr)
+        if dev_id is None:
+            return False
+
+        arr = np.ascontiguousarray(pcm_f32, dtype=np.float32)
+        if arr.size == 0:
+            return False
+        if arr.ndim == 1 and channels > 1:
+            arr = np.repeat(arr[:, None], channels, axis=1)
+        elif arr.ndim == 2 and arr.shape[1] != channels:
+            mono = arr.mean(axis=1)
+            arr = np.repeat(mono[:, None], channels, axis=1) if channels > 1 else mono
+        pcm16 = np.clip(np.round(arr * 32767.0), -32768, 32767).astype("<i2")
+        raw_bytes = pcm16.tobytes()
+        n_frames = arr.shape[0]
+        dur_sec = float(n_frames) / float(max(1, sample_rate))
+
+        # Cancel any prior playback cleanly before taking the serialized playback lock
+        self.stop()
+        with self._play_lock:
+            self._cancel_ev.clear()
+            wfx = _WAVEFORMATEX(
+                wFormatTag=_WAVE_FORMAT_PCM,
+                nChannels=max(1, int(channels)),
+                nSamplesPerSec=max(8000, int(sample_rate)),
+                nAvgBytesPerSec=max(8000, int(sample_rate)) * max(1, int(channels)) * 2,
+                nBlockAlign=max(1, int(channels)) * 2,
+                wBitsPerSample=16,
+                cbSize=0,
+            )
+            h_wave = ctypes.c_void_p()
+            rc_open = winmm.waveOutOpen(
+                ctypes.byref(h_wave),
+                ctypes.c_uint(int(dev_id)),
+                ctypes.byref(wfx),
+                0,
+                0,
+                _CALLBACK_NULL,
+            )
+            if rc_open != 0 or not h_wave.value:
+                return False
+
+            buf = ctypes.create_string_buffer(raw_bytes, len(raw_bytes))
+            hdr = _WAVEHDR(
+                lpData=ctypes.addressof(buf),
+                dwBufferLength=len(raw_bytes),
+                dwBytesRecorded=0,
+                dwUser=0,
+                dwFlags=0,
+                dwLoops=0,
+                lpNext=None,
+                reserved=0,
+            )
+            prepared = False
+            try:
+                if winmm.waveOutPrepareHeader(h_wave, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                    return False
+                prepared = True
+                with self._state_lock:
+                    self._active_handle = h_wave
+                if winmm.waveOutWrite(h_wave, ctypes.byref(hdr), ctypes.sizeof(hdr)) != 0:
+                    return False
+                deadline = time.monotonic() + dur_sec + 1.5
+                while not (hdr.dwFlags & _WHDR_DONE):
+                    if self._cancel_ev.is_set() or time.monotonic() >= deadline:
+                        break
+                    self._cancel_ev.wait(0.015)
+                if not (hdr.dwFlags & _WHDR_DONE):
+                    winmm.waveOutReset(h_wave)
+                return True
+            finally:
+                with self._state_lock:
+                    if self._active_handle == h_wave:
+                        self._active_handle = None
+                if prepared:
+                    try:
+                        winmm.waveOutUnprepareHeader(h_wave, ctypes.byref(hdr), ctypes.sizeof(hdr))
+                    except Exception:
+                        pass
+                try:
+                    winmm.waveOutClose(h_wave)
+                except Exception:
+                    pass
 
 
 def resolve_audio_device(
@@ -746,7 +1014,7 @@ class _NeuralTtsSynthesizer:
                 pass
 
     @staticmethod
-    def _synth_edge_pcm(text: str, voice: str, attempts: int = 3) -> tuple[np.ndarray, int]:
+    def _synth_edge_pcm(text: str, voice: str, attempts: int = 2) -> tuple[np.ndarray, int]:
         import av
         import edge_tts
 
@@ -770,7 +1038,7 @@ class _NeuralTtsSynthesizer:
                 last_exc = exc
                 mp3_bytes = b""
                 if attempt < max(1, attempts):
-                    time.sleep(0.35 * attempt)
+                    time.sleep(0.15 * attempt)
         if not mp3_bytes:
             raise RuntimeError(f"Empty edge-tts audio: {last_exc}")
 
@@ -1148,6 +1416,7 @@ class RoomVoiceService:
         self._sapi = _SapiSynthesizer()
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
         self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, sapi_fallback=self._sapi)
+        self._winmm_player = _WinMmSpeakerPlayer() if sys.platform == "win32" else None
         self.ab = VoiceAbTracker(root_dir=root_dir)
 
         self.listening = False
@@ -1198,11 +1467,17 @@ class RoomVoiceService:
             self._speaker_queue.put_nowait(("stop", None))
         except queue.Full:
             pass
+        self.stop_s330_playback()
         self._close_stream()
         self._tts.close()
         for t in self._worker_threads:
             t.join(timeout=1.5)
         self._worker_threads.clear()
+
+    def stop_s330_playback(self) -> None:
+        """Cancel any active PowerConf S330 speaker playback cleanly."""
+        if self._winmm_player is not None:
+            self._winmm_player.stop()
 
     def update_config(self, raw: dict[str, Any]) -> RoomVoiceConfig:
         with self.lock:
@@ -1537,12 +1812,14 @@ class RoomVoiceService:
         with self._audio_lock:
             out_dev = resolve_audio_device("out", self.cfg.speaker_match)
             if out_dev is None and self._stream is None:
-                try:
-                    sd._terminate()
-                    sd._initialize()
-                except Exception:
-                    pass
-                out_dev = resolve_audio_device("out", self.cfg.speaker_match)
+                with _PORTAUDIO_LOCK:
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
+                    snap = list_audio_devices(force_refresh=True)
+                out_dev = resolve_audio_device("out", self.cfg.speaker_match, snap)
             return out_dev
 
     def synthesize_tts_pcm(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int] | None:
@@ -1580,10 +1857,14 @@ class RoomVoiceService:
         if not self._allow_hardware_audio:
             return False
         out_dev = self._resolve_speaker()
-        if out_dev is None:
+        use_winmm = self._winmm_player is not None and _find_winmm_device_id(self.cfg.speaker_match) is not None
+        if out_dev is None and not use_winmm:
             return False
-        dst_sr = int(out_dev["sampleRate"] or 48_000)
-        dst_ch = max(1, int(out_dev["channels"] or 1))
+        dst_sr = int(out_dev["sampleRate"] or 48_000) if out_dev is not None else 48_000
+        dst_ch = max(1, int(out_dev["channels"] or 2)) if out_dev is not None else 2
+        if use_winmm:
+            dst_sr = 48_000 if dst_sr < 16_000 else dst_sr
+            dst_ch = max(1, min(2, dst_ch))
         try:
             payload = prepare_speaker_pcm(
                 mono_pcm,
@@ -1598,14 +1879,23 @@ class RoomVoiceService:
                 return False
             dur_sec = float(payload.shape[0]) / float(dst_sr)
             self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur_sec + 0.35)
+
+            def _do_hw_play() -> bool:
+                if use_winmm and self._winmm_player is not None:
+                    if self._winmm_player.play(payload, dst_sr, dst_ch, self.cfg.speaker_match):
+                        return True
+                if out_dev is None:
+                    return False
+                with _PORTAUDIO_LOCK:
+                    sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
+                return True
+
             if callable(duck_ctx_factory):
                 with duck_ctx_factory():
-                    sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
-            else:
-                sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
-            return True
+                    return _do_hw_play()
+            return _do_hw_play()
         except Exception as exc:
-            self.log.debug("Speaker playback failed on %s: %s", out_dev.get("name"), exc)
+            self.log.debug("Speaker playback failed on %s: %s", (out_dev or {}).get("name", self.cfg.speaker_match), exc)
             return False
 
     def _speaker_worker_loop(self) -> None:
@@ -1702,12 +1992,14 @@ class RoomVoiceService:
         with self._audio_lock:
             if self._stream is not None:
                 return True
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
-            dev = resolve_audio_device("in", self.cfg.device_match)
+            with _PORTAUDIO_LOCK:
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                except Exception:
+                    pass
+                snap = list_audio_devices(force_refresh=True)
+            dev = resolve_audio_device("in", self.cfg.device_match, snap)
             if dev is None:
                 with self.lock:
                     self.last_error = f"Audio input '{self.cfg.device_match}' not connected"
@@ -1751,15 +2043,16 @@ class RoomVoiceService:
             last_err = ""
             for ch in seen_ch:
                 try:
-                    stream = sd.InputStream(
-                        device=dev["index"],
-                        samplerate=sr,
-                        channels=ch,
-                        dtype="float32",
-                        blocksize=int(round(sr * 0.032)),
-                        callback=_audio_cb,
-                    )
-                    stream.start()
+                    with _PORTAUDIO_LOCK:
+                        stream = sd.InputStream(
+                            device=dev["index"],
+                            samplerate=sr,
+                            channels=ch,
+                            dtype="float32",
+                            blocksize=int(round(sr * 0.032)),
+                            callback=_audio_cb,
+                        )
+                        stream.start()
                     self._stream = stream
                     self._stream_sr = sr
                     self._stream_dev_name = dev["name"]
@@ -1785,14 +2078,15 @@ class RoomVoiceService:
             stream = self._stream
             self._stream = None
             if stream is not None:
-                try:
-                    stream.stop()
-                except Exception:
-                    pass
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+                with _PORTAUDIO_LOCK:
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
                 self.log.info("Room mic closed (%s)", self._stream_dev_name or "idle")
             self._stream_dev_name = ""
             self._stream_host_api = ""

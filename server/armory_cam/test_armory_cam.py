@@ -2833,6 +2833,164 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_adb_stale_offline_recovery_autoplay_off_and_clean_disconnect(self) -> None:
+        cmds: list[list[str]] = []
+        evicted = {"done": False}
+
+        def fake_runner(cmd: list[str], _timeout: float) -> tuple[int, str, str]:
+            args = cmd[1:]
+            cmds.append(args)
+            if args == ["disconnect", "192.168.1.204:5555"]:
+                return 0, "disconnected 192.168.1.204:5555", ""
+            if args == ["reconnect", "offline"]:
+                evicted["done"] = True
+                return 0, "", ""
+            if args == ["connect", "192.168.1.204:5555"]:
+                if not evicted["done"]:
+                    return 0, "already connected to 192.168.1.204:5555", ""
+                return 0, "connected to 192.168.1.204:5555", ""
+            if args == ["devices"]:
+                st = "device" if evicted["done"] else "offline"
+                return 0, f"List of devices attached\n192.168.1.204:5555\t{st}\n", ""
+            if "ro.product.model" in args:
+                return 0, "AFTBAMR311\n", ""
+            return 0, "ok\n", ""
+
+        adb = ac.FireTvAdbController(adb_bin="adb.exe", runner=fake_runner, settle_sec=0.0, wol_wait_sec=0.0)
+        cfg = ac.WallboardConfig(
+            enabled=True,
+            fire_tv_host="192.168.1.204",
+            fire_tv_mac="08:97:98:1f:4c:2b",
+            adb_port=5555,
+            display_client="armory",
+            suppress_screensaver=True,
+        )
+
+        # 1. Probe auto-recovers from stale "already connected" + offline, sets autoplay off, and disconnects cleanly
+        probe = adb.connect_and_probe(cfg)
+        self.assertTrue(probe["ok"])
+        self.assertEqual(probe["state"], "ready")
+        self.assertIn(["disconnect", "192.168.1.204:5555"], cmds)
+        self.assertIn(["reconnect", "offline"], cmds)
+        flat = [" ".join(c) for c in cmds]
+        self.assertTrue(any("featured_item_video_enabled 0" in s for s in flat))
+        self.assertTrue(any("featured_item_video_volume 0.0" in s for s in flat))
+        self.assertEqual(cmds[-1], ["disconnect", "192.168.1.204:5555"])
+
+        # 2. Wake also applies autoplay-off + screensaver suppression and disconnects cleanly
+        evicted["done"] = False
+        cmds.clear()
+        wk = adb.wake_and_launch(cfg, "http://192.168.1.152:8766/wallboard", force=True)
+        self.assertTrue(wk["ok"])
+        flat_w = [" ".join(c) for c in cmds]
+        self.assertTrue(any("featured_item_video_enabled 0" in s for s in flat_w))
+        self.assertTrue(any("screensaver_enabled 0" in s for s in flat_w))
+        self.assertEqual(cmds[-1], ["disconnect", "192.168.1.204:5555"])
+
+        # 3. Sleep disconnects cleanly after KEYCODE_SLEEP
+        cmds.clear()
+        sl = adb.sleep_now(cfg, reason="manual")
+        self.assertTrue(sl["ok"])
+        self.assertTrue(any("KEYCODE_SLEEP" in " ".join(c) for c in cmds))
+        self.assertEqual(cmds[-1], ["disconnect", "192.168.1.204:5555"])
+
+    def test_house_audio_cube_wav_normalization_dedup_poll_and_timing(self) -> None:
+        import io
+        import wave
+
+        # 1. 48 kHz stereo PCM16 WAV passes through untouched; 24 kHz mono upconverts to 48 kHz stereo PCM16
+        stereo_pcm = np.ones((4800, 2), dtype=np.float32) * 0.25
+        wav_48k_st = sd.encode_stereo_pcm16_wav(stereo_pcm, sr=48_000)
+        self.assertEqual(ha.normalize_wav_for_cube(wav_48k_st), wav_48k_st)
+
+        mono_24k = 0.3 * np.sin(2.0 * np.pi * 440.0 * np.linspace(0.0, 0.2, 4800, endpoint=False, dtype=np.float32))
+        wav_24k_mono = ha.encode_mono_pcm_to_wav(mono_24k, 24_000)
+        norm = ha.normalize_wav_for_cube(wav_24k_mono, target_sr=48_000, target_ch=2)
+        with wave.open(io.BytesIO(norm), "rb") as wf:
+            self.assertEqual(wf.getnchannels(), 2)
+            self.assertEqual(wf.getsampwidth(), 2)
+            self.assertEqual(wf.getframerate(), 48_000)
+            self.assertEqual(wf.getnframes(), 9600)
+
+        # 2. status_dict probes Denon & Cube ONCE (not twice via resolve_voice_target), and test_play returns timing + normalized WAV
+        counts = {"denon": 0, "health": 0}
+        posted_wavs: list[bytes] = []
+
+        def fake_denon_get(url: str, _to: float) -> tuple[int, bytes]:
+            counts["denon"] += 1
+            return 200, b"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect><MasterVolume><value>-20.0</value></MasterVolume><Mute><value>off</value></Mute></item>"
+
+        def fake_cube_get(url: str, _to: float) -> tuple[int, bytes]:
+            counts["health"] += 1
+            return 200, b'{"ok":true,"version":"1.1","playCount":1}'
+
+        def fake_cube_post(_url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+            posted_wavs.append(body)
+            return 200, b'{"ok":true,"queued":true}'
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_ha_norm_"))
+        try:
+            mgr = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(cube_enabled=True, cube_host="192.168.1.151", output_route="auto"),
+                allow_network=False,
+                denon_http_get=fake_denon_get,
+                cube_http_get=fake_cube_get,
+                cube_http_post=fake_cube_post,
+                sleep_fn=lambda _s: None,
+            )
+            st = mgr.status_dict(live_probe=True)
+            self.assertEqual(st["activeRoute"], "cube")
+            self.assertEqual(counts["denon"], 1)
+            self.assertEqual(counts["health"], 1)
+
+            tp = mgr.test_play(
+                kind="tts",
+                mode="overlay",
+                target="cube",
+                text="225 for 8, got it",
+                synthesize_tts_fn=lambda _txt: (mono_24k, 24_000),
+            )
+            self.assertTrue(tp["ok"])
+            self.assertIn("timing", tp)
+            self.assertGreaterEqual(tp["timing"]["totalMs"], 0)
+            self.assertEqual(len(posted_wavs), 1)
+            with wave.open(io.BytesIO(posted_wavs[0]), "rb") as wf_post:
+                self.assertEqual((wf_post.getnchannels(), wf_post.getframerate()), (2, 48_000))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_room_voice_device_cache_and_winmm_truncated_name_matching(self) -> None:
+        # 1. list_audio_devices() caches PortAudio snapshot for TTL unless force_refresh=True
+        fake_devs = [
+            {"name": "Anker PowerConf S330", "hostapi": 0, "default_samplerate": 48000, "max_input_channels": 2, "max_output_channels": 0},
+            {"name": "Speakers (2- Anker PowerConf S330)", "hostapi": 0, "default_samplerate": 48000, "max_input_channels": 0, "max_output_channels": 2},
+        ]
+        rv._AUDIO_DEVICES_CACHE = None
+        rv._AUDIO_DEVICES_TS = 0.0
+        with (
+            mock.patch.object(rv.sd, "query_devices", return_value=fake_devs) as m_qdev,
+            mock.patch.object(rv.sd, "query_hostapis", return_value={"name": "Windows WASAPI"}),
+        ):
+            s1 = rv.list_audio_devices()
+            s2 = rv.list_audio_devices()
+            self.assertEqual(len(s1["inputs"]), 1)
+            self.assertEqual(s1["outputs"][0]["hostApi"], "Windows WASAPI")
+            self.assertEqual(m_qdev.call_count, 1)
+            rv.list_audio_devices(force_refresh=True)
+            self.assertEqual(m_qdev.call_count, 2)
+        rv._AUDIO_DEVICES_CACHE = None
+
+        # 2. Windows 31-char WAVEOUTCAPSW truncation ('Speakers (2- Anker PowerConf S3') resolves cleanly
+        winmm_devs = [
+            (0, "Speakers (2- Anker PowerConf S3"),
+            (1, "HISENSE (NVIDIA High Definition"),
+        ]
+        self.assertEqual(rv._find_winmm_device_id("PowerConf S330", wave_devices=winmm_devs), 0)
+        self.assertEqual(rv._find_winmm_device_id("PowerConf", wave_devices=winmm_devs), 0)
+        self.assertEqual(rv._find_winmm_device_id("", wave_devices=winmm_devs), rv.WAVE_MAPPER_ID)
+        self.assertIsNone(rv._find_winmm_device_id("NonExistentMic", wave_devices=winmm_devs))
+
 
 if __name__ == "__main__":
     unittest.main()
