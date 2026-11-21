@@ -45,6 +45,11 @@ try:
 except ImportError:
     from room_voice import RoomVoiceConfig, RoomVoiceService
 
+try:
+    from .house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
+except ImportError:
+    from house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
+
 DEFAULT_PORT = 8766
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_PRE_ROLL_SEC = 120
@@ -1811,12 +1816,20 @@ class ArmoryCamService:
         self.wallboard = WallboardRelay(self.root)
         self.adb = adb_controller or FireTvAdbController()
         self._voice_autostart = (root_dir is None) if voice_autostart is None else bool(voice_autostart)
+        self.house_audio_cfg = HouseAudioConfig()
+        self.house_audio = HouseAudioManager(
+            root_dir=self.root,
+            config=self.house_audio_cfg,
+            adb_controller=self.adb,
+            allow_network=self._voice_autostart,
+        )
         self.voice_cfg = RoomVoiceConfig()
         self.voice = RoomVoiceService(
             config=self.voice_cfg,
             on_fallback_transcript=self._forward_voice_to_wallboard_source,
             allow_hardware_audio=self._voice_autostart,
             root_dir=self.root,
+            house_audio_router=self.house_audio.try_route_voice_pcm,
         )
 
         self.lock = threading.RLock()
@@ -2005,6 +2018,7 @@ class ArmoryCamService:
             self.wallboard_cfg = WallboardConfig()
             self.voice_cfg = RoomVoiceConfig()
             self.voice.update_config(self.voice_cfg.to_dict())
+            self.house_audio_cfg = self.house_audio.update_config({})
             self.save_config()
             return
         try:
@@ -2021,6 +2035,8 @@ class ArmoryCamService:
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
             self.voice_cfg = RoomVoiceConfig.from_dict(raw.get("voice"))
             self.voice.update_config(self.voice_cfg.to_dict())
+            ha_raw = raw.get("houseAudio") if isinstance(raw.get("houseAudio"), dict) else {}
+            self.house_audio_cfg = self.house_audio.update_config(ha_raw)
             raw_cams = [item for item in raw.get("cameras", []) if isinstance(item, dict) and str(item.get("name", "")).strip()]
             loaded = self._build_camera_configs(raw_cams) if raw_cams else []
             self.cameras = loaded or default_cams
@@ -2039,6 +2055,7 @@ class ArmoryCamService:
             "cameras": [c.to_dict() for c in self.cameras],
             "wallboard": self.wallboard_cfg.to_dict(),
             "voice": self.voice_cfg.to_dict(),
+            "houseAudio": self.house_audio_cfg.to_dict(),
         }
         tmp = self.config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -2123,6 +2140,8 @@ class ArmoryCamService:
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
             if isinstance(raw.get("voice"), dict):
                 self.voice_cfg = self.voice.update_config(raw["voice"])
+            if isinstance(raw.get("houseAudio"), dict):
+                self.house_audio_cfg = self.house_audio.update_config(raw["houseAudio"])
             if isinstance(raw.get("cameras"), list):
                 next_cams = self._build_camera_configs(raw["cameras"], prev_by_slug=prev_by_slug)
                 if next_cams:
@@ -4330,7 +4349,28 @@ class ArmoryCamService:
                 "cameras": cams,
                 "wallboard": wb_status,
                 "voice": self.voice.status_dict(),
+                "houseAudio": self.house_audio.status_dict(live_probe=False),
             }
+
+    def play_house_audio_test(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute an explicit House Audio / Mode Test Bench cue with direct S330 fallback support."""
+        def _play_s330(pcm: np.ndarray, sr: int, kind: str) -> bool:
+            return self.voice._play_pcm_blocking(
+                pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84, kind=kind, allow_router=False
+            )
+
+        return self.house_audio.test_play(
+            kind=str(params.get("kind") or "chime"),
+            mode=params.get("mode"),
+            usage=params.get("usage"),
+            gain=params.get("gain"),
+            target=str(params.get("target") or "auto"),
+            text=str(params.get("text") or "225 for 8, got it"),
+            sfx_file=str(params.get("sfxFile") or ""),
+            with_denon_duck=bool(params.get("withDenonDuck", False)),
+            synthesize_tts_fn=self.voice.synthesize_tts_pcm,
+            play_s330_fn=_play_s330,
+        )
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -4348,6 +4388,8 @@ DASHBOARD_HTML = """<!doctype html>
   .pill{font-size:11px;padding:3px 10px;border-radius:999px;background:#1d2836;color:var(--mut);font-weight:800;letter-spacing:.04em}
   .pill.ok{background:rgba(34,197,94,.18);color:#86efac}
   .pill.live{background:rgba(30,155,255,.18);color:#7cc4ff}
+  .pill.warn{background:rgba(245,158,11,.20);color:#fcd34d}
+  .pill.err{background:rgba(239,68,68,.20);color:#fca5a5}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin-top:14px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
   .card h2{margin:0 0 10px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
@@ -4589,6 +4631,165 @@ DASHBOARD_HTML = """<!doctype html>
       <div id="vxAbSummary">Enable Dual-Mic A/B Benchmark or run the 10-Phrase Shootout in Armory Fit to compare catch % and improvement.</div>
       <div id="vxAbRuns" style="margin-top:8px"></div>
       <div id="vxAbTrials" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>
+      <span>House Audio (Denon AVR-3313CI + Fire TV Cube Mixer)</span>
+      <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <span id="haDenonPill" class="pill">DENON…</span>
+        <span id="haCubePill" class="pill">CUBE…</span>
+      </span>
+    </h2>
+    <div id="haMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Checking Denon AVR (<code>192.168.1.15</code>) &amp; Fire TV Cube mixer…</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px">
+      <div>
+        <label>Output Route</label>
+        <select id="haRoute">
+          <option value="s330">PowerConf S330 Only</option>
+          <option value="auto">Auto: Cube (when MPLAY) -&gt; S330</option>
+          <option value="cube">Fire TV Cube Only</option>
+        </select>
+      </div>
+      <div><label>Denon AVR IP</label><input id="haDenonHost" type="text" value="192.168.1.15" placeholder="192.168.1.15"></div>
+      <div>
+        <label>Loud-Only Denon Duck</label>
+        <select id="haDuckEnabled">
+          <option value="0">Off (Never drop music)</option>
+          <option value="1">Loud-Only (Above threshold)</option>
+        </select>
+      </div>
+      <div><label>Loud Threshold (dB)</label><input id="haDuckThresh" type="number" min="-65" max="10" step="0.5" value="-20.0"></div>
+      <div><label>Gentle Dip (dB)</label><input id="haDuckDrop" type="number" min="0.5" max="30" step="0.5" value="5.0"></div>
+      <div><label>Fire TV Cube IP</label><input id="haCubeHost" type="text" placeholder="192.168.1.xxx"></div>
+      <div>
+        <label>Cube Mixer APK</label>
+        <select id="haCubeEnabled">
+          <option value="0">Disabled</option>
+          <option value="1">Enabled (:8767)</option>
+        </select>
+      </div>
+      <div>
+        <label>Readback Mode</label>
+        <select id="haReadMode">
+          <option value="overlay">Overlay (No Pause/Duck)</option>
+          <option value="duck">Duck (MAY_DUCK)</option>
+          <option value="takeover">Takeover (Pause &amp; Resume)</option>
+        </select>
+      </div>
+      <div>
+        <label>Chime Mode</label>
+        <select id="haChimeMode">
+          <option value="overlay">Overlay (No Pause/Duck)</option>
+          <option value="duck">Duck (MAY_DUCK)</option>
+          <option value="takeover">Takeover (Pause &amp; Resume)</option>
+        </select>
+      </div>
+      <div>
+        <label>1RM / Hype Mode</label>
+        <select id="haHypeMode">
+          <option value="takeover">Takeover (Pause &amp; Resume)</option>
+          <option value="duck">Duck (MAY_DUCK)</option>
+          <option value="overlay">Overlay (No Pause/Duck)</option>
+        </select>
+      </div>
+      <div>
+        <label>Cube Audio Usage</label>
+        <select id="haUsage">
+          <option value="media">media (STREAM_MUSIC)</option>
+          <option value="assist">assist (Guidance/TTS)</option>
+          <option value="sonification">sonification (Chimes)</option>
+          <option value="alarm">alarm (High Priority)</option>
+        </select>
+      </div>
+      <div><label>Readback Gain (0.05–1.0)</label><input id="haReadGain" type="number" min="0.05" max="1.0" step="0.05" value="0.85"></div>
+      <div><label>SFX Gain (0.05–1.0)</label><input id="haSfxGain" type="number" min="0.05" max="1.0" step="0.05" value="0.90"></div>
+    </div>
+    <div class="ctrl-row" style="margin-top:10px">
+      <button class="btn" id="haSaveBtn" type="button">Save Audio</button>
+      <button class="btn sec" id="haDenonDipBtn" type="button">Test Denon Dip</button>
+      <button class="btn sec" id="haCubeProbeBtn" type="button">Probe Cube ADB</button>
+      <button class="btn ok" id="haCubeReviveBtn" type="button">Revive Cube Service</button>
+      <span id="haOut" style="color:var(--mut);font-size:12px"></span>
+    </div>
+    <div id="haAdbDetails" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
+
+    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+      <div style="font-weight:700;margin-bottom:6px">One-Click Mode Test Bench</div>
+      <div style="display:grid;grid-template-columns:minmax(180px,2fr) repeat(3,minmax(120px,1fr));gap:8px;align-items:end">
+        <div><label>Test TTS Phrase</label><input id="haTestText" type="text" value="225 for 8, got it"></div>
+        <div>
+          <label>Target</label>
+          <select id="haTestTarget">
+            <option value="auto">Auto Route</option>
+            <option value="cube">Fire TV Cube</option>
+            <option value="s330">PowerConf S330</option>
+          </select>
+        </div>
+        <div>
+          <label>Custom SFX (S:\\ArmoryCam\\sfx)</label>
+          <select id="haSfxSel"><option value="">(None placed yet)</option></select>
+        </div>
+        <div>
+          <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer">
+            <input id="haTestDenonDuck" type="checkbox" style="width:auto">
+            <span>Pair w/ Denon Dip</span>
+          </label>
+        </div>
+      </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <button class="btn sec sm" type="button" data-hatest="tts:overlay">TTS Overlay</button>
+        <button class="btn sec sm" type="button" data-hatest="tts:duck">TTS Duck</button>
+        <button class="btn sec sm" type="button" data-hatest="tts:takeover">TTS Takeover</button>
+        <button class="btn sec sm" type="button" data-hatest="chime:overlay">Chime Overlay</button>
+        <button class="btn sec sm" type="button" data-hatest="rest_done:overlay">Rest Done</button>
+        <button class="btn ok sm" type="button" data-hatest="pr_fanfare:takeover">PR Fanfare Takeover</button>
+        <button class="btn sec sm" type="button" data-hatest="pr_fanfare:duck">PR Fanfare Duck</button>
+        <button class="btn sec sm" type="button" id="haSfxPlayBtn">Play Custom SFX</button>
+        <button class="btn red sm" type="button" id="haStopBtn">Stop</button>
+        <span id="haTestOut" style="color:var(--mut);font-size:12px"></span>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+        <b>Gym App Compatibility Matrix</b>
+        <button class="btn sec sm" id="haMatrixResetBtn" type="button">Reset Matrix</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;align-items:end;margin-bottom:8px">
+        <div>
+          <label>App</label>
+          <select id="haMxApp">
+            <option>Spotify</option>
+            <option>YouTube</option>
+            <option>Netflix</option>
+            <option>Prime Video</option>
+            <option>Amazon / Apple Music</option>
+            <option>Live TV / Sports</option>
+          </select>
+        </div>
+        <div>
+          <label>Mode</label>
+          <select id="haMxMode">
+            <option value="overlay">overlay</option>
+            <option value="duck">duck</option>
+            <option value="takeover">takeover</option>
+          </select>
+        </div>
+        <div>
+          <label>Result</label>
+          <select id="haMxStatus">
+            <option value="pass">pass</option>
+            <option value="warn">warn</option>
+            <option value="fail">fail</option>
+            <option value="untested">untested</option>
+          </select>
+        </div>
+        <div><label>Observed Behavior</label><input id="haMxBehavior" type="text" placeholder="e.g. Clean mix, no pause"></div>
+        <div><button class="btn sm" id="haMxSaveBtn" type="button">Log Result</button></div>
+      </div>
+      <div id="haMatrixTable" style="color:var(--mut);font-size:12px">Loading compatibility matrix…</div>
     </div>
   </div>
 
@@ -6883,7 +7084,177 @@ async function pollStatus() {
     if (st.voice) {
       syncVoiceUI(st.voice);
     }
+    if (st.houseAudio) {
+      syncHouseAudioUI(st.houseAudio);
+    }
   } catch {}
+}
+
+function escHtml(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function populateHouseAudioInputs(ha) {
+  if (!ha) return;
+  $('haRoute').value = ha.outputRoute || 's330';
+  $('haDenonHost').value = ha.denonHost || '192.168.1.15';
+  $('haDuckEnabled').value = ha.denonDuckEnabled ? '1' : '0';
+  $('haDuckThresh').value = String(ha.denonDuckThresholdDb != null ? ha.denonDuckThresholdDb : -20.0);
+  $('haDuckDrop').value = String(ha.denonDuckDropDb != null ? ha.denonDuckDropDb : 5.0);
+  $('haCubeHost').value = ha.cubeHost || '';
+  $('haCubeEnabled').value = ha.cubeEnabled ? '1' : '0';
+  $('haReadMode').value = ha.readbackMode || 'overlay';
+  $('haChimeMode').value = ha.chimeMode || 'overlay';
+  $('haHypeMode').value = ha.hypeMode || 'takeover';
+  $('haUsage').value = ha.cubeUsage || 'media';
+  $('haReadGain').value = String(ha.readbackGain != null ? ha.readbackGain : 0.85);
+  $('haSfxGain').value = String(ha.sfxGain != null ? ha.sfxGain : 0.90);
+}
+
+function renderAudioMatrix(mx) {
+  const el = $('haMatrixTable');
+  if (!el || !mx || !Array.isArray(mx.apps)) return;
+  const modes = Array.isArray(mx.modes) ? mx.modes : ['overlay', 'duck', 'takeover'];
+  const cells = mx.cells || {};
+  const pillCls = { pass: 'ok', warn: 'warn', fail: 'err', untested: '' };
+  el.innerHTML = `<table><thead><tr><th>Gym App</th>${modes.map(m => `<th>${escHtml(m.toUpperCase())}</th>`).join('')}</tr></thead><tbody>` +
+    mx.apps.map(app => {
+      const row = cells[app] || {};
+      const cols = modes.map(mode => {
+        const entry = row[mode] || { status: 'untested', behavior: '' };
+        const st = entry.status || 'untested';
+        const beh = entry.behavior ? ` <small>${escHtml(entry.behavior)}</small>` : '';
+        return `<td style="cursor:pointer" data-mxapp="${escHtml(app)}" data-mxmode="${escHtml(mode)}"><span class="pill ${pillCls[st] || ''}">${escHtml(st.toUpperCase())}</span>${beh}</td>`;
+      }).join('');
+      return `<tr><td><b>${escHtml(app)}</b></td>${cols}</tr>`;
+    }).join('') +
+    `</tbody></table>`;
+}
+
+function syncHouseAudioUI(ha) {
+  if (!ha) return;
+  const d = ha.denon || {};
+  const dp = $('haDenonPill');
+  if (dp) {
+    if (!d.ok) {
+      dp.textContent = d.disabled ? 'DENON OFF' : 'DENON OFFLINE';
+      dp.className = 'pill';
+    } else {
+      const volTxt = d.muted ? 'MUTED' : (d.volumeDb != null ? `${d.volumeDb} dB` : '--');
+      dp.textContent = `DENON ${d.power || 'ON'} · ${d.input || '?'} · ${volTxt}`;
+      dp.className = 'pill ' + (d.power === 'ON' ? 'ok' : 'live');
+    }
+  }
+  const c = ha.cube || {};
+  const cp = $('haCubePill');
+  if (cp) {
+    if (c.unconfigured) {
+      cp.textContent = 'CUBE UNCONFIGURED';
+      cp.className = 'pill';
+    } else if (c.ok) {
+      cp.textContent = `CUBE ONLINE${c.playing ? ' · PLAYING' : ''}`;
+      cp.className = 'pill ok';
+    } else {
+      cp.textContent = 'CUBE OFFLINE';
+      cp.className = 'pill warn';
+    }
+  }
+  const msgEl = $('haMsg');
+  if (msgEl) {
+    const cCfg = ha.config || {};
+    const parts = [
+      `Active Route: <b>${escHtml((ha.activeRoute || 's330').toUpperCase())}</b>`,
+      `Ducking: <b>${cCfg.denonDuckEnabled ? `Loud-Only (&ge; ${cCfg.denonDuckThresholdDb} dB, -${cCfg.denonDuckDropDb} dB)` : 'OFF'}</b>`,
+    ];
+    if (d.ok) {
+      parts.push(`Surround: <b>${escHtml(d.surround || 'Unknown')}</b>`);
+    } else if (d.error) {
+      parts.push(`<span style="color:var(--amber)">Denon: ${escHtml(d.error)}</span>`);
+    }
+    if (c.ok) {
+      parts.push(`Cube Vol: <b>${c.streamVol}/${c.streamMaxVol}</b> · Plays: <b>${c.playCount || 0}</b>${c.musicActive ? ' · Music Active' : ''}`);
+    } else if (!c.unconfigured && c.error) {
+      parts.push(`<span style="color:var(--amber)">Cube: ${escHtml(c.error)}</span>`);
+    }
+    msgEl.innerHTML = parts.join(' · ');
+  }
+  const sfxSel = $('haSfxSel');
+  if (sfxSel && Array.isArray(ha.sfxFiles) && document.activeElement !== sfxSel) {
+    const curSfx = sfxSel.value;
+    if (!ha.sfxFiles.length) {
+      sfxSel.innerHTML = '<option value="">(None placed yet)</option>';
+    } else {
+      sfxSel.innerHTML = ha.sfxFiles.map(f => `<option value="${escHtml(f.name)}">${escHtml(f.name)} (${Math.max(1, Math.round(f.bytes / 1024))} KB)</option>`).join('');
+      if (curSfx && ha.sfxFiles.some(f => f.name === curSfx)) sfxSel.value = curSfx;
+    }
+  }
+  if (ha.matrix) {
+    renderAudioMatrix(ha.matrix);
+  }
+}
+
+async function pollAudioStatus() {
+  try {
+    const ha = await fetch('/api/audio/status').then(r => r.json());
+    if (ha && ha.config && cfg) cfg.houseAudio = ha.config;
+    syncHouseAudioUI(ha);
+  } catch {}
+}
+
+async function saveHouseAudioConfig(triggerBtn) {
+  const body = {
+    outputRoute: $('haRoute').value || 's330',
+    denonHost: $('haDenonHost').value.trim() || '192.168.1.15',
+    denonDuckEnabled: $('haDuckEnabled').value === '1',
+    denonDuckThresholdDb: Number($('haDuckThresh').value),
+    denonDuckDropDb: Number($('haDuckDrop').value) || 5.0,
+    cubeHost: $('haCubeHost').value.trim(),
+    cubeEnabled: $('haCubeEnabled').value === '1',
+    readbackMode: $('haReadMode').value || 'overlay',
+    chimeMode: $('haChimeMode').value || 'overlay',
+    hypeMode: $('haHypeMode').value || 'takeover',
+    cubeUsage: $('haUsage').value || 'media',
+    readbackGain: Number($('haReadGain').value) || 0.85,
+    sfxGain: Number($('haSfxGain').value) || 0.90,
+  };
+  try {
+    const r = await fetch('/api/audio/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    if (!r || !r.ok) throw new Error('Rejected');
+    if (cfg) cfg.houseAudio = r.config;
+    populateHouseAudioInputs(r.config);
+    syncHouseAudioUI(r.status);
+    $('haOut').textContent = 'House audio settings saved!';
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'saved', '✓ Saved!', 2000);
+  } catch {
+    $('haOut').textContent = 'Save failed';
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Failed', 2500);
+  }
+}
+
+async function runHouseAudioTest(kind, mode, sfxFile = '') {
+  $('haTestOut').textContent = `Running ${kind}${mode ? ` (${mode})` : ''}…`;
+  try {
+    const r = await fetch('/api/audio/test-play', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        kind,
+        mode,
+        usage: $('haUsage').value || 'media',
+        target: $('haTestTarget').value || 'auto',
+        text: $('haTestText').value.trim() || '225 for 8, got it',
+        sfxFile,
+        withDenonDuck: $('haTestDenonDuck').checked,
+      }),
+    }).then(x => x.json());
+    $('haTestOut').textContent = r.ok ? `✓ Played via ${(r.route || '').toUpperCase()} (${r.mode || mode})` : `✗ ${r.error || 'Failed'}`;
+  } catch {
+    $('haTestOut').textContent = '✗ Request failed';
+  }
 }
 
 async function pollClips() {
@@ -6922,13 +7293,15 @@ async function init() {
   $('vxTtsVoice').value = vx.ttsVoice || 'en-US-AndrewNeural';
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
+  populateHouseAudioInputs(cfg.houseAudio || {});
   renderCameras();
   syncAlignmentUI();
   wireMaskModal();
   setInterval(drawAllCanvases, 100);
-  await Promise.all([pollStatus(), pollVoiceStatus(), pollVoiceAb(), pollClips()]);
+  await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips()]);
   setInterval(pollStatus, 1000);
   setInterval(pollVoiceStatus, 3000);
+  setInterval(pollAudioStatus, 3000);
   setInterval(pollVoiceAb, 4000);
   setInterval(pollClips, 6000);
 }
@@ -6992,6 +7365,86 @@ $('vxAbResetBtn').onclick = async () => {
   $('vxOut').textContent = 'Cleared passive workout A/B trials';
   await pollVoiceAb();
 };
+$('haSaveBtn').onclick = () => saveHouseAudioConfig($('haSaveBtn'));
+$('haDenonDipBtn').onclick = async () => {
+  await saveHouseAudioConfig();
+  $('haOut').textContent = 'Testing gentle Denon dip…';
+  try {
+    const r = await fetch('/api/audio/denon/test-duck', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ holdSec: 1.4 }) }).then(x => x.json());
+    $('haOut').textContent = r.ok ? `✓ Dipped ${r.duck.fromDb} -> ${r.duck.toDb} dB & restored` : `Skipped (${(r.duck && r.duck.reason) || 'offline'})`;
+    await pollAudioStatus();
+  } catch {
+    $('haOut').textContent = 'Denon dip request failed';
+  }
+};
+$('haCubeProbeBtn').onclick = async () => {
+  await saveHouseAudioConfig();
+  $('haOut').textContent = 'Probing Cube ADB & surround settings…';
+  try {
+    const r = await fetch('/api/audio/cube/probe', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+    $('haOut').textContent = r.message || r.state || 'Done';
+    const box = $('haAdbDetails');
+    if (box) {
+      if (r.ok) {
+        box.hidden = false;
+        box.innerHTML = `Model: <b>${escHtml(r.model || '?')}</b> · Android ${escHtml(r.androidVersion || '?')} · Surround: <code>${escHtml(r.surroundOutput || r.surroundMode || 'unknown')}</code> · Mixer APK: <b>${r.apkInstalled ? 'Installed' : 'Not installed'}</b> · 3rd-party pkgs (${(r.thirdPartyPackages || []).length}): <code>${escHtml((r.thirdPartyPackages || []).join(', ') || 'none')}</code>`;
+      } else {
+        box.hidden = true;
+      }
+    }
+    await pollAudioStatus();
+  } catch {
+    $('haOut').textContent = 'Cube probe failed';
+  }
+};
+$('haCubeReviveBtn').onclick = async () => {
+  await saveHouseAudioConfig();
+  $('haOut').textContent = 'Starting Cube service over ADB…';
+  try {
+    const r = await fetch('/api/audio/cube/revive', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+    $('haOut').textContent = r.message || r.state || 'Done';
+    await pollAudioStatus();
+  } catch {
+    $('haOut').textContent = 'Cube revive failed';
+  }
+};
+document.querySelectorAll('[data-hatest]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const [kind, mode] = btn.dataset.hatest.split(':');
+    runHouseAudioTest(kind, mode);
+  });
+});
+$('haSfxPlayBtn').onclick = () => {
+  const f = $('haSfxSel').value;
+  runHouseAudioTest('sfx', $('haHypeMode').value || 'takeover', f);
+};
+$('haStopBtn').onclick = async () => {
+  await fetch('/api/audio/stop', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+  $('haTestOut').textContent = 'Stopped playback';
+};
+$('haMxSaveBtn').onclick = async () => {
+  const r = await fetch('/api/audio/matrix', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      app: $('haMxApp').value,
+      mode: $('haMxMode').value,
+      status: $('haMxStatus').value,
+      behavior: $('haMxBehavior').value.trim(),
+    }),
+  }).then(x => x.json());
+  if (r && r.matrix) renderAudioMatrix(r.matrix);
+};
+$('haMatrixResetBtn').onclick = async () => {
+  const r = await fetch('/api/audio/matrix', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ reset: true }) }).then(x => x.json());
+  if (r && r.matrix) renderAudioMatrix(r.matrix);
+};
+$('haMatrixTable').addEventListener('click', (ev) => {
+  const td = ev.target.closest('td[data-mxapp]');
+  if (!td) return;
+  $('haMxApp').value = td.dataset.mxapp;
+  $('haMxMode').value = td.dataset.mxmode;
+});
 init();
 </script>
 </body>
@@ -7125,6 +7578,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "cameras": cams,
                 "wallboard": service.wallboard_cfg.to_dict(),
                 "voice": service.voice_cfg.to_dict(),
+                "houseAudio": service.house_audio_cfg.to_dict(),
                 "disk": service.disk_stats(),
             }
         return jsonify(payload)
@@ -7443,6 +7897,125 @@ def create_app(service: ArmoryCamService) -> Flask:
         clear_runs = bool(body.get("clearRuns", False))
         summary = service.voice.ab.reset(clear_runs=clear_runs)
         return jsonify({"ok": True, "summary": summary})
+
+    @app.get("/api/audio/status")
+    def api_audio_status() -> Response:
+        resp = jsonify(service.house_audio.status_dict(live_probe=True))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/audio/config")
+    def api_audio_config() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid config payload"}), 400
+        with service.lock:
+            service.house_audio_cfg = service.house_audio.update_config(body)
+            service.save_config()
+            cfg_dict = service.house_audio_cfg.to_dict()
+        return jsonify({"ok": True, "config": cfg_dict, "status": service.house_audio.status_dict(live_probe=True)})
+
+    @app.post("/api/audio/denon/test-duck")
+    def api_audio_denon_test_duck() -> Response:
+        body = request.get_json(silent=True) or {}
+        try:
+            hold_sec = max(0.3, min(5.0, float(body.get("holdSec", 1.2) or 1.2)))
+        except (TypeError, ValueError):
+            hold_sec = 1.2
+        drop_raw = body.get("dropDb")
+        drop_db = float(drop_raw) if drop_raw is not None else None
+        with service.house_audio.denon.duck_context(drop_db=drop_db, force=True) as duck_info:
+            if duck_info.get("ducked"):
+                service.house_audio.denon._sleep(hold_sec)
+        return jsonify({
+            "ok": bool(duck_info.get("ducked")),
+            "duck": duck_info,
+            "denon": service.house_audio.denon.get_status(),
+        })
+
+    @app.post("/api/audio/cube/probe")
+    def api_audio_cube_probe() -> Response:
+        body = request.get_json(silent=True) or {}
+        cfg = service.house_audio.get_config()
+        host = str(body.get("host") or cfg.cube_host or "").strip()
+        try:
+            adb_port = max(1, min(65535, int(body.get("adbPort", cfg.cube_adb_port))))
+        except (TypeError, ValueError):
+            adb_port = cfg.cube_adb_port
+        res = service.house_audio.cube.adb_probe_and_audit(service.adb, host, adb_port, cfg.cube_port)
+        return jsonify(res)
+
+    @app.post("/api/audio/cube/revive")
+    def api_audio_cube_revive() -> Response:
+        body = request.get_json(silent=True) or {}
+        cfg = service.house_audio.get_config()
+        host = str(body.get("host") or cfg.cube_host or "").strip()
+        try:
+            adb_port = max(1, min(65535, int(body.get("adbPort", cfg.cube_adb_port))))
+        except (TypeError, ValueError):
+            adb_port = cfg.cube_adb_port
+        res = service.house_audio.cube.adb_ensure_service(service.adb, host, adb_port, cfg.cube_port)
+        return jsonify(res)
+
+    @app.post("/api/audio/test-play")
+    def api_audio_test_play() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid payload"}), 400
+        res = service.play_house_audio_test(body)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/audio/stop")
+    def api_audio_stop() -> Response:
+        cfg = service.house_audio.get_config()
+        res = service.house_audio.cube.stop(cfg.cube_host, cfg.cube_port) if cfg.cube_host else {"ok": True, "stopped": False}
+        return jsonify(res)
+
+    @app.get("/api/audio/sfx/<path:filename>")
+    def api_audio_sfx_file(filename: str) -> Response:
+        valid = validate_sfx_filename(filename)
+        if not valid or service.house_audio.sfx_dir is None:
+            return Response(status=400)
+        base = service.house_audio.sfx_dir.resolve()
+        target = (base / valid).resolve()
+        if target.parent != base:
+            return Response(status=400)
+        if not target.is_file():
+            return Response(status=404)
+        mime = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".ogg": "audio/ogg",
+            ".m4a": "audio/mp4",
+        }.get(target.suffix.lower(), "application/octet-stream")
+        resp = Response(target.read_bytes(), mimetype=mime)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/audio/matrix")
+    def api_audio_get_matrix() -> Response:
+        resp = jsonify({"ok": True, "matrix": service.house_audio.matrix.snapshot_dict()})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/audio/matrix")
+    def api_audio_post_matrix() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid matrix payload"}), 400
+        if body.get("reset"):
+            return jsonify({"ok": True, "matrix": service.house_audio.matrix.reset()})
+        try:
+            snap = service.house_audio.matrix.record(
+                str(body.get("app") or ""),
+                str(body.get("mode") or ""),
+                status=str(body.get("status") or "untested"),
+                behavior=str(body.get("behavior") or ""),
+                notes=str(body.get("notes") or ""),
+            )
+            return jsonify({"ok": True, "matrix": snap})
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.get("/api/clips")
     def api_clips() -> Response:

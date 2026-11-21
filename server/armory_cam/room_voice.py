@@ -1067,6 +1067,7 @@ class RoomVoiceService:
         speak_fn: Callable[[str], bool] | None = None,
         allow_hardware_audio: bool = True,
         root_dir: Path | None = None,
+        house_audio_router: Callable[..., dict[str, Any] | None] | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
@@ -1074,6 +1075,7 @@ class RoomVoiceService:
         self._asr_transcribe_fn = asr_transcribe_fn
         self._speak_fn = speak_fn
         self._allow_hardware_audio = allow_hardware_audio
+        self._house_audio_router = house_audio_router
 
         self.log = logging.getLogger("armory-voice")
         self.lock = threading.RLock()
@@ -1469,6 +1471,13 @@ class RoomVoiceService:
                 out_dev = resolve_audio_device("out", self.cfg.speaker_match)
             return out_dev
 
+    def synthesize_tts_pcm(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int] | None:
+        """Synthesize speech into `(mono_float32_pcm, sample_rate)` using configured neural/SAPI voice."""
+        clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
+        if not clean:
+            return None
+        return self._tts.synthesize(clean, voice=voice or self.cfg.tts_voice)
+
     def _play_pcm_blocking(
         self,
         mono_pcm: np.ndarray,
@@ -1476,8 +1485,25 @@ class RoomVoiceService:
         lead_ms: int = 420,
         tail_ms: int = 300,
         target_peak: float = 0.84,
+        kind: str = "tts",
+        allow_router: bool = True,
     ) -> bool:
-        if not self._allow_hardware_audio or mono_pcm.size == 0:
+        if mono_pcm.size == 0:
+            return False
+        duck_ctx_factory = None
+        if allow_router and self._house_audio_router is not None:
+            try:
+                route_res = self._house_audio_router(mono_pcm, src_sr, kind=kind)
+            except Exception as exc:
+                self.log.debug("House audio router error: %s", exc)
+                route_res = None
+            if isinstance(route_res, dict):
+                if route_res.get("handled"):
+                    dur = float(route_res.get("durationSec") or (float(mono_pcm.size) / float(max(1, src_sr))))
+                    self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur + 0.70)
+                    return True
+                duck_ctx_factory = route_res.get("duckContext")
+        if not self._allow_hardware_audio:
             return False
         out_dev = self._resolve_speaker()
         if out_dev is None:
@@ -1498,7 +1524,11 @@ class RoomVoiceService:
                 return False
             dur_sec = float(payload.shape[0]) / float(dst_sr)
             self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur_sec + 0.35)
-            sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
+            if callable(duck_ctx_factory):
+                with duck_ctx_factory():
+                    sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
+            else:
+                sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
             return True
         except Exception as exc:
             self.log.debug("Speaker playback failed on %s: %s", out_dev.get("name"), exc)
@@ -1515,13 +1545,15 @@ class RoomVoiceService:
             try:
                 if kind == "pcm":
                     pcm, sr, lead_ms, tail_ms, target_peak = data
-                    self._play_pcm_blocking(pcm, sr, lead_ms=lead_ms, tail_ms=tail_ms, target_peak=target_peak)
+                    self._play_pcm_blocking(
+                        pcm, sr, lead_ms=lead_ms, tail_ms=tail_ms, target_peak=target_peak, kind="chime"
+                    )
                 elif kind == "tts":
                     text, voice = data
                     rendered = self._tts.synthesize(text, voice=voice)
                     if rendered:
                         pcm, sr = rendered
-                        self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84)
+                        self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84, kind="tts")
             except Exception as exc:
                 self.log.debug("Speaker worker error: %s", exc)
 
@@ -1542,8 +1574,8 @@ class RoomVoiceService:
                 return
 
     def play_ready_chime(self) -> bool:
-        """Play a brief 120 ms two-tone ready chime on the PowerConf S330 speaker."""
-        if not self._allow_hardware_audio:
+        """Play a brief 120 ms two-tone ready chime on House Audio / PowerConf S330 speaker."""
+        if not self._allow_hardware_audio and self._house_audio_router is None:
             return False
         sr = 48_000
         n1 = int(sr * 0.055)
@@ -1563,18 +1595,18 @@ class RoomVoiceService:
                 return True
             except queue.Full:
                 return False
-        return self._play_pcm_blocking(tone, sr, lead_ms=220, tail_ms=150, target_peak=0.28)
+        return self._play_pcm_blocking(tone, sr, lead_ms=220, tail_ms=150, target_peak=0.28, kind="chime")
 
     def speak_confirmation(self, text: str) -> bool:
-        """Synthesize natural neural confirmation speech and queue padded playback to PowerConf S330."""
+        """Synthesize natural neural confirmation speech and queue padded playback to House Audio / S330."""
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
             return False
         if self._speak_fn is not None:
             return bool(self._speak_fn(clean))
-        if not self._allow_hardware_audio:
+        if not self._allow_hardware_audio and self._house_audio_router is None:
             return False
-        if self._resolve_speaker() is None:
+        if self._resolve_speaker() is None and self._house_audio_router is None:
             return False
         voice = self.cfg.tts_voice
         if self._started:
@@ -1588,7 +1620,7 @@ class RoomVoiceService:
         if not rendered:
             return False
         pcm, sr = rendered
-        return self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84)
+        return self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84, kind="tts")
 
     # ---------- capture & ASR loops ----------
 

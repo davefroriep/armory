@@ -20,6 +20,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import armory_cam_server as ac  # noqa: E402
+import house_audio as ha  # noqa: E402
 import room_voice as rv  # noqa: E402
 
 
@@ -1790,6 +1791,225 @@ class ArmoryCamTests(unittest.TestCase):
             rst = client.post("/api/voice/ab/reset", json={"clearRuns": False}).get_json()
             self.assertEqual(rst["summary"]["totalTrials"], 0)
             self.assertEqual(len(client.get("/api/voice/ab").get_json()["runs"]), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_denon_xml_mv_and_loud_only_ducking(self) -> None:
+        self.assertEqual(ha.db_to_denon_mv(-21.0), "MV59")
+        self.assertEqual(ha.db_to_denon_mv(-21.5), "MV585")
+        self.assertEqual(ha.db_to_denon_mv(-80.0), "MV00")
+
+        sample_xml = """<?xml version="1.0" encoding="utf-8" ?>
+        <item>
+          <Power><value>ON</value></Power>
+          <InputFuncSelect><value>MPLAY</value></InputFuncSelect>
+          <SurrMode><value>MULTI CH STEREO               </value></SurrMode>
+          <MasterVolume><value>-21.0</value></MasterVolume>
+          <Mute><value>off</value></Mute>
+        </item>"""
+        parsed = ha.parse_denon_status_xml(sample_xml)
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(parsed["power"], "ON")
+        self.assertEqual(parsed["input"], "MPLAY")
+        self.assertAlmostEqual(parsed["volumeDb"], -21.0)
+        self.assertAlmostEqual(parsed["volumeAbs"], 59.0)
+        self.assertFalse(parsed["muted"])
+        self.assertEqual(parsed["surround"], "MULTI CH STEREO")
+
+        muted_xml = """<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect><MasterVolume><value>--</value></MasterVolume><Mute><value>on</value></Mute></item>"""
+        parsed_muted = ha.parse_denon_status_xml(muted_xml)
+        self.assertTrue(parsed_muted["ok"])
+        self.assertIsNone(parsed_muted["volumeDb"])
+        self.assertTrue(parsed_muted["muted"])
+
+        # Fake Denon HTTP responder tracking volume + MV commands sent
+        state = {"vol": -18.0, "power": "ON", "input": "MPLAY", "cmds": []}
+
+        def fake_denon_get(url: str, _timeout: float) -> tuple[int, bytes]:
+            if "formMainZone_MainZoneXmlStatus.xml" in url:
+                xml = (
+                    f"<item><Power><value>{state['power']}</value></Power>"
+                    f"<InputFuncSelect><value>{state['input']}</value></InputFuncSelect>"
+                    f"<MasterVolume><value>{state['vol']:.1f}</value></MasterVolume>"
+                    f"<Mute><value>off</value></Mute><SurrMode><value>STEREO</value></SurrMode></item>"
+                )
+                return 200, xml.encode("utf-8")
+            if "formiPhoneAppDirect.xml?" in url:
+                cmd = url.split("?", 1)[1]
+                state["cmds"].append(cmd)
+                if cmd.startswith("MV") and cmd[2:].isdigit():
+                    raw = cmd[2:]
+                    val = float(raw[:2]) + (0.5 if len(raw) == 3 and raw[2] == "5" else 0.0)
+                    state["vol"] = round(val - 80.0, 1)
+                return 200, b""
+            return 404, b""
+
+        cfg = ha.HouseAudioConfig(
+            denon_enabled=True,
+            denon_host="192.168.1.15",
+            denon_duck_enabled=False,
+            denon_duck_threshold_db=-20.0,
+            denon_duck_drop_db=5.0,
+            denon_ramp_steps=3,
+            denon_ramp_step_ms=0,
+        )
+        client = ha.DenonAvrClient(lambda: cfg, http_get=fake_denon_get, sleep_fn=lambda _s: None)
+
+        # 1. Disabled by default -> sends 0 MV commands
+        with client.duck_context() as d1:
+            self.assertFalse(d1["ducked"])
+            self.assertEqual(d1["reason"], "disabled")
+        self.assertEqual(state["cmds"], [])
+
+        # 2. Enabled, but current volume (-26.0) is below -20.0 threshold -> sends 0 MV commands
+        cfg.denon_duck_enabled = True
+        state["vol"] = -26.0
+        with client.duck_context() as d2:
+            self.assertFalse(d2["ducked"])
+            self.assertEqual(d2["reason"], "below_threshold")
+        self.assertEqual(state["cmds"], [])
+
+        # 3. Loud (-16.0 >= -20.0) -> ramps smoothly down 5 dB to -21.0 and restores exact -16.0
+        state["vol"] = -16.0
+        with client.duck_context() as d3:
+            self.assertTrue(d3["ducked"])
+            self.assertAlmostEqual(state["vol"], -21.0)
+        self.assertAlmostEqual(state["vol"], -16.0)
+        self.assertGreaterEqual(len(state["cmds"]), 4)
+        self.assertEqual(state["cmds"][-1], "MV64")
+
+        # 4. Manual remote volume change (> 1 dB drift) during duck -> must NOT overwrite user's manual level
+        state["cmds"].clear()
+        state["vol"] = -16.0
+        with client.duck_context() as d4:
+            self.assertTrue(d4["ducked"])
+            self.assertAlmostEqual(state["vol"], -21.0)
+            state["vol"] = -12.0  # Dave cranked the knob manually mid-duck
+        self.assertAlmostEqual(state["vol"], -12.0)
+        self.assertEqual(client.last_duck_info.get("restoreSkipped"), "manual_volume_change")
+
+    def test_house_audio_routing_matrix_and_flask_endpoints(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_ha_test_"))
+        try:
+            denon_state = {"power": "ON", "input": "MPLAY", "vol": -22.0}
+            cube_calls: list[dict[str, object]] = []
+            cube_healthy = {"ok": True}
+
+            def fake_denon_get(url: str, _timeout: float) -> tuple[int, bytes]:
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    xml = (
+                        f"<item><Power><value>{denon_state['power']}</value></Power>"
+                        f"<InputFuncSelect><value>{denon_state['input']}</value></InputFuncSelect>"
+                        f"<MasterVolume><value>{denon_state['vol']:.1f}</value></MasterVolume>"
+                        f"<Mute><value>off</value></Mute><SurrMode><value>MULTI CH STEREO</value></SurrMode></item>"
+                    )
+                    return 200, xml.encode("utf-8")
+                return 200, b""
+
+            def fake_cube_get(url: str, _timeout: float) -> tuple[int, bytes]:
+                if url.endswith("/health"):
+                    if cube_healthy["ok"]:
+                        return 200, b'{"ok":true,"pkg":"com.froriep.armoryaudio","port":8767,"playing":false,"streamVol":12,"streamMaxVol":15,"playCount":3}'
+                    raise OSError("Cube unreachable")
+                return 404, b""
+
+            def fake_cube_post(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                cube_calls.append({"url": url, "bytes": len(body), "is_wav": body[:4] == b"RIFF"})
+                if not cube_healthy["ok"]:
+                    raise OSError("Cube down")
+                return 200, b'{"ok":true,"played":true}'
+
+            mgr = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(cube_enabled=True, cube_host="192.168.1.99", output_route="auto"),
+                allow_network=True,
+                denon_http_get=fake_denon_get,
+                cube_http_get=fake_cube_get,
+                cube_http_post=fake_cube_post,
+                sleep_fn=lambda _s: None,
+            )
+
+            pcm = 0.3 * np.sin(2.0 * np.pi * 440.0 * np.linspace(0, 0.25, 12_000, endpoint=False, dtype=np.float32))
+            # 1. Auto route with Denon ON + MPLAY + Cube healthy -> routes WAV to Cube
+            r_cube = mgr.try_route_voice_pcm(pcm, 48_000, kind="tts")
+            self.assertTrue(r_cube["handled"])
+            self.assertEqual(r_cube["route"], "cube")
+            self.assertEqual(len(cube_calls), 1)
+            self.assertTrue(cube_calls[0]["is_wav"])
+            self.assertIn("mode=overlay", str(cube_calls[0]["url"]))
+
+            # 2. Denon switched away from MPLAY (e.g. CBL/SAT) -> cleanly falls back to S330
+            denon_state["input"] = "CBL/SAT"
+            r_s330 = mgr.try_route_voice_pcm(pcm, 48_000, kind="tts")
+            self.assertFalse(r_s330["handled"])
+            self.assertEqual(r_s330["route"], "s330")
+
+            # 3. Forced Cube route fails when Cube POST raises -> cleanly falls back to S330
+            denon_state["input"] = "MPLAY"
+            mgr.update_config({"outputRoute": "cube"})
+            cube_healthy["ok"] = False
+            r_fail = mgr.try_route_voice_pcm(pcm, 48_000, kind="tts")
+            self.assertFalse(r_fail["handled"])
+            self.assertTrue(r_fail["fallback"])
+
+            # 4. AudioMatrixStore persistence & reset
+            snap1 = mgr.matrix.record("Spotify", "overlay", status="pass", behavior="Clean mix, zero pause")
+            self.assertEqual(snap1["cells"]["Spotify"]["overlay"]["status"], "pass")
+            reloaded = ha.AudioMatrixStore(root_dir=tmp)
+            self.assertEqual(reloaded.snapshot_dict()["cells"]["Spotify"]["overlay"]["behavior"], "Clean mix, zero pause")
+            snap_rst = reloaded.reset()
+            self.assertEqual(snap_rst["cells"]["Spotify"]["overlay"]["status"], "untested")
+
+            # 5. Flask API endpoints + dashboard UI + SFX path-traversal guard
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.house_audio.denon._http_get = fake_denon_get
+            svc.house_audio.cube._http_get = fake_cube_get
+            svc.house_audio.cube._http_post = fake_cube_post
+            cube_healthy["ok"] = True
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash = client.get("/").get_data(as_text=True)
+            self.assertIn("House Audio (Denon AVR-3313CI + Fire TV Cube Mixer)", dash)
+            self.assertIn("haDenonPill", dash)
+            self.assertIn("haMatrixTable", dash)
+
+            st_res = client.get("/api/audio/status")
+            self.assertEqual(st_res.status_code, 200)
+            st_json = st_res.get_json()
+            self.assertTrue(st_json["denon"]["ok"])
+            self.assertFalse(st_json["config"]["denonDuckEnabled"])
+
+            cfg_res = client.post(
+                "/api/audio/config",
+                json={"cubeEnabled": True, "cubeHost": "192.168.1.99", "outputRoute": "auto", "denonDuckEnabled": False},
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            self.assertEqual(cfg_res.get_json()["config"]["cubeHost"], "192.168.1.99")
+
+            svc_reload = ac.ArmoryCamService(root_dir=tmp)
+            self.assertEqual(svc_reload.house_audio_cfg.cube_host, "192.168.1.99")
+            self.assertEqual(svc_reload.house_audio_cfg.output_route, "auto")
+
+            tp_res = client.post(
+                "/api/audio/test-play",
+                json={"kind": "pr_fanfare", "mode": "takeover", "target": "cube"},
+            )
+            self.assertEqual(tp_res.status_code, 200)
+            self.assertEqual(tp_res.get_json()["route"], "cube")
+
+            mx_res = client.post(
+                "/api/audio/matrix",
+                json={"app": "YouTube", "mode": "duck", "status": "warn", "behavior": "Paused briefly"},
+            )
+            self.assertEqual(mx_res.status_code, 200)
+            self.assertEqual(mx_res.get_json()["matrix"]["cells"]["YouTube"]["duck"]["status"], "warn")
+
+            # Traversal protection on SFX route
+            bad1 = client.get("/api/audio/sfx/../config.json")
+            self.assertIn(bad1.status_code, (400, 404))
+            bad2 = client.get("/api/audio/sfx/%2e%2e%2fconfig.json")
+            self.assertIn(bad2.status_code, (400, 404))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
