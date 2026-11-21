@@ -4333,6 +4333,47 @@ class ShowDirector:
 
         return {"ok": True, "url": url, "results": results}
 
+    def _restore_wallboard_tv(self, *, force_stop_youtube: bool = False) -> dict[str, Any]:
+        """Return the dedicated Wallboard Fire TV cleanly back to the Armory Wallboard URL."""
+        wb_cfg = self._wallboard_cfg_fn() if self._wallboard_cfg_fn is not None else None
+        wb_host = str(getattr(wb_cfg, "fire_tv_host", "") or "").strip() if wb_cfg else ""
+        wb_port = int(getattr(wb_cfg, "adb_port", 5555) or 5555) if wb_cfg else 5555
+        if not wb_host or self.adb is None:
+            return {"ok": False, "skipped": True}
+        wb_ser = f"{wb_host}:{wb_port}" if ":" not in wb_host else wb_host
+        wb_url = f"{self._resolve_stage_base_url()}/wallboard"
+        st, detail = self.adb._connect_and_status(wb_ser)
+        if st != "device":
+            if hasattr(self.adb, "disconnect_serial"):
+                try:
+                    self.adb.disconnect_serial(wb_ser)
+                except Exception:
+                    pass
+            return {"ok": False, "state": st, "error": detail}
+        try:
+            if force_stop_youtube:
+                self.adb._run(
+                    ["-s", wb_ser, "shell", "am", "force-stop", "com.amazon.firetv.youtube"],
+                    timeout=4.0,
+                )
+            self.adb._run(["-s", wb_ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+            if wb_cfg is not None and hasattr(self.adb, "_launch_cmd"):
+                cmd_args = self.adb._launch_cmd(wb_cfg, wb_url, wb_ser)
+            else:
+                cmd = (
+                    f"am start -W -a android.intent.action.VIEW -d {shlex.quote(wb_url)} "
+                    "-n com.froriep.armorywallboard/.WallboardActivity"
+                )
+                cmd_args = ["-s", wb_ser, "shell", cmd]
+            rc, out, err = self.adb._run(cmd_args, timeout=6.0)
+            return {"ok": rc == 0, "url": wb_url, "out": (out or err).strip()}
+        finally:
+            if hasattr(self.adb, "disconnect_serial"):
+                try:
+                    self.adb.disconnect_serial(wb_ser)
+                except Exception:
+                    pass
+
     # ---------- Anti-Roller-Coaster Live Execution ----------
 
     def _restore_denon_down(self, from_db: float, to_db: float, *, fast: bool = False) -> None:
@@ -4890,6 +4931,10 @@ class ShowDirector:
                     self.displays.sync_denon_monitor_for_spin()
                 except Exception:
                     pass
+            try:
+                self._restore_wallboard_tv(force_stop_youtube=False)
+            except Exception:
+                pass
             if cube_stage_launched and cube_ser and self.adb is not None:
                 try:
                     st, _ = self.adb._connect_and_status(cube_ser)
@@ -4995,6 +5040,7 @@ class ShowDirector:
         denon_raised = False
         denon_restored = False
         cube_started = False
+        wallboard_youtube_launched = False
         out_res: dict[str, Any] = {"ok": True, "showId": spec.id}
 
         try:
@@ -5145,6 +5191,7 @@ class ShowDirector:
                 out_res["threeScreen"] = self._launch_three_screen_youtube(
                     spec.youtube_url, exclude_main_tv=eff_exclude_main
                 )
+                wallboard_youtube_launched = True
                 self._emit_cue(
                     "screens",
                     f"(ALL 3 SCREENS LIVE · DENON {spec.denon_vol})",
@@ -5268,9 +5315,15 @@ class ShowDirector:
             out_res = {"ok": False, "showId": spec.id, "error": str(exc)}
             return out_res
         finally:
+            self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
             # Emergency safety guarantee: ALWAYS ramp Denon back down FIRST before stopping Cube!
             if denon_raised and not denon_restored and self.house_audio is not None:
                 self._restore_denon_down(current_db, prev_db, fast=True)
+            if wallboard_youtube_launched:
+                try:
+                    self._restore_wallboard_tv(force_stop_youtube=True)
+                except Exception:
+                    pass
             if cancel_ev.is_set() and cube_started and self.house_audio is not None:
                 try:
                     cfg_ha = self.house_audio.get_config()
@@ -5333,7 +5386,13 @@ class ShowDirector:
         t.start()
         return {"ok": True, "started": True, "showId": spec.id, "showName": spec.name}
 
-    def stop_active_show(self, *, wait_timeout: float = 2.0, broadcast_stop: bool = True) -> dict[str, Any]:
+    def stop_active_show(
+        self,
+        *,
+        wait_timeout: float = 2.0,
+        broadcast_stop: bool = True,
+        restore_wallboard: bool = False,
+    ) -> dict[str, Any]:
         with self._lock:
             ev = self._active_cancel
             t = self._active_thread
@@ -5355,4 +5414,9 @@ class ShowDirector:
                 pass
         if broadcast_stop:
             self._broadcast_stage_event("stage_stop", runId=run_id, showId="")
+        if restore_wallboard and (not was_active or (t is not None and t.is_alive())):
+            try:
+                self._restore_wallboard_tv(force_stop_youtube=False)
+            except Exception:
+                pass
         return {"ok": True, "stopped": was_active}

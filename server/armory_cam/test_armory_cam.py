@@ -2766,6 +2766,18 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertTrue(any("192.168.1.204:5555" in s and "media volume --stream 3 --set 0" in s for s in joined_adb))
             self.assertTrue(any("192.168.1.204:5555" in s and "05vwKMySzKw" in s for s in joined_adb))
             self.assertTrue(any("192.168.1.151:5555" in s and "05vwKMySzKw" in s for s in joined_adb))
+            # Wallboard TV MUST force-stop YouTube and relaunch /wallboard when 3-screen show finishes
+            idx_yt_stop = next(
+                (i for i, s in enumerate(joined_adb) if "192.168.1.204:5555" in s and "force-stop com.amazon.firetv.youtube" in s),
+                -1,
+            )
+            self.assertGreaterEqual(idx_yt_stop, 0)
+            self.assertTrue(
+                any(
+                    "192.168.1.204:5555" in s and "am start" in s and "/wallboard" in s
+                    for s in joined_adb[idx_yt_stop:]
+                )
+            )
 
             # Visual FX cues logged for on-screen SSE simulator
             cue_tags = [c["tag"] for c in director.recent_cues]
@@ -3296,6 +3308,8 @@ class ShowDirectorTests(unittest.TestCase):
 
             wb_html = client.get("/wallboard").get_data(as_text=True)
             self.assertIn("armoryShowStage", wb_html)
+            self.assertIn("vid.onerror", ac.WALLBOARD_STAGE_OVERLAY_SNIPPET)
+            self.assertIn("safetyTimer", ac.WALLBOARD_STAGE_OVERLAY_SNIPPET)
 
             t_resp = client.get("/api/shows/time")
             self.assertEqual(t_resp.status_code, 200)
@@ -3325,8 +3339,31 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertTrue(any("192.168.1.151:5555" in s and "/stage?role=cube&audio=1" in s for s in joined_adb))
             self.assertTrue(any("192.168.1.204:5555" in s and "media volume --stream 3 --set 0" in s for s in joined_adb))
             self.assertTrue(any("192.168.1.204:5555" in s and "/wallboard" in s for s in joined_adb))
-            self.assertTrue(any("192.168.1.151:5555" in s and "input keyevent 4" in s for s in joined_adb))
+            idx_cube_exit = next(
+                (i for i, s in enumerate(joined_adb) if "192.168.1.151:5555" in s and "input keyevent 4" in s),
+                -1,
+            )
+            self.assertGreaterEqual(idx_cube_exit, 0)
+            wb_launches = [s for s in joined_adb if "192.168.1.204:5555" in s and "am start" in s and "/wallboard" in s]
+            self.assertGreaterEqual(len(wb_launches), 2)
             self.assertFalse(any("com.amazon.firetv.youtube" in s for s in joined_adb))
+
+            # SSE /api/shows/events replays stage_stop on connect/reconnect when idle
+            with client.get("/api/shows/events?role=test_sse", buffered=False) as ev_resp:
+                it = iter(ev_resp.response)
+                c1 = json.loads(next(it).decode("utf-8").removeprefix("data: ").strip())
+                c2 = json.loads(next(it).decode("utf-8").removeprefix("data: ").strip())
+                self.assertEqual(c1["type"], "hello")
+                self.assertEqual(c2["type"], "stage_stop")
+
+            # stop_active_show(restore_wallboard=True) relaunches /wallboard when idle; default does not
+            adb_cmds.clear()
+            svc.shows.stop_active_show()
+            self.assertEqual(adb_cmds, [])
+            svc.shows.stop_active_show(restore_wallboard=True)
+            joined_idle = [" ".join(c) for c in adb_cmds]
+            self.assertTrue(any("192.168.1.204:5555" in s and "am start" in s and "/wallboard" in s for s in joined_idle))
+
             svc.stop_background()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

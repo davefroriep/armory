@@ -138,6 +138,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
   var curRunId = 0;
   var readyAcked = false;
   var startTimer = null;
+  var safetyTimer = null;
   var syncIv = null;
   var flashRaf = null;
   var flashWindows = [];
@@ -208,6 +209,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
 
   function clearPlayTimers(){
     if (startTimer){ clearTimeout(startTimer); startTimer = null; }
+    if (safetyTimer){ clearTimeout(safetyTimer); safetyTimer = null; }
     if (syncIv){ clearInterval(syncIv); syncIv = null; }
     clearFlash();
   }
@@ -218,6 +220,10 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     curRunId = 0;
     readyAcked = false;
     activeStartMs = 0;
+    vid.oncanplay = null;
+    vid.onloadeddata = null;
+    vid.onended = null;
+    vid.onerror = null;
     try { vid.pause(); vid.playbackRate = 1.0; vid.removeAttribute('src'); vid.load(); } catch(e){}
     box.style.display = 'none';
   }
@@ -242,6 +248,8 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     var fallbackT = setTimeout(sendReady, 2600);
     vid.oncanplay = function(){ clearTimeout(fallbackT); sendReady(); };
     vid.onloadeddata = function(){ try { vid.currentTime = 0; } catch(e){} };
+    vid.onerror = function(){ stopStage(); };
+    safetyTimer = setTimeout(stopStage, 14000);
     vid.onended = function(){
       var rid = curRunId;
       stopStage();
@@ -302,7 +310,10 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     clearPlayTimers();
     curRunId = Number(ev.runId || 0);
     activeStartMs = Number(ev.startAtMs || (Date.now() + clockOffsetMs));
+    var totalSec = Math.max(5, Number(ev.totalDurationSec || 60));
     var waitMs = (activeStartMs - clockOffsetMs) - Date.now();
+    var safetyMs = Math.max(8000, Math.round(waitMs + (totalSec + 5) * 1000));
+    safetyTimer = setTimeout(stopStage, safetyMs);
     if (waitMs > 18 && waitMs < 10000) {
       startTimer = setTimeout(beginPlayback, waitMs);
     } else {
@@ -350,6 +361,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
   var curRunId = 0;
   var readyAcked = false;
   var startTimer = null;
+  var safetyTimer = null;
   var syncIv = null;
   var flashRaf = null;
   var flashWindows = [];
@@ -421,6 +433,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
 
   function clearPlayTimers(){
     if (startTimer){ clearTimeout(startTimer); startTimer = null; }
+    if (safetyTimer){ clearTimeout(safetyTimer); safetyTimer = null; }
     if (syncIv){ clearInterval(syncIv); syncIv = null; }
     clearFlash();
   }
@@ -431,6 +444,10 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     curRunId = 0;
     readyAcked = false;
     activeStartMs = 0;
+    vid.oncanplay = null;
+    vid.onloadeddata = null;
+    vid.onended = null;
+    vid.onerror = null;
     try { vid.pause(); vid.playbackRate = 1.0; vid.removeAttribute('src'); vid.load(); } catch(e){}
   }
 
@@ -512,7 +529,10 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     clearPlayTimers();
     curRunId = Number(ev.runId || 0);
     activeStartMs = Number(ev.startAtMs || (Date.now() + clockOffsetMs));
+    var totalSec = Math.max(5, Number(ev.totalDurationSec || 60));
     var waitMs = (activeStartMs - clockOffsetMs) - Date.now();
+    var safetyMs = Math.max(8000, Math.round(waitMs + (totalSec + 5) * 1000));
+    safetyTimer = setTimeout(stopStage, safetyMs);
     if (waitMs > 18 && waitMs < 10000) {
       startTimer = setTimeout(beginPlayback, waitMs);
     } else {
@@ -5055,7 +5075,7 @@ class ArmoryCamService:
         )
         if show_match:
             if show_match.get("action") == "stop":
-                self.shows.stop_active_show()
+                self.shows.stop_active_show(restore_wallboard=True)
                 return {
                     "handled": True,
                     "ok": True,
@@ -10267,6 +10287,8 @@ def create_app(service: ArmoryCamService) -> Flask:
                 cur_stage = service.shows.current_stage_state()
                 if cur_stage.get("type") in ("stage_prepare", "stage_play") and cur_stage.get("videoUrl"):
                     yield f"data: {json.dumps(cur_stage)}\n\n"
+                elif cur_stage.get("type") == "stage_stop":
+                    yield f"data: {json.dumps(cur_stage)}\n\n"
                 while True:
                     try:
                         ev = q.get(timeout=15.0)
@@ -10429,7 +10451,7 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.post("/api/shows/stop")
     def api_shows_stop() -> Response:
-        res = service.shows.stop_active_show()
+        res = service.shows.stop_active_show(restore_wallboard=True)
         return jsonify({**res, "status": service.shows.status_dict()})
 
     @app.post("/api/shows/fx-hooks")
