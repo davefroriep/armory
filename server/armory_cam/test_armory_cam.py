@@ -3812,6 +3812,98 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_dual_zone_house_lights_rack_smith_and_pr_drop_flashes(self) -> None:
+        # 1. URL resolution for rack, smith, all, and legacy fallback
+        fx_dual = sd.SmartFxConfig(lights_rack_host="192.168.1.71", lights_smith_host="192.168.1.72")
+        self.assertEqual(fx_dual.resolve_lights_urls(True, "rack"), ["http://192.168.1.71/rpc/Switch.Set?id=0&on=true"])
+        self.assertEqual(fx_dual.resolve_lights_urls(False, "smith"), ["http://192.168.1.72/rpc/Switch.Set?id=0&on=false"])
+        self.assertEqual(
+            fx_dual.resolve_lights_urls(True, "all"),
+            ["http://192.168.1.71/rpc/Switch.Set?id=0&on=true", "http://192.168.1.72/rpc/Switch.Set?id=0&on=true"],
+        )
+        fx_leg = sd.SmartFxConfig(lights_host="192.168.1.70")
+        self.assertEqual(fx_leg.resolve_lights_urls(True, "all"), ["http://192.168.1.70/rpc/Switch.Set?id=0&on=true"])
+        self.assertEqual(fx_leg.resolve_lights_urls(True, "rack"), ["http://192.168.1.70/rpc/Switch.Set?id=0&on=true"])
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_dual_lights_"))
+        try:
+            hits: list[str] = []
+
+            def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+                hits.append(url)
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, b"<item><Power><value>ON</value></Power><MasterVolume><value>-30.0</value></MasterVolume></item>"
+                return 200, b"ok"
+
+            ham = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15", cube_enabled=True, cube_host="192.168.1.151"),
+                allow_network=False,
+                denon_http_get=fake_get,
+                cube_http_post=lambda _u, _b, _h, _t: (200, b"ok"),
+                sleep_fn=lambda _s: None,
+            )
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.shows = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                allow_network=False,
+                http_get=fake_get,
+                sleep_fn=lambda _s: None,
+            )
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # 2. Save dual-zone hosts & trigger manual Rack/Smith/Alt Flash endpoints
+            r_rack_on = client.post(
+                "/api/shows/fx-hooks",
+                json={"lightsRackHost": "192.168.1.71", "lightsSmithHost": "192.168.1.72", "test": "rack_on"},
+            )
+            self.assertEqual(r_rack_on.status_code, 200)
+            self.assertIn("http://192.168.1.71/rpc/Switch.Set?id=0&on=true", hits)
+
+            hits.clear()
+            client.post("/api/shows/fx-hooks", json={"lightsRackHost": "192.168.1.71", "lightsSmithHost": "192.168.1.72", "test": "smith_off"})
+            self.assertEqual(hits, ["http://192.168.1.72/rpc/Switch.Set?id=0&on=false"])
+
+            hits.clear()
+            svc.shows._flash_lights(2, zone="alternate", end_on=True, on_sec=0.1, off_sec=0.1)
+            # Step 1: Rack ON + Smith OFF, both OFF; Step 2: Smith ON + Rack OFF, end_on -> both ON
+            self.assertIn("http://192.168.1.71/rpc/Switch.Set?id=0&on=true", hits)
+            self.assertIn("http://192.168.1.72/rpc/Switch.Set?id=0&on=false", hits)
+            self.assertEqual(
+                set(hits[-2:]),
+                {"http://192.168.1.71/rpc/Switch.Set?id=0&on=true", "http://192.168.1.72/rpc/Switch.Set?id=0&on=true"},
+            )
+
+            # 3. Voice commands for Rack / Smith / House lights
+            hits.clear()
+            self.assertEqual(svc.shows.match_voice_command("Armory, turn off rack lights"), {"action": "lights", "zone": "rack", "on": False})
+            self.assertEqual(svc.shows.match_voice_command("Armory, smith lights on"), {"action": "lights", "zone": "smith", "on": True})
+            self.assertEqual(svc.shows.match_voice_command("Armory, lights off"), {"action": "lights", "zone": "all", "on": False})
+            hv = svc._handle_local_voice_command("Armory, turn off rack lights")
+            self.assertIsNotNone(hv)
+            self.assertTrue(hv["ok"])
+            self.assertEqual(hv["speech"], "Rack lights off")
+            self.assertIn("http://192.168.1.71/rpc/Switch.Set?id=0&on=false", hits)
+
+            # 4. PR drop-in with lightsFlashCount=2 triggers dual-zone flashes cleanly
+            hits.clear()
+            svc.shows.update_show("matt_pr", {"lightsFlashCount": 2, "songDurationSec": 1.0}, rebuild=True)
+            res_pr = svc.shows.fire_show("matt_pr", async_run=False)
+            self.assertTrue(res_pr["ok"])
+            self.assertTrue(any("192.168.1.71/rpc/Switch.Set" in u for u in hits))
+            self.assertTrue(any("192.168.1.72/rpc/Switch.Set" in u for u in hits))
+
+            # 5. Dashboard HTML exposes Rack & Smith controls
+            dash = client.get("/").get_data(as_text=True)
+            for tok in ("fxLightsRackHost", "fxLightsSmithHost", "fxRackOnBtn", "fxRackOffBtn", "fxSmithOnBtn", "fxSmithOffBtn", "fxTestAltFlashBtn"):
+                self.assertIn(tok, dash)
+
+            svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

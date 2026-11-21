@@ -4971,6 +4971,35 @@ class ArmoryCamService:
                     "speech": "Show stopped",
                     "ackText": "⏹ Show stopped",
                 }
+            if show_match.get("action") == "lights":
+                zone = str(show_match.get("zone") or "all")
+                want_on = bool(show_match.get("on", True))
+                res = self.shows._fire_lights_state(
+                    want_on,
+                    zone=zone,
+                    tag=("lights_on" if want_on else "lights_off"),
+                    label=f"({zone.upper()} LIGHTS {'ON' if want_on else 'OFF'})",
+                )
+                z_label = {"rack": "Rack lights", "smith": "Smith lights"}.get(zone, "House lights")
+                state_word = "on" if want_on else "off"
+                if res.get("skipped"):
+                    speech = f"{z_label} relay IP not configured"
+                    ack = f"⚠ {speech}"
+                    ok = False
+                else:
+                    ok = bool(res.get("ok"))
+                    speech = f"{z_label} {state_word}" if ok else f"{z_label} command failed"
+                    ack = f"💡 {speech}" if ok else f"✗ {speech}"
+                return {
+                    "handled": True,
+                    "ok": ok,
+                    "target": "lights",
+                    "zone": zone,
+                    "on": want_on,
+                    "speech": speech,
+                    "ackText": ack,
+                    "result": res,
+                }
             res = self.shows.fire_show(str(show_match.get("showId") or ""), async_run=True)
             ok = bool(res.get("ok"))
             return {
@@ -5681,18 +5710,36 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
     </details>
     <details style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
-      <summary style="cursor:pointer;font-weight:800;font-size:13px;color:#7cc4ff">Smart FX Hooks (Lights Switch &amp; Fog Machine — Future Ready)</summary>
+      <summary style="cursor:pointer;font-weight:800;font-size:13px;color:#7cc4ff">Smart FX Hooks (House Lights Rack &amp; Smith + Fog Machine)</summary>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:8px">
-        <div><label>House Lights IP (Shelly Plus 1 / Gen3)</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
-        <div><label>Lights OFF URL (optional override)</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-        <div><label>Lights ON URL (optional override)</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+        <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
+        <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+        <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+        <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
+        <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+        <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
         <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
         <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
         <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
       </div>
-      <div class="ctrl-row" style="margin-top:10px">
+      <details style="margin-top:6px">
+        <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Single-Relay Legacy Fallback (optional)</summary>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-top:6px">
+          <div><label>Legacy House Lights IP</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
+          <div><label>Legacy Lights OFF URL</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+          <div><label>Legacy Lights ON URL</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+        </div>
+      </details>
+      <div class="ctrl-row" style="margin-top:10px;flex-wrap:wrap;gap:6px">
         <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
-        <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Lights Flash</button>
+        <button class="btn sm ok" id="fxRackOnBtn" type="button">Rack ON</button>
+        <button class="btn sm sec" id="fxRackOffBtn" type="button">Rack OFF</button>
+        <button class="btn sm ok" id="fxSmithOnBtn" type="button">Smith ON</button>
+        <button class="btn sm sec" id="fxSmithOffBtn" type="button">Smith OFF</button>
+        <button class="btn sm ok" id="fxAllOnBtn" type="button">All Lights ON</button>
+        <button class="btn sm sec" id="fxAllOffBtn" type="button">All Lights OFF</button>
+        <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Both Flash</button>
+        <button class="btn sec sm" id="fxTestAltFlashBtn" type="button">Test 4x Alternate Rack ↔ Smith</button>
         <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
         <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
       </div>
@@ -8621,6 +8668,12 @@ function populateFxHookInputs(fx) {
   if ($('fxLightsHost')) $('fxLightsHost').value = fx.lightsHost || '';
   if ($('fxLightsOffUrl')) $('fxLightsOffUrl').value = fx.lightsOffUrl || '';
   if ($('fxLightsOnUrl')) $('fxLightsOnUrl').value = fx.lightsOnUrl || '';
+  if ($('fxLightsRackHost')) $('fxLightsRackHost').value = fx.lightsRackHost || '';
+  if ($('fxLightsRackOffUrl')) $('fxLightsRackOffUrl').value = fx.lightsRackOffUrl || '';
+  if ($('fxLightsRackOnUrl')) $('fxLightsRackOnUrl').value = fx.lightsRackOnUrl || '';
+  if ($('fxLightsSmithHost')) $('fxLightsSmithHost').value = fx.lightsSmithHost || '';
+  if ($('fxLightsSmithOffUrl')) $('fxLightsSmithOffUrl').value = fx.lightsSmithOffUrl || '';
+  if ($('fxLightsSmithOnUrl')) $('fxLightsSmithOnUrl').value = fx.lightsSmithOnUrl || '';
   if ($('fxFogHost')) $('fxFogHost').value = fx.fogHost || '';
   if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
   if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 30);
@@ -8798,6 +8851,7 @@ function makeRyFxRowHtml(fc, idx) {
   const cid = escHtml(fc.id || `fx_${idx + 1}`);
   const tgt = fc.target === 'intro' ? 'intro' : 'video';
   const ftype = fc.type || 'flash';
+  const fzone = fc.zone || 'all';
   const atStr = escHtml(fmtTimeSec(fc.atSec != null ? fc.atSec : 0));
   const dur = fc.durationSec != null ? fc.durationSec : (ftype === 'fog' ? 4.0 : 0.2);
   const cnt = fc.count != null ? fc.count : 1;
@@ -8818,6 +8872,12 @@ function makeRyFxRowHtml(fc, idx) {
           <option value="lights_off" ${ftype==='lights_off'?'selected':''}>Lights OFF</option>
           <option value="lights_on" ${ftype==='lights_on'?'selected':''}>Lights ON</option>
           <option value="fog" ${ftype==='fog'?'selected':''}>Fog Burst</option>
+        </select>
+        <select class="ry-fx-zone" title="Light zone">
+          <option value="all" ${fzone==='all'?'selected':''}>Both Sides</option>
+          <option value="rack" ${fzone==='rack'?'selected':''}>Rack Side</option>
+          <option value="smith" ${fzone==='smith'?'selected':''}>Smith Side</option>
+          <option value="alternate" ${fzone==='alternate'?'selected':''}>Alternate ↔</option>
         </select>
         <label style="margin:0;font-size:11px">Dur(s)</label>
         <input class="ry-fx-dur" type="number" min="0.1" max="60" step="0.1" value="${escHtml(String(dur))}" style="width:64px">
@@ -8863,6 +8923,7 @@ function collectRyFxCues() {
       target: row.querySelector('.ry-fx-target').value === 'intro' ? 'intro' : 'video',
       atSec: parseTimeSec(row.querySelector('.ry-fx-at').value),
       type: row.querySelector('.ry-fx-type').value || 'flash',
+      zone: (row.querySelector('.ry-fx-zone') && row.querySelector('.ry-fx-zone').value) || 'all',
       durationSec: Math.max(0.1, Math.min(60, Number(row.querySelector('.ry-fx-dur').value || 0.2))),
       count: Math.max(1, Math.min(6, Math.round(Number(row.querySelector('.ry-fx-cnt').value || 1)))),
       screenFlash: Boolean(row.querySelector('.ry-fx-screen').checked),
@@ -8912,8 +8973,14 @@ function renderShows(data) {
             <option value="overlay" ${s.cubeMode==='overlay'?'selected':''}>overlay</option>
           </select></div>
           <div><label>Start (s)</label><input id="shStart_${id}" type="number" min="0" step="0.25" value="${s.songStartSec}"></div>
-          <div><label>Dur (s)</label><input id="shDur_${id}" type="number" min="0" max="50" step="0.5" value="${s.songDurationSec}"></div>
+          <div><label>Dur (s)</label><input id="shDur_${id}" type="number" min="0" max="65" step="0.5" value="${s.songDurationSec}"></div>
           <div><label>Fade (s)</label><input id="shFade_${id}" type="number" min="0.3" max="10" step="0.2" value="${s.fadeOutSec}"></div>
+          <div><label>Flashes (0–6)</label><input id="shFlash_${id}" type="number" min="0" max="6" step="1" value="${s.lightsFlashCount || 0}"></div>
+        </div>
+        <div class="ctrl-row" style="margin-top:0">
+          <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+            <input id="shCheer_${id}" type="checkbox" ${s.addCheer ? 'checked' : ''} style="width:auto;margin:0"> Add Crowd Cheer
+          </label>
         </div>
         ${s.kind !== 'pr_drop' ? `<div><label>Announcer Script</label><textarea id="shAnn_${id}" rows="2">${escHtml(s.announcerText || '')}</textarea></div>` : ''}
         <div class="ctrl-row" style="margin-top:2px">
@@ -8985,6 +9052,8 @@ async function saveShowConfig(id, btn) {
     songDurationSec: Number($('shDur_' + id).value || 15),
     fadeOutSec: Number($('shFade_' + id).value || 2.5),
   };
+  if ($('shFlash_' + id)) body.lightsFlashCount = Math.max(0, Math.min(6, Math.round(Number($('shFlash_' + id).value || 0))));
+  if ($('shCheer_' + id)) body.addCheer = Boolean($('shCheer_' + id).checked);
   if ($('shAnn_' + id)) body.announcerText = $('shAnn_' + id).value.trim();
   if ($('shYt_' + id)) body.youtubeUrl = $('shYt_' + id).value.trim();
   if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Saving & rendering…';
@@ -9033,6 +9102,12 @@ async function saveFxHooks(extraBody) {
     lightsHost: ($('fxLightsHost') && $('fxLightsHost').value.trim()) || '',
     lightsOffUrl: ($('fxLightsOffUrl') && $('fxLightsOffUrl').value.trim()) || '',
     lightsOnUrl: ($('fxLightsOnUrl') && $('fxLightsOnUrl').value.trim()) || '',
+    lightsRackHost: ($('fxLightsRackHost') && $('fxLightsRackHost').value.trim()) || '',
+    lightsRackOffUrl: ($('fxLightsRackOffUrl') && $('fxLightsRackOffUrl').value.trim()) || '',
+    lightsRackOnUrl: ($('fxLightsRackOnUrl') && $('fxLightsRackOnUrl').value.trim()) || '',
+    lightsSmithHost: ($('fxLightsSmithHost') && $('fxLightsSmithHost').value.trim()) || '',
+    lightsSmithOffUrl: ($('fxLightsSmithOffUrl') && $('fxLightsSmithOffUrl').value.trim()) || '',
+    lightsSmithOnUrl: ($('fxLightsSmithOnUrl') && $('fxLightsSmithOnUrl').value.trim()) || '',
     fogHost: ($('fxFogHost') && $('fxFogHost').value.trim()) || '',
     fogTriggerUrl: ($('fxFogUrl') && $('fxFogUrl').value.trim()) || '',
     fogBurstSec: Number(($('fxFogBurst') && $('fxFogBurst').value) || 4.0),
@@ -9043,7 +9118,11 @@ async function saveFxHooks(extraBody) {
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify(body),
   }).then(x => x.json());
-  if ($('fxOut')) $('fxOut').textContent = r.ok ? '✓ FX hooks saved' : `✗ ${r.error || 'Failed'}`;
+  if ($('fxOut')) {
+    if (r.ok && r.hookResult && r.hookResult.skipped) $('fxOut').textContent = `⚠ Relay IP not set for ${r.tested || 'zone'}`;
+    else if (r.ok && r.hookResult && r.hookResult.ok === false) $('fxOut').textContent = `✗ ${r.hookResult.error || 'Hook failed'}`;
+    else $('fxOut').textContent = r.ok ? (r.tested ? `✓ Tested ${r.tested}` : '✓ FX hooks saved') : `✗ ${r.error || 'Failed'}`;
+  }
   return r;
 }
 
@@ -9387,7 +9466,14 @@ if ($('devRyVidFile')) $('devRyVidFile').onchange = async (ev) => {
   }
 };
 if ($('fxSaveBtn')) $('fxSaveBtn').onclick = () => saveFxHooks();
+if ($('fxRackOnBtn')) $('fxRackOnBtn').onclick = () => saveFxHooks({ test: 'rack_on' });
+if ($('fxRackOffBtn')) $('fxRackOffBtn').onclick = () => saveFxHooks({ test: 'rack_off' });
+if ($('fxSmithOnBtn')) $('fxSmithOnBtn').onclick = () => saveFxHooks({ test: 'smith_on' });
+if ($('fxSmithOffBtn')) $('fxSmithOffBtn').onclick = () => saveFxHooks({ test: 'smith_off' });
+if ($('fxAllOnBtn')) $('fxAllOnBtn').onclick = () => saveFxHooks({ test: 'all_on' });
+if ($('fxAllOffBtn')) $('fxAllOffBtn').onclick = () => saveFxHooks({ test: 'all_off' });
 if ($('fxTestFlashBtn')) $('fxTestFlashBtn').onclick = () => saveFxHooks({ test: 'lights_flash' });
+if ($('fxTestAltFlashBtn')) $('fxTestAltFlashBtn').onclick = () => saveFxHooks({ test: 'lights_alt_flash' });
 if ($('fxTestFogBtn')) $('fxTestFogBtn').onclick = () => saveFxHooks({ test: 'fog' });
 
 init();
@@ -10261,8 +10347,21 @@ def create_app(service: ArmoryCamService) -> Flask:
         res = service.shows.update_fx_hooks(body)
         test_kind = str(body.get("test") or "").strip().lower()
         if test_kind == "lights_flash":
-            service.shows._flash_lights(2)
+            service.shows._flash_lights(2, zone="all")
             res["tested"] = "lights_flash"
+        elif test_kind == "lights_alt_flash":
+            service.shows._flash_lights(4, zone="alternate")
+            res["tested"] = "lights_alt_flash"
+        elif test_kind in ("rack_on", "rack_off", "smith_on", "smith_off", "all_on", "all_off"):
+            zone, state = test_kind.split("_", 1)
+            want_on = state == "on"
+            res["tested"] = test_kind
+            res["hookResult"] = service.shows._fire_lights_state(
+                want_on,
+                zone=zone,
+                tag=("lights_on" if want_on else "lights_off"),
+                label=f"({zone.upper()} LIGHTS {'ON' if want_on else 'OFF'})",
+            )
         elif test_kind == "fog":
             fog_url = service.shows.fx_hooks.resolve_fog_url()
             res["tested"] = "fog"

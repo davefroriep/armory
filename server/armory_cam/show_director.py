@@ -301,13 +301,22 @@ def _strip_optional_wake(text: str, wake_word: str = "armory") -> str:
     return _strip_wake_prefix(norm, wake_word=wake_word)
 
 
+VALID_FX_ZONES = ("all", "rack", "smith", "alternate")
+
+
 @dataclass
 class SmartFxConfig:
-    """Optional local HTTP hooks for fast lighting switches (Shelly/Kasa) and fog triggers."""
+    """Optional local HTTP hooks for dual-zone Shelly lighting (Rack + Smith) and fog triggers."""
 
     lights_host: str = ""
     lights_off_url: str = ""
     lights_on_url: str = ""
+    lights_rack_host: str = ""
+    lights_rack_off_url: str = ""
+    lights_rack_on_url: str = ""
+    lights_smith_host: str = ""
+    lights_smith_off_url: str = ""
+    lights_smith_on_url: str = ""
     fog_host: str = ""
     fog_trigger_url: str = ""
     fog_burst_sec: float = 4.0
@@ -317,6 +326,12 @@ class SmartFxConfig:
             "lightsHost": self.lights_host,
             "lightsOffUrl": self.lights_off_url,
             "lightsOnUrl": self.lights_on_url,
+            "lightsRackHost": self.lights_rack_host,
+            "lightsRackOffUrl": self.lights_rack_off_url,
+            "lightsRackOnUrl": self.lights_rack_on_url,
+            "lightsSmithHost": self.lights_smith_host,
+            "lightsSmithOffUrl": self.lights_smith_off_url,
+            "lightsSmithOnUrl": self.lights_smith_on_url,
             "fogHost": self.fog_host,
             "fogTriggerUrl": self.fog_trigger_url,
             "fogBurstSec": round(float(self.fog_burst_sec), 1),
@@ -334,20 +349,49 @@ class SmartFxConfig:
             lights_host=str(raw.get("lightsHost", "") or "").strip(),
             lights_off_url=str(raw.get("lightsOffUrl", "") or "").strip(),
             lights_on_url=str(raw.get("lightsOnUrl", "") or "").strip(),
+            lights_rack_host=str(raw.get("lightsRackHost", "") or "").strip(),
+            lights_rack_off_url=str(raw.get("lightsRackOffUrl", "") or "").strip(),
+            lights_rack_on_url=str(raw.get("lightsRackOnUrl", "") or "").strip(),
+            lights_smith_host=str(raw.get("lightsSmithHost", "") or "").strip(),
+            lights_smith_off_url=str(raw.get("lightsSmithOffUrl", "") or "").strip(),
+            lights_smith_on_url=str(raw.get("lightsSmithOnUrl", "") or "").strip(),
             fog_host=str(raw.get("fogHost", "") or "").strip(),
             fog_trigger_url=str(raw.get("fogTriggerUrl", "") or "").strip(),
             fog_burst_sec=burst,
         )
 
-    def resolve_lights_url(self, on: bool) -> str:
-        explicit = self.lights_on_url if on else self.lights_off_url
+    @staticmethod
+    def _single_light_url(host: str, explicit_on: str, explicit_off: str, on: bool) -> str:
+        explicit = explicit_on if on else explicit_off
         if explicit:
-            return explicit
-        host = self.lights_host.strip()
-        if not host:
+            return explicit.strip()
+        h = host.strip()
+        if not h:
             return ""
         flag = "true" if on else "false"
-        return f"http://{host}/rpc/Switch.Set?id=0&on={flag}"
+        return f"http://{h}/rpc/Switch.Set?id=0&on={flag}"
+
+    def resolve_lights_urls(self, on: bool, zone: str = "all") -> list[str]:
+        """Resolve HTTP light control URLs for `rack`, `smith`, or `all` (with legacy `lightsHost` fallback)."""
+        z = (zone or "all").strip().lower()
+        rack_u = self._single_light_url(self.lights_rack_host, self.lights_rack_on_url, self.lights_rack_off_url, on)
+        smith_u = self._single_light_url(self.lights_smith_host, self.lights_smith_on_url, self.lights_smith_off_url, on)
+        legacy_u = self._single_light_url(self.lights_host, self.lights_on_url, self.lights_off_url, on)
+        if z == "rack":
+            return [rack_u] if rack_u else ([legacy_u] if (legacy_u and not smith_u) else [])
+        if z == "smith":
+            return [smith_u] if smith_u else ([legacy_u] if (legacy_u and not rack_u) else [])
+        urls: list[str] = []
+        for u in (rack_u, smith_u):
+            if u and u not in urls:
+                urls.append(u)
+        if urls:
+            return urls
+        return [legacy_u] if legacy_u else []
+
+    def resolve_lights_url(self, on: bool) -> str:
+        urls = self.resolve_lights_urls(on, "all")
+        return urls[0] if urls else ""
 
     def resolve_fog_url(self, burst_sec: float | None = None) -> str:
         val = float(burst_sec) if (burst_sec is not None and float(burst_sec) > 0.0) else float(self.fog_burst_sec)
@@ -452,6 +496,8 @@ def _normalize_fx_cues(raw_list: Any) -> list[dict[str, Any]]:
         if cid in seen_ids:
             cid = f"{cid}_{idx + 1}"
         seen_ids.add(cid)
+        zone_raw = str(item.get("zone") or "all").strip().lower()
+        zone = zone_raw if zone_raw in VALID_FX_ZONES else "all"
         out.append({
             "id": cid,
             "target": target,
@@ -460,6 +506,7 @@ def _normalize_fx_cues(raw_list: Any) -> list[dict[str, Any]]:
             "count": cnt,
             "durationSec": dur,
             "screenFlash": bool(item.get("screenFlash", True)),
+            "zone": zone,
         })
     return out
 
@@ -752,7 +799,7 @@ class ShowSpec:
             demo_shout=str(raw.get("demoShout", "") or "").strip(),
             source_file=src_valid,
             song_start_sec=max(0.0, _f("songStartSec", 0.0)),
-            song_duration_sec=_clamp(_f("songDurationSec", 15.0), 0.0, 50.0),
+            song_duration_sec=_clamp(_f("songDurationSec", 15.0), 0.0, 65.0),
             fade_out_sec=_clamp(_f("fadeOutSec", 2.5), 0.3, 10.0),
             trim_leading_silence=bool(raw.get("trimLeadingSilence", True)),
             add_cheer=bool(raw.get("addCheer", True)),
@@ -3993,6 +4040,18 @@ class ShowDirector:
             if show_active or not workout_active:
                 return {"action": "stop"}
 
+        m_lt = re.match(
+            r"^(?:turn\s+|switch\s+|shut\s+|power\s+)?(on|off)\s+(?:the\s+)?(?:(rack|smith|all|house|gym)\s+)?lights?$|"
+            r"^(?:(?:turn|switch|shut|power)\s+)?(?:the\s+)?(?:(rack|smith|all|house|gym)\s+)?lights?\s+(on|off)$|"
+            r"^(?:turn\s+|switch\s+|shut\s+)?(?:the\s+)?house\s+lights?\s+(rack|smith)\s+(on|off)$",
+            cmd,
+        )
+        if m_lt:
+            state_tok = (m_lt.group(1) or m_lt.group(4) or m_lt.group(6) or "").lower()
+            zone_tok = (m_lt.group(2) or m_lt.group(3) or m_lt.group(5) or "all").lower()
+            zone = zone_tok if zone_tok in ("rack", "smith") else "all"
+            return {"action": "lights", "zone": zone, "on": state_tok == "on"}
+
         best: tuple[int, ShowSpec] | None = None
         with self._lock:
             specs = [self.shows[sid] for sid in self._show_order if sid in self.shows and self.shows[sid].enabled]
@@ -4028,13 +4087,36 @@ class ShowDirector:
         except Exception as exc:
             return {"ok": False, "url": clean, "error": str(exc)}
 
-    def _fire_lights_state(self, on: bool, *, tag: str = "", label: str = "", show_id: str = "", duration_ms: int = 1200) -> dict[str, Any]:
+    def _fire_http_hooks_parallel(self, urls: Sequence[str]) -> list[dict[str, Any]]:
+        clean_urls = [str(u or "").strip() for u in urls if str(u or "").strip()]
+        if not clean_urls:
+            return []
+        if len(clean_urls) == 1:
+            return [self._fire_http_hook(clean_urls[0])]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(clean_urls)) as ex:
+            futs = [ex.submit(self._fire_http_hook, u) for u in clean_urls]
+            return [f.result() for f in futs]
+
+    def _fire_lights_state(
+        self,
+        on: bool,
+        *,
+        zone: str = "all",
+        tag: str = "",
+        label: str = "",
+        show_id: str = "",
+        duration_ms: int = 1200,
+    ) -> dict[str, Any]:
         with self._lock:
             fx = self.fx_hooks
         if tag:
-            self._emit_cue(tag, label or tag, show_id=show_id, duration_ms=duration_ms, lightsOn=on)
-        url = fx.resolve_lights_url(on)
-        return self._fire_http_hook(url) if url else {"ok": False, "skipped": True}
+            self._emit_cue(tag, label or tag, show_id=show_id, duration_ms=duration_ms, lightsOn=on, zone=zone)
+        urls = fx.resolve_lights_urls(on, zone=zone)
+        if not urls:
+            return {"ok": False, "skipped": True, "zone": zone}
+        res_list = self._fire_http_hooks_parallel(urls)
+        ok = all(bool(r.get("ok")) for r in res_list)
+        return {"ok": ok, "zone": zone, "on": bool(on), "results": res_list}
 
     def _flash_lights(
         self,
@@ -4046,32 +4128,64 @@ class ShowDirector:
         on_sec: float = 0.18,
         off_sec: float = 0.16,
         tag_prefix: str = "FLASH",
+        zone: str = "all",
     ) -> None:
         with self._lock:
             fx = self.fx_hooks
-        on_url = fx.resolve_lights_url(True)
-        off_url = fx.resolve_lights_url(False)
         if count <= 0:
             return
+        z_norm = (zone or "all").strip().lower()
+        rack_on = fx.resolve_lights_urls(True, "rack")
+        rack_off = fx.resolve_lights_urls(False, "rack")
+        smith_on = fx.resolve_lights_urls(True, "smith")
+        smith_off = fx.resolve_lights_urls(False, "smith")
+        has_both = bool(rack_on and smith_on and rack_on != smith_on)
+        all_on = fx.resolve_lights_urls(True, "all")
+        all_off = fx.resolve_lights_urls(False, "all")
+        on_urls = all_on if (z_norm not in ("rack", "smith")) else fx.resolve_lights_urls(True, z_norm)
+        off_urls = all_off if (z_norm not in ("rack", "smith")) else fx.resolve_lights_urls(False, z_norm)
+
         for idx in range(1, count + 1):
             if cancel_ev and cancel_ev.is_set():
                 return
             lbl = f"({tag_prefix} {idx}/{count})" if count > 1 else f"({tag_prefix})"
-            self._emit_cue("flash", lbl, show_id=show_id, duration_ms=int(max(120, on_sec * 1000)), step=idx, total=count)
-            if on_url:
-                self._fire_http_hook(on_url)
-            if self._wait_cancelable(cancel_ev, on_sec):
-                return
-            # Skip final OFF if we're finishing ON for the last flash
-            if off_sec > 0.0 and not (end_on and idx == count):
-                if off_url:
-                    self._fire_http_hook(off_url)
-                if self._wait_cancelable(cancel_ev, off_sec):
+            self._emit_cue(
+                "flash",
+                lbl,
+                show_id=show_id,
+                duration_ms=int(max(120, on_sec * 1000)),
+                step=idx,
+                total=count,
+                zone=z_norm,
+            )
+            if z_norm == "alternate" and has_both:
+                step_urls = (rack_on + smith_off) if (idx % 2 == 1) else (smith_on + rack_off)
+                self._fire_http_hooks_parallel(step_urls)
+                if self._wait_cancelable(cancel_ev, on_sec):
                     return
-            elif not end_on and off_url:
-                self._fire_http_hook(off_url)
-        if end_on and on_url:
-            self._fire_http_hook(on_url)
+                if off_sec > 0.0 and not (end_on and idx == count):
+                    self._fire_http_hooks_parallel(all_off)
+                    if self._wait_cancelable(cancel_ev, off_sec):
+                        return
+                elif not end_on and all_off:
+                    self._fire_http_hooks_parallel(all_off)
+            else:
+                if on_urls:
+                    self._fire_http_hooks_parallel(on_urls)
+                if self._wait_cancelable(cancel_ev, on_sec):
+                    return
+                # Skip final OFF if we're finishing ON for the last flash
+                if off_sec > 0.0 and not (end_on and idx == count):
+                    if off_urls:
+                        self._fire_http_hooks_parallel(off_urls)
+                    if self._wait_cancelable(cancel_ev, off_sec):
+                        return
+                elif not end_on and off_urls:
+                    self._fire_http_hooks_parallel(off_urls)
+        if end_on:
+            fin_urls = all_on if z_norm == "alternate" else on_urls
+            if fin_urls:
+                self._fire_http_hooks_parallel(fin_urls)
 
     def _pulse_lights_loop(
         self,
@@ -4086,8 +4200,8 @@ class ShowDirector:
         n_pulses = max(1, int(round(dur / interval)))
         with self._lock:
             fx = self.fx_hooks
-        on_url = fx.resolve_lights_url(True)
-        off_url = fx.resolve_lights_url(False)
+        on_urls = fx.resolve_lights_urls(True, "all")
+        off_urls = fx.resolve_lights_urls(False, "all")
         for i in range(1, n_pulses + 1):
             if cancel_ev.is_set():
                 return True
@@ -4099,12 +4213,12 @@ class ShowDirector:
                 pulseIndex=i,
                 pulseTotal=n_pulses,
             )
-            if on_url:
-                self._fire_http_hook(on_url)
+            if on_urls:
+                self._fire_http_hooks_parallel(on_urls)
             if self._wait_cancelable(cancel_ev, on_s):
                 return True
-            if off_url:
-                self._fire_http_hook(off_url)
+            if off_urls:
+                self._fire_http_hooks_parallel(off_urls)
             if self._wait_cancelable(cancel_ev, off_s):
                 return True
         return False
@@ -4649,13 +4763,9 @@ class ShowDirector:
                         pulseIndex=idx_p,
                         pulseTotal=tot_p,
                     )
-                    on_u = fx.resolve_lights_url(True)
-                    if on_u:
-                        self._fire_http_hook(on_u)
+                    self._fire_http_hooks_parallel(fx.resolve_lights_urls(True, "all"))
                 elif kind == "pulse_off":
-                    off_u = fx.resolve_lights_url(False)
-                    if off_u:
-                        self._fire_http_hook(off_u)
+                    self._fire_http_hooks_parallel(fx.resolve_lights_urls(False, "all"))
                 elif kind == "lights_full_on":
                     self._fire_lights_state(
                         True,
@@ -4692,6 +4802,7 @@ class ShowDirector:
                     fx_type = str(payload.get("type") or "flash")
                     dur_fx = float(payload.get("durationSec") or 0.2)
                     cnt_fx = int(payload.get("count") or 1)
+                    zone_fx = str(payload.get("zone") or "all")
                     if fx_type == "flash":
                         self._flash_lights(
                             cnt_fx,
@@ -4701,15 +4812,16 @@ class ShowDirector:
                             on_sec=max(0.1, min(2.0, dur_fx)),
                             off_sec=0.14,
                             tag_prefix="FLASH · CUSTOM",
+                            zone=zone_fx,
                         )
                         sim_clock += cnt_fx * max(0.1, min(2.0, dur_fx)) + max(0, cnt_fx - 1) * 0.14
                     elif fx_type == "lights_off":
                         self._fire_lights_state(
-                            False, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
+                            False, zone=zone_fx, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
                         )
                     elif fx_type == "lights_on":
                         self._fire_lights_state(
-                            True, tag="lights_on", label="(LIGHTS ON · FX)", show_id=spec.id, duration_ms=1200
+                            True, zone=zone_fx, tag="lights_on", label="(LIGHTS ON · FX)", show_id=spec.id, duration_ms=1200
                         )
                     elif fx_type == "fog":
                         b_str = f"{dur_fx:.1f}".rstrip("0").rstrip(".")
@@ -4975,6 +5087,30 @@ class ShowDirector:
             rem_intro = max(0.15, preview_dur - intro_elapsed - 0.05)
             with self._lock:
                 self._active_state["phase"] = "playing"
+            if not (spec.three_screen_video and spec.youtube_url) and spec.lights_flash_count > 0:
+                both_z = bool(
+                    fx.resolve_lights_urls(True, "rack")
+                    and fx.resolve_lights_urls(True, "smith")
+                    and fx.resolve_lights_urls(True, "rack") != fx.resolve_lights_urls(True, "smith")
+                )
+                z_pr = "alternate" if both_z else "all"
+                if self._has_custom_sleep:
+                    self._flash_lights(
+                        spec.lights_flash_count,
+                        cancel_ev=cancel_ev,
+                        show_id=spec.id,
+                        end_on=True,
+                        zone=z_pr,
+                        tag_prefix="FLASH",
+                    )
+                else:
+                    threading.Thread(
+                        target=self._flash_lights,
+                        args=(spec.lights_flash_count, cancel_ev),
+                        kwargs={"show_id": spec.id, "end_on": True, "zone": z_pr, "tag_prefix": "FLASH"},
+                        name=f"ArmoryPrFlash-{spec.id}",
+                        daemon=True,
+                    ).start()
             if self._wait_cancelable(cancel_ev, rem_intro):
                 return {"ok": False, "canceled": True}
 

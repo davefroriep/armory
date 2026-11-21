@@ -224,6 +224,10 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "enough",
         "end",
         "cancel",
+        "rack lights",
+        "smith lights",
+        "lights on",
+        "lights off",
     ]
     seen = {x.lower() for x in core}
     extras: list[str] = []
