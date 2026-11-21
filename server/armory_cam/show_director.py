@@ -286,6 +286,7 @@ def sanitize_video_upload_filename(raw_name: str, show_id: str) -> str:
 def _norm_trigger_text(text: str) -> str:
     s = str(text or "").lower()
     s = s.replace("’", "'")
+    s = re.sub(r"\bp\.?\s*r\.?(?:'?e?d|\s+d)\b", " prd ", s)
     s = re.sub(r"\bp\.?\s*r\.?\b", " pr ", s)
     s = re.sub(r"\bmatt's\b", "matt is", s)
     s = re.sub(r"\bryder's\b", "ryder is", s)
@@ -838,10 +839,15 @@ def default_shows() -> list[ShowSpec]:
     return [
         ShowSpec(
             id="matt_pr",
-            name="Matt PR Drop-In (Simply the Best)",
+            name="Global PR Drop-In (Simply the Best)",
             kind="pr_drop",
             enabled=True,
             triggers=[
+                "i prd",
+                "matt prd",
+                "just prd",
+                "hit a pr",
+                "new pr",
                 "matt just hit a pr",
                 "matt hit a pr",
                 "matt pr",
@@ -4065,6 +4071,16 @@ class ShowDirector:
                     if best is None or len(nt) > best[0]:
                         best = (len(nt), spec)
         if best is None:
+            if (
+                re.search(
+                    r"\b(?:prd|(?:hit|got|set|broke|smashed|crushed)\s+(?:a\s+|my\s+|his\s+|her\s+|their\s+)?pr|new\s+pr|personal\s+record)\b",
+                    cmd,
+                )
+                or re.match(r"^(?:play\s+)?(?:the\s+)?pr(?:\s+(?:drop|song|music|track|show))?$", cmd)
+            ):
+                pr_spec = next((s for s in specs if s.kind == "pr_drop"), None)
+                if pr_spec is not None:
+                    return {"action": "fire", "showId": pr_spec.id, "showName": pr_spec.name}
             return None
         spec = best[1]
         return {"action": "fire", "showId": spec.id, "showName": spec.name}

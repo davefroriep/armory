@@ -2507,6 +2507,8 @@ class ShowDirectorTests(unittest.TestCase):
 
             prompt, hotwords = rv.build_whisper_prompt("armory")
             self.assertIn("Matt just hit a PR", prompt)
+            self.assertIn("I PR'd", prompt)
+            self.assertIn("Matt PR'd", prompt)
             self.assertIn("Matt just got here", prompt)
             self.assertIn("Ryder is here", prompt)
             self.assertIn("Jared and Mark", prompt)
@@ -2514,6 +2516,17 @@ class ShowDirectorTests(unittest.TestCase):
             sd_dir = svc.shows
             self.assertEqual(sd_dir.match_voice_command("Armory, Matt just hit a PR")["showId"], "matt_pr")
             self.assertEqual(sd_dir.match_voice_command("Hey Armory matt hit a p.r.")["showId"], "matt_pr")
+            for pr_phrase in (
+                "Armory, Matt PR'd",
+                "Armory, I PR'd",
+                "Armory, I P.R.'d",
+                "Armory, Ryder just PR'd",
+                "Armory, I just hit a PR",
+                "Armory, we broke a PR",
+                "Armory, new PR",
+                "Armory, PR",
+            ):
+                self.assertEqual(sd_dir.match_voice_command(pr_phrase)["showId"], "matt_pr", msg=pr_phrase)
             self.assertEqual(sd_dir.match_voice_command("Armory Matt just got here")["showId"], "matt_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Matt's in the gym")["showId"], "matt_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory, Matt is here")["showId"], "matt_walkin")
@@ -2523,8 +2536,14 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(sd_dir.match_voice_command("Armory Gabe is here")["showId"], "gabe_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Josh is here")["showId"], "josh_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory stop show")["action"], "stop")
+            self.assertIsNone(sd_dir.match_voice_command("Armory, incline press 185 for 6"))
             self.assertIsNone(sd_dir.match_voice_command("Armory 225 for 8"))
             self.assertIsNone(sd_dir.match_voice_command("Armory open the gym"))
+
+            # Disabling matt_pr cleanly disables both trigger matching and the global PR fallback
+            sd_dir.shows["matt_pr"].enabled = False
+            self.assertIsNone(sd_dir.match_voice_command("Armory, I PR'd"))
+            sd_dir.shows["matt_pr"].enabled = True
 
             # Voice injection for matt_pr fires locally, stays off Pixel SSE, and suppresses S330 TTS readback
             with mock.patch.object(svc.shows, "fire_show", return_value={"ok": True, "showId": "matt_pr", "showName": "Matt PR Drop-In"}) as m_fire:
