@@ -75,7 +75,7 @@ class SpinDisplayConfig:
     mac: str = ""
     ecp_port: int = 8060
     hdmi_input: str = "InputHDMI1"
-    auto_denon_dual: bool = True
+    auto_denon_dual: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -101,7 +101,7 @@ class SpinDisplayConfig:
             mac=str(raw.get("mac", "") or "").strip(),
             ecp_port=ecp_port,
             hdmi_input=str(raw.get("hdmiInput", "InputHDMI1") or "InputHDMI1").strip(),
-            auto_denon_dual=bool(raw.get("autoDenonDual", True)),
+            auto_denon_dual=bool(raw.get("autoDenonDual", False)),
         )
 
 

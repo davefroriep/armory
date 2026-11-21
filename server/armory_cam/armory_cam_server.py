@@ -4874,7 +4874,7 @@ DASHBOARD_HTML = """<!doctype html>
       <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
       <div>
         <label>Auto Denon Monitor 1 / Dual</label>
-        <select id="dpSpinDual"><option value="1">Yes (Single Sink when Spin OFF)</option><option value="0">No (Leave Denon Auto)</option></select>
+        <select id="dpSpinDual"><option value="0">No (Keep Denon on Auto Dual)</option><option value="1">Yes (Single Sink when Spin OFF)</option></select>
       </div>
     </div>
     <div class="ctrl-row" style="margin-top:10px">
@@ -7364,7 +7364,7 @@ function populateDisplaysInputs(dc) {
   $('dpSpinHost').value = s.host || '';
   $('dpSpinMac').value = s.mac || '';
   $('dpSpinHdmi').value = s.hdmiInput || 'InputHDMI1';
-  $('dpSpinDual').value = s.autoDenonDual === false ? '0' : '1';
+  $('dpSpinDual').value = s.autoDenonDual === true ? '1' : '0';
 }
 
 function syncDisplaysUI(ds) {

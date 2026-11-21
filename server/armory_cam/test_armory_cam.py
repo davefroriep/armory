@@ -2042,6 +2042,7 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertEqual(dc.parse_display_voice_command("Armory sleep wallboard"), {"target": "wallboard", "action": "off", "speech": "Wallboard off"})
         self.assertEqual(dc.parse_display_voice_command("Armory turn off denon")["target"], "avr")
         self.assertEqual(dc.parse_display_voice_command("Armory gym off"), {"target": "gym", "action": "off", "speech": "Gym displays off"})
+        self.assertFalse(dc.SpinDisplayConfig().auto_denon_dual)
 
         # 2. Controller: Primary ADB discrete keyevents + Roku ECP + Denon VSMONIAUTO/VSMONI1 + Wallboard
         adb_cmds: list[list[str]] = []
