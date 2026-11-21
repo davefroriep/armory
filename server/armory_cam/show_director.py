@@ -8,6 +8,7 @@ local HTTP smart-home hooks (lighting flashes & fog machine triggers).
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -16,6 +17,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import queue
 import re
 import shlex
 import subprocess
@@ -27,7 +29,7 @@ import urllib.request
 import wave
 
 import numpy as np
-from scipy.signal import butter, sosfilt
+from scipy.signal import butter, fftconvolve, resample_poly, sosfilt
 
 try:
     from .display_control import _strip_wake_prefix, normalize_youtube_tv_url
@@ -47,7 +49,73 @@ VALID_SHOW_KINDS = ("pr_drop", "walkin", "debut_video")
 VALID_CUBE_MODES = ("duck", "takeover", "overlay")
 VALID_DEMO_STYLES = ("anthem", "boombap", "thunder_only", "hype")
 RYDER_ENTRANCE_URL = "https://www.youtube.com/watch?v=05vwKMySzKw"
-DEFAULT_ANNOUNCER_VOICE = "en-US-ChristopherNeural"
+DEFAULT_ANNOUNCER_VOICE = "kokoro:onyx_fenrir_epic"
+DEFAULT_KOKORO_MODELS_DIR = Path(r"S:\ArmoryCam\models\kokoro")
+BANNED_ROBOTIC_VOICES = frozenset({"en-US-ChristopherNeural", "sapi"})
+
+EPIC_VOICE_PRESETS: dict[str, dict[str, Any]] = {
+    "kokoro:onyx_fenrir_epic": {
+        "label": "Onyx + Fenrir Epic (Deep Ring Announcer)",
+        "engine": "kokoro",
+        "weights": {"am_onyx": 0.55, "am_fenrir": 0.45},
+        "speed": 0.90,
+        "finalSpeed": 0.80,
+    },
+    "kokoro:am_onyx": {
+        "label": "Onyx Ultra-Deep (Movie Trailer Bass)",
+        "engine": "kokoro",
+        "weights": {"am_onyx": 1.0},
+        "speed": 0.90,
+        "finalSpeed": 0.80,
+    },
+    "kokoro:onyx_george_hbo": {
+        "label": "Onyx + George HBO (Championship Boxing)",
+        "engine": "kokoro",
+        "weights": {"am_onyx": 0.55, "bm_george": 0.45},
+        "speed": 0.89,
+        "finalSpeed": 0.79,
+    },
+    "kokoro:am_fenrir": {
+        "label": "Fenrir Bold Epic Baritone",
+        "engine": "kokoro",
+        "weights": {"am_fenrir": 1.0},
+        "speed": 0.92,
+        "finalSpeed": 0.82,
+    },
+    "kokoro:am_adam": {
+        "label": "Adam Rich American Baritone",
+        "engine": "kokoro",
+        "weights": {"am_adam": 1.0},
+        "speed": 0.92,
+        "finalSpeed": 0.84,
+    },
+    "edge:en-US-BrianMultilingualNeural": {
+        "label": "Brian HD Multilingual (Clean Edge)",
+        "engine": "edge",
+        "voice": "en-US-BrianMultilingualNeural",
+        "rate": "-4%",
+    },
+    "edge:en-US-AndrewMultilingualNeural": {
+        "label": "Andrew HD Multilingual (Clean Edge)",
+        "engine": "edge",
+        "voice": "en-US-AndrewMultilingualNeural",
+        "rate": "-4%",
+    },
+}
+
+
+def resolve_voice_id(voice: str | None) -> str:
+    """Resolve preset ID while rejecting legacy robotic/warbled voices."""
+    raw = str(voice or "").strip()
+    if not raw or raw in BANNED_ROBOTIC_VOICES:
+        return DEFAULT_ANNOUNCER_VOICE
+    if raw in EPIC_VOICE_PRESETS:
+        return raw
+    if raw.startswith("edge:") and raw[5:].strip() not in BANNED_ROBOTIC_VOICES:
+        return raw
+    if raw in ("en-US-BrianMultilingualNeural", "en-US-AndrewMultilingualNeural"):
+        return f"edge:{raw}"
+    return DEFAULT_ANNOUNCER_VOICE
 
 
 def _clamp(val: float, lo: float, hi: float) -> float:
@@ -143,7 +211,7 @@ class SmartFxConfig:
         if not isinstance(raw, dict):
             return cls()
         try:
-            burst = _clamp(float(raw.get("fogBurstSec", 4.0) or 4.0), 1.0, 10.0)
+            burst = _clamp(float(raw.get("fogBurstSec", 4.0) or 4.0), 1.0, 60.0)
         except (TypeError, ValueError):
             burst = 4.0
         return cls(
@@ -165,8 +233,9 @@ class SmartFxConfig:
         flag = "true" if on else "false"
         return f"http://{host}/rpc/Switch.Set?id=0&on={flag}"
 
-    def resolve_fog_url(self) -> str:
-        sec_str = f"{_clamp(self.fog_burst_sec, 1.0, 10.0):.1f}".rstrip("0").rstrip(".")
+    def resolve_fog_url(self, burst_sec: float | None = None) -> str:
+        val = float(burst_sec) if (burst_sec is not None and float(burst_sec) > 0.0) else float(self.fog_burst_sec)
+        sec_str = f"{_clamp(val, 1.0, 60.0):.1f}".rstrip("0").rstrip(".")
         if self.fog_trigger_url:
             return self.fog_trigger_url.replace("{sec}", sec_str)
         host = self.fog_host.strip()
@@ -190,7 +259,7 @@ class ShowSpec:
     announcer_text: str = ""
     announcer_voice: str = DEFAULT_ANNOUNCER_VOICE
     announcer_rate: str = "-6%"
-    announcer_pitch: str = "-4Hz"
+    announcer_pitch: str = ""
     demo_style: str = "anthem"
     demo_shout: str = ""
     source_file: str = ""
@@ -207,6 +276,17 @@ class ShowSpec:
     youtube_url: str = ""
     three_screen_video: bool = False
     video_hold_sec: float = 45.0
+    is_dev_drop: bool = False
+    fog_burst_sec: float = 0.0
+    lightning_flash_sec: float = 0.0
+    lights_pulse_duration_sec: float = 0.0
+    lights_pulse_interval_sec: float = 2.0
+    lights_pulse_on_sec: float = 0.25
+    overlay_at_sec: float = 0.0
+    overlay_text: str = ""
+    post_overlay_denon_vol: int = 0
+    voice_reverb_wet: float = 0.11
+    voice_boost_db: float = 2.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -219,7 +299,7 @@ class ShowSpec:
             "cubeMode": self.cube_mode,
             "overlayGain": round(float(self.overlay_gain), 2),
             "announcerText": self.announcer_text,
-            "announcerVoice": self.announcer_voice,
+            "announcerVoice": resolve_voice_id(self.announcer_voice),
             "announcerRate": self.announcer_rate,
             "announcerPitch": self.announcer_pitch,
             "demoStyle": self.demo_style,
@@ -238,6 +318,17 @@ class ShowSpec:
             "youtubeUrl": self.youtube_url,
             "threeScreenVideo": bool(self.three_screen_video),
             "videoHoldSec": round(float(self.video_hold_sec), 1),
+            "isDevDrop": bool(self.is_dev_drop),
+            "fogBurstSec": round(float(self.fog_burst_sec), 1),
+            "lightningFlashSec": round(float(self.lightning_flash_sec), 2),
+            "lightsPulseDurationSec": round(float(self.lights_pulse_duration_sec), 1),
+            "lightsPulseIntervalSec": round(float(self.lights_pulse_interval_sec), 2),
+            "lightsPulseOnSec": round(float(self.lights_pulse_on_sec), 2),
+            "overlayAtSec": round(float(self.overlay_at_sec), 1),
+            "overlayText": self.overlay_text,
+            "postOverlayDenonVol": int(self.post_overlay_denon_vol),
+            "voiceReverbWet": round(float(self.voice_reverb_wet), 2),
+            "voiceBoostDb": round(float(self.voice_boost_db), 1),
         }
 
     @classmethod
@@ -279,6 +370,9 @@ class ShowSpec:
                 if nt and nt not in triggers:
                     triggers.append(nt)
         src_valid = validate_song_filename(str(raw.get("sourceFile", "") or "")) or ""
+        post_vol = _i("postOverlayDenonVol", 0)
+        if post_vol != 0:
+            post_vol = max(MIN_SHOW_DENON_VOL, min(MAX_SHOW_DENON_VOL, post_vol))
         return cls(
             id=sid,
             name=str(raw.get("name") or sid).strip(),
@@ -289,9 +383,9 @@ class ShowSpec:
             cube_mode=cube_mode,
             overlay_gain=_clamp(_f("overlayGain", 1.0), 0.1, 1.0),
             announcer_text=str(raw.get("announcerText", "") or "").strip(),
-            announcer_voice=str(raw.get("announcerVoice", DEFAULT_ANNOUNCER_VOICE) or DEFAULT_ANNOUNCER_VOICE).strip(),
+            announcer_voice=resolve_voice_id(raw.get("announcerVoice")),
             announcer_rate=str(raw.get("announcerRate", "-6%") or "-6%").strip(),
-            announcer_pitch=str(raw.get("announcerPitch", "-4Hz") or "-4Hz").strip(),
+            announcer_pitch="",  # Never inject warbly SSML pitch shifts
             demo_style=demo_style,
             demo_shout=str(raw.get("demoShout", "") or "").strip(),
             source_file=src_valid,
@@ -307,7 +401,18 @@ class ShowSpec:
             trigger_fog=bool(raw.get("triggerFog", False)),
             youtube_url=str(raw.get("youtubeUrl", "") or "").strip(),
             three_screen_video=bool(raw.get("threeScreenVideo", False)),
-            video_hold_sec=_clamp(_f("videoHoldSec", 45.0), 5.0, 240.0),
+            video_hold_sec=_clamp(_f("videoHoldSec", 45.0), 5.0, 300.0),
+            is_dev_drop=bool(raw.get("isDevDrop", sid == "ryder_walkin")),
+            fog_burst_sec=_clamp(_f("fogBurstSec", 0.0), 0.0, 60.0),
+            lightning_flash_sec=_clamp(_f("lightningFlashSec", 0.0), 0.0, 15.0),
+            lights_pulse_duration_sec=_clamp(_f("lightsPulseDurationSec", 0.0), 0.0, 120.0),
+            lights_pulse_interval_sec=_clamp(_f("lightsPulseIntervalSec", 2.0), 0.5, 15.0),
+            lights_pulse_on_sec=_clamp(_f("lightsPulseOnSec", 0.25), 0.1, 2.0),
+            overlay_at_sec=_clamp(_f("overlayAtSec", 0.0), 0.0, 300.0),
+            overlay_text=str(raw.get("overlayText", "") or "").strip(),
+            post_overlay_denon_vol=post_vol,
+            voice_reverb_wet=_clamp(_f("voiceReverbWet", 0.11), 0.0, 0.30),
+            voice_boost_db=_clamp(_f("voiceBoostDb", 2.0), -4.0, 6.0),
         )
 
 
@@ -374,7 +479,7 @@ def default_shows() -> list[ShowSpec]:
         ),
         ShowSpec(
             id="ryder_walkin",
-            name="Ryder Curry Debut (Thunder + Fog + 3 Screens)",
+            name="DEV DROP · Ryder Curry Debut (Thunder + 30s Fog + 3 Screens + 1:20 Overlay)",
             kind="debut_video",
             enabled=True,
             triggers=[
@@ -391,12 +496,13 @@ def default_shows() -> list[ShowSpec]:
             cube_mode="takeover",
             overlay_gain=1.0,
             announcer_text=(
-                "Ladies and gentlemen! Out of Toms River, New Jersey... "
-                "making his Armory debut... Ryder... Curry!!"
+                "Ladies and gentlemen! ... "
+                "Out of Toms River, New Jersey! ... "
+                "Making his Armory debut... Ryder, Curry!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
-            announcer_rate="-8%",
-            announcer_pitch="-5Hz",
+            announcer_rate="-6%",
+            announcer_pitch="",
             demo_style="thunder_only",
             song_start_sec=0.0,
             song_duration_sec=0.0,
@@ -410,7 +516,18 @@ def default_shows() -> list[ShowSpec]:
             trigger_fog=True,
             youtube_url=RYDER_ENTRANCE_URL,
             three_screen_video=True,
-            video_hold_sec=45.0,
+            video_hold_sec=218.0,
+            is_dev_drop=True,
+            fog_burst_sec=30.0,
+            lightning_flash_sec=0.75,
+            lights_pulse_duration_sec=20.0,
+            lights_pulse_interval_sec=2.0,
+            lights_pulse_on_sec=0.25,
+            overlay_at_sec=80.0,
+            overlay_text="Ryder Curry... welcome to The Armory. Remember... strength is never a weakness.",
+            post_overlay_denon_vol=55,
+            voice_reverb_wet=0.11,
+            voice_boost_db=2.0,
         ),
         ShowSpec(
             id="jared_mark_walkin",
@@ -644,8 +761,13 @@ def synth_crowd_cheer_stereo(
     return apply_fade_out_stereo(stereo, sr=sr, fade_out_sec=fade_out_sec)
 
 
-def synth_thunder_rumble_stereo(dur_sec: float = 4.2, sr: int = SHOW_SR) -> np.ndarray:
-    """Deep stadium sub-bass rolling thunder + initial lightning crack."""
+def synth_thunder_rumble_stereo(
+    dur_sec: float = 4.2,
+    sr: int = SHOW_SR,
+    *,
+    crack_at_sec: float = 0.75,
+) -> np.ndarray:
+    """Deep stadium sub-bass rolling thunder + timed lightning crack transient."""
     n = max(1, int(round(max(1.0, dur_sec) * sr)))
     rng = np.random.default_rng(7731)
     nl = rng.standard_normal(n).astype(np.float32)
@@ -655,15 +777,16 @@ def synth_thunder_rumble_stereo(dur_sec: float = 4.2, sr: int = SHOW_SR) -> np.n
     sos_sub = butter(3, [32.0, 145.0], btype="bandpass", fs=sr, output="sos")
     sos_crack = butter(2, [420.0, 2600.0], btype="bandpass", fs=sr, output="sos")
 
+    c0 = max(0.05, float(crack_at_sec))
     env_rumble = (
-        np.exp(-((t - 0.55) / 0.95) ** 2)
-        + 0.72 * np.exp(-((t - 2.15) / 1.15) ** 2)
-        + 0.40 * np.exp(-t / max(0.8, dur_sec * 0.45))
+        np.exp(-((t - c0) / 0.75) ** 2)
+        + 0.72 * np.exp(-((t - (c0 + 1.4)) / 1.05) ** 2)
+        + 0.35 * np.exp(-t / max(0.8, dur_sec * 0.45))
     )
-    crack_env = np.exp(-np.maximum(0.0, t - 0.08) / 0.14) * (t >= 0.08)
+    crack_env = np.exp(-np.maximum(0.0, t - c0) / 0.14) * (t >= c0)
 
-    l = (sosfilt(sos_sub, nl) * env_rumble * 1.35 + sosfilt(sos_crack, nl) * crack_env * 0.35).astype(np.float32)
-    r = (sosfilt(sos_sub, nr) * env_rumble * 1.35 + sosfilt(sos_crack, nr) * crack_env * 0.35).astype(np.float32)
+    l = (sosfilt(sos_sub, nl) * env_rumble * 1.35 + sosfilt(sos_crack, nl) * crack_env * 0.42).astype(np.float32)
+    r = (sosfilt(sos_sub, nr) * env_rumble * 1.35 + sosfilt(sos_crack, nr) * crack_env * 0.42).astype(np.float32)
     stereo = np.stack([l, r], axis=1)
     peak = float(np.max(np.abs(stereo)))
     if peak > 1e-6:
@@ -803,56 +926,189 @@ def pad_wav_for_cube_duck(
     return bio.getvalue(), dur_sec
 
 
-# ---------------- Announcer TTS & Song Decoding Pipeline ----------------
+# ---------------- Studio Kokoro Neural TTS & Mastering ----------------
+
+_KOKORO_LOCK = threading.Lock()
+_KOKORO_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def _resolve_kokoro_paths(models_dir: Path | None, *, allow_fallback: bool) -> tuple[Path, Path] | None:
+    candidates: list[Path] = []
+    if models_dir is not None:
+        candidates.append(Path(models_dir))
+    if allow_fallback and DEFAULT_KOKORO_MODELS_DIR not in candidates:
+        candidates.append(DEFAULT_KOKORO_MODELS_DIR)
+    for d in candidates:
+        onnx_p = d / "kokoro-v1.0.onnx"
+        voices_p = d / "voices-v1.0.bin"
+        if onnx_p.is_file() and voices_p.is_file():
+            return onnx_p, voices_p
+    return None
+
+
+def _get_kokoro(models_dir: Path | None, *, allow_fallback: bool = True) -> Any | None:
+    paths = _resolve_kokoro_paths(models_dir, allow_fallback=allow_fallback)
+    if paths is None:
+        return None
+    key = (str(paths[0].resolve()), str(paths[1].resolve()))
+    with _KOKORO_LOCK:
+        inst = _KOKORO_CACHE.get(key)
+        if inst is not None:
+            return inst
+        from kokoro_onnx import Kokoro
+        inst = Kokoro(str(paths[0]), str(paths[1]))
+        _KOKORO_CACHE[key] = inst
+        return inst
+
+
+def kokoro_models_available(models_dir: Path | None = None) -> bool:
+    return _resolve_kokoro_paths(models_dir, allow_fallback=True) is not None
+
+
+def _split_announcer_beats(text: str) -> list[str]:
+    """Split script on '...' or '|' so ring-announcer pauses land cleanly."""
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not normalized:
+        return []
+    parts = [p.strip() for p in re.split(r"\s*(?:\.{3,}|…|\|)\s*", normalized) if p.strip()]
+    return parts or [normalized]
+
+
+def master_announcer_stereo(
+    mono_pcm: np.ndarray,
+    src_sr: int,
+    *,
+    target_sr: int = SHOW_SR,
+    reverb_wet: float = 0.11,
+    boost_db: float = 2.0,
+) -> np.ndarray:
+    """Broadcast/arena mastering: clean resample, chest EQ, diffuse convolution hall, -1 dBFS true-peak cap."""
+    x = np.asarray(mono_pcm, dtype=np.float32).reshape(-1)
+    if x.size < 16:
+        return np.zeros((max(16, int(0.2 * target_sr)), 2), dtype=np.float32)
+
+    if int(src_sr) != int(target_sr):
+        g = math.gcd(int(src_sr), int(target_sr))
+        x = resample_poly(x, int(target_sr) // g, int(src_sr) // g).astype(np.float32)
+
+    # 1. Clean 55 Hz sub-rumble filter (preserves deep 80-180 Hz baritone chest resonance!)
+    sos_hpf = butter(2, 55.0, btype="highpass", fs=target_sr, output="sos")
+    x = sosfilt(sos_hpf, x).astype(np.float32)
+
+    # 2. Warm baritone chest fullness (85-220 Hz) + crisp presence (2.4-4.2 kHz), zero harshness
+    sos_warm = butter(2, [85.0, 220.0], btype="bandpass", fs=target_sr, output="sos")
+    sos_pres = butter(2, [2400.0, 4200.0], btype="bandpass", fs=target_sr, output="sos")
+    x = x + 0.34 * sosfilt(sos_warm, x).astype(np.float32) + 0.18 * sosfilt(sos_pres, x).astype(np.float32)
+
+    # 3. Gentle broadcast compression & level target BEFORE stereo hall IR
+    env = np.sqrt(np.maximum(1e-8, sosfilt(butter(1, 14.0, btype="lowpass", fs=target_sr, output="sos"), x * x)))
+    comp_gain = np.where(env > 0.18, 0.18 + (env - 0.18) * 0.42, env) / env
+    x = (x * comp_gain).astype(np.float32)
+
+    rms = float(np.sqrt(np.mean(x * x)))
+    if rms > 1e-6:
+        x *= 0.25 / rms
+
+    # 4. Diffuse stereo stadium hall convolution reverb (35 ms pre-delay, warm 3 kHz damped tail, NO metallic aecho!)
+    wet = _clamp(float(reverb_wet), 0.0, 0.30)
+    if wet > 0.005:
+        ir_len = int(round(0.95 * target_sr))
+        pre_n = int(round(0.035 * target_sr))
+        rng = np.random.default_rng(4401)
+        t_ir = np.linspace(0.0, 0.95, ir_len, endpoint=False, dtype=np.float32)
+        decay = np.exp(-t_ir / 0.28)
+        sos_ir = butter(2, 3000.0, btype="lowpass", fs=target_sr, output="sos")
+        ir_l = sosfilt(sos_ir, rng.standard_normal(ir_len).astype(np.float32)) * decay
+        ir_r = sosfilt(sos_ir, rng.standard_normal(ir_len).astype(np.float32)) * decay
+        ir_l[:pre_n] = 0.0
+        ir_r[:pre_n] = 0.0
+        norm_ir = max(float(np.sqrt(np.sum(ir_l * ir_l))), float(np.sqrt(np.sum(ir_r * ir_r))), 1e-6)
+        ir_l /= norm_ir
+        ir_r /= norm_ir
+        # Subtle early stereo width + diffuse tail
+        tail_n = int(round(0.45 * target_sr))
+        xp = np.pad(x, (0, tail_n))
+        wet_l = fftconvolve(xp, ir_l, mode="full")[: xp.size].astype(np.float32)
+        wet_r = fftconvolve(xp, ir_r, mode="full")[: xp.size].astype(np.float32)
+        stereo = np.stack([(1.0 - wet) * xp + wet * wet_l, (1.0 - wet) * xp + wet * wet_r], axis=1)
+    else:
+        stereo = np.stack([x, x], axis=1)
+
+    # 5. Loudness trim + smooth soft-knee true-peak limiter (0.90 ceiling = -0.9 dBFS, ZERO hard clipping)
+    lin_boost = 10.0 ** (_clamp(float(boost_db), -4.0, 6.0) / 20.0)
+    stereo = stereo * float(lin_boost)
+    peak = float(np.max(np.abs(stereo)))
+    if peak > 0.90:
+        # Smooth tanh knee above 0.72 so spikes saturate warmly like analog hardware instead of clipping
+        stereo = np.where(np.abs(stereo) > 0.72, np.sign(stereo) * (0.72 + 0.18 * np.tanh((np.abs(stereo) - 0.72) / 0.25)), stereo)
+        pk2 = float(np.max(np.abs(stereo)))
+        if pk2 > 0.90:
+            stereo *= 0.90 / pk2
+
+    return trim_edge_silence_stereo(stereo.astype(np.float32), sr=target_sr, thresh=0.008, pad_lead_ms=10.0, pad_tail_ms=90.0)
+
+
+def duck_bed_under_speech(
+    bed: np.ndarray,
+    speech: np.ndarray,
+    speech_offset_samples: int,
+    *,
+    sr: int = SHOW_SR,
+    duck_gain: float = 0.16,
+    base_gain: float = 0.85,
+) -> np.ndarray:
+    """Smoothly duck thunder/crowd bed `-16 dB` whenever speech is speaking so every syllable dominates."""
+    out = bed.copy()
+    if out.shape[0] == 0 or speech.shape[0] == 0:
+        return out * float(base_gain)
+    sp_env_full = np.zeros(out.shape[0], dtype=np.float32)
+    s0 = max(0, int(speech_offset_samples))
+    avail = min(speech.shape[0], out.shape[0] - s0)
+    if avail > 0:
+        sp_abs = np.max(np.abs(speech[:avail]), axis=1)
+        sos_env = butter(1, 4.5, btype="lowpass", fs=sr, output="sos")
+        smooth = sosfilt(sos_env, sp_abs).astype(np.float32)
+        sp_env_full[s0 : s0 + avail] = smooth
+    # Normalize speech envelope into [0, 1] duck control signal (active above gentle speech floor)
+    gate = np.clip((sp_env_full - 0.015) / 0.065, 0.0, 1.0)
+    # Zero-phase forward-backward smoothing so duck dips slightly BEFORE each word
+    sos_sm = butter(1, 5.5, btype="lowpass", fs=sr, output="sos")
+    gate = np.clip(sosfilt(sos_sm, gate[::-1])[::-1], 0.0, 1.0)
+    gain_curve = (float(base_gain) - gate * (float(base_gain) - float(duck_gain))).astype(np.float32)
+    return (out * gain_curve[:, None]).astype(np.float32)
 
 
 def synthesize_announcer_wav(
     text: str,
     *,
     voice: str = DEFAULT_ANNOUNCER_VOICE,
-    rate: str = "-6%",
-    pitch: str = "-4Hz",
+    rate: str = "-4%",
+    pitch: str = "",
     out_wav: Path,
     ffmpeg_bin: str = "",
     allow_network: bool = True,
+    models_dir: Path | None = None,
+    reverb_wet: float = 0.11,
+    boost_db: float = 2.0,
 ) -> Path:
-    """Synthesize a stadium PA arena-announcer WAV using Edge Neural TTS + FFmpeg reverb/EQ."""
-    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    """Synthesize a high-end studio neural announcer stem (Kokoro-82M FP32 -> Edge HD fallback)."""
+    del pitch  # Forbidden SSML pitch-shifting warble
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    if not clean or not allow_network:
-        # Offline/test mode deterministic tonal intro
-        t_dur = 0.8 if not clean else 1.2
-        pcm = synth_demo_music_bed("anthem", t_dur, sr=SHOW_SR) * 0.55
-        pcm = apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=0.25)
+    beats = _split_announcer_beats(text)
+    if not beats:
+        pcm = np.zeros((int(0.5 * SHOW_SR), 2), dtype=np.float32)
         tmp = out_wav.with_suffix(".wav.tmp")
         tmp.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
         tmp.replace(out_wav)
         return out_wav
 
-    import asyncio
-    import edge_tts
+    voice_id = resolve_voice_id(voice)
+    preset = EPIC_VOICE_PRESETS.get(voice_id, EPIC_VOICE_PRESETS[DEFAULT_ANNOUNCER_VOICE])
+    engine = preset.get("engine", "kokoro")
 
-    async def _fetch(use_pitch: bool) -> bytes:
-        kwargs: dict[str, Any] = {"voice": voice, "rate": rate}
-        if use_pitch and pitch:
-            kwargs["pitch"] = pitch
-        comm = edge_tts.Communicate(clean, **kwargs)
-        chunks: list[bytes] = []
-        async for ch in comm.stream():
-            if ch.get("type") == "audio":
-                chunks.append(ch["data"])
-        return b"".join(chunks)
-
-    mp3_bytes = b""
-    for attempt in range(3):
-        try:
-            mp3_bytes = asyncio.run(_fetch(use_pitch=(attempt == 0)))
-            if mp3_bytes:
-                break
-        except Exception:
-            time.sleep(0.25 * (attempt + 1))
-
-    if not mp3_bytes:
+    # Offline test deterministic fallback ONLY when Kokoro weights aren't staged locally
+    kokoro = _get_kokoro(models_dir, allow_fallback=allow_network) if engine == "kokoro" else None
+    if not allow_network and kokoro is None:
         pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
         pcm = apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=0.25)
         tmp = out_wav.with_suffix(".wav.tmp")
@@ -860,70 +1116,111 @@ def synthesize_announcer_wav(
         tmp.replace(out_wav)
         return out_wav
 
-    raw_mp3 = out_wav.with_suffix(".raw.mp3")
-    tmp_wav = out_wav.with_suffix(".wav.tmp")
-    raw_mp3.write_bytes(mp3_bytes)
-    try:
-        if ffmpeg_bin:
-            pa_filter = (
-                "silenceremove=start_periods=1:start_silence=0.02:start_threshold=-40dB,"
-                "highpass=f=85,"
-                "equalizer=f=240:width_type=o:width=1.2:g=3.5,"
-                "equalizer=f=2800:width_type=o:width=1.2:g=4.0,"
-                "acompressor=threshold=-18dB:ratio=4:attack=8:release=120:makeup=4dB,"
-                "aecho=0.82:0.74:55|115:0.26|0.15,"
-                "alimiter=limit=0.95"
-            )
-            proc = subprocess.run(
-                [
-                    ffmpeg_bin,
-                    "-y",
-                    "-i",
-                    str(raw_mp3),
-                    "-af",
-                    pa_filter,
-                    "-ar",
-                    str(SHOW_SR),
-                    "-ac",
-                    "2",
-                    "-c:a",
-                    "pcm_s16le",
-                    str(tmp_wav),
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=30,
-                **_no_window_kwargs(),
-            )
-            if proc.returncode == 0 and tmp_wav.is_file() and tmp_wav.stat().st_size > 100:
-                pcm = trim_edge_silence_stereo(read_wav_stereo_float(tmp_wav, target_sr=SHOW_SR), sr=SHOW_SR)
-                tmp_wav.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
-                tmp_wav.replace(out_wav)
-                return out_wav
-
-        # Fallback PyAV decode if ffmpeg binary is unavailable
-        import av
-
-        resampler = av.AudioResampler(format="flt", layout="stereo", rate=SHOW_SR)
+    # Path 1: Local Kokoro-82M FP32 studio neural synthesis
+    if engine == "kokoro" and kokoro is not None:
+        weights: dict[str, float] = dict(preset.get("weights") or {"am_onyx": 0.55, "am_fenrir": 0.45})
+        style_vec = None
+        for v_name, w in weights.items():
+            vec = kokoro.get_voice_style(v_name) * float(w)
+            style_vec = vec if style_vec is None else (style_vec + vec)
+        base_speed = float(preset.get("speed", 0.90))
+        final_speed = float(preset.get("finalSpeed", 0.80))
         parts: list[np.ndarray] = []
+        k_sr = 24_000
+        for idx, phrase in enumerate(beats):
+            is_last = idx == len(beats) - 1 and len(beats) > 1
+            spd = final_speed if is_last else base_speed
+            samples, k_sr = kokoro.create(phrase, voice=style_vec, speed=spd, lang="en-us")
+            arr = np.asarray(samples, dtype=np.float32).reshape(-1)
+            # Strip dead edges cleanly on each beat before adding exact dramatic rest
+            nz = np.flatnonzero(np.abs(arr) >= 0.008)
+            if nz.size:
+                pad_s = int(0.02 * k_sr)
+                arr = arr[max(0, int(nz[0]) - pad_s) : min(arr.size, int(nz[-1]) + pad_s)]
+            parts.append(arr)
+            if idx < len(beats) - 1:
+                next_is_last = (idx + 1) == (len(beats) - 1) and len(beats) > 1
+                gap_sec = 0.50 if next_is_last else 0.36
+                parts.append(np.zeros(int(round(gap_sec * k_sr)), dtype=np.float32))
+        mono = np.concatenate(parts) if parts else np.zeros(int(0.5 * k_sr), dtype=np.float32)
+        stereo = master_announcer_stereo(mono, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+        tmp = out_wav.with_suffix(".wav.tmp")
+        tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
+        tmp.replace(out_wav)
+        return out_wav
+
+    # Path 2: Clean HD Edge Multilingual voice (ZERO SSML pitch warble, ZERO aecho)
+    edge_voice = str(preset.get("voice") or "en-US-BrianMultilingualNeural")
+    edge_rate = str(preset.get("rate") or rate or "-4%")
+    if not edge_rate.startswith(("+", "-")):
+        edge_rate = "-4%"
+
+    if not allow_network:
+        pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
+        pcm = apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=0.25)
+        tmp = out_wav.with_suffix(".wav.tmp")
+        tmp.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
+        tmp.replace(out_wav)
+        return out_wav
+
+    import asyncio
+    import av
+    import edge_tts
+
+    async def _fetch_phrase(phr: str, spd_rate: str) -> bytes:
+        comm = edge_tts.Communicate(phr, voice=edge_voice, rate=spd_rate)
+        chunks: list[bytes] = []
+        async for ch in comm.stream():
+            if ch.get("type") == "audio":
+                chunks.append(ch["data"])
+        return b"".join(chunks)
+
+    mono_parts: list[np.ndarray] = []
+    for idx, phrase in enumerate(beats):
+        is_last = idx == len(beats) - 1 and len(beats) > 1
+        r_str = "-10%" if is_last else edge_rate
+        mp3_bytes = b""
+        for attempt in range(3):
+            try:
+                mp3_bytes = asyncio.run(_fetch_phrase(phrase, r_str))
+                if mp3_bytes:
+                    break
+            except Exception:
+                time.sleep(0.25 * (attempt + 1))
+        if not mp3_bytes:
+            continue
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=24_000)
+        dec: list[np.ndarray] = []
         with av.open(io.BytesIO(mp3_bytes), format="mp3") as container:
             for frame in container.decode(audio=0):
                 for rf in resampler.resample(frame):
-                    parts.append(rf.to_ndarray().reshape(-1, 2))
+                    dec.append(rf.to_ndarray().reshape(-1))
             for rf in resampler.resample(None):
-                parts.append(rf.to_ndarray().reshape(-1, 2))
-        pcm = np.concatenate(parts, axis=0).astype(np.float32) if parts else np.zeros((SHOW_SR, 2), dtype=np.float32)
-        pcm = trim_edge_silence_stereo(pcm, sr=SHOW_SR)
-        tmp_wav.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
-        tmp_wav.replace(out_wav)
+                dec.append(rf.to_ndarray().reshape(-1))
+        if dec:
+            seg = np.concatenate(dec).astype(np.float32)
+            nz = np.flatnonzero(np.abs(seg) >= 0.008)
+            if nz.size:
+                seg = seg[max(0, int(nz[0]) - 480) : min(seg.size, int(nz[-1]) + 480)]
+            mono_parts.append(seg)
+            if idx < len(beats) - 1:
+                next_is_last = (idx + 1) == (len(beats) - 1) and len(beats) > 1
+                mono_parts.append(np.zeros(int((0.50 if next_is_last else 0.36) * 24_000), dtype=np.float32))
+
+    if not mono_parts:
+        pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
+        pcm = apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=0.25)
+        tmp = out_wav.with_suffix(".wav.tmp")
+        tmp.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
+        tmp.replace(out_wav)
         return out_wav
-    finally:
-        try:
-            raw_mp3.unlink(missing_ok=True)
-            if tmp_wav.exists():
-                tmp_wav.unlink(missing_ok=True)
-        except Exception:
-            pass
+
+    mono_all = np.concatenate(mono_parts)
+    stereo = master_announcer_stereo(mono_all, 24_000, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+    tmp = out_wav.with_suffix(".wav.tmp")
+    tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
+    tmp.replace(out_wav)
+    return out_wav
 
 
 def decode_and_trim_song_file(
@@ -1029,6 +1326,7 @@ class ShowDirector:
         self.shows_dir = self.root_dir / "shows"
         self.sources_dir = self.shows_dir / "sources"
         self.rendered_dir = self.shows_dir / "rendered"
+        self.models_dir = self.root_dir / "models" / "kokoro"
         self.config_path = self.root_dir / "shows.json"
         for d in (self.shows_dir, self.sources_dir, self.rendered_dir):
             d.mkdir(parents=True, exist_ok=True)
@@ -1049,6 +1347,10 @@ class ShowDirector:
         self.shows: dict[str, ShowSpec] = {}
         self._show_order: list[str] = []
 
+        self._event_lock = threading.Lock()
+        self._event_subs: list[queue.Queue[dict[str, Any]]] = []
+        self.recent_cues: deque[dict[str, Any]] = deque(maxlen=30)
+
         self._run_lock = threading.Lock()
         self._active_run_id: int = 0
         self._active_cancel: threading.Event | None = None
@@ -1065,10 +1367,60 @@ class ShowDirector:
 
         self._load_or_init()
 
+    # ---------- Cue Event Bus (SSE Live Simulator) ----------
+
+    def subscribe_events(self) -> queue.Queue[dict[str, Any]]:
+        q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=64)
+        with self._event_lock:
+            self._event_subs.append(q)
+        return q
+
+    def unsubscribe_events(self, q: queue.Queue[dict[str, Any]]) -> None:
+        with self._event_lock:
+            try:
+                self._event_subs.remove(q)
+            except ValueError:
+                pass
+
+    def _emit_cue(self, tag: str, label: str, *, show_id: str = "", duration_ms: int = 1200, **extra: Any) -> None:
+        evt: dict[str, Any] = {
+            "type": "cue",
+            "tag": tag,
+            "label": label,
+            "showId": show_id,
+            "durationMs": int(duration_ms),
+            "tsMs": int(time.time() * 1000),
+            **extra,
+        }
+        with self._event_lock:
+            self.recent_cues.append(evt)
+            subs = list(self._event_subs)
+        for q in subs:
+            try:
+                q.put_nowait(evt)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(evt)
+                except Exception:
+                    pass
+
+    def list_voices(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "defaultVoice": DEFAULT_ANNOUNCER_VOICE,
+            "kokoroReady": kokoro_models_available(self.models_dir),
+            "voices": [
+                {"id": vid, "label": meta["label"], "engine": meta["engine"]}
+                for vid, meta in EPIC_VOICE_PRESETS.items()
+            ],
+        }
+
     # ---------- Persistence & Configuration ----------
 
     def _load_or_init(self) -> None:
         defaults = default_shows()
+        default_map = {s.id: s for s in defaults}
         with self._lock:
             self.shows = {s.id: s for s in defaults}
             self._show_order = [s.id for s in defaults]
@@ -1084,6 +1436,31 @@ class ShowDirector:
                             for sid, sraw in raw_shows.items():
                                 if isinstance(sraw, dict):
                                     s_merged = {"id": sid, **sraw}
+                                    # Targeted migration ONLY on ryder_walkin Dev Drop
+                                    if sid == "ryder_walkin" and (
+                                        str(sraw.get("announcerVoice") or "") in BANNED_ROBOTIC_VOICES
+                                        or not str(sraw.get("overlayText") or "").strip()
+                                    ):
+                                        d_ryder = default_map["ryder_walkin"].to_dict()
+                                        for k in (
+                                            "name",
+                                            "announcerVoice",
+                                            "announcerText",
+                                            "isDevDrop",
+                                            "fogBurstSec",
+                                            "lightningFlashSec",
+                                            "lightsPulseDurationSec",
+                                            "lightsPulseIntervalSec",
+                                            "lightsPulseOnSec",
+                                            "overlayAtSec",
+                                            "overlayText",
+                                            "postOverlayDenonVol",
+                                            "videoHoldSec",
+                                            "voiceReverbWet",
+                                            "voiceBoostDb",
+                                        ):
+                                            s_merged[k] = d_ryder[k]
+                                        dirty = True
                                     spec = ShowSpec.from_dict(s_merged)
                                     self.shows[spec.id] = spec
                                     if spec.id not in self._show_order:
@@ -1112,6 +1489,10 @@ class ShowDirector:
         sid = _safe_show_id(show_id)
         return self.rendered_dir / f"{sid}_preview.wav"
 
+    def overlay_wav_path(self, show_id: str) -> Path:
+        sid = _safe_show_id(show_id)
+        return self.rendered_dir / f"{sid}_overlay.wav"
+
     def status_dict(self) -> dict[str, Any]:
         with self._lock:
             items: list[dict[str, Any]] = []
@@ -1122,18 +1503,29 @@ class ShowDirector:
                 p_wav = self.preview_wav_path(sid)
                 ready = p_wav.is_file() and p_wav.stat().st_size > 100
                 dur = wav_duration_sec(p_wav) if ready else 0.0
+                o_wav = self.overlay_wav_path(sid)
+                o_ready = o_wav.is_file() and o_wav.stat().st_size > 100
+                o_dur = wav_duration_sec(o_wav) if o_ready else 0.0
                 items.append({
                     **spec.to_dict(),
                     "previewReady": ready,
                     "previewDurationSec": dur,
                     "previewUrl": f"/api/shows/{sid}/preview.wav",
+                    "overlayReady": o_ready,
+                    "overlayDurationSec": o_dur,
+                    "overlayUrl": f"/api/shows/{sid}/overlay.wav" if spec.overlay_text else "",
                     "sourceUploaded": bool(spec.source_file and (self.sources_dir / spec.source_file).is_file()),
                 })
+            with self._event_lock:
+                cues = list(self.recent_cues)[-12:]
             return {
                 "shows": items,
                 "fxHooks": self.fx_hooks.to_dict(),
                 "active": dict(self._active_state),
                 "lastResult": dict(self._last_result),
+                "kokoroReady": kokoro_models_available(self.models_dir),
+                "voices": self.list_voices()["voices"],
+                "recentCues": cues,
             }
 
     def update_show(self, show_id: str, patch: dict[str, Any], *, rebuild: bool = True) -> dict[str, Any]:
@@ -1208,25 +1600,59 @@ class ShowDirector:
 
     # ---------- Composite Preview Audio Builder ----------
 
-    def _get_announcer_stem(self, spec: ShowSpec, *, suffix: str = "announcer", text_override: str | None = None) -> np.ndarray | None:
+    def _get_announcer_stem(
+        self,
+        spec: ShowSpec,
+        *,
+        suffix: str = "announcer",
+        text_override: str | None = None,
+        reverb_override: float | None = None,
+    ) -> np.ndarray | None:
         txt = str(text_override if text_override is not None else spec.announcer_text).strip()
         if not txt:
             return None
-        key_src = f"{txt}|{spec.announcer_voice}|{spec.announcer_rate}|{spec.announcer_pitch}|{int(self.allow_network)}"
+        voice_id = resolve_voice_id(spec.announcer_voice)
+        reverb = spec.voice_reverb_wet if reverb_override is None else float(reverb_override)
+        key_src = (
+            f"v2|{txt}|{voice_id}|{spec.announcer_rate}|{reverb:.2f}|{spec.voice_boost_db:.1f}|"
+            f"{int(self.allow_network)}|{int(kokoro_models_available(self.models_dir))}"
+        )
         digest = hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:12]
         stem_path = self.rendered_dir / f"{spec.id}_{suffix}_{digest}.wav"
         if not stem_path.is_file() or stem_path.stat().st_size < 100:
             synthesize_announcer_wav(
                 txt,
-                voice=spec.announcer_voice,
+                voice=voice_id,
                 rate=spec.announcer_rate,
-                pitch=spec.announcer_pitch,
                 out_wav=stem_path,
                 ffmpeg_bin=self.ffmpeg_bin,
                 allow_network=self.allow_network,
+                models_dir=self.models_dir,
+                reverb_wet=reverb,
+                boost_db=spec.voice_boost_db,
             )
         pcm = read_wav_stereo_float(stem_path, target_sr=SHOW_SR)
         return pcm if pcm.shape[0] > 0 else None
+
+    def build_show_overlay(self, show_id: str, *, force: bool = False) -> dict[str, Any]:
+        """Render standalone mid-video voice overlay WAV (`shows/rendered/<id>_overlay.wav`)."""
+        spec = self.get_show(show_id)
+        if spec is None:
+            return {"ok": False, "error": f"Unknown show: {show_id}"}
+        if not spec.overlay_text:
+            return {"ok": True, "skipped": True}
+        out_wav = self.overlay_wav_path(spec.id)
+        if not force and out_wav.is_file() and out_wav.stat().st_size > 200:
+            return {"ok": True, "cached": True, "path": str(out_wav), "durationSec": wav_duration_sec(out_wav)}
+        # Crisp warm broadcast reverb (0.03) so mid-song message cuts cleanly over ducked YouTube
+        pcm = self._get_announcer_stem(spec, suffix="overlay", text_override=spec.overlay_text, reverb_override=0.03)
+        if pcm is None or pcm.shape[0] == 0:
+            pcm = np.zeros((int(0.5 * SHOW_SR), 2), dtype=np.float32)
+        wav_bytes = encode_stereo_pcm16_wav(pcm, sr=SHOW_SR)
+        tmp = out_wav.with_suffix(".wav.tmp")
+        tmp.write_bytes(wav_bytes)
+        tmp.replace(out_wav)
+        return {"ok": True, "showId": spec.id, "path": str(out_wav), "durationSec": wav_duration_sec(out_wav)}
 
     def build_show_preview(self, show_id: str, *, force: bool = False) -> dict[str, Any]:
         """Render the tight local preview WAV (`shows/rendered/<id>_preview.wav`) with zero lead-in waste."""
@@ -1293,18 +1719,40 @@ class ShowDirector:
             pre_thunder_n = int(round(2.3 * SHOW_SR))
             post_tail_n = int(round(1.6 * SHOW_SR))
             total_n = pre_thunder_n + ann_pcm.shape[0] + post_tail_n
-            mix = np.zeros((total_n, 2), dtype=np.float32)
-            thunder = synth_thunder_rumble_stereo(float(total_n) / float(SHOW_SR), sr=SHOW_SR)
-            mix_into(mix, thunder, 0, gain=0.82)
-            # Duck thunder lightly during the HBO announcement so every word cuts through
-            mix[pre_thunder_n : pre_thunder_n + ann_pcm.shape[0]] *= 0.42
-            mix_into(mix, ann_pcm, pre_thunder_n, gain=1.0)
+            thunder_raw = synth_thunder_rumble_stereo(
+                float(total_n) / float(SHOW_SR),
+                sr=SHOW_SR,
+                crack_at_sec=spec.lightning_flash_sec or 0.75,
+            )
+            bed = duck_bed_under_speech(
+                thunder_raw,
+                ann_pcm,
+                pre_thunder_n,
+                sr=SHOW_SR,
+                duck_gain=0.16,
+                base_gain=0.86,
+            )
             if spec.add_cheer:
-                c_start = pre_thunder_n + int(ann_pcm.shape[0] * 0.58)
+                cheer_full = np.zeros((total_n, 2), dtype=np.float32)
+                c_start = pre_thunder_n + int(ann_pcm.shape[0] * 0.52)
                 c_len = max(1.5, float(total_n - c_start) / float(SHOW_SR))
                 cheer = synth_crowd_cheer_stereo(c_len, sr=SHOW_SR, swell_sec=0.8, fade_out_sec=1.3)
-                mix_into(mix, cheer, c_start, gain=0.58)
-            mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(1.3, float(post_tail_n) / SHOW_SR))
+                mix_into(cheer_full, cheer, c_start, gain=0.72)
+                bed += duck_bed_under_speech(
+                    cheer_full,
+                    ann_pcm,
+                    pre_thunder_n,
+                    sr=SHOW_SR,
+                    duck_gain=0.18,
+                    base_gain=0.90,
+                )
+            mix = bed
+            mix_into(mix, ann_pcm, pre_thunder_n, gain=1.0)
+            mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(1.25, float(post_tail_n) / SHOW_SR))
+            # Soft true-peak protection after mixing thunder+crowd+speech
+            pk_mix = float(np.max(np.abs(mix)))
+            if pk_mix > 0.94:
+                mix = mix * (0.92 / pk_mix)
 
         else:  # "walkin": announcer intro -> tight crossfade into walk-in song
             ann_pcm = self._get_announcer_stem(spec, suffix="announcer")
@@ -1337,6 +1785,8 @@ class ShowDirector:
         tmp_wav = out_wav.with_suffix(".wav.tmp")
         tmp_wav.write_bytes(wav_bytes)
         tmp_wav.replace(out_wav)
+        if spec.overlay_text:
+            self.build_show_overlay(spec.id, force=force)
         dur_actual = round(float(mix.shape[0]) / float(SHOW_SR), 2)
         return {
             "ok": True,
@@ -1403,23 +1853,86 @@ class ShowDirector:
         except Exception as exc:
             return {"ok": False, "url": clean, "error": str(exc)}
 
-    def _flash_lights(self, count: int, cancel_ev: threading.Event | None = None) -> None:
+    def _fire_lights_state(self, on: bool, *, tag: str = "", label: str = "", show_id: str = "", duration_ms: int = 1200) -> dict[str, Any]:
+        with self._lock:
+            fx = self.fx_hooks
+        if tag:
+            self._emit_cue(tag, label or tag, show_id=show_id, duration_ms=duration_ms, lightsOn=on)
+        url = fx.resolve_lights_url(on)
+        return self._fire_http_hook(url) if url else {"ok": False, "skipped": True}
+
+    def _flash_lights(
+        self,
+        count: int,
+        cancel_ev: threading.Event | None = None,
+        *,
+        show_id: str = "",
+        end_on: bool = True,
+        on_sec: float = 0.18,
+        off_sec: float = 0.16,
+        tag_prefix: str = "FLASH",
+    ) -> None:
         with self._lock:
             fx = self.fx_hooks
         on_url = fx.resolve_lights_url(True)
         off_url = fx.resolve_lights_url(False)
-        if not on_url or not off_url or count <= 0:
+        if count <= 0:
             return
-        for _ in range(count):
+        for idx in range(1, count + 1):
             if cancel_ev and cancel_ev.is_set():
                 return
+            lbl = f"({tag_prefix} {idx}/{count})" if count > 1 else f"({tag_prefix})"
+            self._emit_cue("flash", lbl, show_id=show_id, duration_ms=int(max(120, on_sec * 1000)), step=idx, total=count)
+            if on_url:
+                self._fire_http_hook(on_url)
+            if self._wait_cancelable(cancel_ev, on_sec):
+                return
+            # Skip final OFF if we're finishing ON for the last flash
+            if off_sec > 0.0 and not (end_on and idx == count):
+                if off_url:
+                    self._fire_http_hook(off_url)
+                if self._wait_cancelable(cancel_ev, off_sec):
+                    return
+            elif not end_on and off_url:
+                self._fire_http_hook(off_url)
+        if end_on and on_url:
             self._fire_http_hook(on_url)
-            if self._wait_cancelable(cancel_ev, 0.18):
-                return
-            self._fire_http_hook(off_url)
-            if self._wait_cancelable(cancel_ev, 0.16):
-                return
-        self._fire_http_hook(on_url)
+
+    def _pulse_lights_loop(
+        self,
+        spec: ShowSpec,
+        cancel_ev: threading.Event,
+    ) -> bool:
+        """Strobe lights `on_sec` every `interval_sec` for `duration_sec`. Returns True if canceled."""
+        dur = float(spec.lights_pulse_duration_sec)
+        interval = max(0.5, float(spec.lights_pulse_interval_sec or 2.0))
+        on_s = max(0.1, min(interval - 0.1, float(spec.lights_pulse_on_sec or 0.25)))
+        off_s = max(0.05, interval - on_s)
+        n_pulses = max(1, int(round(dur / interval)))
+        with self._lock:
+            fx = self.fx_hooks
+        on_url = fx.resolve_lights_url(True)
+        off_url = fx.resolve_lights_url(False)
+        for i in range(1, n_pulses + 1):
+            if cancel_ev.is_set():
+                return True
+            self._emit_cue(
+                "pulse",
+                f"(FLASH {on_s:.2f}s · Pulse {i}/{n_pulses})",
+                show_id=spec.id,
+                duration_ms=int(on_s * 1000),
+                pulseIndex=i,
+                pulseTotal=n_pulses,
+            )
+            if on_url:
+                self._fire_http_hook(on_url)
+            if self._wait_cancelable(cancel_ev, on_s):
+                return True
+            if off_url:
+                self._fire_http_hook(off_url)
+            if self._wait_cancelable(cancel_ev, off_s):
+                return True
+        return False
 
     def _wait_cancelable(self, cancel_ev: threading.Event | None, seconds: float) -> bool:
         """Sleep up to `seconds`; returns True immediately if canceled."""
@@ -1536,14 +2049,14 @@ class ShowDirector:
 
         prev_db = -35.0
         target_db = _clamp(float(spec.denon_vol) - 80.0, -50.0, -5.0)
+        current_db = prev_db
         denon_raised = False
         denon_restored = False
         cube_started = False
-        was_standby = False
         out_res: dict[str, Any] = {"ok": True, "showId": spec.id}
 
         try:
-            # 1. Guarantee tight preview WAV exists
+            # 1. Guarantee tight preview WAV (and optional overlay WAV) exists
             build_info = self.build_show_preview(spec.id, force=False)
             p_wav = self.preview_wav_path(spec.id)
             if not p_wav.is_file():
@@ -1551,8 +2064,6 @@ class ShowDirector:
             raw_wav = p_wav.read_bytes()
             preview_dur = wav_duration_sec(p_wav)
 
-            # Pad 220ms silent lead-in (Cube ducks BEFORE Denon ramps up)
-            # & 1400ms silent tail (Denon ramps back down BEFORE Cube releases duck)
             lead_ms = 220
             tail_ms = 250 if spec.three_screen_video else 1400
             padded_wav, total_padded_sec = pad_wav_for_cube_duck(
@@ -1573,19 +2084,28 @@ class ShowDirector:
                         self.house_audio.denon.send_command("SIMPLAY")
                         self.house_audio.denon.send_command("MSMCH STEREO")
                         prev_db = min(prev_db, target_db)
+            current_db = prev_db
 
-            # 3. Pre-show smart FX hooks (lights out + fog machine burst)
+            # 3. Pre-show smart FX hooks (lights out + fog burst + live SSE cue simulation)
             if spec.lights_out:
-                l_off = fx.resolve_lights_url(False)
-                if l_off:
-                    out_res["lightsOff"] = self._fire_http_hook(l_off)
+                out_res["lightsOff"] = self._fire_lights_state(
+                    False, tag="lights_off", label="(LIGHTS OFF)", show_id=spec.id, duration_ms=1500
+                )
             if spec.trigger_fog:
-                fog_url = fx.resolve_fog_url()
+                burst_val = spec.fog_burst_sec if spec.fog_burst_sec > 0.0 else fx.fog_burst_sec
+                burst_str = f"{float(burst_val):.1f}".rstrip("0").rstrip(".")
+                self._emit_cue(
+                    "fog",
+                    f"(TRIGGER FOG · {burst_str}s)",
+                    show_id=spec.id,
+                    duration_ms=int(burst_val * 1000),
+                    fogSec=float(burst_val),
+                )
+                fog_url = fx.resolve_fog_url(burst_sec=burst_val)
                 if fog_url:
                     out_res["fog"] = self._fire_http_hook(fog_url)
 
-            # 4. PHASE 1 (ANTI-ROLLER-COASTER ENTRY):
-            # Fire Cube first (sync=False -> requests MAY_DUCK & starts 220ms silent lead-in immediately!)
+            # 4. PHASE 1 (ANTI-ROLLER-COASTER ENTRY): Cube ducks FIRST during 220ms silent lead-in
             if self.house_audio is not None:
                 cfg_ha = self.house_audio.get_config()
                 if cfg_ha.cube_host:
@@ -1604,33 +2124,158 @@ class ShowDirector:
                     out_res["cubePlay"] = c_res
                     cube_started = bool(c_res.get("ok"))
 
-            # Wait briefly so Cube completes AudioFocus duck before Denon moves upward
             if self._wait_cancelable(cancel_ev, 0.08):
                 return {"ok": False, "canceled": True}
 
-            # 5. Ramp Denon smoothly up to target show level (e.g., MV70 = -10.0 dB) right during lead-in
+            # 5. Ramp Denon smoothly up to show target level (e.g., MV70 = -10.0 dB) right during lead-in
             if self.house_audio is not None:
                 self.house_audio.denon._ramp_volume(prev_db, target_db, steps=4, step_ms=35)
+                current_db = target_db
                 denon_raised = True
+            self._emit_cue(
+                "intro",
+                f"(DENON VOL {spec.denon_vol} · ANNOUNCER + FX)",
+                show_id=spec.id,
+                duration_ms=int(preview_dur * 1000),
+                denonVol=spec.denon_vol,
+                caption=spec.announcer_text,
+            )
 
-            # 6. Wait for preview music + cheer to play and complete its baked fade-out
-            wait_sec = max(0.2, preview_dur - 0.05)
+            # 6. Wait through intro audio, firing optional lightning crack flash during opening thunder
+            intro_elapsed = 0.22
+            if spec.lightning_flash_sec > 0.0 and spec.lightning_flash_sec < (preview_dur - 0.5):
+                pre_flash_wait = max(0.0, spec.lightning_flash_sec - intro_elapsed)
+                if self._wait_cancelable(cancel_ev, pre_flash_wait):
+                    return {"ok": False, "canceled": True}
+                self._flash_lights(
+                    1,
+                    cancel_ev=cancel_ev,
+                    show_id=spec.id,
+                    end_on=False,
+                    on_sec=0.16,
+                    off_sec=0.05,
+                    tag_prefix="FLASH · LIGHTNING",
+                )
+                intro_elapsed += pre_flash_wait + 0.21
+
+            rem_intro = max(0.15, preview_dur - intro_elapsed - 0.05)
             with self._lock:
                 self._active_state["phase"] = "playing"
-            if self._wait_cancelable(cancel_ev, wait_sec):
+            if self._wait_cancelable(cancel_ev, rem_intro):
                 return {"ok": False, "canceled": True}
 
-            # 7A. Ryder / Debut 3-screen video handoff at MV70
+            # 7A. Ryder / Debut 3-screen video + light strobe + 1:20 duck/overlay/MV55 choreography
             if spec.three_screen_video and spec.youtube_url:
                 with self._lock:
                     self._active_state["phase"] = "video_screens"
                 if spec.lights_flash_count > 0:
-                    self._flash_lights(spec.lights_flash_count, cancel_ev=cancel_ev)
+                    self._flash_lights(
+                        spec.lights_flash_count,
+                        cancel_ev=cancel_ev,
+                        show_id=spec.id,
+                        end_on=True,
+                        tag_prefix="FLASH",
+                    )
                 out_res["threeScreen"] = self._launch_three_screen_youtube(spec.youtube_url)
-                if self._wait_cancelable(cancel_ev, spec.video_hold_sec):
-                    return {"ok": False, "canceled": True}
-                # Gently restore Denon down after video hold finishes
-                self._restore_denon_down(target_db, prev_db, fast=False)
+                self._emit_cue(
+                    "screens",
+                    f"(ALL 3 SCREENS LIVE · DENON {spec.denon_vol})",
+                    show_id=spec.id,
+                    duration_ms=4000,
+                    denonVol=spec.denon_vol,
+                    youtubeUrl=spec.youtube_url,
+                )
+
+                video_elapsed = 0.0
+                if spec.lights_pulse_duration_sec > 0.0:
+                    with self._lock:
+                        self._active_state["phase"] = "strobe_video"
+                    if self._pulse_lights_loop(spec, cancel_ev):
+                        return {"ok": False, "canceled": True}
+                    video_elapsed += float(spec.lights_pulse_duration_sec)
+                    self._fire_lights_state(
+                        True,
+                        tag="lights_on",
+                        label="(FULL HOUSE LIGHTS ON)",
+                        show_id=spec.id,
+                        duration_ms=2500,
+                    )
+                elif spec.lights_out:
+                    self._fire_lights_state(
+                        True,
+                        tag="lights_on",
+                        label="(FULL HOUSE LIGHTS ON)",
+                        show_id=spec.id,
+                        duration_ms=2500,
+                    )
+
+                # Optional mid-video YouTube duck + personal overlay + Denon drop (e.g., 1:20 -> MV55)
+                if spec.overlay_text and spec.overlay_at_sec > 0.0:
+                    pre_ov_wait = max(0.0, float(spec.overlay_at_sec) - video_elapsed)
+                    if pre_ov_wait > 0.0:
+                        with self._lock:
+                            self._active_state["phase"] = "video_main"
+                        if self._wait_cancelable(cancel_ev, pre_ov_wait):
+                            return {"ok": False, "canceled": True}
+                        video_elapsed += pre_ov_wait
+
+                    ov_info = self.build_show_overlay(spec.id, force=False)
+                    ov_wav = self.overlay_wav_path(spec.id)
+                    ov_dur = wav_duration_sec(ov_wav) if ov_wav.is_file() else 0.0
+                    if ov_info.get("ok") and ov_wav.is_file() and ov_dur > 0.2:
+                        with self._lock:
+                            self._active_state["phase"] = "overlay_duck"
+                        self._emit_cue(
+                            "overlay",
+                            f"(DUCK YOUTUBE + OVERLAY · \"{spec.overlay_text}\")",
+                            show_id=spec.id,
+                            duration_ms=int((ov_dur + 1.0) * 1000),
+                            caption=spec.overlay_text,
+                        )
+                        ov_padded, ov_pad_dur = pad_wav_for_cube_duck(
+                            ov_wav.read_bytes(), lead_silence_ms=220, tail_silence_ms=1400
+                        )
+                        if self.house_audio is not None and self.house_audio.get_config().cube_host:
+                            cfg_ha = self.house_audio.get_config()
+                            self.house_audio.cube.play_wav_bytes(
+                                cfg_ha.cube_host,
+                                cfg_ha.cube_port,
+                                ov_padded,
+                                mode="duck",
+                                usage=cfg_ha.cube_usage,
+                                gain=1.0,
+                                max_sec=max(5, min(60, int(math.ceil(ov_pad_dur + 3.0)))),
+                                sync=False,
+                            )
+                        if self._wait_cancelable(cancel_ev, max(0.2, 0.22 + ov_dur - 0.05)):
+                            return {"ok": False, "canceled": True}
+                        video_elapsed += max(0.2, 0.22 + ov_dur)
+
+                        # Step Denon down to post_overlay_denon_vol (55) during 1.4s silent tail BEFORE un-duck!
+                        if spec.post_overlay_denon_vol > 0:
+                            post_db = _clamp(float(spec.post_overlay_denon_vol) - 80.0, -50.0, -5.0)
+                            self._restore_denon_down(current_db, post_db, fast=False)
+                            current_db = post_db
+                            self._emit_cue(
+                                "denon_drop",
+                                f"(RESTORE YOUTUBE · DENON {spec.denon_vol} → {spec.post_overlay_denon_vol} · FULL LIGHTS ON)",
+                                show_id=spec.id,
+                                duration_ms=3000,
+                                denonVol=spec.post_overlay_denon_vol,
+                            )
+                        if self._wait_cancelable(cancel_ev, 0.45):
+                            return {"ok": False, "canceled": True}
+                        video_elapsed += 0.45
+
+                rem_video = max(0.0, float(spec.video_hold_sec) - video_elapsed)
+                if rem_video > 0.0:
+                    with self._lock:
+                        self._active_state["phase"] = "video_finish"
+                    if self._wait_cancelable(cancel_ev, rem_video):
+                        return {"ok": False, "canceled": True}
+
+                if spec.post_overlay_denon_vol <= 0:
+                    self._restore_denon_down(current_db, prev_db, fast=False)
                 denon_restored = True
                 if self.displays is not None:
                     try:
@@ -1639,16 +2284,16 @@ class ShowDirector:
                         pass
             else:
                 # 7B. PHASE 2 (ANTI-ROLLER-COASTER EXIT):
-                # Audio already faded smoothly to silence and entered the 1400ms silent tail.
-                # Cube STILL holds AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK right now!
-                # Ramp Denon BACK DOWN to prev_db BEFORE Cube un-ducks background music!
+                # Audio already faded smoothly to silence and entered 1400ms silent tail.
+                # Ramp Denon BACK DOWN to prev_db WHILE Cube still holds MAY_DUCK!
                 with self._lock:
                     self._active_state["phase"] = "restoring_denon"
                 if denon_raised:
-                    self._restore_denon_down(target_db, prev_db, fast=False)
+                    self._restore_denon_down(current_db, prev_db, fast=False)
                     denon_restored = True
                 self._wait_cancelable(cancel_ev, 0.35)
 
+            self._emit_cue("ended", "(SHOW COMPLETE)", show_id=spec.id, duration_ms=1200)
             return out_res
 
         except Exception as exc:
@@ -1657,7 +2302,7 @@ class ShowDirector:
         finally:
             # Emergency safety guarantee: ALWAYS ramp Denon back down FIRST before stopping Cube!
             if denon_raised and not denon_restored and self.house_audio is not None:
-                self._restore_denon_down(target_db, prev_db, fast=True)
+                self._restore_denon_down(current_db, prev_db, fast=True)
             if cancel_ev.is_set() and cube_started and self.house_audio is not None:
                 try:
                     cfg_ha = self.house_audio.get_config()

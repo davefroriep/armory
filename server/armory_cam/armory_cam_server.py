@@ -22,6 +22,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import socket
@@ -4580,6 +4581,22 @@ DASHBOARD_HTML = """<!doctype html>
   .show-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap}
   .show-trigs{font-size:11px;color:var(--mut);line-height:1.5}
   .show-audio{width:100%;height:34px;border-radius:8px;background:#131a22}
+  .dev-drop-box{background:#090d12;border:1px solid #2b4566;border-radius:12px;padding:12px;margin-bottom:12px}
+  .dev-stage{position:relative;border-radius:12px;border:2px solid #233040;background:#0a0e14;min-height:240px;padding:12px;display:flex;flex-direction:column;justify-content:space-between;gap:10px;overflow:hidden;transition:background-color .12s ease,box-shadow .12s ease,border-color .12s ease}
+  .dev-stage.lights-off{background:#020305;border-color:#1e293b}
+  .dev-stage.lights-on{background:#231f16;border-color:#facc15;box-shadow:inset 0 0 60px rgba(250,204,21,.22)}
+  .dev-stage.flashing{background:#ffffff!important;border-color:#ffffff!important;box-shadow:0 0 60px rgba(255,255,255,.95)!important;color:#000!important}
+  .dev-stage.fs{position:fixed;inset:12px;z-index:10060;margin:0;min-height:0}
+  .fx-hud{display:flex;flex-wrap:wrap;gap:8px;align-items:center;z-index:2}
+  .fx-tag{padding:5px 11px;border-radius:999px;font-size:12px;font-weight:900;letter-spacing:.05em;background:#131a22;color:#94a3b8;border:1px solid #233040}
+  .fx-tag.fog{background:rgba(34,211,238,.18);color:#67e8f9;border-color:#06b6d4;box-shadow:0 0 18px rgba(34,211,238,.45)}
+  .fx-tag.flash{background:#fef08a;color:#1e1b4b;border-color:#fff;box-shadow:0 0 22px rgba(255,255,255,.9)}
+  .fx-tag.dark{background:#020617;color:#94a3b8;border-color:#334155}
+  .fx-tag.lit{background:rgba(250,204,21,.22);color:#fde047;border-color:#facc15}
+  .dev-yt-wrap{position:relative;width:100%;max-width:560px;aspect-ratio:16/9;background:#000;border-radius:8px;overflow:hidden;border:1px solid #233040;margin:0 auto;z-index:2}
+  .dev-yt-wrap iframe{width:100%;height:100%;border:0}
+  .dev-caption{text-align:center;font-weight:900;font-size:15px;color:#f8fafc;background:rgba(0,0,0,.62);border:1px solid rgba(255,255,255,.15);padding:8px 12px;border-radius:8px;z-index:2}
+  .dev-log{font:11px/1.4 ui-monospace,Consolas,monospace;color:#7cc4ff;max-height:74px;overflow:auto;background:rgba(0,0,0,.45);padding:6px 8px;border-radius:6px;z-index:2}
   .btn{background:var(--blue);color:#00131f;border:0;border-radius:9px;padding:7px 12px;font-weight:800;font-size:12px;cursor:pointer;transition:transform .08s ease,background-color .15s ease,border-color .15s ease,box-shadow .15s ease,filter .15s ease,color .15s ease;user-select:none}
   .btn:hover:not(:disabled){filter:brightness(1.12);box-shadow:0 2px 10px rgba(0,0,0,.35)}
   .btn:active:not(:disabled){transform:translateY(2px) scale(.96);filter:brightness(.92);box-shadow:inset 0 2px 5px rgba(0,0,0,.45)}
@@ -4991,11 +5008,74 @@ DASHBOARD_HTML = """<!doctype html>
       </span>
     </h2>
     <div id="shMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
-      Preview locally in your browser before firing live on Denon (zero fade roller-coaster: Cube ducks before Denon ramps up, then Denon steps down during silent tail before un-duck). Swap any <code>.mp3</code> / <code>.wav</code> track anytime.
+      Iterating on the <b>Ryder Dev Drop</b> below leaves your other 5 shows untouched. Studio voice uses local <b>Kokoro-82M FP32</b> neural synthesis + clean stadium hall mastering (zero robotic/clipped voices).
     </div>
-    <div id="shGrid" class="show-grid">
-      <div style="color:var(--mut);font-size:12px">Loading shows…</div>
+    <div id="devRyderBox" class="dev-drop-box">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+        <div>
+          <span class="pill live" style="margin-right:6px">DEV DROP</span>
+          <strong style="font-size:15px">Ryder Curry Armory Debut — Full FX &amp; 3-Screen Simulator</strong>
+          <span id="devKokoroPill" class="pill ok" style="margin-left:6px">Checking Voices…</span>
+        </div>
+        <div class="ctrl-row" style="margin-top:0">
+          <button class="btn sm ok" id="devSimFullBtn" type="button">🎬 Simulate Full Show (Local)</button>
+          <button class="btn sm sec" id="devSimJumpBtn" type="button">⏩ Jump to 1:16 (Test 1:20 Overlay)</button>
+          <button class="btn sm red" id="devSimStopBtn" type="button">⏹ Stop Sim</button>
+          <button class="btn sm sec" id="devSimFsBtn" type="button">⤢ Fullscreen</button>
+          <button class="btn sm" id="devFireLiveBtn" type="button">🔥 Fire Ryder LIVE (3 Screens + Denon 70)</button>
+        </div>
+      </div>
+
+      <div id="devStage" class="dev-stage">
+        <div class="fx-hud">
+          <span id="devLightsHud" class="fx-tag">LIGHTS: STANDBY</span>
+          <span id="devFogHud" class="fx-tag">FOG: OFF</span>
+          <span id="devFlashHud" class="fx-tag">FLASH: READY</span>
+          <span id="devDenonHud" class="fx-tag">DENON: STANDBY</span>
+          <span id="devSimClock" class="fx-tag">0:00</span>
+        </div>
+        <div class="dev-yt-wrap" id="devYtWrap">
+          <div id="ryYtPlayer" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:12px">Cody Rhodes YouTube player activates during simulation (https://www.youtube.com/watch?v=05vwKMySzKw)</div>
+        </div>
+        <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch (LIGHTS OFF), (TRIGGER FOG · 30s), and (FLASH) cues live on screen.</div>
+        <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px">
+        <div>
+          <label>Audition Intro (Thunder + Announcer + Crowd)</label>
+          <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
+        </div>
+        <div>
+          <label>Audition 1:20 Mid-Video Overlay (&ldquo;Welcome to The Armory…&rdquo;)</label>
+          <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:8px">
+        <div><label>Epic Studio Voice</label><select id="devRyVoice"></select></div>
+        <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.11"></div>
+        <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
+        <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
+        <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
+        <div><label>1:20 Overlay → Denon Vol</label><input id="devRyPostVol" type="number" min="30" max="75" value="55"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin-top:6px">
+        <div><label>HBO-Style Intro Script (<code>...</code> adds dramatic pause)</label><textarea id="devRyIntroTxt" rows="2"></textarea></div>
+        <div><label>1:20 Video Overlay Script</label><textarea id="devRyOvTxt" rows="2"></textarea></div>
+      </div>
+      <div class="ctrl-row" style="margin-top:8px">
+        <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Rebuild Ryder Voice</button>
+        <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
+      </div>
     </div>
+
+    <details style="margin-top:10px">
+      <summary style="cursor:pointer;font-weight:800;font-size:13px;color:var(--mut)">Other Walk-Ins &amp; PR Drop-Ins (5 — Kept Untouched While Iterating on Ryder)</summary>
+      <div id="shGrid" class="show-grid">
+        <div style="color:var(--mut);font-size:12px">Loading shows…</div>
+      </div>
+    </details>
     <details style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
       <summary style="cursor:pointer;font-weight:800;font-size:13px;color:#7cc4ff">Smart FX Hooks (Lights Switch &amp; Fog Machine — Future Ready)</summary>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:8px">
@@ -5004,7 +5084,7 @@ DASHBOARD_HTML = """<!doctype html>
         <div><label>Lights ON URL (optional override)</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
         <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
         <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
-        <div><label>Fog Burst Duration (1–10s)</label><input id="fxFogBurst" type="number" min="1" max="10" step="0.5" value="4.0"></div>
+        <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
       </div>
       <div class="ctrl-row" style="margin-top:10px">
         <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
@@ -7566,6 +7646,222 @@ $('dpFindRokuBtn').onclick = async () => {
   }
 };
 
+let devRyderSpec = null;
+let rySimState = { running: false, timers: [], iv: null, ytPlayer: null, introEl: null, ovEl: null, fogLeft: 0 };
+
+function logDevCue(msg) {
+  const el = $('devLog');
+  if (!el) return;
+  const row = document.createElement('div');
+  row.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+}
+
+function fxSetLights(mode) {
+  const st = $('devStage'), hud = $('devLightsHud');
+  if (!st || !hud) return;
+  st.classList.remove('lights-off', 'lights-on');
+  if (mode === 'off') {
+    st.classList.add('lights-off');
+    hud.textContent = '(LIGHTS OFF)';
+    hud.className = 'fx-tag dark';
+  } else if (mode === 'on') {
+    st.classList.add('lights-on');
+    hud.textContent = '(FULL HOUSE LIGHTS ON)';
+    hud.className = 'fx-tag lit';
+  } else {
+    hud.textContent = 'LIGHTS: STANDBY';
+    hud.className = 'fx-tag';
+  }
+}
+
+function fxFlash(label, durMs) {
+  const st = $('devStage'), fh = $('devFlashHud');
+  if (!st) return;
+  st.classList.add('flashing');
+  if (fh) { fh.textContent = label || '(FLASH)'; fh.className = 'fx-tag flash'; }
+  setTimeout(() => {
+    st.classList.remove('flashing');
+    if (fh) { fh.textContent = 'FLASH: READY'; fh.className = 'fx-tag'; }
+  }, Math.max(120, Number(durMs || 220)));
+}
+
+function fxTriggerFog(sec) {
+  const fh = $('devFogHud');
+  rySimState.fogLeft = Math.max(1, Math.round(Number(sec || 30)));
+  if (fh) { fh.textContent = `(TRIGGER FOG · ${rySimState.fogLeft}s)`; fh.className = 'fx-tag fog'; }
+}
+
+function fxApplyCue(ev) {
+  if (!ev || !ev.tag) return;
+  const tag = ev.tag;
+  if (tag === 'lights_off') fxSetLights('off');
+  else if (tag === 'lights_on') fxSetLights('on');
+  else if (tag === 'fog') fxTriggerFog(ev.fogSec || 30);
+  else if (tag === 'flash' || tag === 'pulse') fxFlash(ev.label || '(FLASH)', ev.durationMs || 220);
+  if (ev.denonVol && $('devDenonHud')) $('devDenonHud').textContent = `DENON: VOL ${ev.denonVol}`;
+  if (ev.caption && $('devCaption')) $('devCaption').textContent = ev.caption;
+  else if (ev.label && $('devCaption')) $('devCaption').textContent = ev.label;
+  logDevCue(ev.label || tag);
+}
+
+function ensureShowSse() {
+  if (window._showSse) return;
+  try {
+    const es = new EventSource('/api/shows/events');
+    es.onmessage = (msg) => {
+      try {
+        const d = JSON.parse(msg.data);
+        if (d && d.type === 'cue') fxApplyCue(d);
+      } catch {}
+    };
+    window._showSse = es;
+  } catch {}
+}
+
+function extractYtId(url) {
+  const m = String(url || '').match(/(?:v=|youtu[.]be[/])([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : '05vwKMySzKw';
+}
+
+function getYtPlayer(videoId) {
+  return new Promise((resolve) => {
+    const wrap = $('devYtWrap');
+    if (!wrap) return resolve(null);
+    const createIt = () => {
+      if (rySimState.ytPlayer && typeof rySimState.ytPlayer.loadVideoById === 'function') {
+        return resolve(rySimState.ytPlayer);
+      }
+      wrap.innerHTML = '<div id="ryYtPlayer"></div>';
+      rySimState.ytPlayer = new YT.Player('ryYtPlayer', {
+        videoId,
+        playerVars: { autoplay: 0, controls: 1, modestbranding: 1, rel: 0 },
+        events: { onReady: () => resolve(rySimState.ytPlayer) },
+      });
+    };
+    if (window.YT && window.YT.Player) return createIt();
+    window.onYouTubeIframeAPIReady = createIt;
+    if (!document.getElementById('ytIframeApi')) {
+      const s = document.createElement('script');
+      s.id = 'ytIframeApi';
+      s.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(s);
+    }
+  });
+}
+
+function stopLocalRyderSim() {
+  rySimState.running = false;
+  (rySimState.timers || []).forEach(id => clearTimeout(id));
+  rySimState.timers = [];
+  if (rySimState.iv) { clearInterval(rySimState.iv); rySimState.iv = null; }
+  [rySimState.introEl, rySimState.ovEl].forEach(a => {
+    if (a) { try { a.pause(); a.currentTime = 0; } catch {} }
+  });
+  if (rySimState.ytPlayer && typeof rySimState.ytPlayer.pauseVideo === 'function') {
+    try { rySimState.ytPlayer.pauseVideo(); rySimState.ytPlayer.setVolume(100); } catch {}
+  }
+  rySimState.fogLeft = 0;
+  if ($('devFogHud')) { $('devFogHud').textContent = 'FOG: OFF'; $('devFogHud').className = 'fx-tag'; }
+  if ($('devDenonHud')) $('devDenonHud').textContent = 'DENON: STANDBY';
+  fxSetLights('standby');
+}
+
+async function startLocalRyderSim(jumpToSec) {
+  stopLocalRyderSim();
+  rySimState.running = true;
+  const spec = devRyderSpec || { denonVol: 70, postOverlayDenonVol: 55, fogBurstSec: 30, lightningFlashSec: 0.75, lightsPulseDurationSec: 20, lightsPulseIntervalSec: 2.0, lightsPulseOnSec: 0.25, overlayAtSec: 80, youtubeUrl: 'https://www.youtube.com/watch?v=05vwKMySzKw', announcerText: '', overlayText: '' };
+  const ytId = extractYtId(spec.youtubeUrl);
+  const yt = await getYtPlayer(ytId);
+  if (!rySimState.running) return;
+  const sch = (ms, fn) => {
+    const id = setTimeout(() => { if (rySimState.running) fn(); }, Math.max(0, ms));
+    rySimState.timers.push(id);
+  };
+  let secClock = jumpToSec != null ? Number(jumpToSec) : 0;
+  rySimState.iv = setInterval(() => {
+    if (!rySimState.running) return;
+    if (rySimState.fogLeft > 0) {
+      rySimState.fogLeft -= 1;
+      if ($('devFogHud')) {
+        if (rySimState.fogLeft > 0) $('devFogHud').textContent = `(TRIGGER FOG · ${rySimState.fogLeft}s)`;
+        else { $('devFogHud').textContent = 'FOG: DONE'; $('devFogHud').className = 'fx-tag'; }
+      }
+    }
+    if (yt && typeof yt.getCurrentTime === 'function' && yt.getPlayerState && yt.getPlayerState() === 1) {
+      const ct = Math.floor(yt.getCurrentTime());
+      const mm = Math.floor(ct / 60), ss = String(ct % 60).padStart(2, '0');
+      if ($('devSimClock')) $('devSimClock').textContent = `VID ${mm}:${ss}`;
+    } else if ($('devSimClock')) {
+      $('devSimClock').textContent = `SIM ${Math.floor(secClock)}s`;
+    }
+    secClock += 1;
+  }, 1000);
+
+  if (jumpToSec != null) {
+    fxSetLights('on');
+    $('devDenonHud').textContent = `DENON: VOL ${spec.denonVol || 70}`;
+    if (yt && typeof yt.loadVideoById === 'function') {
+      yt.loadVideoById({ videoId: ytId, startSeconds: Number(jumpToSec) });
+      yt.setVolume(100);
+    }
+    logDevCue(`⏩ Jumped video to ${jumpToSec}s — waiting for 1:20 (80s) overlay cue…`);
+    const waitMs = Math.max(500, (80 - Number(jumpToSec)) * 1000);
+    sch(waitMs, () => triggerLocalOverlay(yt, spec));
+    return;
+  }
+
+  // Full local simulation: Lights Out -> Fog 30s -> Lightning Flash -> Kokoro Intro -> 2x Flash -> YouTube + 20s Pulses -> Lights On -> 1:20 Overlay -> Denon 55
+  const introEl = $('shAudio_ryder_walkin');
+  rySimState.introEl = introEl;
+  fxApplyCue({ tag: 'lights_off', label: '(LIGHTS OFF) · (TRIGGER FOG · 30s)', fogSec: spec.fogBurstSec || 30, denonVol: spec.denonVol || 70, caption: spec.announcerText || 'Thunder rumbling…' });
+  introEl.src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
+  introEl.load();
+  introEl.play().catch(() => {});
+
+  sch(Math.round((spec.lightningFlashSec || 0.75) * 1000), () => fxApplyCue({ tag: 'flash', label: '(FLASH · LIGHTNING CRACK)', durationMs: 180 }));
+
+  const onIntroDone = () => {
+    if (!rySimState.running) return;
+    fxApplyCue({ tag: 'flash', label: '(FLASH 1/2)', durationMs: 180 });
+    sch(340, () => fxApplyCue({ tag: 'flash', label: '(FLASH 2/2) · ALL 3 SCREENS LIVE (Cody Rhodes @ Vol 70)', durationMs: 220, denonVol: spec.denonVol || 70 }));
+    sch(650, () => {
+      if (yt && typeof yt.loadVideoById === 'function') {
+        yt.loadVideoById({ videoId: ytId, startSeconds: 0 });
+        yt.setVolume(100);
+      }
+      logDevCue('📺 Cody Rhodes video started (0:00) @ Denon 70');
+      const pulses = Math.round((spec.lightsPulseDurationSec || 20) / (spec.lightsPulseIntervalSec || 2));
+      for (let i = 0; i < pulses; i++) {
+        sch(i * (spec.lightsPulseIntervalSec || 2) * 1000, () => {
+          fxFlash(`(FLASH 0.25s · Pulse ${i + 1}/${pulses})`, 250);
+          logDevCue(`⚡ (FLASH 0.25s) Pulse ${i + 1}/${pulses}`);
+        });
+      }
+      sch((spec.lightsPulseDurationSec || 20) * 1000, () => fxApplyCue({ tag: 'lights_on', label: '(FULL HOUSE LIGHTS ON) — Playing to 1:20…' }));
+      sch((spec.overlayAtSec || 80) * 1000, () => triggerLocalOverlay(yt, spec));
+    });
+  };
+  introEl.onended = onIntroDone;
+}
+
+function triggerLocalOverlay(yt, spec) {
+  if (!rySimState.running) return;
+  const ovEl = $('shOvAudio_ryder_walkin');
+  rySimState.ovEl = ovEl;
+  fxApplyCue({ tag: 'overlay', label: `(DUCK YOUTUBE + OVERLAY · "${spec.overlayText || ''}")`, caption: spec.overlayText });
+  if (yt && typeof yt.setVolume === 'function') yt.setVolume(25);
+  ovEl.src = `/api/shows/ryder_walkin/overlay.wav?t=${Date.now()}`;
+  ovEl.load();
+  ovEl.play().catch(() => {});
+  ovEl.onended = () => {
+    if (!rySimState.running) return;
+    if (yt && typeof yt.setVolume === 'function') yt.setVolume(100);
+    fxApplyCue({ tag: 'denon_drop', label: `(RESTORE YOUTUBE · DENON ${spec.denonVol || 70} → ${spec.postOverlayDenonVol || 55} · FULL LIGHTS ON)`, denonVol: spec.postOverlayDenonVol || 55 });
+  };
+}
+
 function syncShowActiveBadge(active) {
   const b = $('shBadge');
   if (!b) return;
@@ -7585,7 +7881,30 @@ function populateFxHookInputs(fx) {
   if ($('fxLightsOnUrl')) $('fxLightsOnUrl').value = fx.lightsOnUrl || '';
   if ($('fxFogHost')) $('fxFogHost').value = fx.fogHost || '';
   if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
-  if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 4.0);
+  if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 30);
+}
+
+function populateRyderDevPanel(ry, voices, kokoroReady) {
+  const kp = $('devKokoroPill');
+  if (kp) {
+    kp.textContent = kokoroReady ? 'STUDIO NEURAL: KOKORO-82M FP32' : 'STUDIO HD EDGE VOICE';
+    kp.className = kokoroReady ? 'pill ok' : 'pill live';
+  }
+  const vSel = $('devRyVoice');
+  if (vSel && Array.isArray(voices) && voices.length) {
+    vSel.innerHTML = voices.map(v => `<option value="${escHtml(v.id)}">${escHtml(v.label)}</option>`).join('');
+  }
+  if (!ry) return;
+  devRyderSpec = ry;
+  if (vSel) vSel.value = ry.announcerVoice || 'kokoro:onyx_fenrir_epic';
+  if ($('devRyRev')) $('devRyRev').value = String(ry.voiceReverbWet != null ? ry.voiceReverbWet : 0.11);
+  if ($('devRyBoost')) $('devRyBoost').value = String(ry.voiceBoostDb != null ? ry.voiceBoostDb : 2.0);
+  if ($('devRyFog')) $('devRyFog').value = String(ry.fogBurstSec || 30);
+  if ($('devRyPostVol')) $('devRyPostVol').value = String(ry.postOverlayDenonVol || 55);
+  if ($('devRyIntroTxt')) $('devRyIntroTxt').value = ry.announcerText || '';
+  if ($('devRyOvTxt')) $('devRyOvTxt').value = ry.overlayText || '';
+  if ($('shAudio_ryder_walkin')) $('shAudio_ryder_walkin').src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
+  if ($('shOvAudio_ryder_walkin')) $('shOvAudio_ryder_walkin').src = `/api/shows/ryder_walkin/overlay.wav?t=${Date.now()}`;
 }
 
 function renderShows(data) {
@@ -7593,17 +7912,19 @@ function renderShows(data) {
   if (!grid || !data) return;
   syncShowActiveBadge(data.active || {});
   populateFxHookInputs(data.fxHooks || {});
-  const shows = Array.isArray(data.shows) ? data.shows : [];
-  if (!shows.length) {
-    grid.innerHTML = '<div style="color:var(--mut);font-size:12px">No shows configured.</div>';
+  const allShows = Array.isArray(data.shows) ? data.shows : [];
+  const ryder = allShows.find(s => s.id === 'ryder_walkin');
+  populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady));
+  const others = allShows.filter(s => s.id !== 'ryder_walkin');
+  if (!others.length) {
+    grid.innerHTML = '<div style="color:var(--mut);font-size:12px">No other shows configured.</div>';
     return;
   }
-  grid.innerHTML = shows.map(s => {
+  grid.innerHTML = others.map(s => {
     const id = escHtml(s.id);
     const trigs = (s.triggers || []).map(t => `<code>"Armory, ${escHtml(t)}"</code>`).join(' ');
     const srcTag = s.sourceUploaded ? `<span class="pill ok">CUSTOM: ${escHtml(s.sourceFile)}</span>` : '<span class="pill">DEMO TRACK</span>';
     const durTag = s.previewReady ? `${s.previewDurationSec}s ready` : 'Not built';
-    const hasMusic = s.kind !== 'debut_video';
     return `
       <div class="show-item" data-showid="${id}">
         <div class="show-head">
@@ -7631,12 +7952,10 @@ function renderShows(data) {
           <div><label>Fade (s)</label><input id="shFade_${id}" type="number" min="0.3" max="10" step="0.2" value="${s.fadeOutSec}"></div>
         </div>
         ${s.kind !== 'pr_drop' ? `<div><label>Announcer Script</label><textarea id="shAnn_${id}" rows="2">${escHtml(s.announcerText || '')}</textarea></div>` : ''}
-        ${s.threeScreenVideo ? `<div><label>3-Screen YouTube URL</label><input id="shYt_${id}" type="text" value="${escHtml(s.youtubeUrl || '')}"></div>` : ''}
-        ${hasMusic ? `
         <div class="ctrl-row" style="margin-top:2px">
           <label style="margin:0;flex:1;min-width:170px">Swap Song (.mp3/.wav): <input id="shFile_${id}" type="file" accept=".mp3,.wav,.m4a,.ogg" onchange="uploadShowSong('${id}', this)"></label>
           ${s.sourceUploaded ? `<button class="btn sm sec" type="button" onclick="clearShowSong('${id}')">Revert Demo</button>` : ''}
-        </div>` : ''}
+        </div>
         <div class="ctrl-row" style="margin-top:2px">
           <button class="btn sm sec" type="button" onclick="saveShowConfig('${id}', this)">Save &amp; Rebuild Mix</button>
           <span id="shOut_${id}" style="color:var(--mut);font-size:11px"></span>
@@ -7646,6 +7965,7 @@ function renderShows(data) {
 }
 
 async function loadShows() {
+  ensureShowSse();
   try {
     const r = await fetch('/api/shows').then(x => x.json());
     renderShows(r);
@@ -7761,7 +8081,31 @@ async function saveFxHooks(extraBody) {
   return r;
 }
 
-if ($('shStopAllBtn')) $('shStopAllBtn').onclick = () => stopShow();
+if ($('shStopAllBtn')) $('shStopAllBtn').onclick = () => { stopLocalRyderSim(); stopShow(); };
+if ($('devSimFullBtn')) $('devSimFullBtn').onclick = () => startLocalRyderSim(null);
+if ($('devSimJumpBtn')) $('devSimJumpBtn').onclick = () => startLocalRyderSim(76);
+if ($('devSimStopBtn')) $('devSimStopBtn').onclick = () => stopLocalRyderSim();
+if ($('devSimFsBtn')) $('devSimFsBtn').onclick = () => { if ($('devStage')) $('devStage').classList.toggle('fs'); };
+if ($('devFireLiveBtn')) $('devFireLiveBtn').onclick = () => fireShow('ryder_walkin');
+if ($('devRySaveBtn')) $('devRySaveBtn').onclick = async () => {
+  const body = {
+    announcerVoice: $('devRyVoice').value,
+    voiceReverbWet: Number($('devRyRev').value || 0.11),
+    voiceBoostDb: Number($('devRyBoost').value || 2.0),
+    fogBurstSec: Number($('devRyFog').value || 30),
+    postOverlayDenonVol: Number($('devRyPostVol').value || 55),
+    announcerText: $('devRyIntroTxt').value.trim(),
+    overlayText: $('devRyOvTxt').value.trim(),
+  };
+  $('shOut_ryder_walkin').textContent = 'Rendering studio Kokoro mix…';
+  try {
+    const r = await fetch('/api/shows/ryder_walkin/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    $('shOut_ryder_walkin').textContent = r.ok ? `✓ Rebuilt (${(r.build && r.build.durationSec) || '?'}s)` : `✗ ${r.error || 'Failed'}`;
+  } catch {
+    $('shOut_ryder_walkin').textContent = '✗ Render failed';
+  }
+};
 if ($('fxSaveBtn')) $('fxSaveBtn').onclick = () => saveFxHooks();
 if ($('fxTestFlashBtn')) $('fxTestFlashBtn').onclick = () => saveFxHooks({ test: 'lights_flash' });
 if ($('fxTestFogBtn')) $('fxTestFogBtn').onclick = () => saveFxHooks({ test: 'fog' });
@@ -8355,6 +8699,34 @@ def create_app(service: ArmoryCamService) -> Flask:
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
+    @app.get("/api/shows/voices")
+    def api_shows_voices() -> Response:
+        resp = jsonify(service.shows.list_voices())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/shows/events")
+    def api_shows_events() -> Response:
+        q = service.shows.subscribe_events()
+
+        def generate():
+            try:
+                init_ev = json.dumps({"type": "hello", **service.shows.list_voices()})
+                yield f"data: {init_ev}\n\n"
+                while True:
+                    try:
+                        ev = q.get(timeout=15.0)
+                        yield f"data: {json.dumps(ev)}\n\n"
+                    except queue.Empty:
+                        yield ": keepalive\n\n"
+            finally:
+                service.shows.unsubscribe_events(q)
+
+        resp = Response(generate(), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
     @app.get("/api/shows/<show_id>/preview.wav")
     def api_show_preview_wav(show_id: str) -> Response:
         spec = service.shows.get_show(show_id)
@@ -8366,6 +8738,20 @@ def create_app(service: ArmoryCamService) -> Flask:
             if not res.get("ok") or not p_wav.is_file():
                 return jsonify({"ok": False, "error": res.get("error") or "Preview build failed"}), 500
         resp = Response(p_wav.read_bytes(), mimetype="audio/wav")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/shows/<show_id>/overlay.wav")
+    def api_show_overlay_wav(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None or not spec.overlay_text:
+            return jsonify({"ok": False, "error": f"No overlay audio for show: {show_id}"}), 404
+        o_wav = service.shows.overlay_wav_path(spec.id)
+        if not o_wav.is_file() or o_wav.stat().st_size < 100:
+            res = service.shows.build_show_overlay(spec.id, force=True)
+            if not res.get("ok") or not o_wav.is_file():
+                return jsonify({"ok": False, "error": res.get("error") or "Overlay build failed"}), 500
+        resp = Response(o_wav.read_bytes(), mimetype="audio/wav")
         resp.headers["Cache-Control"] = "no-store"
         return resp
 

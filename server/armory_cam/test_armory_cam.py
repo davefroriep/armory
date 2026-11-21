@@ -2686,21 +2686,38 @@ class ShowDirectorTests(unittest.TestCase):
 
             urls = [u for k, u in trace if k == "http_get"]
             self.assertIn("http://192.168.1.60/rpc/Switch.Set?id=0&on=false", urls)
-            self.assertIn("http://192.168.1.61/rpc/Switch.Set?id=0&on=true&toggle_after=4.5", urls)
-            # 2x light flash sequence includes on/off cycles
-            self.assertGreaterEqual(urls.count("http://192.168.1.60/rpc/Switch.Set?id=0&on=true"), 2)
-            # Denon Dual HDMI Out (AUTO) + MV70 + SmartSpin PowerOn & InputHDMI1
+            # Ryder uses dedicated 30s fog burst (while leaving other shows' 4.5s default intact)
+            self.assertIn("http://192.168.1.61/rpc/Switch.Set?id=0&on=true&toggle_after=30", urls)
+            # Lightning flash + 2x flash + 10x 0.25s strobe pulses + full lights on = 14+ ON triggers
+            self.assertGreaterEqual(urls.count("http://192.168.1.60/rpc/Switch.Set?id=0&on=true"), 14)
+            # Denon Dual HDMI Out (AUTO) + MV70 -> post-1:20 MV55 drop!
             self.assertTrue(any("VSMONIAUTO" in u for u in urls))
             self.assertTrue(any("MV70" in u for u in urls))
+            mv70_idx = next(i for i, u in enumerate(urls) if "MV70" in u)
+            last_mv55_idx = max(i for i, u in enumerate(urls) if "MV55" in u)
+            self.assertGreater(last_mv55_idx, mv70_idx)
+            mv_cmds = [u.split("?", 1)[1] for u in urls if "formiPhoneAppDirect.xml?MV" in u]
+            self.assertEqual(mv_cmds[-1], "MV55")
+
+            # Cube plays intro (takeover) then 1:20 overlay in mode=duck BEFORE Denon drops MV70->MV55
+            cube_posts = [u for k, u in trace if k == "http_post" and "192.168.1.151:8767/play" in u]
+            self.assertGreaterEqual(len(cube_posts), 2)
+            self.assertIn("mode=duck", cube_posts[-1])
+            self.assertIn("gain=1.00", cube_posts[-1])
+
             posts = [u for k, u in trace if k == "http_post"]
             self.assertIn("http://192.168.1.88:8060/keypress/PowerOn", posts)
             self.assertIn("http://192.168.1.88:8060/keypress/InputHDMI1", posts)
-            # Wallboard woken, muted cleanly via media volume 0, and both Wallboard & Cube launched Cody Rhodes URL
             self.assertIn(("wb", "wake"), trace)
             joined_adb = [" ".join(c) for c in adb_cmds]
             self.assertTrue(any("192.168.1.204:5555" in s and "media volume --stream 3 --set 0" in s for s in joined_adb))
             self.assertTrue(any("192.168.1.204:5555" in s and "05vwKMySzKw" in s for s in joined_adb))
             self.assertTrue(any("192.168.1.151:5555" in s and "05vwKMySzKw" in s for s in joined_adb))
+
+            # Visual FX cues logged for on-screen SSE simulator
+            cue_tags = [c["tag"] for c in director.recent_cues]
+            for req_tag in ("lights_off", "fog", "flash", "screens", "pulse", "lights_on", "overlay", "denon_drop", "ended"):
+                self.assertIn(req_tag, cue_tags)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2713,7 +2730,23 @@ class ShowDirectorTests(unittest.TestCase):
 
             dash = client.get("/").get_data(as_text=True)
             self.assertIn("Walk-Ins &amp; PR Drop-Ins (Show Lab)", dash)
+            self.assertIn("devRyderBox", dash)
             self.assertIn("shStopAllBtn", dash)
+
+            v_resp = client.get("/api/shows/voices")
+            self.assertEqual(v_resp.status_code, 200)
+            self.assertEqual(v_resp.get_json()["defaultVoice"], sd.DEFAULT_ANNOUNCER_VOICE)
+
+            ov_resp = client.get("/api/shows/ryder_walkin/overlay.wav")
+            self.assertEqual(ov_resp.status_code, 200)
+            self.assertEqual(ov_resp.mimetype, "audio/wav")
+
+            # Banned legacy robotic voice auto-upgrades cleanly & never clips on master chain
+            upgraded = sd.ShowSpec.from_dict({"id": "t1", "announcerVoice": "en-US-ChristopherNeural"})
+            self.assertEqual(upgraded.announcer_voice, sd.DEFAULT_ANNOUNCER_VOICE)
+            raw_sig = 0.9 * np.sin(2.0 * np.pi * 140.0 * np.linspace(0, 0.5, 12000, endpoint=False, dtype=np.float32))
+            mastered = sd.master_announcer_stereo(raw_sig, 24000, boost_db=5.0)
+            self.assertLessEqual(float(np.max(np.abs(mastered))), 0.92)
 
             lst = client.get("/api/shows")
             self.assertEqual(lst.status_code, 200)
