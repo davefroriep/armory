@@ -4874,8 +4874,8 @@ DASHBOARD_HTML = """<!doctype html>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
       <div><label>TV IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
       <div><label>TV Wi-Fi MAC</label><input id="dpPrimMac" type="text" value="bc:09:b9:e7:35:26"></div>
-      <div><label>TV PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="com.mediatek.tis/.HdmiInputService/HW2"></div>
-      <div><label>TV Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="com.mediatek.tis/.HdmiInputService/HW3"></div>
+      <div><label>TV PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="KEYCODE_TV_INPUT_HDMI_1"></div>
+      <div><label>TV Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="KEYCODE_TV_INPUT_HDMI_2"></div>
       <div><label>SmartSpin TV IP (TCL)</label><input id="dpSpinHost" type="text" placeholder="192.168.1.xxx"></div>
       <div><label>SmartSpin MAC</label><input id="dpSpinMac" type="text" placeholder="xx:xx:xx:xx:xx:xx"></div>
       <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
@@ -7373,8 +7373,8 @@ function populateDisplaysInputs(dc) {
   const s = dc.spin || {};
   $('dpPrimHost').value = p.host || '192.168.1.230';
   $('dpPrimMac').value = p.mac || 'bc:09:b9:e7:35:26';
-  $('dpPrimHdmi1').value = p.hdmiOptiplexInput || 'com.mediatek.tis/.HdmiInputService/HW2';
-  $('dpPrimHdmi2').value = p.hdmiDenonInput || 'com.mediatek.tis/.HdmiInputService/HW3';
+  $('dpPrimHdmi1').value = p.hdmiOptiplexInput || 'KEYCODE_TV_INPUT_HDMI_1';
+  $('dpPrimHdmi2').value = p.hdmiDenonInput || 'KEYCODE_TV_INPUT_HDMI_2';
   $('dpSpinHost').value = s.host || '';
   $('dpSpinMac').value = s.mac || '';
   $('dpSpinHdmi').value = s.hdmiInput || 'InputHDMI1';

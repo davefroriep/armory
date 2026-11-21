@@ -25,8 +25,8 @@ import xml.etree.ElementTree as ET
 
 DEFAULT_PRIMARY_HOST = "192.168.1.230"
 DEFAULT_PRIMARY_MAC = "bc:09:b9:e7:35:26"
-DEFAULT_HDMI_OPTIPLEX_INPUT = "com.mediatek.tis/.HdmiInputService/HW2"
-DEFAULT_HDMI_DENON_INPUT = "com.mediatek.tis/.HdmiInputService/HW3"
+DEFAULT_HDMI_OPTIPLEX_INPUT = "KEYCODE_TV_INPUT_HDMI_1"
+DEFAULT_HDMI_DENON_INPUT = "KEYCODE_TV_INPUT_HDMI_2"
 DEFAULT_CUBE_HOST = "192.168.1.151"
 DEFAULT_OPEN_GYM_MUSIC_QUERY = "workout music mix"
 
@@ -159,6 +159,45 @@ def normalize_youtube_tv_url(url: str) -> str:
     if not raw:
         return ""
     return re.sub(r"^https?://music\.youtube\.com\b", "https://www.youtube.com", raw, flags=re.I)
+
+
+_HDMI_INPUT_KEYCODES: dict[str, str] = {
+    "keycode_tv_input_hdmi_1": "243",
+    "hdmi1": "243",
+    "hdmi 1": "243",
+    "hdmi_1": "243",
+    "/hw2": "243",
+    "keycode_tv_input_hdmi_2": "244",
+    "hdmi2": "244",
+    "hdmi 2": "244",
+    "hdmi_2": "244",
+    "/hw3": "244",
+    "keycode_tv_input_hdmi_3": "245",
+    "hdmi3": "245",
+    "hdmi 3": "245",
+    "hdmi_3": "245",
+    "/hw4": "245",
+    "keycode_tv_input_hdmi_4": "246",
+    "hdmi4": "246",
+    "hdmi 4": "246",
+    "hdmi_4": "246",
+    "/hw5": "246",
+}
+
+
+def resolve_hdmi_keyevent(input_spec: str, fallback_keycode: str) -> str:
+    """Resolve an HDMI keycode, shorthand, or legacy MediaTek TIF ID to an ADB keyevent code."""
+    s = str(input_spec or "").strip().lower()
+    if not s:
+        return fallback_keycode
+    if s.isdigit():
+        return s
+    for key, code in _HDMI_INPUT_KEYCODES.items():
+        if key.startswith("/") and s.endswith(key):
+            return code
+        if s == key:
+            return code
+    return fallback_keycode
 
 
 def _default_http_get(url: str, timeout: float = 1.5) -> tuple[int, bytes]:
@@ -566,9 +605,11 @@ class GymDisplayController:
             }
 
         if action in ("hdmi1", "pc", "hdmi2", "firetv"):
-            input_id = cfg.hdmi_optiplex_input if action in ("hdmi1", "pc") else cfg.hdmi_denon_input
+            is_hdmi1 = action in ("hdmi1", "pc")
+            input_id = cfg.hdmi_optiplex_input if is_hdmi1 else cfg.hdmi_denon_input
             if not input_id:
                 return {"ok": False, "target": "tv", "action": action, "error": "HDMI input ID not configured"}
+            keycode = resolve_hdmi_keyevent(input_id, "243" if is_hdmi1 else "244")
             st, detail = self.adb._connect_and_status(ser)
             if st != "device" and cfg.mac and self._wol_sender is not None:
                 self._wol_sender(cfg.mac)
@@ -577,17 +618,22 @@ class GymDisplayController:
             if st != "device":
                 return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
             self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
-            uri = f"content://android.media.tv/passthrough/{urllib.parse.quote(input_id, safe='')}"
+            self._sleep(0.25)
             rc, out, err = self.adb._run(
-                ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", uri],
-                timeout=5.0,
+                ["-s", ser, "shell", "input", "keyevent", keycode],
+                timeout=4.0,
             )
             return {
                 "ok": rc == 0,
                 "target": "tv",
                 "action": action,
+                "keycode": keycode,
                 "inputId": input_id,
-                "message": f"Switched TV to {input_id}" if rc == 0 else (err or out).strip(),
+                "message": (
+                    f"Switched TV to {'HDMI 1 (PC)' if is_hdmi1 else 'HDMI 2 (Fire TV)'} (keyevent {keycode})"
+                    if rc == 0
+                    else (err or out).strip()
+                ),
             }
 
         return {"ok": False, "target": "tv", "action": action, "error": f"Unsupported action: {action}"}

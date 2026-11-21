@@ -2100,12 +2100,17 @@ class ArmoryCamTests(unittest.TestCase):
             allow_network=False,
         )
 
+        self.assertEqual(dc.resolve_hdmi_keyevent("com.mediatek.tis/.HdmiInputService/HW2", "243"), "243")
+        self.assertEqual(dc.resolve_hdmi_keyevent("com.mediatek.tis/.HdmiInputService/HW3", "244"), "244")
         self.assertTrue(ctrl.execute("primary", "on")["ok"])
         self.assertTrue(any(c[-3:] == ["input", "keyevent", "224"] for c in adb_cmds))
         self.assertTrue(ctrl.execute("primary", "off")["ok"])
         self.assertTrue(any(c[-3:] == ["input", "keyevent", "223"] for c in adb_cmds))
         self.assertTrue(ctrl.execute("primary", "hdmi1")["ok"])
-        self.assertTrue(any("android.media.tv/passthrough/" in " ".join(c) for c in adb_cmds))
+        self.assertTrue(any(c[-3:] == ["input", "keyevent", "243"] for c in adb_cmds))
+        self.assertFalse(any("android.media.tv/passthrough/" in " ".join(c) for c in adb_cmds))
+        self.assertTrue(ctrl.execute("tv", "hdmi2")["ok"])
+        self.assertTrue(any(c[-3:] == ["input", "keyevent", "244"] for c in adb_cmds))
 
         # Test Roku ECP + Denon VSMONIAUTO / VSMONI1 fallback
         self.assertTrue(ctrl.execute("spin", "on")["ok"])
