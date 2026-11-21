@@ -4649,10 +4649,8 @@ DASHBOARD_HTML = """<!doctype html>
       <div>
         <label>Speaker Voice</label>
         <select id="vxTtsVoice">
-          <option value="en-US-AndrewNeural">Andrew (Neural Natural)</option>
-          <option value="en-US-BrianNeural">Brian (Neural Warm)</option>
-          <option value="en-US-GuyNeural">Guy (Neural Crisp)</option>
-          <option value="en-US-AriaNeural">Aria (Neural Female)</option>
+          <option value="en-US-AndrewMultilingualNeural">Andrew (Warm Male — Default)</option>
+          <option value="en-US-AvaMultilingualNeural">Ava (Crisp Female)</option>
           <option value="sapi">Windows Offline SAPI</option>
         </select>
       </div>
@@ -7031,7 +7029,7 @@ async function saveVoiceConfig(triggerBtn) {
     listenMode: $('vxMode').value || 'workout',
     deviceMatch: $('vxDevice').value || 'PowerConf S330',
     speakerReadback: $('vxReadback').value === '1',
-    ttsVoice: $('vxTtsVoice').value || 'en-US-AndrewNeural',
+    ttsVoice: $('vxTtsVoice').value || 'en-US-AndrewMultilingualNeural',
     modelSize: $('vxModel').value || 'base.en',
     vadThreshold: Number($('vxVad').value) || 0.45,
   };
@@ -7471,7 +7469,7 @@ async function init() {
   $('vxEnabled').value = vx.enabled === false ? '0' : '1';
   $('vxMode').value = vx.listenMode === 'always' ? 'always' : 'workout';
   $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
-  $('vxTtsVoice').value = vx.ttsVoice || 'en-US-AndrewNeural';
+  $('vxTtsVoice').value = vx.ttsVoice || 'en-US-AndrewMultilingualNeural';
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
   populateHouseAudioInputs(cfg.houseAudio || {});

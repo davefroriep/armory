@@ -538,17 +538,42 @@ export function hasCommandTailAfterWake(raw: string, wakeWord?: string, armed = 
   return false;
 }
 
+export const SET_CONFIRM_TAGS = [
+  'got it',
+  'check',
+  'done',
+  'logged',
+  'locked in',
+  'banked',
+  'solid',
+  'clean',
+  'on the board',
+  'in the books',
+] as const;
+
+/** Picks a punchy set-logged confirmation tag at random without repeating `prevTag` back-to-back. */
+export function pickSetConfirmTag(
+  prevTag?: string | null,
+  rng: () => number = Math.random,
+): string {
+  const pool = prevTag
+    ? SET_CONFIRM_TAGS.filter((t) => t !== prevTag)
+    : SET_CONFIRM_TAGS;
+  const idx = Math.min(pool.length - 1, Math.max(0, Math.floor(rng() * pool.length)));
+  return pool[idx] ?? SET_CONFIRM_TAGS[0];
+}
+
 /** Returns concise spoken readback confirmation text (or `null` for silent wake arming). */
-export function defaultReadbackForIntent(intent: VoiceIntent): string | null {
+export function defaultReadbackForIntent(intent: VoiceIntent, confirmTag = 'got it'): string | null {
   switch (intent.kind) {
     case 'arm_wake':
       return null;
     case 'log_current':
-      if (intent.seconds != null) return `${intent.seconds} seconds, got it`;
-      if (intent.bodyweight && intent.reps != null) return `Bodyweight for ${intent.reps}, got it`;
-      if (intent.weight != null && intent.reps != null) return `${intent.weight} for ${intent.reps}, got it`;
-      if (intent.reps != null) return `For ${intent.reps}, got it`;
-      return 'Checked, got it';
+      if (intent.seconds != null) return `${intent.seconds} seconds, ${confirmTag}`;
+      if (intent.bodyweight && intent.reps != null) return `Bodyweight for ${intent.reps}, ${confirmTag}`;
+      if (intent.weight != null && intent.reps != null) return `${intent.weight} for ${intent.reps}, ${confirmTag}`;
+      if (intent.reps != null) return `For ${intent.reps}, ${confirmTag}`;
+      return confirmTag === 'check' ? 'Set checked' : `Checked, ${confirmTag}`;
     case 'set_only':
       if (intent.weight != null) return `Weight ${intent.weight}, got it`;
       if (intent.reps != null) return `Reps ${intent.reps}, got it`;

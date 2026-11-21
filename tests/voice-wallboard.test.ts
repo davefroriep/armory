@@ -11,8 +11,8 @@ import {
 } from '../src/lifts/cursor';
 import { buildExercise, driveUrlFor, secondsSinceLastSet } from '../src/lifts/logic';
 import {
-  AB_SHOOTOUT_PHRASES, defaultReadbackForIntent, hasCommandTailAfterWake, hasWakeWord,
-  parseVoiceTranscript, voiceIntentKey, voiceTokenMatchPct,
+  AB_SHOOTOUT_PHRASES, SET_CONFIRM_TAGS, defaultReadbackForIntent, hasCommandTailAfterWake, hasWakeWord,
+  parseVoiceTranscript, pickSetConfirmTag, voiceIntentKey, voiceTokenMatchPct,
 } from '../src/lifts/voiceParser';
 import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
@@ -251,8 +251,18 @@ describe('voice transcript parser', () => {
     expect(defaultReadbackForIntent({ kind: 'arm_wake' })).toBeNull();
     expect(defaultReadbackForIntent({ kind: 'log_current', reps: 10 })).toBe('For 10, got it');
     expect(defaultReadbackForIntent({ kind: 'log_current', weight: 225, reps: 8 })).toBe('225 for 8, got it');
+    expect(defaultReadbackForIntent({ kind: 'log_current', weight: 225, reps: 10 }, 'locked in')).toBe('225 for 10, locked in');
     expect(defaultReadbackForIntent({ kind: 'log_current' })).toBe('Checked, got it');
+    expect(defaultReadbackForIntent({ kind: 'log_current' }, 'check')).toBe('Set checked');
     expect(defaultReadbackForIntent({ kind: 'undo' })).toBe('Undid last');
+
+    let prevTag: string | null = null;
+    for (let i = 0; i < 20; i++) {
+      const next = pickSetConfirmTag(prevTag);
+      expect(SET_CONFIRM_TAGS).toContain(next);
+      expect(next).not.toBe(prevTag);
+      prevTag = next;
+    }
   });
 });
 

@@ -43,15 +43,19 @@ HOST_API_PREFERENCE = (
     "Windows DirectSound",
     "Windows WDM-KS",
 )
+DEFAULT_TTS_VOICE = "en-US-AndrewMultilingualNeural"
 TTS_VOICES = (
-    "en-US-AndrewNeural",
-    "en-US-BrianNeural",
-    "en-US-GuyNeural",
-    "en-US-AriaNeural",
+    "en-US-AndrewMultilingualNeural",
+    "en-US-AvaMultilingualNeural",
     "sapi",
 )
+_LEGACY_TTS_VOICE_MAP = {
+    "en-US-AndrewNeural": "en-US-AndrewMultilingualNeural",
+    "en-US-AvaNeural": "en-US-AvaMultilingualNeural",
+}
 PREWARM_TTS_PHRASES = (
     "Armory room mic ready",
+    "Armory mic on",
     "Checked, got it",
     "Didn't catch that",
     "Rest skipped",
@@ -223,7 +227,7 @@ class RoomVoiceConfig:
     model_size: str = "base.en"   # empirically benchmarked <= 1.2s on i7-4790
     wake_word: str = "armory"
     speaker_readback: bool = True
-    tts_voice: str = "en-US-AndrewNeural"
+    tts_voice: str = DEFAULT_TTS_VOICE
     vad_threshold: float = 0.45
     min_speech_ms: int = 280
     end_silence_ms: int = 620
@@ -256,8 +260,9 @@ class RoomVoiceConfig:
         model_raw = str(raw.get("modelSize", "base.en")).strip()
         model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en") else "base.en"
         wake = str(raw.get("wakeWord") or "armory").strip().lower() or "armory"
-        tts_raw = str(raw.get("ttsVoice") or "en-US-AndrewNeural").strip()
-        tts_voice = tts_raw if tts_raw in TTS_VOICES else "en-US-AndrewNeural"
+        tts_raw = str(raw.get("ttsVoice") or DEFAULT_TTS_VOICE).strip()
+        tts_raw = _LEGACY_TTS_VOICE_MAP.get(tts_raw, tts_raw)
+        tts_voice = tts_raw if tts_raw in TTS_VOICES else DEFAULT_TTS_VOICE
         return cls(
             enabled=bool(raw.get("enabled", True)),
             device_match=str(raw.get("deviceMatch", "PowerConf S330") or "").strip(),
@@ -725,7 +730,7 @@ class _NeuralTtsSynthesizer:
                 pass
 
     @staticmethod
-    def _synth_edge_pcm(text: str, voice: str) -> tuple[np.ndarray, int]:
+    def _synth_edge_pcm(text: str, voice: str, attempts: int = 3) -> tuple[np.ndarray, int]:
         import av
         import edge_tts
 
@@ -737,9 +742,22 @@ class _NeuralTtsSynthesizer:
                     chunks.append(chunk["data"])
             return b"".join(chunks)
 
-        mp3_bytes = asyncio.run(_fetch())
+        mp3_bytes = b""
+        last_exc: Exception | None = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                mp3_bytes = asyncio.run(_fetch())
+                if not mp3_bytes:
+                    raise RuntimeError("Empty edge-tts audio")
+                break
+            except Exception as exc:
+                last_exc = exc
+                mp3_bytes = b""
+                if attempt < max(1, attempts):
+                    time.sleep(0.35 * attempt)
         if not mp3_bytes:
-            raise RuntimeError("Empty edge-tts audio")
+            raise RuntimeError(f"Empty edge-tts audio: {last_exc}")
+
         resampler = av.AudioResampler(format="flt", layout="mono", rate=24_000)
         parts: list[np.ndarray] = []
         with av.open(io.BytesIO(mp3_bytes), format="mp3") as container:
@@ -752,7 +770,7 @@ class _NeuralTtsSynthesizer:
             raise RuntimeError("Decoded 0 audio frames")
         return np.concatenate(parts).astype(np.float32), 24_000
 
-    def synthesize(self, text: str, voice: str = "en-US-AndrewNeural") -> tuple[np.ndarray, int] | None:
+    def synthesize(self, text: str, voice: str = DEFAULT_TTS_VOICE) -> tuple[np.ndarray, int] | None:
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
             return None

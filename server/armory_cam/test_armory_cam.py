@@ -1645,19 +1645,33 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertTrue(ping["voice"]["enabled"])
             self.assertFalse(ping["voice"]["listening"])
 
-            # Config update persists across service reload
+            # Default & legacy TTS voice normalization + config persistence across service reload
+            self.assertEqual(rv.RoomVoiceConfig().tts_voice, "en-US-AndrewMultilingualNeural")
+            self.assertEqual(
+                rv.RoomVoiceConfig.from_dict({"ttsVoice": "en-US-AndrewNeural"}).tts_voice,
+                "en-US-AndrewMultilingualNeural",
+            )
+            self.assertEqual(
+                rv.RoomVoiceConfig.from_dict({"ttsVoice": "en-US-AvaNeural"}).tts_voice,
+                "en-US-AvaMultilingualNeural",
+            )
+            self.assertEqual(
+                rv.RoomVoiceConfig.from_dict({"ttsVoice": "en-US-BrianNeural"}).tts_voice,
+                "en-US-AndrewMultilingualNeural",
+            )
+
             cfg_res = client.post(
                 "/api/voice/config",
-                json={"listenMode": "always", "modelSize": "tiny.en", "vadThreshold": 0.55, "ttsVoice": "en-US-BrianNeural"},
+                json={"listenMode": "always", "modelSize": "tiny.en", "vadThreshold": 0.55, "ttsVoice": "en-US-AvaMultilingualNeural"},
             )
             self.assertEqual(cfg_res.status_code, 200)
             self.assertEqual(cfg_res.get_json()["config"]["listenMode"], "always")
-            self.assertEqual(cfg_res.get_json()["config"]["ttsVoice"], "en-US-BrianNeural")
+            self.assertEqual(cfg_res.get_json()["config"]["ttsVoice"], "en-US-AvaMultilingualNeural")
 
             svc_reload = ac.ArmoryCamService(root_dir=tmp)
             self.assertEqual(svc_reload.voice_cfg.listen_mode, "always")
             self.assertEqual(svc_reload.voice_cfg.model_size, "tiny.en")
-            self.assertEqual(svc_reload.voice_cfg.tts_voice, "en-US-BrianNeural")
+            self.assertEqual(svc_reload.voice_cfg.tts_voice, "en-US-AvaMultilingualNeural")
             self.assertAlmostEqual(svc_reload.voice_cfg.vad_threshold, 0.55)
 
             # Context update + SSE stream + inject + ack

@@ -80,6 +80,7 @@ vi.mock('../src/lifts/gymCam', async () => {
 
 import { updateSettings } from '../src/store/settings';
 import { voice, type AbMicSample } from '../src/lifts/voice';
+import { SET_CONFIRM_TAGS } from '../src/lifts/voiceParser';
 
 function makeBenchSession(id: string): LiftSession {
   return {
@@ -139,10 +140,9 @@ describe('VoiceController room source relay', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
       const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
       expect(url).toContain('/api/voice/ack');
-      expect(JSON.parse(String(init.body))).toMatchObject({
-        armed: false,
-        speech: '225 for 8, got it',
-      });
+      const ackBody = JSON.parse(String(init.body)) as { armed?: boolean; speech?: string };
+      expect(ackBody.armed).toBe(false);
+      expect(ackBody.speech).toMatch(new RegExp(`^225 for 8, (${SET_CONFIRM_TAGS.join('|')})$`));
       expect(mockState.speakCalls).toEqual([]);
 
       // Immediate duplicate from room source is ignored
@@ -175,7 +175,24 @@ describe('VoiceController room source relay', () => {
       });
       await new Promise((r) => setTimeout(r, 20));
       expect(sess.exs[0].sets[0].done).toBe(true);
-      expect(mockState.speakCalls).toEqual(['195 for 10, got it']);
+      expect(mockState.speakCalls).toHaveLength(1);
+      const re1 = new RegExp(`^195 for 10, (${SET_CONFIRM_TAGS.join('|')})$`);
+      const m1 = mockState.speakCalls[0].match(re1);
+      expect(m1).not.toBeNull();
+
+      voice.receiveExternalEvent({
+        transcript: 'Armory 205 for 8',
+        isFinal: true,
+        source: 'room',
+        state: 'room',
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(sess.exs[0].sets[1].done).toBe(true);
+      expect(mockState.speakCalls).toHaveLength(2);
+      const re2 = new RegExp(`^205 for 8, (${SET_CONFIRM_TAGS.join('|')})$`);
+      const m2 = mockState.speakCalls[1].match(re2);
+      expect(m2).not.toBeNull();
+      expect(m2![1]).not.toBe(m1![1]);
     } finally {
       vi.unstubAllGlobals();
     }

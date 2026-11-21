@@ -16,7 +16,7 @@ import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
 import {
   defaultReadbackForIntent, describeVoiceIntent, hasCommandTailAfterWake, hasWakeWord,
-  parseVoiceTranscript, voiceIntentKey, type VoiceIntent,
+  parseVoiceTranscript, pickSetConfirmTag, voiceIntentKey, type VoiceIntent,
 } from './voiceParser';
 
 export interface VoiceActionNotice {
@@ -155,6 +155,7 @@ class VoiceController {
   private shootoutListener: ((sample: AbMicSample) => void) | null = null;
   private abExecAtMs = 0;
   private abExecSource: NativeVoiceEvent['source'] | null = null;
+  private lastConfirmTag: string | null = null;
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
@@ -1225,15 +1226,18 @@ class VoiceController {
       : ex.type === 'bodyweight' && !set.w
         ? `BW × ${set.r ?? 0}`
         : `${set.w != null ? fmtKg(set.w) : '0'} ${u} × ${set.r ?? 0}`;
+    const confirmTag = pickSetConfirmTag(this.lastConfirmTag);
+    this.lastConfirmTag = confirmTag;
     const hasSpokenNums = intent.weight != null || intent.reps != null || intent.seconds != null;
     const spokenCheck = ex.type === 'time'
-      ? `${set.r ?? 0} seconds, got it`
+      ? `${set.r ?? 0} seconds, ${confirmTag}`
       : ex.type === 'bodyweight' && !set.w
-        ? `Bodyweight for ${set.r ?? 0}, got it`
+        ? `Bodyweight for ${set.r ?? 0}, ${confirmTag}`
         : set.w != null
-          ? `${fmtKg(set.w)} for ${set.r ?? 0}, got it`
-          : `For ${set.r ?? 0}, got it`;
-    return this.notice(`✓ ${cur.label} ${ex.name} · ${valTxt}`, 'ok', true, hasSpokenNums ? fallbackSpeech : spokenCheck);
+          ? `${fmtKg(set.w)} for ${set.r ?? 0}, ${confirmTag}`
+          : `For ${set.r ?? 0}, ${confirmTag}`;
+    const spoken = hasSpokenNums ? defaultReadbackForIntent(intent, confirmTag) : spokenCheck;
+    return this.notice(`✓ ${cur.label} ${ex.name} · ${valTxt}`, 'ok', true, spoken);
   }
 }
 
