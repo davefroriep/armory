@@ -12,6 +12,7 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so A
   - `192.168.1.15` — **Denon AVR-3313CI** on wired Ethernet (Telnet `:23`, HTTP `:80`, UPnP `:8080`).
   - `192.168.1.13` — **Armory-Rack** Wyze Cam v3 (`Thingino` open firmware, `1920×1080 H.264 @ 25 fps + AAC`, `rtsp://.../ch0`).
   - `192.168.1.14` — **Armory-Smith** Wyze Cam v3 (`Thingino` open firmware, `1920×1080 H.264 @ 25 fps + AAC`, `rtsp://.../ch0`).
+  - `192.168.1.204` — **Armory Wallboard** 32" Toshiba Fire TV Edition (`TF-32A710U21` / `AFTBAMR311`, ADB `:5555`, Wi-Fi MAC `08:97:98:1f:4c:2b`, Ethernet MAC `08:97:98:22:59:6b`).
 - **Phone Usage During Training:** Pixel stays close to Dave to log sets and push live state to OptiPlex `:8766`.
 
 ---
@@ -22,7 +23,7 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so A
 [ OptiPlex 192.168.1.152 ] ───HDMI──────────────────────────────────────▶ [ Hisense 43" 43E6QF (HDMI 1) ]
   │ (ArmoryCamDVR :8766)                                                           ▲
   │  ├── Dual Wyze Cam v3 (.13 Rack / .14 Smith) ──RTSP──▶ 24/7 Ring + Clips       │ HDMI Out 1 (4K/1080p)
-  │  ├── /wallboard Relay + ADB over Wi-Fi ──▶ [ 32" Fire TV (Wi-Fi Silk) ]        │
+  │  ├── /wallboard Relay + WoL/ADB ───────▶ [ 32" Fire TV .204 (Kiosk APK) ]      │
   │  └── [ Anker PowerConf S330 (USB) ] ──▶ Room Mic SSE (/api/voice/*) + Win+H    │
                                                                                    │
 [ Fire TV Cube ] ──HDMI──▶ [ Denon AVR-3313CI (192.168.1.15, Multi-Ch Stereo) ] ───┴──▶ HDMI Out 2: [ TCL Roku TV (1080p) ]
@@ -39,18 +40,19 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so A
 
 ---
 
-## 3. Standalone 32" Fire TV Wallboard (OptiPlex Relay + ADB Auto-Wake)
+## 3. Standalone 32" Fire TV Wallboard (`TF-32A710U21` · `com.froriep.armorywallboard`)
 
-Instead of pointing the 32" TV at the Pixel's changing DHCP IP (`:8765`), the 32" Fire TV points permanently at the always-on **OptiPlex relay (`http://192.168.1.152:8766/wallboard`)**:
+Instead of pointing the 32" TV at the Pixel's changing DHCP IP (`:8765`), the 32" Toshiba Fire TV Edition (**`Armory Wallboard`**, model `TF-32A710U21` / `AFTBAMR311`, `192.168.1.204:5555`, Wi-Fi MAC `08:97:98:1f:4c:2b`, Ethernet MAC `08:97:98:22:59:6b`) runs the standalone fullscreen **`Armory Wallboard`** kiosk APK (`wallboard-tv/`, `com.froriep.armorywallboard/.WallboardActivity`) pointed permanently at the always-on **OptiPlex relay (`http://192.168.1.152:8766/wallboard`)**:
 
 1. **Workout Start on Pixel (`v0.61+`):** When Dave hits **Start Workout** (Lift, AirBike, or Spin), Armory Fit pushes live `WallboardState` (`HR`, `rest timer`, `1A <-> 1B` superset progression, watts/RPM) to OptiPlex `:8766/api/wallboard/wake`.
-2. **OptiPlex ADB Auto-Wake:** OptiPlex spawns `adb.exe` silently (`CREATE_NO_WINDOW`) over Wi-Fi (`adb connect <firetv-ip>:5555`), sends `KEYCODE_WAKEUP`, temporarily suppresses the Fire TV screensaver (`screensaver_enabled = 0`), and opens **Amazon Silk** straight to `http://192.168.1.152:8766/wallboard` (live SSE updates, zero browser timeout when idle).
+2. **OptiPlex WoL + ADB Auto-Wake:** OptiPlex spawns `adb.exe` silently (`CREATE_NO_WINDOW`) over LAN (`adb connect 192.168.1.204:5555`). If deep sleep caused `adbd` to go offline, `FireTvAdbController` fires Wake-on-LAN magic packets to `08:97:98:1f:4c:2b` / `08:97:98:22:59:6b` and retries ADB connect; once connected, it sends `KEYCODE_WAKEUP`, locks `screensaver_enabled = 0`, `sleep_timeout = 0`, and `wifi_sleep_policy = 2`, and launches `com.froriep.armorywallboard/.WallboardActivity` (`singleTask` fullscreen WebView, `FLAG_KEEP_SCREEN_ON`, zero URL bar, zero cursor, 3 s auto-retry, live SSE updates).
 3. **Auto-Sleep When Done:** Finishing or pausing a workout schedules `KEYCODE_SLEEP` after `30 s` (and restores `screensaver_enabled = 1`), with a `10 min` idle watchdog if Wi-Fi drops.
+4. **Device Hardening:** Family-room bloatware uninstalled, `str.auto_wake_up_enabled = 1`, `str.auto_wake_up_always = 1`, and `wifi_sleep_policy = 2` applied on the TV.
 
-### One-Time 32" Fire TV Setup Checklist (~2 Minutes When Hung)
-1. Connect the 32" Fire TV to home Wi-Fi (reserve its DHCP IP in the router alongside `.13`, `.14`, `.15`, `.152`).
+### One-Time 32" Fire TV Re-Setup / Recovery Reference
+1. Connect the 32" Fire TV to home Wi-Fi or Ethernet (reserve `192.168.1.204` in router DHCP alongside `.13`, `.14`, `.15`, `.152`).
 2. **Settings -> My Fire TV -> About -> click TV name 7 times** -> enable **Developer Options -> ADB Debugging**.
-3. Open `http://192.168.1.152:8766/` -> enter the TV IP in **32" Fire TV Wallboard** -> click **Connect / Pair ADB** -> accept **"Always allow from this computer"** on the TV screen once.
+3. Build & install the kiosk APK via `.\wallboard-tv\build_wallboard_apk.ps1 -Install -Serial 192.168.1.204:5555` (uses `wallboard-tv/` without touching `android/` or Pixel `rev.json`), or pair in `http://192.168.1.152:8766/` -> **32" Fire TV Wallboard**.
 
 ---
 

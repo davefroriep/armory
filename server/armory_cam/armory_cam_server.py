@@ -1152,6 +1152,7 @@ class LiveStreamHub:
 class WallboardConfig:
     enabled: bool = True
     fire_tv_host: str = ""
+    fire_tv_mac: str = ""
     adb_port: int = DEFAULT_ADB_PORT
     display_client: str = "silk"
     custom_component: str = ""
@@ -1166,7 +1167,7 @@ class WallboardConfig:
         if not isinstance(raw, dict):
             return cls()
         client = str(raw.get("displayClient", "silk")).strip().lower()
-        if client not in ("silk", "fully", "custom"):
+        if client not in ("armory", "silk", "fully", "custom"):
             client = "silk"
         try:
             adb_port = max(1, min(65535, int(raw.get("adbPort", DEFAULT_ADB_PORT))))
@@ -1179,6 +1180,7 @@ class WallboardConfig:
         return cls(
             enabled=bool(raw.get("enabled", True)),
             fire_tv_host=str(raw.get("fireTvHost", "")).strip(),
+            fire_tv_mac=str(raw.get("fireTvMac", "")).strip(),
             adb_port=adb_port,
             display_client=client,
             custom_component=str(raw.get("customComponent", "")).strip(),
@@ -1193,6 +1195,7 @@ class WallboardConfig:
         return {
             "enabled": self.enabled,
             "fireTvHost": self.fire_tv_host,
+            "fireTvMac": self.fire_tv_mac,
             "adbPort": self.adb_port,
             "displayClient": self.display_client,
             "customComponent": self.custom_component,
@@ -1204,6 +1207,35 @@ class WallboardConfig:
         }
 
 
+def send_wol_magic_packet(
+    mac_str: str,
+    broadcast_ips: tuple[str, ...] = ("255.255.255.255", "192.168.1.255"),
+    port: int = 9,
+) -> list[str]:
+    """Send UDP Wake-on-LAN magic packets for each valid MAC in a comma/space-separated string."""
+    sent: list[str] = []
+    tokens = [tok for tok in re.split(r"[\s,;]+", (mac_str or "").strip()) if tok]
+    if not tokens:
+        return sent
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for tok in tokens:
+            clean = re.sub(r"[:-]", "", tok).lower()
+            if len(clean) != 12 or not re.fullmatch(r"[0-9a-f]{12}", clean):
+                continue
+            packet = b"\xff" * 6 + bytes.fromhex(clean) * 16
+            for bcast in broadcast_ips:
+                try:
+                    sock.sendto(packet, (bcast, port))
+                except OSError:
+                    pass
+            sent.append(":".join(clean[i : i + 2] for i in range(0, 12, 2)))
+    finally:
+        sock.close()
+    return sent
+
+
 class FireTvAdbController:
     """Manages ADB-over-Wi-Fi wake, Silk/kiosk launch, screensaver suppression, and auto-sleep."""
 
@@ -1212,10 +1244,16 @@ class FireTvAdbController:
         adb_bin: str | None = None,
         runner: Callable[[list[str], float], tuple[int, str, str]] | None = None,
         settle_sec: float = 0.35,
+        wol_sender: Callable[[str], list[str]] | None = None,
+        wol_wait_sec: float = 2.0,
+        wol_retries: int = 3,
     ) -> None:
         self.adb_bin = adb_bin if adb_bin is not None else resolve_adb_bin()
         self._runner = runner or self._default_runner
         self.settle_sec = max(0.0, float(settle_sec))
+        self._wol_sender = wol_sender or send_wol_magic_packet
+        self.wol_wait_sec = max(0.0, float(wol_wait_sec))
+        self.wol_retries = max(1, int(wol_retries))
         self.lock = threading.RLock()
         self.adb_state = "unconfigured"
         self.last_model = ""
@@ -1329,6 +1367,11 @@ class FireTvAdbController:
 
     @staticmethod
     def _launch_cmd(cfg: WallboardConfig, wallboard_url: str, ser: str) -> list[str]:
+        if cfg.display_client == "armory":
+            return [
+                "-s", ser, "shell", "am", "start", "-W", "-a", "android.intent.action.VIEW",
+                "-d", wallboard_url, "-n", "com.froriep.armorywallboard/.WallboardActivity",
+            ]
         if cfg.display_client == "fully":
             return [
                 "-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW",
@@ -1374,6 +1417,15 @@ class FireTvAdbController:
                     "message": "Fire TV wake already active",
                 }
             st, detail = self._connect_and_status(ser)
+            if st == "offline" and cfg.fire_tv_mac.strip():
+                sent_macs = self._wol_sender(cfg.fire_tv_mac)
+                if sent_macs:
+                    for _ in range(self.wol_retries):
+                        if self.wol_wait_sec > 0:
+                            time.sleep(self.wol_wait_sec)
+                        st, detail = self._connect_and_status(ser)
+                        if st != "offline":
+                            break
             if st == "unauthorized":
                 self.adb_state = "unauthorized"
                 msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
@@ -1398,6 +1450,7 @@ class FireTvAdbController:
             if cfg.suppress_screensaver:
                 self._run(["-s", ser, "shell", "settings", "put", "secure", "screensaver_enabled", "0"], timeout=4.0)
                 self._run(["-s", ser, "shell", "settings", "put", "secure", "sleep_timeout", "0"], timeout=4.0)
+                self._run(["-s", ser, "shell", "settings", "put", "global", "wifi_sleep_policy", "2"], timeout=4.0)
 
             rc_l, out_l, err_l = self._run(self._launch_cmd(cfg, wallboard_url, ser), timeout=8.0)
             if cfg.display_client == "silk" and (rc_l != 0 or "Error" in f"{out_l}\n{err_l}"):
@@ -1517,6 +1570,7 @@ class FireTvAdbController:
                 "adbBin": self.adb_bin or "",
                 "adbState": self.adb_state,
                 "fireTvHost": cfg.fire_tv_host,
+                "fireTvMac": cfg.fire_tv_mac,
                 "adbPort": cfg.adb_port,
                 "fireTvModel": self.last_model,
                 "tvAwake": self.tv_awake_requested,
@@ -4393,10 +4447,12 @@ DASHBOARD_HTML = """<!doctype html>
     <div id="wbMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Permanent URL: <code>/wallboard</code></div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
       <div><label>Fire TV IP / Hostname</label><input id="wbHost" type="text" placeholder="192.168.1.xxx"></div>
+      <div><label>Fire TV MAC (Wake-on-LAN)</label><input id="wbMac" type="text" placeholder="08:97:98:xx:xx:xx"></div>
       <div><label>ADB Port</label><input id="wbPort" type="number" min="1" max="65535" value="5555"></div>
       <div>
         <label>Display Client</label>
         <select id="wbClient">
+          <option value="armory">Armory Wallboard App (Kiosk APK)</option>
           <option value="silk">Amazon Silk</option>
           <option value="fully">Fully Kiosk Browser</option>
           <option value="custom">Custom App / URL Intent</option>
@@ -6495,6 +6551,7 @@ async function saveConfig(triggerBtn = null) {
   const wallboard = {
     ...(cfg.wallboard || {}),
     fireTvHost: $('wbHost').value.trim(),
+    fireTvMac: $('wbMac').value.trim(),
     adbPort: Number($('wbPort').value) || 5555,
     displayClient: $('wbClient').value || 'silk',
     idleSleepSec: clamp(Math.round((Number($('wbIdleMin').value) || 10) * 60), 60, 7200),
@@ -6799,6 +6856,7 @@ async function init() {
   $('driveDir').value = cfg.driveBackupDir || '';
   const wb = cfg.wallboard || {};
   $('wbHost').value = wb.fireTvHost || '';
+  $('wbMac').value = wb.fireTvMac || '';
   $('wbPort').value = wb.adbPort || 5555;
   $('wbClient').value = wb.displayClient || 'silk';
   $('wbIdleMin').value = Math.max(1, Math.round((wb.idleSleepSec || 600) / 60));
@@ -6822,7 +6880,7 @@ async function init() {
   setInterval(pollClips, 6000);
 }
 
-['retDays', 'preRoll', 'driveDir', 'wbHost', 'wbPort', 'wbIdleMin'].forEach(id => {
+['retDays', 'preRoll', 'driveDir', 'wbHost', 'wbMac', 'wbPort', 'wbIdleMin'].forEach(id => {
   $(id).addEventListener('input', () => markDirty());
 });
 ['wbClient', 'wbWake', 'wbSleep'].forEach(id => {

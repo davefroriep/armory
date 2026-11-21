@@ -395,6 +395,70 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_wallboard_armory_kiosk_client_and_wol_recovery(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_wb_wol_test_"))
+        cmds: list[list[str]] = []
+        wol_calls: list[str] = []
+        connect_attempts = {"n": 0}
+
+        def fake_runner(cmd: list[str], timeout: float) -> tuple[int, str, str]:
+            args = cmd[1:]
+            cmds.append(args)
+            if args[:1] == ["connect"]:
+                connect_attempts["n"] += 1
+                return 0, f"connected to {args[1]}", ""
+            if args[:1] == ["devices"]:
+                # First attempt is offline; after WoL fires, second attempt succeeds
+                st = "offline" if connect_attempts["n"] < 2 else "device"
+                return 0, f"List of devices attached\n192.168.1.204:5555\t{st}\n", ""
+            return 0, "Status: ok\n", ""
+
+        def fake_wol(mac_str: str) -> list[str]:
+            wol_calls.append(mac_str)
+            return ["08:97:98:1f:4c:2b"]
+
+        try:
+            adb = ac.FireTvAdbController(
+                adb_bin="adb.exe",
+                runner=fake_runner,
+                settle_sec=0.0,
+                wol_sender=fake_wol,
+                wol_wait_sec=0.0,
+                wol_retries=2,
+            )
+            svc = ac.ArmoryCamService(root_dir=tmp, adb_controller=adb)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            cfg_res = client.post(
+                "/api/config",
+                json={
+                    "wallboard": {
+                        "fireTvHost": "192.168.1.204",
+                        "fireTvMac": "08:97:98:1f:4c:2b, 08:97:98:22:59:6b",
+                        "adbPort": 5555,
+                        "displayClient": "armory",
+                        "wallboardUrl": "http://192.168.1.152:8766/wallboard",
+                    }
+                },
+            )
+            self.assertEqual(cfg_res.status_code, 200)
+            saved = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["wallboard"]["displayClient"], "armory")
+            self.assertEqual(saved["wallboard"]["fireTvMac"], "08:97:98:1f:4c:2b, 08:97:98:22:59:6b")
+
+            res = adb.wake_and_launch(svc.wallboard_cfg, "http://192.168.1.152:8766/wallboard", force=True)
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["state"], "awake")
+            self.assertEqual(wol_calls, ["08:97:98:1f:4c:2b, 08:97:98:22:59:6b"])
+            flat = [" ".join(c) for c in cmds]
+            self.assertTrue(any("com.froriep.armorywallboard/.WallboardActivity" in x for x in flat))
+            self.assertTrue(any("wifi_sleep_policy 2" in x for x in flat))
+            self.assertEqual(adb.status_dict(svc.wallboard_cfg)["fireTvMac"], "08:97:98:1f:4c:2b, 08:97:98:22:59:6b")
+            self.assertEqual(ac.send_wol_magic_packet("invalid-mac"), [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_per_camera_30s_burst_filtering_and_tape_timeline_frame_endpoints(self) -> None:
         base = 1_763_500_000_000
         # 1. Build synthetic 2s samples with an 11s Rack blip (skipped at 30s+) and a 34s Rack set
