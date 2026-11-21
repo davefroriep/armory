@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import queue
 import re
@@ -31,7 +32,7 @@ import urllib.request
 import wave
 
 import numpy as np
-from scipy.signal import butter, fftconvolve, resample_poly, sosfilt
+from scipy.signal import butter, fftconvolve, resample_poly, sosfilt, sosfiltfilt
 
 try:
     from .display_control import _strip_wake_prefix, normalize_youtube_tv_url
@@ -55,67 +56,148 @@ VALID_CUBE_MODES = ("duck", "takeover", "overlay")
 VALID_DEMO_STYLES = ("anthem", "boombap", "thunder_only", "hype")
 RYDER_ENTRANCE_URL = "https://www.youtube.com/watch?v=05vwKMySzKw"
 DEFAULT_ANNOUNCER_VOICE = "kokoro:onyx_fenrir_epic"
+DEFAULT_ELEVENLABS_MODEL = "eleven_v3"
+DEFAULT_RYDER_VOICE_STYLE = (
+    "Electric HBO championship boxing ring announcer in a packed arena. "
+    "Booming deep baritone, authentic crowd-hyping energy, crisp dramatic pacing, "
+    "exploding with excitement on the athlete's name."
+)
 DEFAULT_KOKORO_MODELS_DIR = Path(r"S:\ArmoryCam\models\kokoro")
 DEFAULT_STUDIO_FX_DIR = Path(r"S:\ArmoryCam\shows\fx")
 BANNED_ROBOTIC_VOICES = frozenset({"en-US-ChristopherNeural", "sapi"})
+ELEVEN_V3_AUDIO_CUES = frozenset({
+    "shouting",
+    "excited",
+    "dramatic",
+    "whispers",
+    "whispering",
+    "laughs",
+    "laughing",
+    "sighs",
+    "cheering",
+    "slows down",
+    "rushed",
+    "drawn out",
+})
 
 EPIC_VOICE_PRESETS: dict[str, dict[str, Any]] = {
+    "elevenlabs:JBFqnCBsd6RMkjVDRZzb": {
+        "label": "George Studio (ElevenLabs · Warm Deep British)",
+        "engine": "elevenlabs",
+        "voiceId": "JBFqnCBsd6RMkjVDRZzb",
+    },
+    "elevenlabs:nPczCjzI2devNBz1zQrb": {
+        "label": "Brian Studio (ElevenLabs · Deep Broadcast Announcer)",
+        "engine": "elevenlabs",
+        "voiceId": "nPczCjzI2devNBz1zQrb",
+    },
+    "elevenlabs:pqHfZKP75CvOlQylNhV4": {
+        "label": "Bill Studio (ElevenLabs · Authoritative Baritone)",
+        "engine": "elevenlabs",
+        "voiceId": "pqHfZKP75CvOlQylNhV4",
+    },
+    "elevenlabs:N2lVS1w4EtoT3dr4eOWO": {
+        "label": "Callum Studio (ElevenLabs · Gritty Intense)",
+        "engine": "elevenlabs",
+        "voiceId": "N2lVS1w4EtoT3dr4eOWO",
+    },
+    "gemini:Fenrir": {
+        "label": "Fenrir Expressive (Gemini 2.5 Flash · Dynamic Deep)",
+        "engine": "gemini",
+        "voiceName": "Fenrir",
+    },
+    "gemini:Charon": {
+        "label": "Charon Deep (Gemini 2.5 Flash · Resonant Informative)",
+        "engine": "gemini",
+        "voiceName": "Charon",
+    },
+    "gemini:Alnilam": {
+        "label": "Alnilam Strong (Gemini 2.5 Flash · Firm Announcer)",
+        "engine": "gemini",
+        "voiceName": "Alnilam",
+    },
+    "gemini:Orus": {
+        "label": "Orus Firm (Gemini 2.5 Flash · Crisp Baritone)",
+        "engine": "gemini",
+        "voiceName": "Orus",
+    },
+    "openai:onyx": {
+        "label": "Onyx Deep (OpenAI gpt-4o-mini-tts)",
+        "engine": "openai",
+        "voiceName": "onyx",
+    },
+    "openai:ash": {
+        "label": "Ash Bold (OpenAI gpt-4o-mini-tts · Prompt-Directed)",
+        "engine": "openai",
+        "voiceName": "ash",
+    },
+    "openai:ballad": {
+        "label": "Ballad Dramatic (OpenAI gpt-4o-mini-tts)",
+        "engine": "openai",
+        "voiceName": "ballad",
+    },
     "kokoro:onyx_fenrir_epic": {
-        "label": "Onyx + Fenrir Epic (Deep Ring Announcer)",
+        "label": "Onyx + Fenrir (Kokoro Local Offline)",
         "engine": "kokoro",
         "weights": {"am_onyx": 0.55, "am_fenrir": 0.45},
-        "speed": 0.90,
-        "finalSpeed": 0.80,
+        "speed": 0.95,
+        "finalSpeed": 0.88,
     },
     "kokoro:am_onyx": {
-        "label": "Onyx Ultra-Deep (Movie Trailer Bass)",
+        "label": "Onyx Deep (Kokoro Local Offline)",
         "engine": "kokoro",
         "weights": {"am_onyx": 1.0},
-        "speed": 0.90,
-        "finalSpeed": 0.80,
+        "speed": 0.98,
+        "finalSpeed": 0.92,
     },
     "kokoro:onyx_george_hbo": {
-        "label": "Onyx + George HBO (Championship Boxing)",
+        "label": "Onyx + George (Kokoro Local Offline)",
         "engine": "kokoro",
         "weights": {"am_onyx": 0.55, "bm_george": 0.45},
-        "speed": 0.89,
-        "finalSpeed": 0.79,
+        "speed": 0.95,
+        "finalSpeed": 0.88,
     },
     "kokoro:am_fenrir": {
-        "label": "Fenrir Bold Epic Baritone",
+        "label": "Fenrir Baritone (Kokoro Local Offline)",
         "engine": "kokoro",
         "weights": {"am_fenrir": 1.0},
-        "speed": 0.92,
-        "finalSpeed": 0.82,
+        "speed": 0.98,
+        "finalSpeed": 0.92,
     },
     "kokoro:am_adam": {
-        "label": "Adam Rich American Baritone",
+        "label": "Adam Baritone (Kokoro Local Offline)",
         "engine": "kokoro",
         "weights": {"am_adam": 1.0},
-        "speed": 0.92,
-        "finalSpeed": 0.84,
+        "speed": 0.98,
+        "finalSpeed": 0.92,
     },
     "edge:en-US-BrianMultilingualNeural": {
-        "label": "Brian HD Multilingual (Clean Edge)",
+        "label": "Brian HD Multilingual (Cloud Free Edge)",
         "engine": "edge",
         "voice": "en-US-BrianMultilingualNeural",
-        "rate": "-4%",
+        "rate": "-2%",
     },
     "edge:en-US-AndrewMultilingualNeural": {
-        "label": "Andrew HD Multilingual (Clean Edge)",
+        "label": "Andrew HD Multilingual (Cloud Free Edge)",
         "engine": "edge",
         "voice": "en-US-AndrewMultilingualNeural",
-        "rate": "-4%",
+        "rate": "-2%",
     },
 }
 
 
 def resolve_voice_id(voice: str | None) -> str:
-    """Resolve preset ID while rejecting legacy robotic/warbled voices."""
+    """Resolve built-in or dynamic cloud voice ID while rejecting legacy robotic voices."""
     raw = str(voice or "").strip()
     if not raw or raw in BANNED_ROBOTIC_VOICES:
         return DEFAULT_ANNOUNCER_VOICE
     if raw in EPIC_VOICE_PRESETS:
+        return raw
+    if raw.startswith("elevenlabs:") and re.fullmatch(r"elevenlabs:[A-Za-z0-9_-]{6,64}", raw):
+        return raw
+    if raw.startswith("gemini:") and re.fullmatch(r"gemini:[A-Za-z0-9_-]{2,40}", raw):
+        return raw
+    if raw.startswith("openai:") and re.fullmatch(r"openai:[A-Za-z0-9_-]{2,40}", raw):
         return raw
     if raw.startswith("edge:") and raw[5:].strip() not in BANNED_ROBOTIC_VOICES:
         return raw
@@ -319,8 +401,11 @@ class ShowSpec:
     overlay_at_sec: float = 0.0
     overlay_text: str = ""
     post_overlay_denon_vol: int = 0
-    voice_reverb_wet: float = 0.11
+    voice_reverb_wet: float = 0.06
     voice_boost_db: float = 2.0
+    voice_style: str = ""
+    custom_intro_voice_file: str = ""
+    custom_overlay_voice_file: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -364,6 +449,9 @@ class ShowSpec:
             "postOverlayDenonVol": int(self.post_overlay_denon_vol),
             "voiceReverbWet": round(float(self.voice_reverb_wet), 2),
             "voiceBoostDb": round(float(self.voice_boost_db), 1),
+            "voiceStyle": self.voice_style,
+            "customIntroVoiceFile": self.custom_intro_voice_file,
+            "customOverlayVoiceFile": self.custom_overlay_voice_file,
         }
 
     @classmethod
@@ -406,6 +494,8 @@ class ShowSpec:
                     triggers.append(nt)
         src_valid = validate_song_filename(str(raw.get("sourceFile", "") or "")) or ""
         vid_valid = validate_video_filename(str(raw.get("videoSourceFile", "") or "")) or ""
+        ci_valid = validate_song_filename(str(raw.get("customIntroVoiceFile", "") or "")) or ""
+        co_valid = validate_song_filename(str(raw.get("customOverlayVoiceFile", "") or "")) or ""
         post_vol = _i("postOverlayDenonVol", 0)
         if post_vol != 0:
             post_vol = max(MIN_SHOW_DENON_VOL, min(MAX_SHOW_DENON_VOL, post_vol))
@@ -448,8 +538,11 @@ class ShowSpec:
             overlay_at_sec=_clamp(_f("overlayAtSec", 0.0), 0.0, 300.0),
             overlay_text=str(raw.get("overlayText", "") or "").strip(),
             post_overlay_denon_vol=post_vol,
-            voice_reverb_wet=_clamp(_f("voiceReverbWet", 0.11), 0.0, 0.30),
+            voice_reverb_wet=_clamp(_f("voiceReverbWet", 0.06), 0.0, 0.30),
             voice_boost_db=_clamp(_f("voiceBoostDb", 2.0), -4.0, 6.0),
+            voice_style=str(raw.get("voiceStyle", "") or "").strip(),
+            custom_intro_voice_file=ci_valid,
+            custom_overlay_voice_file=co_valid,
         )
 
 
@@ -563,8 +656,9 @@ def default_shows() -> list[ShowSpec]:
             overlay_at_sec=80.0,
             overlay_text="Ryder Curry... welcome to The Armory. Remember... strength is never a weakness.",
             post_overlay_denon_vol=55,
-            voice_reverb_wet=0.11,
+            voice_reverb_wet=0.06,
             voice_boost_db=2.0,
+            voice_style=DEFAULT_RYDER_VOICE_STYLE,
         ),
         ShowSpec(
             id="jared_mark_walkin",
@@ -1061,15 +1155,252 @@ def _split_announcer_beats(text: str) -> list[str]:
     return parts or [normalized]
 
 
+_INLINE_MARKUP_RE = re.compile(
+    r"<\s*break\b[^>]*\btime\s*=\s*['\"]?\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)\s*['\"]?[^>]*/?\s*>"
+    r"|\[([^\[\]]+)\]",
+    re.I,
+)
+
+
+def parse_speech_markup(
+    text: str,
+    *,
+    default_speed: float = 1.0,
+    keep_eleven_v3_tags: bool = False,
+) -> tuple[list[dict[str, Any]], str]:
+    """Parse inline pause, tempo/speed, volume, style, and expressive acting tags into ordered tokens."""
+    raw = str(text or "").strip()
+    if not raw:
+        return [], ""
+
+    base_spd = _clamp(float(default_speed or 1.0), 0.65, 1.50)
+    speed_stack: list[float] = [base_spd]
+    vol_stack: list[float] = [0.0]
+    style_parts: list[str] = []
+    tokens: list[dict[str, Any]] = []
+
+    def _emit_speech(chunk: str, spd: float, gdb: float) -> None:
+        clean = re.sub(r"\s+", " ", chunk).strip()
+        if not clean:
+            return
+        # Keep existing `...` / `…` / `|` beat splitting inside literal speech runs
+        parts = [p.strip() for p in re.split(r"\s*(?:\.{3,}|…|\|)\s*", clean) if p.strip()]
+        if not parts:
+            return
+        for idx, sub in enumerate(parts):
+            tokens.append({"kind": "speech", "text": sub, "speed": round(spd, 4), "gainDb": round(gdb, 2)})
+            if idx < len(parts) - 1:
+                tokens.append({"kind": "pause", "sec": 0.48 if (idx + 1 == len(parts) - 1 and len(parts) > 1) else 0.38, "implicit": True})
+
+    def _emit_pause(sec: float) -> None:
+        sec_c = round(_clamp(float(sec), 0.02, 10.0), 3)
+        if tokens and tokens[-1]["kind"] == "pause":
+            # Explicit pause replaces adjacent implicit pause; coalesce explicit consecutive pauses cleanly
+            if tokens[-1].get("implicit"):
+                tokens[-1] = {"kind": "pause", "sec": sec_c}
+            else:
+                tokens[-1]["sec"] = round(_clamp(float(tokens[-1]["sec"]) + sec_c, 0.02, 10.0), 3)
+        else:
+            tokens.append({"kind": "pause", "sec": sec_c})
+
+    def _parse_speed_val(val: str) -> float | None:
+        s = val.strip().lower()
+        if s in ("normal", "reset", "default", "1x"):
+            return base_spd
+        m_rel = re.fullmatch(r"([+-]\d+(?:\.\d+)?)\s*%", s)
+        if m_rel:
+            return _clamp(base_spd * (1.0 + float(m_rel.group(1)) / 100.0), 0.65, 1.50)
+        m_pct = re.fullmatch(r"(\d+(?:\.\d+)?)\s*%", s)
+        if m_pct:
+            return _clamp(base_spd * (float(m_pct.group(1)) / 100.0), 0.65, 1.50)
+        m_num = re.fullmatch(r"(\d+(?:\.\d+)?)\s*x?", s)
+        if m_num:
+            return _clamp(float(m_num.group(1)), 0.65, 1.50)
+        return None
+
+    def _parse_vol_val(val: str) -> float | None:
+        s = val.strip().lower()
+        if s in ("normal", "reset", "default"):
+            return 0.0
+        m_db = re.fullmatch(r"([+-]?\d+(?:\.\d+)?)\s*(?:db)?", s)
+        if m_db:
+            return _clamp(float(m_db.group(1)), -12.0, 8.0)
+        return None
+
+    buf: list[str] = []
+    pos = 0
+    for m in _INLINE_MARKUP_RE.finditer(raw):
+        if m.start() > pos:
+            buf.append(raw[pos : m.start()])
+        pos = m.end()
+
+        if m.group(1) is not None:
+            _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+            buf.clear()
+            num = float(m.group(1))
+            unit = m.group(2).lower()
+            _emit_pause(num / 1000.0 if unit == "ms" else num)
+            continue
+
+        tag = (m.group(3) or "").strip()
+        low = re.sub(r"\s+", " ", tag).lower()
+
+        # Closing tags [/speed], [/tempo], [/rate], [/vol], [/loud]
+        if low in ("/speed", "/tempo", "/rate"):
+            _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+            buf.clear()
+            if len(speed_stack) > 1:
+                speed_stack.pop()
+            continue
+        if low in ("/vol", "/volume", "/loud"):
+            _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+            buf.clear()
+            if len(vol_stack) > 1:
+                vol_stack.pop()
+            continue
+
+        # Pause [pause:100ms], [pause:0.5s], [p:250ms]
+        mp = re.fullmatch(r"(?:pause|p)\s*[:=\s]\s*([0-9]+(?:\.[0-9]+)?)\s*(ms|s)?", low)
+        if mp:
+            _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+            buf.clear()
+            num = float(mp.group(1))
+            unit = (mp.group(2) or ("ms" if num >= 20.0 else "s")).lower()
+            _emit_pause(num / 1000.0 if unit == "ms" else num)
+            continue
+
+        # Speed / tempo / rate [speed:+10%], [tempo:1.15], [speed:normal]
+        ms = re.fullmatch(r"(?:speed|tempo|rate)\s*[:=\s]\s*(.+)", low)
+        if ms:
+            parsed_spd = _parse_speed_val(ms.group(1))
+            if parsed_spd is not None:
+                _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+                buf.clear()
+                if ms.group(1).strip() in ("normal", "reset", "default"):
+                    speed_stack = [base_spd]
+                else:
+                    speed_stack.append(parsed_spd)
+                continue
+
+        # Volume [vol:+3dB], [loud]
+        if low == "loud":
+            _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+            buf.clear()
+            vol_stack.append(3.0)
+            continue
+        mv = re.fullmatch(r"(?:vol|volume)\s*[:=\s]\s*(.+)", low)
+        if mv:
+            parsed_db = _parse_vol_val(mv.group(1))
+            if parsed_db is not None:
+                _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+                buf.clear()
+                if mv.group(1).strip() in ("normal", "reset", "default"):
+                    vol_stack = [0.0]
+                else:
+                    vol_stack.append(parsed_db)
+                continue
+
+        # Style instruction [style:...]
+        mst = re.match(r"style\s*[:=]\s*(.+)$", tag, re.I | re.S)
+        if mst:
+            st_val = re.sub(r"\s+", " ", mst.group(1)).strip()
+            if st_val:
+                style_parts.append(st_val)
+            continue
+
+        # Expressive ElevenLabs v3 acting cues [shouting], [excited], [whispers], ...
+        if low in ELEVEN_V3_AUDIO_CUES:
+            if keep_eleven_v3_tags:
+                buf.append(f"[{low}] ")
+            continue
+
+        # Unknown bracketed token -> preserve literal text without crashing
+        buf.append(f"[{tag}]")
+
+    if pos < len(raw):
+        buf.append(raw[pos:])
+    _emit_speech("".join(buf), speed_stack[-1], vol_stack[-1])
+
+    # Coalesce adjacent speech runs that ended up with identical speed/gainDb (e.g. from stripped cue or style)
+    merged: list[dict[str, Any]] = []
+    for tok in tokens:
+        if tok["kind"] == "pause":
+            cleaned = {"kind": "pause", "sec": tok["sec"]}
+            if merged and merged[-1]["kind"] == "pause":
+                if not tok.get("implicit"):
+                    merged[-1]["sec"] = round(_clamp(float(cleaned["sec"]), 0.02, 10.0), 3)
+            elif merged:  # Drop leading pause before any words
+                merged.append(cleaned)
+        else:
+            if (
+                merged
+                and merged[-1]["kind"] == "speech"
+                and abs(float(merged[-1]["speed"]) - float(tok["speed"])) < 1e-3
+                and abs(float(merged[-1]["gainDb"]) - float(tok["gainDb"])) < 1e-2
+            ):
+                merged[-1]["text"] = f"{merged[-1]['text']} {tok['text']}".strip()
+            else:
+                merged.append(tok)
+
+    while merged and merged[-1]["kind"] == "pause":
+        merged.pop()
+    return merged, "; ".join(style_parts)
+
+
+def time_stretch_mono_pcm(mono: np.ndarray, sr: int, speed_factor: float, ffmpeg_bin: str) -> np.ndarray:
+    """Pitch-preserving tempo change via FFmpeg `atempo` (no chipmunk pitch shift)."""
+    arr = np.asarray(mono, dtype=np.float32).reshape(-1)
+    spd = _clamp(float(speed_factor), 0.65, 1.50)
+    if arr.size < 64 or abs(spd - 1.0) < 0.015 or not ffmpeg_bin:
+        return arr
+    pcm16_in = np.round(np.clip(arr, -0.99, 0.99) * 32767.0).astype("<i2").tobytes()
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f",
+        "s16le",
+        "-ar",
+        str(int(sr)),
+        "-ac",
+        "1",
+        "-i",
+        "pipe:0",
+        "-af",
+        f"atempo={spd:.4f}",
+        "-f",
+        "s16le",
+        "-ar",
+        str(int(sr)),
+        "-ac",
+        "1",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=pcm16_in,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=25,
+            **_no_window_kwargs(),
+        )
+        if proc.returncode == 0 and len(proc.stdout) >= 4:
+            usable = (len(proc.stdout) // 2) * 2
+            return (np.frombuffer(proc.stdout[:usable], dtype="<i2").astype(np.float32) / 32768.0).astype(np.float32)
+    except Exception:
+        pass
+    return arr
+
+
 def master_announcer_stereo(
     mono_pcm: np.ndarray,
     src_sr: int,
     *,
     target_sr: int = SHOW_SR,
-    reverb_wet: float = 0.11,
+    reverb_wet: float = 0.06,
     boost_db: float = 2.0,
 ) -> np.ndarray:
-    """Broadcast/arena mastering: clean resample, chest EQ, diffuse convolution hall, -1 dBFS true-peak cap."""
+    """Broadcast/arena mastering: zero-phase warm chest EQ, smooth room hall, -0.9 dBFS true-peak cap."""
     x = np.asarray(mono_pcm, dtype=np.float32).reshape(-1)
     if x.size < 16:
         return np.zeros((max(16, int(0.2 * target_sr)), 2), dtype=np.float32)
@@ -1078,14 +1409,20 @@ def master_announcer_stereo(
         g = math.gcd(int(src_sr), int(target_sr))
         x = resample_poly(x, int(target_sr) // g, int(src_sr) // g).astype(np.float32)
 
-    # 1. Clean 55 Hz sub-rumble filter (preserves deep 80-180 Hz baritone chest resonance!)
+    # 1. Clean 55 Hz sub-rumble filter (preserves deep baritone fundamentals)
     sos_hpf = butter(2, 55.0, btype="highpass", fs=target_sr, output="sos")
     x = sosfilt(sos_hpf, x).astype(np.float32)
 
-    # 2. Warm baritone chest fullness (85-220 Hz) + crisp presence (2.4-4.2 kHz), zero harshness
-    sos_warm = butter(2, [85.0, 220.0], btype="bandpass", fs=target_sr, output="sos")
-    sos_pres = butter(2, [2400.0, 4200.0], btype="bandpass", fs=target_sr, output="sos")
-    x = x + 0.34 * sosfilt(sos_warm, x).astype(np.float32) + 0.18 * sosfilt(sos_pres, x).astype(np.float32)
+    # 2. Zero-phase warm baritone EQ (85-200 Hz chest + 2.6-4.2 kHz clarity) — ZERO comb/phase smear!
+    sos_warm = butter(2, [85.0, 200.0], btype="bandpass", fs=target_sr, output="sos")
+    sos_pres = butter(2, [2600.0, 4200.0], btype="bandpass", fs=target_sr, output="sos")
+    if x.size > 36:
+        warm = sosfiltfilt(sos_warm, x).astype(np.float32)
+        pres = sosfiltfilt(sos_pres, x).astype(np.float32)
+    else:
+        warm = sosfilt(sos_warm, x).astype(np.float32)
+        pres = sosfilt(sos_pres, x).astype(np.float32)
+    x = (x + 0.24 * warm + 0.14 * pres).astype(np.float32)
 
     # 3. Gentle broadcast compression & level target BEFORE stereo hall IR
     env = np.sqrt(np.maximum(1e-8, sosfilt(butter(1, 14.0, btype="lowpass", fs=target_sr, output="sos"), x * x)))
@@ -1096,24 +1433,30 @@ def master_announcer_stereo(
     if rms > 1e-6:
         x *= 0.25 / rms
 
-    # 4. Diffuse stereo stadium hall convolution reverb (35 ms pre-delay, warm 3 kHz damped tail, NO metallic aecho!)
+    # 4. Warm diffuse arena room IR (45ms pre-delay, 2.2 kHz damped tail, zero hollow metallic ring)
     wet = _clamp(float(reverb_wet), 0.0, 0.30)
     if wet > 0.005:
-        ir_len = int(round(0.95 * target_sr))
-        pre_n = int(round(0.035 * target_sr))
+        ir_len = int(round(0.78 * target_sr))
+        pre_n = int(round(0.045 * target_sr))
         rng = np.random.default_rng(4401)
-        t_ir = np.linspace(0.0, 0.95, ir_len, endpoint=False, dtype=np.float32)
-        decay = np.exp(-t_ir / 0.28)
-        sos_ir = butter(2, 3000.0, btype="lowpass", fs=target_sr, output="sos")
+        t_ir = np.linspace(0.0, 0.78, ir_len, endpoint=False, dtype=np.float32)
+        decay = np.exp(-t_ir / 0.22)
+        sos_ir = butter(2, 2200.0, btype="lowpass", fs=target_sr, output="sos")
         ir_l = sosfilt(sos_ir, rng.standard_normal(ir_len).astype(np.float32)) * decay
         ir_r = sosfilt(sos_ir, rng.standard_normal(ir_len).astype(np.float32)) * decay
         ir_l[:pre_n] = 0.0
         ir_r[:pre_n] = 0.0
+        # Gentle stereo early reflections ahead of dense diffuse tail
+        er_l = int(round(0.022 * target_sr))
+        er_r = int(round(0.031 * target_sr))
+        if er_l < ir_len:
+            ir_l[er_l] += 0.18
+        if er_r < ir_len:
+            ir_r[er_r] += 0.16
         norm_ir = max(float(np.sqrt(np.sum(ir_l * ir_l))), float(np.sqrt(np.sum(ir_r * ir_r))), 1e-6)
         ir_l /= norm_ir
         ir_r /= norm_ir
-        # Subtle early stereo width + diffuse tail
-        tail_n = int(round(0.45 * target_sr))
+        tail_n = int(round(0.38 * target_sr))
         xp = np.pad(x, (0, tail_n))
         wet_l = fftconvolve(xp, ir_l, mode="full")[: xp.size].astype(np.float32)
         wet_r = fftconvolve(xp, ir_r, mode="full")[: xp.size].astype(np.float32)
@@ -1126,7 +1469,6 @@ def master_announcer_stereo(
     stereo = stereo * float(lin_boost)
     peak = float(np.max(np.abs(stereo)))
     if peak > 0.90:
-        # Smooth tanh knee above 0.72 so spikes saturate warmly like analog hardware instead of clipping
         stereo = np.where(np.abs(stereo) > 0.72, np.sign(stereo) * (0.72 + 0.18 * np.tanh((np.abs(stereo) - 0.72) / 0.25)), stereo)
         pk2 = float(np.max(np.abs(stereo)))
         if pk2 > 0.90:
@@ -1165,6 +1507,64 @@ def duck_bed_under_speech(
     return (out * gain_curve[:, None]).astype(np.float32)
 
 
+def _preset_for_voice(voice_id: str) -> dict[str, Any]:
+    if voice_id in EPIC_VOICE_PRESETS:
+        return dict(EPIC_VOICE_PRESETS[voice_id])
+    if voice_id.startswith("elevenlabs:"):
+        return {"engine": "elevenlabs", "voiceId": voice_id.split(":", 1)[1], "label": voice_id}
+    if voice_id.startswith("gemini:"):
+        return {"engine": "gemini", "voiceName": voice_id.split(":", 1)[1], "label": voice_id}
+    if voice_id.startswith("openai:"):
+        return {"engine": "openai", "voiceName": voice_id.split(":", 1)[1], "label": voice_id}
+    if voice_id.startswith("edge:"):
+        return {"engine": "edge", "voice": voice_id.split(":", 1)[1], "label": voice_id}
+    return dict(EPIC_VOICE_PRESETS[DEFAULT_ANNOUNCER_VOICE])
+
+
+def _decode_mp3_bytes_mono(mp3_bytes: bytes, *, target_sr: int = 24_000) -> np.ndarray:
+    import av
+
+    resampler = av.AudioResampler(format="flt", layout="mono", rate=int(target_sr))
+    dec: list[np.ndarray] = []
+    with av.open(io.BytesIO(mp3_bytes), format="mp3") as container:
+        for frame in container.decode(audio=0):
+            for rf in resampler.resample(frame):
+                dec.append(rf.to_ndarray().reshape(-1))
+        for rf in resampler.resample(None):
+            dec.append(rf.to_ndarray().reshape(-1))
+    if not dec:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(dec).astype(np.float32)
+
+
+def _decode_wav_bytes_mono(wav_bytes: bytes, *, target_sr: int = 24_000) -> np.ndarray:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+        ch = wf.getnchannels()
+        sr = wf.getframerate()
+        sw = wf.getsampwidth()
+        frames = wf.readframes(wf.getnframes())
+    if sw != 2 or not frames:
+        return np.zeros(0, dtype=np.float32)
+    arr = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    if ch > 1:
+        n = (arr.size // ch) * ch
+        arr = np.mean(arr[:n].reshape(-1, ch), axis=1).astype(np.float32)
+    if int(sr) != int(target_sr) and arr.size > 16:
+        g = math.gcd(int(sr), int(target_sr))
+        arr = resample_poly(arr, int(target_sr) // g, int(sr) // g).astype(np.float32)
+    return arr.astype(np.float32)
+
+
+def _trim_mono_edges(seg: np.ndarray, sr: int = 24_000) -> np.ndarray:
+    if seg.size == 0:
+        return seg
+    nz = np.flatnonzero(np.abs(seg) >= 0.008)
+    if nz.size:
+        pad = int(0.02 * sr)
+        return seg[max(0, int(nz[0]) - pad) : min(seg.size, int(nz[-1]) + pad)].astype(np.float32)
+    return seg.astype(np.float32)
+
+
 def synthesize_announcer_wav(
     text: str,
     *,
@@ -1175,72 +1575,246 @@ def synthesize_announcer_wav(
     ffmpeg_bin: str = "",
     allow_network: bool = True,
     models_dir: Path | None = None,
-    reverb_wet: float = 0.11,
+    reverb_wet: float = 0.06,
     boost_db: float = 2.0,
+    voice_style: str = "",
+    tts_secrets: dict[str, Any] | None = None,
+    http_post: Callable[[str, bytes, dict[str, str] | None, float], tuple[int, bytes]] | None = None,
+    gemini_synth_fn: Callable[[str, str, str], bytes] | None = None,
 ) -> Path:
-    """Synthesize a high-end studio neural announcer stem (Kokoro-82M FP32 -> Edge HD fallback)."""
+    """Synthesize a high-end studio announcer stem (ElevenLabs / Gemini 2.5 TTS / OpenAI / Kokoro / Edge HD)."""
     del pitch  # Forbidden SSML pitch-shifting warble
     out_wav.parent.mkdir(parents=True, exist_ok=True)
-    beats = _split_announcer_beats(text)
-    if not beats:
+    voice_id = resolve_voice_id(voice)
+    preset = _preset_for_voice(voice_id)
+    engine = str(preset.get("engine") or "kokoro")
+    sec_cfg = dict(tts_secrets or {})
+    el_model = str(sec_cfg.get("elevenlabsModel") or DEFAULT_ELEVENLABS_MODEL).strip() or DEFAULT_ELEVENLABS_MODEL
+
+    tokens, inline_style = parse_speech_markup(
+        text,
+        default_speed=1.0,
+        keep_eleven_v3_tags=(engine == "elevenlabs" and el_model == "eleven_v3"),
+    )
+    speech_indices = [i for i, t in enumerate(tokens) if t.get("kind") == "speech"]
+    if not speech_indices:
         pcm = np.zeros((int(0.5 * SHOW_SR), 2), dtype=np.float32)
         tmp = out_wav.with_suffix(".wav.tmp")
         tmp.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
         tmp.replace(out_wav)
         return out_wav
 
-    voice_id = resolve_voice_id(voice)
-    preset = EPIC_VOICE_PRESETS.get(voice_id, EPIC_VOICE_PRESETS[DEFAULT_ANNOUNCER_VOICE])
-    engine = preset.get("engine", "kokoro")
+    effective_style = "; ".join(p for p in (str(voice_style or "").strip(), inline_style) if p)
+    last_speech_idx = speech_indices[-1]
+    has_multiple_speech = len(speech_indices) > 1
+    k_sr = 24_000
 
-    # Offline test deterministic fallback ONLY when Kokoro weights aren't staged locally
-    kokoro = _get_kokoro(models_dir, allow_fallback=allow_network) if engine == "kokoro" else None
-    if not allow_network and kokoro is None:
-        pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
-        pcm = apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=0.25)
-        tmp = out_wav.with_suffix(".wav.tmp")
-        tmp.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
-        tmp.replace(out_wav)
-        return out_wav
+    def _do_post_json(url: str, headers: dict[str, str], payload: dict[str, Any], timeout: float = 30.0) -> bytes:
+        raw_body = json.dumps(payload).encode("utf-8")
+        if http_post is not None:
+            code, resp_bytes = http_post(url, raw_body, headers, timeout)
+            if code >= 400:
+                msg = resp_bytes.decode("utf-8", errors="ignore")[:240]
+                raise RuntimeError(f"TTS HTTP {code}: {msg}")
+            return resp_bytes
+        if not allow_network:
+            raise RuntimeError("Network disabled for cloud TTS")
+        req = urllib.request.Request(url, data=raw_body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as he:
+            detail = ""
+            try:
+                detail = he.read().decode("utf-8", errors="ignore")[:240]
+            except Exception:
+                pass
+            raise RuntimeError(f"TTS HTTP {he.code}: {detail or he.reason}") from he
 
-    # Path 1: Local Kokoro-82M FP32 studio neural synthesis
-    if engine == "kokoro" and kokoro is not None:
-        weights: dict[str, float] = dict(preset.get("weights") or {"am_onyx": 0.55, "am_fenrir": 0.45})
-        style_vec = None
-        for v_name, w in weights.items():
-            vec = kokoro.get_voice_style(v_name) * float(w)
-            style_vec = vec if style_vec is None else (style_vec + vec)
-        base_speed = float(preset.get("speed", 0.90))
-        final_speed = float(preset.get("finalSpeed", 0.80))
-        parts: list[np.ndarray] = []
-        k_sr = 24_000
-        for idx, phrase in enumerate(beats):
-            is_last = idx == len(beats) - 1 and len(beats) > 1
-            spd = final_speed if is_last else base_speed
-            samples, k_sr = kokoro.create(phrase, voice=style_vec, speed=spd, lang="en-us")
-            arr = np.asarray(samples, dtype=np.float32).reshape(-1)
-            # Strip dead edges cleanly on each beat before adding exact dramatic rest
-            nz = np.flatnonzero(np.abs(arr) >= 0.008)
-            if nz.size:
-                pad_s = int(0.02 * k_sr)
-                arr = arr[max(0, int(nz[0]) - pad_s) : min(arr.size, int(nz[-1]) + pad_s)]
-            parts.append(arr)
-            if idx < len(beats) - 1:
-                next_is_last = (idx + 1) == (len(beats) - 1) and len(beats) > 1
-                gap_sec = 0.50 if next_is_last else 0.36
-                parts.append(np.zeros(int(round(gap_sec * k_sr)), dtype=np.float32))
-        mono = np.concatenate(parts) if parts else np.zeros(int(0.5 * k_sr), dtype=np.float32)
-        stereo = master_announcer_stereo(mono, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+    # Engine 1: Local Kokoro-82M FP32
+    if engine == "kokoro":
+        kokoro = _get_kokoro(models_dir, allow_fallback=allow_network)
+        if not allow_network and kokoro is None:
+            pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
+            pcm = apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=0.25)
+            tmp = out_wav.with_suffix(".wav.tmp")
+            tmp.write_bytes(encode_stereo_pcm16_wav(pcm, sr=SHOW_SR))
+            tmp.replace(out_wav)
+            return out_wav
+        if kokoro is not None:
+            weights: dict[str, float] = dict(preset.get("weights") or {"am_onyx": 0.55, "am_fenrir": 0.45})
+            style_vec = None
+            for v_name, w in weights.items():
+                vec = kokoro.get_voice_style(v_name) * float(w)
+                style_vec = vec if style_vec is None else (style_vec + vec)
+            base_speed = float(preset.get("speed", 0.95))
+            final_speed = float(preset.get("finalSpeed", 0.88))
+            parts: list[np.ndarray] = []
+            for idx, tok in enumerate(tokens):
+                if tok["kind"] == "pause":
+                    parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
+                    continue
+                is_last = idx == last_speech_idx and has_multiple_speech
+                tok_spd = float(tok.get("speed", 1.0))
+                spd = _clamp((final_speed if (is_last and abs(tok_spd - 1.0) < 1e-3) else base_speed) * tok_spd, 0.65, 1.50)
+                samples, k_sr = kokoro.create(tok["text"], voice=style_vec, speed=spd, lang="en-us")
+                arr = _trim_mono_edges(np.asarray(samples, dtype=np.float32).reshape(-1), k_sr)
+                gdb = float(tok.get("gainDb", 0.0))
+                if abs(gdb) > 0.05:
+                    arr = (arr * (10.0 ** (gdb / 20.0))).astype(np.float32)
+                parts.append(arr)
+            mono = np.concatenate(parts) if parts else np.zeros(int(0.5 * k_sr), dtype=np.float32)
+            stereo = master_announcer_stereo(mono, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+            tmp = out_wav.with_suffix(".wav.tmp")
+            tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
+            tmp.replace(out_wav)
+            return out_wav
+
+    # Engine 2: ElevenLabs Studio Cloud
+    if engine == "elevenlabs":
+        el_key = str(sec_cfg.get("elevenlabsKey") or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+        if not el_key:
+            raise RuntimeError("ElevenLabs API key missing — add your key under Studio Voice API Keys in Show Lab.")
+        el_vid = str(preset.get("voiceId") or "JBFqnCBsd6RMkjVDRZzb").strip()
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{urllib.parse.quote(el_vid, safe='')}?output_format=mp3_44100_128"
+        hdrs = {"xi-api-key": el_key, "Content-Type": "application/json", "Accept": "audio/mpeg"}
+        mono_parts: list[np.ndarray] = []
+        for tok in tokens:
+            if tok["kind"] == "pause":
+                mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
+                continue
+            vset: dict[str, Any] = {"stability": 0.45, "similarity_boost": 0.78}
+            if el_model != "eleven_v3":
+                vset["style"] = 0.45
+            mp3_bytes = _do_post_json(
+                url,
+                hdrs,
+                {"text": tok["text"], "model_id": el_model, "voice_settings": vset},
+            )
+            seg = _decode_mp3_bytes_mono(mp3_bytes, target_sr=k_sr)
+            seg = _trim_mono_edges(seg, k_sr)
+            seg = time_stretch_mono_pcm(seg, k_sr, float(tok.get("speed", 1.0)), ffmpeg_bin)
+            gdb = float(tok.get("gainDb", 0.0))
+            if abs(gdb) > 0.05:
+                seg = (seg * (10.0 ** (gdb / 20.0))).astype(np.float32)
+            mono_parts.append(seg)
+        mono_all = np.concatenate(mono_parts) if mono_parts else np.zeros(int(0.5 * k_sr), dtype=np.float32)
+        stereo = master_announcer_stereo(mono_all, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
         tmp = out_wav.with_suffix(".wav.tmp")
         tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
         tmp.replace(out_wav)
         return out_wav
 
-    # Path 2: Clean HD Edge Multilingual voice (ZERO SSML pitch warble, ZERO aecho)
+    # Engine 3: Google Gemini 2.5 Flash TTS
+    if engine == "gemini":
+        gem_key = str(sec_cfg.get("geminiKey") or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+        if not gem_key and gemini_synth_fn is None:
+            raise RuntimeError("Gemini API key missing — add your free Google AI Studio key in Show Lab.")
+        v_name = str(preset.get("voiceName") or "Fenrir").strip()
+        gem_client = None
+        types_mod = None
+        if gemini_synth_fn is None:
+            if not allow_network:
+                raise RuntimeError("Network disabled for Gemini TTS")
+            from google import genai
+            from google.genai import types as g_types
+
+            gem_client = genai.Client(api_key=gem_key)
+            types_mod = g_types
+
+        mono_parts = []
+        for tok in tokens:
+            if tok["kind"] == "pause":
+                mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
+                continue
+            prompt_txt = (
+                f"Audio direction ({effective_style}). Speak only the exact script below naturally with that energy:\n\n{tok['text']}"
+                if effective_style
+                else tok["text"]
+            )
+            if gemini_synth_fn is not None:
+                raw_pcm = gemini_synth_fn(prompt_txt, v_name, effective_style)
+            else:
+                assert gem_client is not None and types_mod is not None
+                resp = gem_client.models.generate_content(
+                    model="gemini-2.5-flash-preview-tts",
+                    contents=prompt_txt,
+                    config=types_mod.GenerateContentConfig(
+                        response_modalities=["AUDIO"],
+                        speech_config=types_mod.SpeechConfig(
+                            voice_config=types_mod.VoiceConfig(
+                                prebuilt_voice_config=types_mod.PrebuiltVoiceConfig(voice_name=v_name)
+                            )
+                        ),
+                    ),
+                )
+                try:
+                    raw_pcm = resp.candidates[0].content.parts[0].inline_data.data
+                except (IndexError, AttributeError) as exc:
+                    raise RuntimeError("Gemini TTS returned empty audio response") from exc
+            if isinstance(raw_pcm, str):
+                import base64
+
+                raw_pcm = base64.b64decode(raw_pcm)
+            usable = (len(raw_pcm) // 2) * 2
+            seg = (np.frombuffer(raw_pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0) if usable else np.zeros(0, dtype=np.float32)
+            seg = _trim_mono_edges(seg, k_sr)
+            seg = time_stretch_mono_pcm(seg, k_sr, float(tok.get("speed", 1.0)), ffmpeg_bin)
+            gdb = float(tok.get("gainDb", 0.0))
+            if abs(gdb) > 0.05:
+                seg = (seg * (10.0 ** (gdb / 20.0))).astype(np.float32)
+            mono_parts.append(seg)
+        mono_all = np.concatenate(mono_parts) if mono_parts else np.zeros(int(0.5 * k_sr), dtype=np.float32)
+        stereo = master_announcer_stereo(mono_all, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+        tmp = out_wav.with_suffix(".wav.tmp")
+        tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
+        tmp.replace(out_wav)
+        return out_wav
+
+    # Engine 4: OpenAI gpt-4o-mini-tts
+    if engine == "openai":
+        oai_key = str(sec_cfg.get("openaiKey") or os.environ.get("OPENAI_API_KEY") or "").strip()
+        if not oai_key:
+            raise RuntimeError("OpenAI API key missing — add your OpenAI key in Show Lab.")
+        oai_voice = str(preset.get("voiceName") or "onyx").strip()
+        url = "https://api.openai.com/v1/audio/speech"
+        hdrs = {"Authorization": f"Bearer {oai_key}", "Content-Type": "application/json"}
+        inst = effective_style or DEFAULT_RYDER_VOICE_STYLE
+        mono_parts = []
+        for tok in tokens:
+            if tok["kind"] == "pause":
+                mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
+                continue
+            wav_bytes = _do_post_json(
+                url,
+                hdrs,
+                {
+                    "model": "gpt-4o-mini-tts",
+                    "voice": oai_voice,
+                    "input": tok["text"],
+                    "instructions": inst,
+                    "response_format": "wav",
+                },
+            )
+            seg = _decode_wav_bytes_mono(wav_bytes, target_sr=k_sr)
+            seg = _trim_mono_edges(seg, k_sr)
+            seg = time_stretch_mono_pcm(seg, k_sr, float(tok.get("speed", 1.0)), ffmpeg_bin)
+            gdb = float(tok.get("gainDb", 0.0))
+            if abs(gdb) > 0.05:
+                seg = (seg * (10.0 ** (gdb / 20.0))).astype(np.float32)
+            mono_parts.append(seg)
+        mono_all = np.concatenate(mono_parts) if mono_parts else np.zeros(int(0.5 * k_sr), dtype=np.float32)
+        stereo = master_announcer_stereo(mono_all, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+        tmp = out_wav.with_suffix(".wav.tmp")
+        tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
+        tmp.replace(out_wav)
+        return out_wav
+
+    # Engine 5: Clean HD Edge Multilingual voice (ZERO SSML pitch warble, ZERO aecho)
     edge_voice = str(preset.get("voice") or "en-US-BrianMultilingualNeural")
-    edge_rate = str(preset.get("rate") or rate or "-4%")
+    edge_rate = str(preset.get("rate") or rate or "-2%")
     if not edge_rate.startswith(("+", "-")):
-        edge_rate = "-4%"
+        edge_rate = "-2%"
 
     if not allow_network:
         pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
@@ -1251,7 +1825,6 @@ def synthesize_announcer_wav(
         return out_wav
 
     import asyncio
-    import av
     import edge_tts
 
     async def _fetch_phrase(phr: str, spd_rate: str) -> bytes:
@@ -1262,37 +1835,41 @@ def synthesize_announcer_wav(
                 chunks.append(ch["data"])
         return b"".join(chunks)
 
-    mono_parts: list[np.ndarray] = []
-    for idx, phrase in enumerate(beats):
-        is_last = idx == len(beats) - 1 and len(beats) > 1
-        r_str = "-10%" if is_last else edge_rate
+    base_edge_pct = 0
+    try:
+        base_edge_pct = int(round(float(edge_rate.rstrip("%"))))
+    except Exception:
+        base_edge_pct = -2
+
+    mono_parts = []
+    for idx, tok in enumerate(tokens):
+        if tok["kind"] == "pause":
+            mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
+            continue
+        is_last = idx == last_speech_idx and has_multiple_speech
+        tok_spd = float(tok.get("speed", 1.0))
+        if abs(tok_spd - 1.0) >= 0.015:
+            pct = max(-35, min(50, int(round((tok_spd - 1.0) * 100.0))))
+            r_str = f"{pct:+d}%"
+        else:
+            r_str = "-8%" if is_last else f"{base_edge_pct:+d}%"
         mp3_bytes = b""
         for attempt in range(3):
             try:
-                mp3_bytes = asyncio.run(_fetch_phrase(phrase, r_str))
+                mp3_bytes = asyncio.run(_fetch_phrase(tok["text"], r_str))
                 if mp3_bytes:
                     break
             except Exception:
                 time.sleep(0.25 * (attempt + 1))
         if not mp3_bytes:
             continue
-        resampler = av.AudioResampler(format="flt", layout="mono", rate=24_000)
-        dec: list[np.ndarray] = []
-        with av.open(io.BytesIO(mp3_bytes), format="mp3") as container:
-            for frame in container.decode(audio=0):
-                for rf in resampler.resample(frame):
-                    dec.append(rf.to_ndarray().reshape(-1))
-            for rf in resampler.resample(None):
-                dec.append(rf.to_ndarray().reshape(-1))
-        if dec:
-            seg = np.concatenate(dec).astype(np.float32)
-            nz = np.flatnonzero(np.abs(seg) >= 0.008)
-            if nz.size:
-                seg = seg[max(0, int(nz[0]) - 480) : min(seg.size, int(nz[-1]) + 480)]
+        seg = _decode_mp3_bytes_mono(mp3_bytes, target_sr=k_sr)
+        seg = _trim_mono_edges(seg, k_sr)
+        gdb = float(tok.get("gainDb", 0.0))
+        if abs(gdb) > 0.05:
+            seg = (seg * (10.0 ** (gdb / 20.0))).astype(np.float32)
+        if seg.size:
             mono_parts.append(seg)
-            if idx < len(beats) - 1:
-                next_is_last = (idx + 1) == (len(beats) - 1) and len(beats) > 1
-                mono_parts.append(np.zeros(int((0.50 if next_is_last else 0.36) * 24_000), dtype=np.float32))
 
     if not mono_parts:
         pcm = synth_demo_music_bed("anthem", 1.2, sr=SHOW_SR) * 0.55
@@ -1303,7 +1880,7 @@ def synthesize_announcer_wav(
         return out_wav
 
     mono_all = np.concatenate(mono_parts)
-    stereo = master_announcer_stereo(mono_all, 24_000, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
+    stereo = master_announcer_stereo(mono_all, k_sr, target_sr=SHOW_SR, reverb_wet=reverb_wet, boost_db=boost_db)
     tmp = out_wav.with_suffix(".wav.tmp")
     tmp.write_bytes(encode_stereo_pcm16_wav(stereo, sr=SHOW_SR))
     tmp.replace(out_wav)
@@ -1606,10 +2183,16 @@ def _generate_intro_pulse_video(
         "main",
         "-level:v",
         "4.0",
+        "-pix_fmt",
+        "yuv420p",
         "-r",
         str(fps),
         "-g",
         str(fps * 2),
+        "-bf",
+        "0",
+        "-video_track_timescale",
+        "90000",
         "-crf",
         "20",
         "-preset",
@@ -1655,6 +2238,7 @@ class ShowDirector:
         allow_network: bool = True,
         http_get: Callable[[str, float], tuple[int, bytes]] | None = None,
         http_post: Callable[[str, bytes, dict[str, str] | None, float], tuple[int, bytes]] | None = None,
+        gemini_synth_fn: Callable[[str, str, str], bytes] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
         self._lock = threading.RLock()
@@ -1666,6 +2250,7 @@ class ShowDirector:
         self.fx_dir = self.shows_dir / "fx"
         self.models_dir = self.root_dir / "models" / "kokoro"
         self.config_path = self.root_dir / "shows.json"
+        self.tts_secrets_path = self.root_dir / "tts_secrets.json"
         for d in (self.shows_dir, self.sources_dir, self.rendered_dir, self.fx_dir):
             d.mkdir(parents=True, exist_ok=True)
 
@@ -1678,6 +2263,8 @@ class ShowDirector:
         self.allow_network = bool(allow_network)
         self._http_get = http_get
         self._http_post = http_post
+        self._gemini_synth_fn = gemini_synth_fn
+        self._el_voices_cache: tuple[float, list[dict[str, Any]]] | None = None
         self._has_custom_sleep = sleep_fn is not None
         self._sleep = sleep_fn or time.sleep
         self.log = logging.getLogger("armory-shows")
@@ -1818,15 +2405,155 @@ class ShowDirector:
             subs = list(self._event_subs)
         self._fanout_event_locked(evt, subs)
 
+    def load_tts_secrets(self) -> dict[str, str]:
+        """Read outside-git studio TTS API keys & model settings from `tts_secrets.json` (plus env fallback)."""
+        data: dict[str, str] = {
+            "elevenlabsKey": "",
+            "geminiKey": "",
+            "openaiKey": "",
+            "elevenlabsModel": DEFAULT_ELEVENLABS_MODEL,
+        }
+        if self.tts_secrets_path.is_file():
+            try:
+                raw = json.loads(self.tts_secrets_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for k in ("elevenlabsKey", "geminiKey", "openaiKey", "elevenlabsModel"):
+                        v = str(raw.get(k) or "").strip()
+                        if v:
+                            data[k] = v
+            except Exception as exc:
+                self.log.warning("Failed reading tts_secrets.json: %s", exc)
+        if not data["elevenlabsKey"]:
+            data["elevenlabsKey"] = str(os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+        if not data["geminiKey"]:
+            data["geminiKey"] = str(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+        if not data["openaiKey"]:
+            data["openaiKey"] = str(os.environ.get("OPENAI_API_KEY") or "").strip()
+        return data
+
+    def update_tts_secrets(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Persist studio API keys securely to `tts_secrets.json` outside git without exposing raw keys."""
+        if not isinstance(raw, dict):
+            raise ValueError("Invalid TTS provider config")
+        with self._lock:
+            cur: dict[str, str] = {}
+            if self.tts_secrets_path.is_file():
+                try:
+                    loaded = json.loads(self.tts_secrets_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        cur = {str(k): str(v or "") for k, v in loaded.items()}
+                except Exception:
+                    cur = {}
+            for k in ("elevenlabsKey", "geminiKey", "openaiKey"):
+                if raw.get(f"clear_{k}") or raw.get(f"clear{k[0].upper()}{k[1:]}"):
+                    cur[k] = ""
+                elif k in raw:
+                    val = str(raw.get(k) or "").strip()
+                    if val and not val.startswith("••••"):
+                        cur[k] = val
+            if "elevenlabsModel" in raw:
+                m = str(raw.get("elevenlabsModel") or "").strip()
+                if m in ("eleven_v3", "eleven_multilingual_v2", "eleven_flash_v2_5", "eleven_turbo_v2_5"):
+                    cur["elevenlabsModel"] = m
+            tmp = self.tts_secrets_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
+            tmp.replace(self.tts_secrets_path)
+            self._el_voices_cache = None
+        return self.tts_secrets_status()
+
+    @staticmethod
+    def _mask_hint(secret: str) -> str:
+        s = str(secret or "").strip()
+        if not s:
+            return ""
+        return f"••••{s[-4:]}" if len(s) >= 4 else "••••"
+
+    def tts_secrets_status(self) -> dict[str, Any]:
+        sec = self.load_tts_secrets()
+        return {
+            "hasElevenlabsKey": bool(sec.get("elevenlabsKey")),
+            "elevenlabsHint": self._mask_hint(sec.get("elevenlabsKey", "")),
+            "elevenlabsModel": sec.get("elevenlabsModel") or DEFAULT_ELEVENLABS_MODEL,
+            "hasGeminiKey": bool(sec.get("geminiKey")),
+            "geminiHint": self._mask_hint(sec.get("geminiKey", "")),
+            "hasOpenaiKey": bool(sec.get("openaiKey")),
+            "openaiHint": self._mask_hint(sec.get("openaiKey", "")),
+        }
+
+    def fetch_elevenlabs_voices(self, *, force: bool = False) -> list[dict[str, Any]]:
+        """Query account's ElevenLabs voices (cached 5 min) so custom/cloned library voices appear in Show Lab."""
+        sec = self.load_tts_secrets()
+        key = str(sec.get("elevenlabsKey") or "").strip()
+        if not key or (not self.allow_network and self._http_get is None):
+            return []
+        now = time.monotonic()
+        if not force and self._el_voices_cache is not None and (now - self._el_voices_cache[0]) < 300.0:
+            return list(self._el_voices_cache[1])
+        url = "https://api.elevenlabs.io/v1/voices"
+        try:
+            if self._http_get is not None:
+                code, raw = self._http_get(url, 6.0)
+            else:
+                req = urllib.request.Request(url, headers={"xi-api-key": key}, method="GET")
+                with urllib.request.urlopen(req, timeout=6.0) as resp:
+                    code, raw = int(resp.status), resp.read()
+            if code >= 400:
+                return []
+            payload = json.loads(raw.decode("utf-8", errors="ignore"))
+            out: list[dict[str, Any]] = []
+            for v in payload.get("voices") or []:
+                vid = str(v.get("voice_id") or "").strip()
+                name = str(v.get("name") or vid).strip()
+                cat = str(v.get("category") or "").strip()
+                if vid:
+                    out.append({
+                        "id": f"elevenlabs:{vid}",
+                        "label": f"{name} (ElevenLabs · {cat or 'Account'})",
+                        "engine": "elevenlabs",
+                        "requiresKey": True,
+                        "available": True,
+                    })
+            self._el_voices_cache = (now, out)
+            return out
+        except Exception:
+            return []
+
     def list_voices(self) -> dict[str, Any]:
+        sec_status = self.tts_secrets_status()
+        kokoro_ok = kokoro_models_available(self.models_dir)
+        avail_by_engine = {
+            "elevenlabs": bool(sec_status["hasElevenlabsKey"]),
+            "gemini": bool(sec_status["hasGeminiKey"]),
+            "openai": bool(sec_status["hasOpenaiKey"]),
+            "kokoro": kokoro_ok,
+            "edge": True,
+        }
+        voices: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        # Append account-specific / cloned ElevenLabs voices first when key is active
+        if avail_by_engine["elevenlabs"]:
+            for item in self.fetch_elevenlabs_voices():
+                if item["id"] not in seen_ids:
+                    voices.append(item)
+                    seen_ids.add(item["id"])
+        for vid, meta in EPIC_VOICE_PRESETS.items():
+            if vid in seen_ids:
+                continue
+            eng = str(meta["engine"])
+            voices.append({
+                "id": vid,
+                "label": meta["label"],
+                "engine": eng,
+                "requiresKey": eng in ("elevenlabs", "gemini", "openai"),
+                "available": avail_by_engine.get(eng, True),
+            })
+            seen_ids.add(vid)
         return {
             "ok": True,
             "defaultVoice": DEFAULT_ANNOUNCER_VOICE,
-            "kokoroReady": kokoro_models_available(self.models_dir),
-            "voices": [
-                {"id": vid, "label": meta["label"], "engine": meta["engine"]}
-                for vid, meta in EPIC_VOICE_PRESETS.items()
-            ],
+            "kokoroReady": kokoro_ok,
+            "ttsProviders": sec_status,
+            "voices": voices,
         }
 
     # ---------- Persistence & Configuration ----------
@@ -1885,10 +2612,15 @@ class ShowDirector:
                 self._save_locked()
             ry = self.shows.get("ryder_walkin")
             default_ry_vid = self.sources_dir / "ryder_walkin_video.mp4"
+            ry_dirty = False
             if ry and not ry.video_source_file and default_ry_vid.is_file() and default_ry_vid.stat().st_size > 1000:
-                self.shows["ryder_walkin"] = ShowSpec.from_dict(
-                    {**ry.to_dict(), "videoSourceFile": "ryder_walkin_video.mp4"}
-                )
+                ry = ShowSpec.from_dict({**ry.to_dict(), "videoSourceFile": "ryder_walkin_video.mp4"})
+                ry_dirty = True
+            if ry and not ry.voice_style:
+                ry = ShowSpec.from_dict({**ry.to_dict(), "voiceStyle": DEFAULT_RYDER_VOICE_STYLE})
+                ry_dirty = True
+            if ry_dirty and ry is not None:
+                self.shows["ryder_walkin"] = ry
                 self._save_locked()
 
     def _save_locked(self) -> None:
@@ -1981,13 +2713,15 @@ class ShowDirector:
                 cues = list(self.recent_cues)[-12:]
                 stage_roles = dict(self._stage_roles)
                 stage_state = dict(self._stage_state)
+            v_info = self.list_voices()
             return {
                 "shows": items,
                 "fxHooks": self.fx_hooks.to_dict(),
                 "active": dict(self._active_state),
                 "lastResult": dict(self._last_result),
-                "kokoroReady": kokoro_models_available(self.models_dir),
-                "voices": self.list_voices()["voices"],
+                "kokoroReady": v_info["kokoroReady"],
+                "voices": v_info["voices"],
+                "ttsProviders": v_info["ttsProviders"],
                 "recentCues": cues,
                 "stageClients": stage_roles,
                 "stageState": stage_state,
@@ -2025,6 +2759,22 @@ class ShowDirector:
                             (self.sources_dir / old_vid).unlink(missing_ok=True)
                         except Exception:
                             pass
+            if patch and patch.get("clearCustomIntroVoice"):
+                old_ci = cur.custom_intro_voice_file
+                merged["customIntroVoiceFile"] = ""
+                if old_ci:
+                    try:
+                        (self.sources_dir / old_ci).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            if patch and patch.get("clearCustomOverlayVoice"):
+                old_co = cur.custom_overlay_voice_file
+                merged["customOverlayVoiceFile"] = ""
+                if old_co:
+                    try:
+                        (self.sources_dir / old_co).unlink(missing_ok=True)
+                    except Exception:
+                        pass
             if patch and isinstance(patch.get("triggersText"), str):
                 merged["triggers"] = [
                     line.strip()
@@ -2085,6 +2835,30 @@ class ShowDirector:
         tmp.write_bytes(file_bytes)
         tmp.replace(dest)
         return self.update_show(sid, {"videoSourceFile": safe_name}, rebuild=True)
+
+    def save_uploaded_voice_clip(
+        self,
+        show_id: str,
+        slot: str,
+        raw_filename: str,
+        file_bytes: bytes,
+    ) -> dict[str, Any]:
+        """Save user-supplied studio/recorded intro or 1:20 overlay clip cleanly overriding TTS."""
+        sid = _safe_show_id(show_id)
+        if not self.get_show(sid):
+            raise KeyError(f"Unknown show: {show_id}")
+        clean_slot = str(slot or "intro").strip().lower()
+        if clean_slot not in ("intro", "overlay"):
+            raise ValueError("Voice slot must be 'intro' or 'overlay'")
+        if not file_bytes or len(file_bytes) > MAX_SONG_UPLOAD_BYTES:
+            raise ValueError("Voice upload must be non-empty and <= 30 MB")
+        safe_name = sanitize_upload_filename(raw_filename, f"{sid}_{clean_slot}voice")
+        dest = self.sources_dir / safe_name
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_bytes(file_bytes)
+        tmp.replace(dest)
+        field = "customIntroVoiceFile" if clean_slot == "intro" else "customOverlayVoiceFile"
+        return self.update_show(sid, {field: safe_name}, rebuild=True)
 
     def fetch_youtube_video_source(self, show_id: str) -> dict[str, Any]:
         """Download configured YouTube entrance video locally via yt-dlp (no anti-bot bypass)."""
@@ -2175,6 +2949,7 @@ class ShowDirector:
             intro_mp4 = self.rendered_dir / f".intro_{sid}_{stamp}.mp4"
             src_audio_wav = self.rendered_dir / f".srcaud_{sid}_{stamp}.wav"
             master_wav = self.rendered_dir / f".master_{sid}_{stamp}.wav"
+            concat_txt = self.rendered_dir / f".concat_{sid}_{stamp}.txt"
             tmp_mp4 = out_mp4.with_name(f"{out_mp4.stem}.tmp{out_mp4.suffix}")
 
             try:
@@ -2267,55 +3042,171 @@ class ShowDirector:
                     master_pcm = np.concatenate([intro_pcm_48k, ent_pcm], axis=0)
                     master_wav.write_bytes(encode_stereo_pcm16_wav(master_pcm, sr=STAGE_VIDEO_SR))
 
-                    cmd = [
-                        self.ffmpeg_bin,
-                        "-y",
-                        "-i",
-                        str(intro_mp4),
-                        "-i",
-                        str(src_vid),
-                        "-i",
-                        str(master_wav),
-                        "-filter_complex",
-                        (
-                            "[0:v]setsar=1,setpts=PTS-STARTPTS[v0];"
-                            "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
-                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1];"
-                            "[v0][v1]concat=n=2:v=1:a=0[v]"
-                        ),
-                        "-map",
-                        "[v]",
-                        "-map",
-                        "2:a",
-                        "-c:v",
-                        "libx264",
-                        "-profile:v",
-                        "main",
-                        "-level:v",
-                        "4.0",
-                        "-pix_fmt",
-                        "yuv420p",
-                        "-r",
-                        "30",
-                        "-g",
-                        "60",
-                        "-crf",
-                        "21",
-                        "-preset",
-                        "veryfast",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "192k",
-                        "-ar",
-                        str(STAGE_VIDEO_SR),
-                        "-ac",
-                        "2",
-                        "-movflags",
-                        "+faststart",
-                        "-shortest",
-                        str(tmp_mp4),
-                    ]
+                    # Cache normalized 1080p H.264 Main L4.0 30fps (-bf 0) mezzanine once per source video
+                    vid_key = hashlib.sha1(
+                        f"v1|{src_vid.name}|{src_vid.stat().st_size}|{int(src_vid.stat().st_mtime_ns)}".encode("utf-8")
+                    ).hexdigest()[:12]
+                    norm_src_mp4 = self.rendered_dir / f".norm_{vid_key}.mp4"
+                    norm_ready = norm_src_mp4.is_file() and norm_src_mp4.stat().st_size > 1000
+                    if not norm_ready:
+                        tmp_norm = self.rendered_dir / f".norm_{vid_key}_{stamp}.tmp.mp4"
+                        try:
+                            n_proc = subprocess.run(
+                                [
+                                    self.ffmpeg_bin,
+                                    "-y",
+                                    "-i",
+                                    str(src_vid),
+                                    "-an",
+                                    "-vf",
+                                    (
+                                        "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p"
+                                    ),
+                                    "-c:v",
+                                    "libx264",
+                                    "-profile:v",
+                                    "main",
+                                    "-level:v",
+                                    "4.0",
+                                    "-pix_fmt",
+                                    "yuv420p",
+                                    "-r",
+                                    "30",
+                                    "-g",
+                                    "60",
+                                    "-bf",
+                                    "0",
+                                    "-video_track_timescale",
+                                    "90000",
+                                    "-crf",
+                                    "21",
+                                    "-preset",
+                                    "veryfast",
+                                    str(tmp_norm),
+                                ],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                timeout=300,
+                                **_no_window_kwargs(),
+                            )
+                            if n_proc.returncode == 0 and tmp_norm.is_file() and tmp_norm.stat().st_size > 1000:
+                                tmp_norm.replace(norm_src_mp4)
+                                norm_ready = True
+                        finally:
+                            try:
+                                tmp_norm.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+
+                    mux_ok = False
+                    if norm_ready:
+                        p_intro_s = intro_mp4.resolve().as_posix().replace("'", r"\'")
+                        p_norm_s = norm_src_mp4.resolve().as_posix().replace("'", r"\'")
+                        concat_txt.write_text(f"file '{p_intro_s}'\nfile '{p_norm_s}'\n", encoding="utf-8")
+                        fast_cmd = [
+                            self.ffmpeg_bin,
+                            "-y",
+                            "-f",
+                            "concat",
+                            "-safe",
+                            "0",
+                            "-i",
+                            str(concat_txt),
+                            "-i",
+                            str(master_wav),
+                            "-map",
+                            "0:v",
+                            "-map",
+                            "1:a",
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "192k",
+                            "-ar",
+                            str(STAGE_VIDEO_SR),
+                            "-ac",
+                            "2",
+                            "-movflags",
+                            "+faststart",
+                            "-shortest",
+                            str(tmp_mp4),
+                        ]
+                        mux_proc = subprocess.run(
+                            fast_cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=120,
+                            **_no_window_kwargs(),
+                        )
+                        mux_ok = mux_proc.returncode == 0 and tmp_mp4.is_file() and tmp_mp4.stat().st_size > 1000
+
+                    if not mux_ok:
+                        fallback_cmd = [
+                            self.ffmpeg_bin,
+                            "-y",
+                            "-i",
+                            str(intro_mp4),
+                            "-i",
+                            str(src_vid),
+                            "-i",
+                            str(master_wav),
+                            "-filter_complex",
+                            (
+                                "[0:v]setsar=1,setpts=PTS-STARTPTS[v0];"
+                                "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1];"
+                                "[v0][v1]concat=n=2:v=1:a=0[v]"
+                            ),
+                            "-map",
+                            "[v]",
+                            "-map",
+                            "2:a",
+                            "-c:v",
+                            "libx264",
+                            "-profile:v",
+                            "main",
+                            "-level:v",
+                            "4.0",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-r",
+                            "30",
+                            "-g",
+                            "60",
+                            "-bf",
+                            "0",
+                            "-video_track_timescale",
+                            "90000",
+                            "-crf",
+                            "21",
+                            "-preset",
+                            "veryfast",
+                            "-c:a",
+                            "aac",
+                            "-b:a",
+                            "192k",
+                            "-ar",
+                            str(STAGE_VIDEO_SR),
+                            "-ac",
+                            "2",
+                            "-movflags",
+                            "+faststart",
+                            "-shortest",
+                            str(tmp_mp4),
+                        ]
+                        mux_proc = subprocess.run(
+                            fallback_cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=300,
+                            **_no_window_kwargs(),
+                        )
+                        if mux_proc.returncode != 0 or not tmp_mp4.is_file() or tmp_mp4.stat().st_size < 1000:
+                            err = (mux_proc.stderr or b"").decode("utf-8", errors="ignore")[-320:]
+                            raise RuntimeError(f"FFmpeg show MP4 build failed: {err}")
                 else:
                     master_wav.write_bytes(encode_stereo_pcm16_wav(intro_pcm_48k, sr=STAGE_VIDEO_SR))
                     cmd = [
@@ -2344,17 +3235,16 @@ class ShowDirector:
                         "-shortest",
                         str(tmp_mp4),
                     ]
-
-                mux_proc = subprocess.run(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    timeout=300,
-                    **_no_window_kwargs(),
-                )
-                if mux_proc.returncode != 0 or not tmp_mp4.is_file() or tmp_mp4.stat().st_size < 1000:
-                    err = (mux_proc.stderr or b"").decode("utf-8", errors="ignore")[-320:]
-                    raise RuntimeError(f"FFmpeg show MP4 build failed: {err}")
+                    mux_proc = subprocess.run(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=300,
+                        **_no_window_kwargs(),
+                    )
+                    if mux_proc.returncode != 0 or not tmp_mp4.is_file() or tmp_mp4.stat().st_size < 1000:
+                        err = (mux_proc.stderr or b"").decode("utf-8", errors="ignore")[-320:]
+                        raise RuntimeError(f"FFmpeg show MP4 build failed: {err}")
 
                 tmp_mp4.replace(out_mp4)
                 probed_total = _probe_media_duration_sec(out_mp4, self.ffmpeg_bin)
@@ -2376,7 +3266,7 @@ class ShowDirector:
                 tmp_meta.replace(meta_path)
                 return meta
             finally:
-                for p in (intro_mp4, src_audio_wav, master_wav, tmp_mp4):
+                for p in (intro_mp4, src_audio_wav, master_wav, concat_txt, tmp_mp4):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:
@@ -2399,14 +3289,37 @@ class ShowDirector:
         text_override: str | None = None,
         reverb_override: float | None = None,
     ) -> np.ndarray | None:
+        custom_name = (
+            spec.custom_overlay_voice_file if suffix == "overlay" else spec.custom_intro_voice_file
+        )
+        if custom_name:
+            c_path = self.sources_dir / custom_name
+            if c_path.is_file() and c_path.stat().st_size > 100:
+                pcm_custom = decode_and_trim_song_file(
+                    c_path,
+                    start_sec=0.0,
+                    duration_sec=60.0,
+                    fade_out_sec=0.06,
+                    trim_leading_silence=True,
+                    ffmpeg_bin=self.ffmpeg_bin,
+                )
+                if abs(spec.voice_boost_db) > 0.05:
+                    pcm_custom = (pcm_custom * (10.0 ** (_clamp(spec.voice_boost_db, -4.0, 6.0) / 20.0))).astype(np.float32)
+                pk = float(np.max(np.abs(pcm_custom)))
+                if pk > 0.90:
+                    pcm_custom = pcm_custom * (0.90 / pk)
+                return pcm_custom if pcm_custom.shape[0] > 0 else None
+
         txt = str(text_override if text_override is not None else spec.announcer_text).strip()
         if not txt:
             return None
         voice_id = resolve_voice_id(spec.announcer_voice)
         reverb = spec.voice_reverb_wet if reverb_override is None else float(reverb_override)
+        sec = self.load_tts_secrets()
+        el_model = str(sec.get("elevenlabsModel") or DEFAULT_ELEVENLABS_MODEL)
         key_src = (
-            f"v2|{txt}|{voice_id}|{spec.announcer_rate}|{reverb:.2f}|{spec.voice_boost_db:.1f}|"
-            f"{int(self.allow_network)}|{int(kokoro_models_available(self.models_dir))}"
+            f"v3|{txt}|{voice_id}|{spec.announcer_rate}|{reverb:.2f}|{spec.voice_boost_db:.1f}|"
+            f"{spec.voice_style}|{el_model}|{int(self.allow_network)}|{int(kokoro_models_available(self.models_dir))}"
         )
         digest = hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:12]
         stem_path = self.rendered_dir / f"{spec.id}_{suffix}_{digest}.wav"
@@ -2421,6 +3334,10 @@ class ShowDirector:
                 models_dir=self.models_dir,
                 reverb_wet=reverb,
                 boost_db=spec.voice_boost_db,
+                voice_style=spec.voice_style,
+                tts_secrets=sec,
+                http_post=self._http_post,
+                gemini_synth_fn=self._gemini_synth_fn,
             )
         pcm = read_wav_stereo_float(stem_path, target_sr=SHOW_SR)
         return pcm if pcm.shape[0] > 0 else None

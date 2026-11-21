@@ -5015,6 +5015,9 @@ DASHBOARD_HTML = """<!doctype html>
   .dev-yt-wrap iframe{width:100%;height:100%;border:0}
   .dev-caption{text-align:center;font-weight:900;font-size:15px;color:#f8fafc;background:rgba(0,0,0,.62);border:1px solid rgba(255,255,255,.15);padding:8px 12px;border-radius:8px;z-index:2}
   .dev-log{font:11px/1.4 ui-monospace,Consolas,monospace;color:#7cc4ff;max-height:74px;overflow:auto;background:rgba(0,0,0,.45);padding:6px 8px;border-radius:6px;z-index:2}
+  .tag-bar{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
+  .tag-chip{background:#16202c;border:1px solid #2b3d54;color:#9cc7f5;border-radius:7px;padding:3px 8px;font:700 11px/1.3 ui-monospace,Consolas,monospace;cursor:pointer}
+  .tag-chip:hover{background:#1d2b3c;border-color:#7cc4ff;color:#fff}
   .btn{background:var(--blue);color:#00131f;border:0;border-radius:9px;padding:7px 12px;font-weight:800;font-size:12px;cursor:pointer;transition:transform .08s ease,background-color .15s ease,border-color .15s ease,box-shadow .15s ease,filter .15s ease,color .15s ease;user-select:none}
   .btn:hover:not(:disabled){filter:brightness(1.12);box-shadow:0 2px 10px rgba(0,0,0,.35)}
   .btn:active:not(:disabled){transform:translateY(2px) scale(.96);filter:brightness(.92);box-shadow:inset 0 2px 5px rgba(0,0,0,.45)}
@@ -5472,16 +5475,31 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
 
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:8px">
-        <div><label>Epic Studio Voice</label><select id="devRyVoice"></select></div>
-        <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.11"></div>
+        <div><label>Studio Voice Engine</label><select id="devRyVoice"></select></div>
+        <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.06"></div>
         <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
         <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
         <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
         <div><label>1:20 Overlay → Denon Vol</label><input id="devRyPostVol" type="number" min="30" max="75" value="55"></div>
       </div>
+      <div style="margin-top:6px">
+        <label>Voice Acting Style / Direction (used by Gemini 2.5 Flash TTS &amp; OpenAI gpt-4o-mini-tts)</label>
+        <input id="devRyStyle" type="text" placeholder="Electric HBO championship boxing ring announcer in a packed arena...">
+      </div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin-top:6px">
-        <div><label>HBO-Style Intro Script (<code>...</code> adds dramatic pause)</label><textarea id="devRyIntroTxt" rows="2"></textarea></div>
-        <div><label>1:20 Video Overlay Script</label><textarea id="devRyOvTxt" rows="2"></textarea></div>
+        <div><label>HBO-Style Intro Script (supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label><textarea id="devRyIntroTxt" rows="3"></textarea></div>
+        <div><label>1:20 Video Overlay Script</label><textarea id="devRyOvTxt" rows="3"></textarea></div>
+      </div>
+      <div class="tag-bar" id="devRyTagBar">
+        <span style="font-size:11px;color:var(--mut);font-weight:700">Insert Inline Tag:</span>
+        <button class="tag-chip" type="button" data-tag=" [pause:100ms] ">+[pause:100ms]</button>
+        <button class="tag-chip" type="button" data-tag=" [pause:350ms] ">+[pause:350ms]</button>
+        <button class="tag-chip" type="button" data-tag=" [pause:750ms] ">+[pause:750ms]</button>
+        <button class="tag-chip" type="button" data-wrap="speed:+10%">+[speed:+10%]</button>
+        <button class="tag-chip" type="button" data-wrap="speed:-10%">+[speed:-10%]</button>
+        <button class="tag-chip" type="button" data-wrap="vol:+3dB">+[vol:+3dB]</button>
+        <button class="tag-chip" type="button" data-tag=" [shouting] ">+[shouting] (EL v3)</button>
+        <button class="tag-chip" type="button" data-tag=" [excited] ">+[excited] (EL v3)</button>
       </div>
       <div class="ctrl-row" style="margin-top:8px">
         <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Rebuild Ryder Show MP4</button>
@@ -5489,6 +5507,29 @@ DASHBOARD_HTML = """<!doctype html>
         <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
         <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
       </div>
+      <details style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+        <summary style="cursor:pointer;font-weight:800;font-size:12px;color:#7cc4ff">Studio Voice API Keys (ElevenLabs Free 10k/mo · Gemini Free · OpenAI) &amp; Custom Voice Upload</summary>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:8px">
+          <div><label>ElevenLabs API Key <span id="ttsElHint" style="color:#86efac"></span></label><input id="ttsElKey" type="password" autocomplete="off" placeholder="sk_... (elevenlabs.io free tier 10k/mo)"></div>
+          <div><label>ElevenLabs Model</label><select id="ttsElModel"><option value="eleven_v3">eleven_v3 (Most Expressive + [shouting])</option><option value="eleven_multilingual_v2">eleven_multilingual_v2 (Ultra-Stable)</option></select></div>
+          <div><label>Google Gemini AI Studio Key <span id="ttsGemHint" style="color:#86efac"></span></label><input id="ttsGemKey" type="password" autocomplete="off" placeholder="AIza... (aistudio.google.com free)"></div>
+          <div><label>OpenAI API Key <span id="ttsOaiHint" style="color:#86efac"></span></label><input id="ttsOaiKey" type="password" autocomplete="off" placeholder="sk-... (gpt-4o-mini-tts)"></div>
+        </div>
+        <div class="ctrl-row" style="margin-top:8px">
+          <button class="btn sm" id="ttsSaveKeysBtn" type="button">Save API Keys &amp; Refresh Voices</button>
+          <span id="ttsKeysOut" style="color:var(--mut);font-size:12px"></span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;margin-top:8px;border-top:1px dashed rgba(255,255,255,.08);padding-top:8px">
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <label style="margin:0;font-size:12px">Custom Intro Voice (.mp3/.wav): <input id="devRyIntroVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
+            <button class="btn sm sec" id="devRyIntroVoiceClr" type="button" hidden>Revert to TTS</button>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <label style="margin:0;font-size:12px">Custom 1:20 Overlay (.mp3/.wav): <input id="devRyOvVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
+            <button class="btn sm sec" id="devRyOvVoiceClr" type="button" hidden>Revert to TTS</button>
+          </div>
+        </div>
+      </details>
     </div>
 
     <details style="margin-top:10px">
@@ -8282,11 +8323,28 @@ async function startLocalRyderSim(jumpToSec) {
   vid.load();
 }
 
-function populateRyderDevPanel(ry, voices, kokoroReady, stageClients) {
+function populateTtsProviders(p) {
+  if (!p) return;
+  if ($('ttsElHint')) $('ttsElHint').textContent = p.hasElevenlabsKey ? `(Saved ${p.elevenlabsHint})` : '';
+  if ($('ttsGemHint')) $('ttsGemHint').textContent = p.hasGeminiKey ? `(Saved ${p.geminiHint})` : '';
+  if ($('ttsOaiHint')) $('ttsOaiHint').textContent = p.hasOpenaiKey ? `(Saved ${p.openaiHint})` : '';
+  if ($('ttsElModel') && p.elevenlabsModel) $('ttsElModel').value = p.elevenlabsModel;
+}
+
+function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProviders) {
+  populateTtsProviders(ttsProviders);
   const kp = $('devKokoroPill');
   if (kp) {
-    kp.textContent = kokoroReady ? 'STUDIO NEURAL: KOKORO-82M FP32' : 'STUDIO HD EDGE VOICE';
-    kp.className = kokoroReady ? 'pill ok' : 'pill live';
+    const activeEngine = (ry && String(ry.announcerVoice || '').split(':')[0]) || 'kokoro';
+    const tagMap = {
+      elevenlabs: 'STUDIO CLOUD: ELEVENLABS',
+      gemini: 'STUDIO CLOUD: GEMINI 2.5 TTS',
+      openai: 'STUDIO CLOUD: OPENAI TTS',
+      kokoro: kokoroReady ? 'LOCAL OFFLINE: KOKORO-82M' : 'STUDIO VOICE',
+      edge: 'CLOUD FREE: EDGE HD',
+    };
+    kp.textContent = tagMap[activeEngine] || (kokoroReady ? 'LOCAL OFFLINE: KOKORO-82M' : 'STUDIO VOICE');
+    kp.className = (activeEngine === 'elevenlabs' || activeEngine === 'gemini' || activeEngine === 'openai') ? 'pill ok' : 'pill live';
   }
   const sp = $('devStagePill');
   if (sp && ry) {
@@ -8299,17 +8357,38 @@ function populateRyderDevPanel(ry, voices, kokoroReady, stageClients) {
   }
   const vSel = $('devRyVoice');
   if (vSel && Array.isArray(voices) && voices.length) {
-    vSel.innerHTML = voices.map(v => `<option value="${escHtml(v.id)}">${escHtml(v.label)}</option>`).join('');
+    const groups = [
+      ['elevenlabs', 'ElevenLabs Studio (Hyper-Realistic)'],
+      ['gemini', 'Google Gemini 2.5 Flash TTS (Free AI Studio Key)'],
+      ['openai', 'OpenAI gpt-4o-mini-tts (Directed)'],
+      ['kokoro', 'Local Offline (Kokoro-82M FP32)'],
+      ['edge', 'Free Cloud (Microsoft Edge HD)'],
+    ];
+    let html = '';
+    groups.forEach(([eng, glabel]) => {
+      const items = voices.filter(v => v.engine === eng);
+      if (!items.length) return;
+      html += `<optgroup label="${escHtml(glabel)}">`;
+      items.forEach(v => {
+        const suffix = (v.requiresKey && !v.available) ? ' (needs API key)' : '';
+        html += `<option value="${escHtml(v.id)}">${escHtml(v.label + suffix)}</option>`;
+      });
+      html += '</optgroup>';
+    });
+    vSel.innerHTML = html || voices.map(v => `<option value="${escHtml(v.id)}">${escHtml(v.label)}</option>`).join('');
   }
   if (!ry) return;
   devRyderSpec = ry;
   if (vSel) vSel.value = ry.announcerVoice || 'kokoro:onyx_fenrir_epic';
-  if ($('devRyRev')) $('devRyRev').value = String(ry.voiceReverbWet != null ? ry.voiceReverbWet : 0.11);
+  if ($('devRyRev')) $('devRyRev').value = String(ry.voiceReverbWet != null ? ry.voiceReverbWet : 0.06);
   if ($('devRyBoost')) $('devRyBoost').value = String(ry.voiceBoostDb != null ? ry.voiceBoostDb : 2.0);
   if ($('devRyFog')) $('devRyFog').value = String(ry.fogBurstSec || 30);
   if ($('devRyPostVol')) $('devRyPostVol').value = String(ry.postOverlayDenonVol || 55);
+  if ($('devRyStyle')) $('devRyStyle').value = ry.voiceStyle || '';
   if ($('devRyIntroTxt')) $('devRyIntroTxt').value = ry.announcerText || '';
   if ($('devRyOvTxt')) $('devRyOvTxt').value = ry.overlayText || '';
+  if ($('devRyIntroVoiceClr')) $('devRyIntroVoiceClr').hidden = !ry.customIntroVoiceFile;
+  if ($('devRyOvVoiceClr')) $('devRyOvVoiceClr').hidden = !ry.customOverlayVoiceFile;
   if ($('shAudio_ryder_walkin')) $('shAudio_ryder_walkin').src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
   if ($('shOvAudio_ryder_walkin')) $('shOvAudio_ryder_walkin').src = `/api/shows/ryder_walkin/overlay.wav?t=${Date.now()}`;
   const vid = $('devRyVideo');
@@ -8325,7 +8404,7 @@ function renderShows(data) {
   populateFxHookInputs(data.fxHooks || {});
   const allShows = Array.isArray(data.shows) ? data.shows : [];
   const ryder = allShows.find(s => s.id === 'ryder_walkin');
-  populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady), data.stageClients || {});
+  populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady), data.stageClients || {}, data.ttsProviders || null);
   const others = allShows.filter(s => s.id !== 'ryder_walkin');
   if (!others.length) {
     grid.innerHTML = '<div style="color:var(--mut);font-size:12px">No other shows configured.</div>';
@@ -8498,25 +8577,104 @@ if ($('devSimJumpBtn')) $('devSimJumpBtn').onclick = () => startLocalRyderSim(76
 if ($('devSimStopBtn')) $('devSimStopBtn').onclick = () => stopLocalRyderSim();
 if ($('devSimFsBtn')) $('devSimFsBtn').onclick = () => { if ($('devStage')) $('devStage').classList.toggle('fs'); };
 if ($('devFireLiveBtn')) $('devFireLiveBtn').onclick = () => fireShow('ryder_walkin');
+let activeRyTextarea = null;
+['devRyIntroTxt', 'devRyOvTxt'].forEach(tid => {
+  const ta = $(tid);
+  if (ta) ta.addEventListener('focus', () => { activeRyTextarea = ta; });
+});
+if ($('devRyTagBar')) $('devRyTagBar').addEventListener('click', (ev) => {
+  const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-tag],button[data-wrap]') : null;
+  if (!btn) return;
+  const ta = activeRyTextarea || $('devRyIntroTxt');
+  if (!ta) return;
+  const s0 = ta.selectionStart != null ? ta.selectionStart : ta.value.length;
+  const s1 = ta.selectionEnd != null ? ta.selectionEnd : ta.value.length;
+  const tagTxt = btn.getAttribute('data-tag');
+  const wrapTag = btn.getAttribute('data-wrap');
+  let ins = '';
+  if (tagTxt) {
+    ins = tagTxt;
+  } else if (wrapTag) {
+    const sel = ta.value.slice(s0, s1) || 'word';
+    const closeTag = wrapTag.split(':')[0];
+    ins = `[${wrapTag}]${sel}[/${closeTag}]`;
+  }
+  ta.value = ta.value.slice(0, s0) + ins + ta.value.slice(s1);
+  ta.focus();
+  ta.selectionStart = ta.selectionEnd = s0 + ins.length;
+});
 if ($('devRySaveBtn')) $('devRySaveBtn').onclick = async () => {
   const body = {
     announcerVoice: $('devRyVoice').value,
-    voiceReverbWet: Number($('devRyRev').value || 0.11),
+    voiceReverbWet: Number($('devRyRev').value || 0.06),
     voiceBoostDb: Number($('devRyBoost').value || 2.0),
     fogBurstSec: Number($('devRyFog').value || 30),
     postOverlayDenonVol: Number($('devRyPostVol').value || 55),
+    voiceStyle: ($('devRyStyle') && $('devRyStyle').value.trim()) || '',
     announcerText: $('devRyIntroTxt').value.trim(),
     overlayText: $('devRyOvTxt').value.trim(),
   };
-  $('shOut_ryder_walkin').textContent = 'Rendering studio Kokoro mix…';
+  $('shOut_ryder_walkin').textContent = 'Synthesizing voice & updating Show MP4…';
   try {
     const r = await fetch('/api/shows/ryder_walkin/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
     if (r.status) renderShows(r.status);
     $('shOut_ryder_walkin').textContent = r.ok ? `✓ Rebuilt Show MP4` : `✗ ${r.error || 'Failed'}`;
-    if ($('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+    if (r.ok && $('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
   } catch {
     $('shOut_ryder_walkin').textContent = '✗ Render failed';
   }
+};
+if ($('ttsSaveKeysBtn')) $('ttsSaveKeysBtn').onclick = async () => {
+  const payload = {
+    elevenlabsModel: ($('ttsElModel') && $('ttsElModel').value) || 'eleven_v3',
+  };
+  if ($('ttsElKey') && $('ttsElKey').value.trim()) payload.elevenlabsKey = $('ttsElKey').value.trim();
+  if ($('ttsGemKey') && $('ttsGemKey').value.trim()) payload.geminiKey = $('ttsGemKey').value.trim();
+  if ($('ttsOaiKey') && $('ttsOaiKey').value.trim()) payload.openaiKey = $('ttsOaiKey').value.trim();
+  if ($('ttsKeysOut')) $('ttsKeysOut').textContent = 'Saving keys & fetching voices…';
+  try {
+    const r = await fetch('/api/shows/tts-providers', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    }).then(x => x.json());
+    if (r.ok) {
+      if ($('ttsElKey')) $('ttsElKey').value = '';
+      if ($('ttsGemKey')) $('ttsGemKey').value = '';
+      if ($('ttsOaiKey')) $('ttsOaiKey').value = '';
+      await loadShows();
+      if ($('ttsKeysOut')) $('ttsKeysOut').textContent = '✓ Saved outside git & refreshed voices';
+    } else if ($('ttsKeysOut')) {
+      $('ttsKeysOut').textContent = `✗ ${r.error || 'Save failed'}`;
+    }
+  } catch {
+    if ($('ttsKeysOut')) $('ttsKeysOut').textContent = '✗ Save failed';
+  }
+};
+async function uploadRyderCustomVoice(slot, inputEl) {
+  const f = inputEl && inputEl.files && inputEl.files[0];
+  if (!f) return;
+  $('shOut_ryder_walkin').textContent = `Uploading custom ${slot} voice (${f.name})…`;
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    const r = await fetch(`/api/shows/ryder_walkin/upload-voice?slot=${encodeURIComponent(slot)}`, { method: 'POST', body: fd }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    $('shOut_ryder_walkin').textContent = r.ok ? `✓ Custom ${slot} voice applied` : `✗ ${r.error || 'Upload failed'}`;
+    if (r.ok && $('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  } catch {
+    $('shOut_ryder_walkin').textContent = '✗ Voice upload failed';
+  }
+}
+if ($('devRyIntroVoiceFile')) $('devRyIntroVoiceFile').onchange = (e) => uploadRyderCustomVoice('intro', e.target);
+if ($('devRyOvVoiceFile')) $('devRyOvVoiceFile').onchange = (e) => uploadRyderCustomVoice('overlay', e.target);
+if ($('devRyIntroVoiceClr')) $('devRyIntroVoiceClr').onclick = async () => {
+  const r = await fetch('/api/shows/ryder_walkin/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ clearCustomIntroVoice: true }) }).then(x => x.json());
+  if (r.status) renderShows(r.status);
+};
+if ($('devRyOvVoiceClr')) $('devRyOvVoiceClr').onclick = async () => {
+  const r = await fetch('/api/shows/ryder_walkin/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ clearCustomOverlayVoice: true }) }).then(x => x.json());
+  if (r.status) renderShows(r.status);
 };
 if ($('devRyFetchVidBtn')) $('devRyFetchVidBtn').onclick = async () => {
   $('shOut_ryder_walkin').textContent = 'Downloading YouTube video & encoding 1080p MP4…';
@@ -9171,6 +9329,40 @@ def create_app(service: ArmoryCamService) -> Flask:
         resp = jsonify(service.shows.list_voices())
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @app.route("/api/shows/tts-providers", methods=["GET", "POST"])
+    def api_shows_tts_providers() -> Response:
+        if request.method == "POST":
+            body = request.get_json(silent=True) or {}
+            try:
+                status = service.shows.update_tts_secrets(body)
+                return jsonify({"ok": True, **status, **service.shows.list_voices()})
+            except Exception as exc:
+                return jsonify({"ok": False, "error": str(exc)}), 400
+        resp = jsonify({"ok": True, **service.shows.tts_secrets_status(), **service.shows.list_voices()})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/shows/<show_id>/upload-voice")
+    def api_show_upload_voice(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None:
+            return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
+        slot = str(request.args.get("slot") or (request.form.get("slot") if request.form else "") or "intro").strip().lower()
+        if "file" in request.files:
+            up = request.files["file"]
+            raw_name = str(up.filename or "voice.wav")
+            file_bytes = up.read()
+        else:
+            raw_name = str(request.args.get("filename") or request.headers.get("X-Filename") or "voice.wav")
+            file_bytes = request.get_data() or b""
+        try:
+            res = service.shows.save_uploaded_voice_clip(spec.id, slot, raw_name, file_bytes)
+            return jsonify(res)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
     @app.get("/api/shows/events")
     def api_shows_events() -> Response:

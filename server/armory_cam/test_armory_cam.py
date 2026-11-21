@@ -3270,6 +3270,210 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_inline_speech_markup_parser_and_zero_phase_tempo_mastering(self) -> None:
+        # 1. Inline pauses, scoped/nested speed & tempo, vol, style extraction, ElevenLabs v3 cues
+        raw_script = (
+            "[style:Booming championship announcer] "
+            "[shouting] Ladies and gentlemen! [pause:100ms] "
+            "[speed:+10%] Out of [tempo:1.25] Toms [/tempo] River [/speed] "
+            '<break time="0.5s"/> [vol:+3dB] Ryder Curry!! [/vol]'
+        )
+        toks_clean, style_a = sd.parse_speech_markup(raw_script, keep_eleven_v3_tags=False)
+        self.assertEqual(style_a, "Booming championship announcer")
+        kinds_a = [(t["kind"], t.get("sec") or t.get("text"), t.get("speed"), t.get("gainDb")) for t in toks_clean]
+        self.assertEqual(kinds_a[0], ("speech", "Ladies and gentlemen!", 1.0, 0.0))
+        self.assertEqual(kinds_a[1], ("pause", 0.1, None, None))
+        self.assertEqual(kinds_a[2], ("speech", "Out of", 1.1, 0.0))
+        self.assertEqual(kinds_a[3], ("speech", "Toms", 1.25, 0.0))
+        self.assertEqual(kinds_a[4], ("speech", "River", 1.1, 0.0))
+        self.assertEqual(kinds_a[5], ("pause", 0.5, None, None))
+        self.assertEqual(kinds_a[6], ("speech", "Ryder Curry!!", 1.0, 3.0))
+
+        # ElevenLabs v3 keeps expressive bracket cues intact while non-v3 strips them
+        toks_v3, _ = sd.parse_speech_markup(raw_script, keep_eleven_v3_tags=True)
+        self.assertIn("[shouting]", toks_v3[0]["text"])
+
+        # Explicit pause next to `...` never double-inserts a pause
+        toks_dedup, _ = sd.parse_speech_markup("First ... [pause:120ms] Second")
+        self.assertEqual([(t["kind"], t.get("sec")) for t in toks_dedup], [("speech", None), ("pause", 0.12), ("speech", None)])
+
+        # 2. Zero-phase mastering produces clean stereo <= 0.90 peak
+        t_arr = np.linspace(0.0, 0.5, 12_000, endpoint=False, dtype=np.float32)
+        sine_mono = 0.7 * np.sin(2.0 * np.pi * 160.0 * t_arr)
+        mastered = sd.master_announcer_stereo(sine_mono, 24_000, target_sr=sd.SHOW_SR, reverb_wet=0.06, boost_db=3.0)
+        self.assertEqual(mastered.shape[1], 2)
+        self.assertLessEqual(float(np.max(np.abs(mastered))), 0.91)
+
+        # 3. Pitch-preserving tempo shift via FFmpeg atempo
+        ffmpeg_bin = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        if ffmpeg_bin:
+            one_sec = 0.4 * np.sin(2.0 * np.pi * 220.0 * np.linspace(0.0, 1.0, 24_000, endpoint=False, dtype=np.float32))
+            fast = sd.time_stretch_mono_pcm(one_sec, 24_000, 1.20, ffmpeg_bin)
+            slow = sd.time_stretch_mono_pcm(one_sec, 24_000, 0.85, ffmpeg_bin)
+            self.assertLess(fast.size, 21_500)
+            self.assertGreater(slow.size, 26_500)
+
+    def test_cloud_tts_secrets_masking_custom_voice_and_fast_mezzanine(self) -> None:
+        ffmpeg_bin = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        tmp = Path(tempfile.mkdtemp(prefix="armory_tts_cloud_"))
+        try:
+            posted: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+            gemini_calls: list[tuple[str, str, str]] = []
+
+            # Pre-generate tiny real MP3 and WAV payloads using ffmpeg / wave for realistic decode tests
+            tone_16k = 0.5 * np.sin(2.0 * np.pi * 180.0 * np.linspace(0.0, 0.4, 9600, endpoint=False, dtype=np.float32))
+            tone_wav = sd.encode_stereo_pcm16_wav(tone_16k, sr=24_000)
+            tone_pcm16_mono = (np.round(np.clip(tone_16k, -0.95, 0.95) * 32767.0).astype("<i2")).tobytes()
+            mp3_bytes = b""
+            if ffmpeg_bin:
+                p_mp3 = subprocess.run(
+                    [ffmpeg_bin, "-y", "-f", "wav", "-i", "pipe:0", "-c:a", "libmp3lame", "-f", "mp3", "pipe:1"],
+                    input=tone_wav,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=15,
+                )
+                if p_mp3.returncode == 0 and len(p_mp3.stdout) > 200:
+                    mp3_bytes = p_mp3.stdout
+
+            def fake_post(url: str, body: bytes, hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                posted.append((url, dict(hdrs or {}), json.loads(body.decode("utf-8"))))
+                if "api.elevenlabs.io" in url and mp3_bytes:
+                    return 200, mp3_bytes
+                if "api.openai.com" in url:
+                    return 200, tone_wav
+                return 404, b"unsupported"
+
+            def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+                if "api.elevenlabs.io/v1/voices" in url:
+                    return 200, json.dumps({"voices": [{"voice_id": "customClone99", "name": "Dave Buffer Clone", "category": "cloned"}]}).encode("utf-8")
+                return 404, b""
+
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.shows = sd.ShowDirector(
+                root_dir=tmp,
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                http_get=fake_get,
+                http_post=fake_post,
+                gemini_synth_fn=lambda p, v, s: (gemini_calls.append((p, v, s)), tone_pcm16_mono)[1],
+            )
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # 1. Saving API keys stores them outside git in tts_secrets.json and NEVER leaks raw secrets in GET/POST responses
+            r_post = client.post(
+                "/api/shows/tts-providers",
+                json={
+                    "elevenlabsKey": "sk_test_secret_el_1234",
+                    "geminiKey": "AIzaSecretGem9876",
+                    "openaiKey": "sk-proj-secret-oai-4321",
+                    "elevenlabsModel": "eleven_v3",
+                },
+            )
+            self.assertEqual(r_post.status_code, 200)
+            txt_post = r_post.get_data(as_text=True)
+            self.assertNotIn("sk_test_secret_el_1234", txt_post)
+            self.assertNotIn("AIzaSecretGem9876", txt_post)
+            self.assertNotIn("sk-proj-secret-oai-4321", txt_post)
+            j_get = client.get("/api/shows/tts-providers").get_json()
+            self.assertTrue(j_get["hasElevenlabsKey"])
+            self.assertEqual(j_get["elevenlabsHint"], "••••1234")
+            self.assertTrue(j_get["hasGeminiKey"])
+            self.assertTrue(j_get["hasOpenaiKey"])
+            self.assertTrue(any(v["id"] == "elevenlabs:customClone99" for v in j_get["voices"]))
+
+            # 2. Gemini 2.5 Flash TTS honors inline tags + voiceStyle
+            out_gem = tmp / "gem_test.wav"
+            sd.synthesize_announcer_wav(
+                "[shouting] Intro [pause:100ms] Ryder!",
+                voice="gemini:Fenrir",
+                out_wav=out_gem,
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                voice_style="Championship announcer",
+                tts_secrets=svc.shows.load_tts_secrets(),
+                gemini_synth_fn=lambda p, v, s: (gemini_calls.append((p, v, s)), tone_pcm16_mono)[1],
+            )
+            self.assertTrue(out_gem.is_file())
+            self.assertGreaterEqual(len(gemini_calls), 2)
+            self.assertNotIn("[shouting]", gemini_calls[0][0])
+            self.assertEqual(gemini_calls[0][1], "Fenrir")
+
+            # 3. OpenAI gpt-4o-mini-tts sends instructions + wav format
+            out_oai = tmp / "oai_test.wav"
+            sd.synthesize_announcer_wav(
+                "[speed:+15%] Faster hype! [/speed]",
+                voice="openai:onyx",
+                out_wav=out_oai,
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                voice_style="Arena boss",
+                tts_secrets=svc.shows.load_tts_secrets(),
+                http_post=fake_post,
+            )
+            self.assertTrue(out_oai.is_file())
+            oai_req = next(p for p in posted if "api.openai.com" in p[0])
+            self.assertEqual(oai_req[2]["model"], "gpt-4o-mini-tts")
+            self.assertEqual(oai_req[2]["instructions"], "Arena boss")
+
+            # 4. ElevenLabs v3 preserves `[shouting]` inline acting tag & includes xi-api-key header
+            if mp3_bytes:
+                out_el = tmp / "el_test.wav"
+                sd.synthesize_announcer_wav(
+                    "[shouting] Making his debut!",
+                    voice="elevenlabs:JBFqnCBsd6RMkjVDRZzb",
+                    out_wav=out_el,
+                    ffmpeg_bin=ffmpeg_bin,
+                    allow_network=False,
+                    tts_secrets=svc.shows.load_tts_secrets(),
+                    http_post=fake_post,
+                )
+                el_req = next(p for p in posted if "api.elevenlabs.io" in p[0])
+                self.assertEqual(el_req[1]["xi-api-key"], "sk_test_secret_el_1234")
+                self.assertIn("[shouting]", el_req[2]["text"])
+                self.assertEqual(el_req[2]["model_id"], "eleven_v3")
+
+            # 5. Custom voice upload override & revert + cached H.264 mezzanine stream-copy rebuild
+            up_voice = client.post(
+                "/api/shows/ryder_walkin/upload-voice?slot=intro&filename=real_announcer.wav",
+                data=tone_wav,
+                content_type="audio/wav",
+            )
+            self.assertEqual(up_voice.status_code, 200)
+            self.assertTrue(up_voice.get_json()["show"]["customIntroVoiceFile"].endswith(".wav"))
+            clr_voice = client.post("/api/shows/ryder_walkin/config", json={"clearCustomIntroVoice": True})
+            self.assertEqual(clr_voice.status_code, 200)
+            self.assertEqual(clr_voice.get_json()["show"]["customIntroVoiceFile"], "")
+
+            if ffmpeg_bin:
+                sample_vid = tmp / "shows" / "sources" / "ryder_walkin_video.mp4"
+                sample_vid.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    [
+                        ffmpeg_bin, "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=2.5",
+                        "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=2.5",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(sample_vid),
+                    ],
+                    capture_output=True,
+                    timeout=30,
+                    check=True,
+                )
+                svc.shows.update_show("ryder_walkin", {"videoSourceFile": "ryder_walkin_video.mp4", "overlayAtSec": 1.0}, rebuild=False)
+                b1 = svc.shows.build_show_multimedia("ryder_walkin", force=True)
+                self.assertTrue(b1["ok"])
+                norm_files = list((tmp / "shows" / "rendered").glob(".norm_*.mp4"))
+                self.assertEqual(len(norm_files), 1)
+                mtime1 = norm_files[0].stat().st_mtime_ns
+                # Modify announcer script -> second rebuild MUST reuse cached .norm_*.mp4 without re-encoding video
+                b2_cfg = svc.shows.update_show("ryder_walkin", {"announcerText": "Fast [pause:100ms] Mezzanine!!"}, rebuild=True)
+                self.assertTrue(b2_cfg["ok"])
+                self.assertEqual(norm_files[0].stat().st_mtime_ns, mtime1)
+
+            svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
