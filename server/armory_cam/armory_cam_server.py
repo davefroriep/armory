@@ -5467,10 +5467,19 @@ DASHBOARD_HTML = """<!doctype html>
         <div>
           <label>Audition Intro (Thunder + Announcer + Crowd)</label>
           <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
+          <div class="ctrl-row" style="margin-top:4px">
+            <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice (~1s)</button>
+            <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+              <input id="devRyTestFxChk" type="checkbox" style="width:auto;margin:0"> + Thunder &amp; Crowd
+            </label>
+          </div>
         </div>
         <div>
           <label>Audition 1:20 Mid-Video Overlay (&ldquo;Welcome to The Armory…&rdquo;)</label>
           <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
+          <div class="ctrl-row" style="margin-top:4px">
+            <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1:20 Overlay (~1s)</button>
+          </div>
         </div>
       </div>
 
@@ -5502,7 +5511,7 @@ DASHBOARD_HTML = """<!doctype html>
         <button class="tag-chip" type="button" data-tag=" [excited] ">+[excited] (EL v3)</button>
       </div>
       <div class="ctrl-row" style="margin-top:8px">
-        <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Rebuild Ryder Show MP4</button>
+        <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Bake Into Show MP4</button>
         <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
         <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
         <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
@@ -8379,6 +8388,14 @@ function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProvide
   }
   const vSel = $('devRyVoice');
   if (vSel && Array.isArray(voices) && voices.length) {
+    const TOP_VOICES = new Set([
+      'elevenlabs:nPczCjzI2devNBz1zQrb',
+      'gemini:Fenrir',
+      'elevenlabs:N2lVS1w4EtoT3dr4eOWO',
+      'edge:en-US-BrianMultilingualNeural',
+      'kokoro:onyx_fenrir_epic',
+      'kokoro:am_onyx',
+    ]);
     const groups = [
       ['elevenlabs', 'ElevenLabs Studio (Hyper-Realistic)'],
       ['gemini', 'Google Gemini 2.5 Flash TTS (Free AI Studio Key)'],
@@ -8392,12 +8409,13 @@ function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProvide
       if (!items.length) return;
       html += `<optgroup label="${escHtml(glabel)}">`;
       items.forEach(v => {
+        const prefix = TOP_VOICES.has(v.id) ? '★ ' : '';
         const suffix = (v.requiresKey && !v.available) ? ' (needs API key)' : '';
-        html += `<option value="${escHtml(v.id)}">${escHtml(v.label + suffix)}</option>`;
+        html += `<option value="${escHtml(v.id)}">${escHtml(prefix + v.label + suffix)}</option>`;
       });
       html += '</optgroup>';
     });
-    vSel.innerHTML = html || voices.map(v => `<option value="${escHtml(v.id)}">${escHtml(v.label)}</option>`).join('');
+    vSel.innerHTML = html || voices.map(v => `<option value="${escHtml(v.id)}">${escHtml((TOP_VOICES.has(v.id) ? '★ ' : '') + v.label)}</option>`).join('');
   }
   if (!ry) return;
   devRyderSpec = ry;
@@ -8627,6 +8645,65 @@ if ($('devRyTagBar')) $('devRyTagBar').addEventListener('click', (ev) => {
   ta.focus();
   ta.selectionStart = ta.selectionEnd = s0 + ins.length;
 });
+const ryAuditionBlobUrls = { intro: null, overlay: null };
+async function auditionRyderVoice(slot) {
+  const isOv = slot === 'overlay';
+  const btn = $(isOv ? 'devRyTestOvBtn' : 'devRyTestIntroBtn');
+  const txtEl = $(isOv ? 'devRyOvTxt' : 'devRyIntroTxt');
+  const audioEl = $(isOv ? 'shOvAudio_ryder_walkin' : 'shAudio_ryder_walkin');
+  const outEl = $('shOut_ryder_walkin');
+  const text = (txtEl && txtEl.value.trim()) || '';
+  if (!text) {
+    if (outEl) outEl.textContent = `✗ Enter ${isOv ? '1:20 overlay' : 'intro'} text first`;
+    return;
+  }
+  const withFx = !isOv && Boolean($('devRyTestFxChk') && $('devRyTestFxChk').checked);
+  if (btn) btn.disabled = true;
+  if (outEl) outEl.textContent = `Auditioning ${slot} voice (no MP4 rebuild)…`;
+  try {
+    const resp = await fetch('/api/shows/audition-voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        slot,
+        text,
+        voice: ($('devRyVoice') && $('devRyVoice').value) || '',
+        voiceStyle: ($('devRyStyle') && $('devRyStyle').value.trim()) || '',
+        voiceReverbWet: Number(($('devRyRev') && $('devRyRev').value) || 0.06),
+        voiceBoostDb: Number(($('devRyBoost') && $('devRyBoost').value) || 2.0),
+        withFx,
+      }),
+    });
+    if (!resp.ok) {
+      let errMsg = `HTTP ${resp.status}`;
+      try {
+        const j = await resp.json();
+        if (j && j.error) errMsg = j.error;
+      } catch {}
+      if (outEl) outEl.textContent = `✗ ${errMsg}`;
+      return;
+    }
+    const durHdr = resp.headers.get('X-Armory-Duration-Sec') || '?';
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    if (ryAuditionBlobUrls[slot]) {
+      try { URL.revokeObjectURL(ryAuditionBlobUrls[slot]); } catch {}
+    }
+    ryAuditionBlobUrls[slot] = url;
+    if (audioEl) {
+      audioEl.src = url;
+      audioEl.load();
+      audioEl.play().catch(() => {});
+    }
+    if (outEl) outEl.textContent = `✓ Playing ${slot} audition (${durHdr}s — MP4 untouched)`;
+  } catch (e) {
+    if (outEl) outEl.textContent = `✗ Audition failed: ${(e && e.message) || 'error'}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+if ($('devRyTestIntroBtn')) $('devRyTestIntroBtn').onclick = () => auditionRyderVoice('intro');
+if ($('devRyTestOvBtn')) $('devRyTestOvBtn').onclick = () => auditionRyderVoice('overlay');
 if ($('devRySaveBtn')) $('devRySaveBtn').onclick = async () => {
   const body = {
     announcerVoice: $('devRyVoice').value,
@@ -9365,6 +9442,34 @@ def create_app(service: ArmoryCamService) -> Flask:
                 return jsonify({"ok": False, "error": str(exc)}), 400
         resp = jsonify({"ok": True, **service.shows.tts_secrets_status(), **service.shows.list_voices()})
         resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/shows/audition-voice")
+    def api_shows_audition_voice() -> Response:
+        body = request.get_json(silent=True)
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid payload"}), 400
+        try:
+            rev_raw = body.get("voiceReverbWet")
+            boost_raw = body.get("voiceBoostDb")
+            wav_bytes, dur_sec = service.shows.audition_voice(
+                text=str(body.get("text") or ""),
+                voice=str(body.get("voice") or ""),
+                voice_style=str(body.get("voiceStyle") or ""),
+                reverb_wet=float(rev_raw) if rev_raw not in (None, "") else 0.06,
+                boost_db=float(boost_raw) if boost_raw not in (None, "") else 2.0,
+                with_fx=bool(body.get("withFx", False)),
+                slot=str(body.get("slot") or "intro"),
+            )
+        except (ValueError, RuntimeError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+        resp = Response(wav_bytes, mimetype="audio/wav")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["X-Armory-Duration-Sec"] = f"{dur_sec:.2f}"
         return resp
 
     @app.post("/api/shows/<show_id>/upload-voice")

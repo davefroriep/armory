@@ -24,6 +24,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -3362,6 +3363,146 @@ class ShowDirector:
         tmp.replace(out_wav)
         return {"ok": True, "showId": spec.id, "path": str(out_wav), "durationSec": wav_duration_sec(out_wav)}
 
+    def _mix_debut_intro_stereo(
+        self,
+        ann_pcm: np.ndarray,
+        *,
+        lightning_flash_sec: float = 0.75,
+        add_cheer: bool = True,
+    ) -> np.ndarray:
+        """Mix announcer speech over ducked thunder rumble, crack, and stadium crowd cheer."""
+        pre_thunder_n = int(round(2.3 * SHOW_SR))
+        post_tail_n = int(round(1.6 * SHOW_SR))
+        total_n = pre_thunder_n + ann_pcm.shape[0] + post_tail_n
+        total_sec = float(total_n) / float(SHOW_SR)
+        crack_sec = lightning_flash_sec or 0.75
+        thunder_raw = load_studio_fx_stereo(
+            self.fx_dir,
+            "thunder_rumble.wav",
+            total_sec,
+            allow_default_fallback=self.allow_network,
+            swell_sec=0.15,
+            fade_out_sec=1.1,
+            sr=SHOW_SR,
+        )
+        if thunder_raw is None:
+            thunder_raw = synth_thunder_rumble_stereo(
+                total_sec,
+                sr=SHOW_SR,
+                crack_at_sec=crack_sec,
+            )
+        crack_pcm = load_studio_fx_stereo(
+            self.fx_dir,
+            "thunder_crack.wav",
+            min(4.0, total_sec),
+            allow_default_fallback=self.allow_network,
+            swell_sec=0.02,
+            fade_out_sec=1.2,
+            sr=SHOW_SR,
+        )
+        if crack_pcm is not None:
+            crack_off = int(round(crack_sec * SHOW_SR))
+            mix_into(thunder_raw, crack_pcm, crack_off, gain=0.82)
+        bed = duck_bed_under_speech(
+            thunder_raw,
+            ann_pcm,
+            pre_thunder_n,
+            sr=SHOW_SR,
+            duck_gain=0.14,
+            base_gain=0.88,
+        )
+        if add_cheer:
+            cheer_full = np.zeros((total_n, 2), dtype=np.float32)
+            c_start = pre_thunder_n + int(ann_pcm.shape[0] * 0.52)
+            c_len = max(1.5, float(total_n - c_start) / float(SHOW_SR))
+            cheer = load_studio_fx_stereo(
+                self.fx_dir,
+                "stadium_crowd.wav",
+                c_len,
+                allow_default_fallback=self.allow_network,
+                swell_sec=0.8,
+                fade_out_sec=1.3,
+                sr=SHOW_SR,
+            )
+            if cheer is None:
+                cheer = synth_crowd_cheer_stereo(c_len, sr=SHOW_SR, swell_sec=0.8, fade_out_sec=1.3)
+            mix_into(cheer_full, cheer, c_start, gain=0.82)
+            bed += duck_bed_under_speech(
+                cheer_full,
+                ann_pcm,
+                pre_thunder_n,
+                sr=SHOW_SR,
+                duck_gain=0.16,
+                base_gain=0.92,
+            )
+        mix = bed
+        mix_into(mix, ann_pcm, pre_thunder_n, gain=1.0)
+        mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(1.25, float(post_tail_n) / SHOW_SR))
+        # Soft true-peak protection after mixing thunder+crowd+speech
+        pk_mix = float(np.max(np.abs(mix)))
+        if pk_mix > 0.94:
+            mix = mix * (0.92 / pk_mix)
+        return mix
+
+    def audition_voice(
+        self,
+        *,
+        text: str,
+        voice: str = DEFAULT_ANNOUNCER_VOICE,
+        voice_style: str = "",
+        reverb_wet: float = 0.06,
+        boost_db: float = 2.0,
+        with_fx: bool = False,
+        slot: str = "intro",
+        lightning_flash_sec: float = 0.75,
+        add_cheer: bool = True,
+    ) -> tuple[bytes, float]:
+        """Synthesize a stateless audition WAV in memory/temp without touching shows.json or rebuilding MP4s."""
+        clean_text = str(text or "").strip()
+        if not clean_text:
+            raise ValueError("Script text is empty")
+        slot_norm = (slot or "intro").strip().lower()
+        reverb = _clamp(float(reverb_wet), 0.0, 0.25)
+        use_fx = bool(with_fx)
+        if slot_norm == "overlay":
+            reverb = min(reverb, 0.03)
+            use_fx = False
+        boost = _clamp(float(boost_db), -4.0, 6.0)
+        resolved_voice = resolve_voice_id(voice)
+        secrets = self.load_tts_secrets()
+
+        with tempfile.TemporaryDirectory(prefix="armory_aud_") as tmp_dir:
+            tmp_wav = Path(tmp_dir) / "audition.wav"
+            synthesize_announcer_wav(
+                clean_text,
+                voice=resolved_voice,
+                out_wav=tmp_wav,
+                ffmpeg_bin=self.ffmpeg_bin,
+                allow_network=self.allow_network,
+                models_dir=self.models_dir,
+                reverb_wet=reverb,
+                boost_db=boost,
+                voice_style=str(voice_style or "").strip(),
+                tts_secrets=secrets,
+                http_post=self._http_post,
+                gemini_synth_fn=self._gemini_synth_fn,
+            )
+            if use_fx:
+                ann_pcm = read_wav_stereo_float(tmp_wav, target_sr=SHOW_SR)
+                if ann_pcm.shape[0] == 0:
+                    ann_pcm = np.zeros((int(0.5 * SHOW_SR), 2), dtype=np.float32)
+                mix = self._mix_debut_intro_stereo(
+                    ann_pcm,
+                    lightning_flash_sec=lightning_flash_sec,
+                    add_cheer=add_cheer,
+                )
+                wav_bytes = encode_stereo_pcm16_wav(mix, sr=SHOW_SR)
+                dur_sec = round(float(mix.shape[0]) / float(SHOW_SR), 2)
+            else:
+                wav_bytes = tmp_wav.read_bytes()
+                dur_sec = wav_duration_sec(tmp_wav)
+        return wav_bytes, dur_sec
+
     def build_show_preview(self, show_id: str, *, force: bool = False) -> dict[str, Any]:
         """Render the tight local preview WAV (`shows/rendered/<id>_preview.wav`) with zero lead-in waste."""
         spec = self.get_show(show_id)
@@ -3434,76 +3575,11 @@ class ShowDirector:
             ann_pcm = self._get_announcer_stem(spec, suffix="announcer")
             if ann_pcm is None:
                 ann_pcm = np.zeros((int(2.0 * SHOW_SR), 2), dtype=np.float32)
-            pre_thunder_n = int(round(2.3 * SHOW_SR))
-            post_tail_n = int(round(1.6 * SHOW_SR))
-            total_n = pre_thunder_n + ann_pcm.shape[0] + post_tail_n
-            total_sec = float(total_n) / float(SHOW_SR)
-            thunder_raw = load_studio_fx_stereo(
-                self.fx_dir,
-                "thunder_rumble.wav",
-                total_sec,
-                allow_default_fallback=self.allow_network,
-                swell_sec=0.15,
-                fade_out_sec=1.1,
-                sr=SHOW_SR,
-            )
-            if thunder_raw is None:
-                thunder_raw = synth_thunder_rumble_stereo(
-                    total_sec,
-                    sr=SHOW_SR,
-                    crack_at_sec=spec.lightning_flash_sec or 0.75,
-                )
-            crack_pcm = load_studio_fx_stereo(
-                self.fx_dir,
-                "thunder_crack.wav",
-                min(4.0, total_sec),
-                allow_default_fallback=self.allow_network,
-                swell_sec=0.02,
-                fade_out_sec=1.2,
-                sr=SHOW_SR,
-            )
-            if crack_pcm is not None:
-                crack_off = int(round((spec.lightning_flash_sec or 0.75) * SHOW_SR))
-                mix_into(thunder_raw, crack_pcm, crack_off, gain=0.82)
-            bed = duck_bed_under_speech(
-                thunder_raw,
+            mix = self._mix_debut_intro_stereo(
                 ann_pcm,
-                pre_thunder_n,
-                sr=SHOW_SR,
-                duck_gain=0.14,
-                base_gain=0.88,
+                lightning_flash_sec=spec.lightning_flash_sec or 0.75,
+                add_cheer=spec.add_cheer,
             )
-            if spec.add_cheer:
-                cheer_full = np.zeros((total_n, 2), dtype=np.float32)
-                c_start = pre_thunder_n + int(ann_pcm.shape[0] * 0.52)
-                c_len = max(1.5, float(total_n - c_start) / float(SHOW_SR))
-                cheer = load_studio_fx_stereo(
-                    self.fx_dir,
-                    "stadium_crowd.wav",
-                    c_len,
-                    allow_default_fallback=self.allow_network,
-                    swell_sec=0.8,
-                    fade_out_sec=1.3,
-                    sr=SHOW_SR,
-                )
-                if cheer is None:
-                    cheer = synth_crowd_cheer_stereo(c_len, sr=SHOW_SR, swell_sec=0.8, fade_out_sec=1.3)
-                mix_into(cheer_full, cheer, c_start, gain=0.82)
-                bed += duck_bed_under_speech(
-                    cheer_full,
-                    ann_pcm,
-                    pre_thunder_n,
-                    sr=SHOW_SR,
-                    duck_gain=0.16,
-                    base_gain=0.92,
-                )
-            mix = bed
-            mix_into(mix, ann_pcm, pre_thunder_n, gain=1.0)
-            mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(1.25, float(post_tail_n) / SHOW_SR))
-            # Soft true-peak protection after mixing thunder+crowd+speech
-            pk_mix = float(np.max(np.abs(mix)))
-            if pk_mix > 0.94:
-                mix = mix * (0.92 / pk_mix)
 
         else:  # "walkin": announcer intro -> tight crossfade into walk-in song
             ann_pcm = self._get_announcer_stem(spec, suffix="announcer")

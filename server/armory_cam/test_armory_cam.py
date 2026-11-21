@@ -3486,6 +3486,99 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_stateless_voice_audition_without_mp4_rebuild(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_audition_"))
+        try:
+            tone_16k = 0.5 * np.sin(2.0 * np.pi * 190.0 * np.linspace(0.0, 0.4, 9600, endpoint=False, dtype=np.float32))
+            tone_pcm16_mono = (np.round(np.clip(tone_16k, -0.95, 0.95) * 32767.0).astype("<i2")).tobytes()
+
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.shows = sd.ShowDirector(
+                root_dir=tmp,
+                allow_network=False,
+                gemini_synth_fn=lambda _p, _v, _s: tone_pcm16_mono,
+            )
+            svc.shows.update_tts_secrets({"geminiKey": "AIzaDummyKey9999"})
+
+            # Pre-seed an existing show MP4 + capture shows.json snapshot to prove audition never touches either
+            show_mp4 = svc.shows.show_mp4_path("ryder_walkin")
+            show_mp4.parent.mkdir(parents=True, exist_ok=True)
+            show_mp4.write_bytes(b"FAKE_MP4_HEADER_BYTES")
+            mp4_mtime_before = show_mp4.stat().st_mtime_ns
+            shows_json_before = svc.shows.config_path.read_text(encoding="utf-8")
+
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # Dashboard UI contains instant audition controls + Top-3 star helper
+            dash = client.get("/").get_data(as_text=True)
+            for token in ("devRyTestIntroBtn", "devRyTestOvBtn", "devRyTestFxChk", "auditionRyderVoice", "/api/shows/audition-voice", "TOP_VOICES"):
+                self.assertIn(token, dash)
+
+            # Dry intro audition
+            r_dry = client.post(
+                "/api/shows/audition-voice",
+                json={
+                    "slot": "intro",
+                    "text": "Ryder [pause:100ms] Curry!!",
+                    "voice": "gemini:Fenrir",
+                    "voiceStyle": "HBO ring announcer",
+                    "voiceReverbWet": 0.06,
+                    "voiceBoostDb": 2.0,
+                    "withFx": False,
+                },
+            )
+            self.assertEqual(r_dry.status_code, 200)
+            self.assertEqual(r_dry.mimetype, "audio/wav")
+            self.assertTrue(r_dry.data.startswith(b"RIFF"))
+            dur_dry = float(r_dry.headers.get("X-Armory-Duration-Sec") or "0")
+            self.assertGreater(dur_dry, 0.2)
+
+            # Mixed intro (+ thunder & crowd bed)
+            r_fx = client.post(
+                "/api/shows/audition-voice",
+                json={
+                    "slot": "intro",
+                    "text": "Ryder Curry!!",
+                    "voice": "gemini:Fenrir",
+                    "withFx": True,
+                },
+            )
+            self.assertEqual(r_fx.status_code, 200)
+            self.assertTrue(r_fx.data.startswith(b"RIFF"))
+            dur_fx = float(r_fx.headers.get("X-Armory-Duration-Sec") or "0")
+            self.assertGreater(dur_fx, dur_dry + 3.0)
+
+            # Overlay slot works even with withFx=True forced false cleanly
+            r_ov = client.post(
+                "/api/shows/audition-voice",
+                json={
+                    "slot": "overlay",
+                    "text": "Welcome to The Armory.",
+                    "voice": "gemini:Fenrir",
+                    "withFx": True,
+                },
+            )
+            self.assertEqual(r_ov.status_code, 200)
+            self.assertTrue(r_ov.data.startswith(b"RIFF"))
+
+            # Verify shows.json & show MP4 remained completely untouched
+            self.assertEqual(show_mp4.stat().st_mtime_ns, mp4_mtime_before)
+            self.assertEqual(svc.shows.config_path.read_text(encoding="utf-8"), shows_json_before)
+
+            # Error handling: empty script or missing API key returns 400 JSON
+            r_empty = client.post("/api/shows/audition-voice", json={"slot": "intro", "text": "   ", "voice": "kokoro:am_onyx"})
+            self.assertEqual(r_empty.status_code, 400)
+            self.assertFalse(r_empty.get_json()["ok"])
+
+            r_nokey = client.post("/api/shows/audition-voice", json={"slot": "intro", "text": "Test!", "voice": "elevenlabs:nPczCjzI2devNBz1zQrb"})
+            self.assertEqual(r_nokey.status_code, 400)
+            self.assertIn("ElevenLabs API key missing", r_nokey.get_json()["error"])
+
+            svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
