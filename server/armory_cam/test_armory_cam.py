@@ -290,6 +290,8 @@ class ArmoryCamTests(unittest.TestCase):
             st0 = client.get("/wallboard/state").get_json()
             self.assertEqual(st0["mode"], "standby")
             self.assertEqual(st0["standby"]["weekLabel"], "")
+            self.assertFalse(st0["standby"]["scheduleSynced"])
+            self.assertEqual(st0["standby"]["todayItems"], [])
 
             # 3. POST /api/config persists wallboard settings without clobbering cameras
             cfg_res = client.post(
@@ -457,6 +459,39 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertTrue(any("wifi_sleep_policy 2" in x for x in flat))
             self.assertEqual(adb.status_dict(svc.wallboard_cfg)["fireTvMac"], "08:97:98:1f:4c:2b, 08:97:98:22:59:6b")
             self.assertEqual(ac.send_wol_magic_packet("invalid-mac"), [])
+
+            # Standby schedule push (workoutActive=False) must NOT wake ADB and must persist across restarts
+            cmds.clear()
+            standby_payload = {
+                "ts": int(time.time() * 1000),
+                "mode": "standby",
+                "standby": {
+                    "dateLabel": "Friday, Nov 20",
+                    "timeLabel": "10:00 PM",
+                    "weekLabel": "Wk 1 · Step 4/24",
+                    "todayItems": [
+                        {
+                            "title": "Lower 2",
+                            "equipmentLabel": "Strength",
+                            "carried": False,
+                            "preview": "Deadlift (3) · Bulgarian Split Squat (3)",
+                        }
+                    ],
+                },
+            }
+            sb_res = client.post(
+                "/api/wallboard/state",
+                json={"state": standby_payload, "workoutActive": False, "sourceUrl": ""},
+            )
+            self.assertEqual(sb_res.status_code, 200)
+            self.assertEqual(cmds, [])
+            self.assertTrue((tmp / "wallboard_standby.json").is_file())
+
+            restarted_relay = ac.WallboardRelay(tmp)
+            st_restarted = json.loads(restarted_relay.current_state_json())
+            self.assertTrue(st_restarted["standby"]["scheduleSynced"])
+            self.assertEqual(st_restarted["standby"]["weekLabel"], "Wk 1 · Step 4/24")
+            self.assertEqual(st_restarted["standby"]["todayItems"][0]["title"], "Lower 2")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

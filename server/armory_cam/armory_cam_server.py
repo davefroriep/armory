@@ -1586,6 +1586,7 @@ class WallboardRelay:
     def __init__(self, root_dir: Path) -> None:
         self.root_dir = root_dir
         self.cache_html_path = root_dir / "wallboard_cache.html"
+        self.standby_cache_path = root_dir / "wallboard_standby.json"
         self.repo_page_ts_path = Path(__file__).resolve().parents[2] / "src" / "wallboard" / "page.ts"
         self.cond = threading.Condition()
         self.seq = 0
@@ -1596,6 +1597,37 @@ class WallboardRelay:
         self.last_active_push_ms = 0
         self.source_url = ""
         self.sse_clients = 0
+        self.saved_standby: dict[str, Any] | None = self._load_saved_standby()
+
+    def _load_saved_standby(self) -> dict[str, Any] | None:
+        if not self.standby_cache_path.is_file():
+            return None
+        try:
+            obj = json.loads(self.standby_cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if (
+            isinstance(obj, dict)
+            and isinstance(obj.get("ymd"), str)
+            and isinstance(obj.get("todayItems"), list)
+        ):
+            return {
+                "ymd": obj["ymd"],
+                "weekLabel": str(obj.get("weekLabel") or ""),
+                "todayItems": list(obj["todayItems"]),
+            }
+        return None
+
+    def _save_standby_schedule(self, ymd: str, week_label: str, today_items: list[Any]) -> dict[str, Any]:
+        rec = {
+            "ymd": ymd,
+            "weekLabel": week_label,
+            "todayItems": list(today_items),
+        }
+        tmp = self.standby_cache_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        tmp.replace(self.standby_cache_path)
+        return rec
 
     def get_html(self) -> str:
         repo_html: str | None = None
@@ -1630,11 +1662,14 @@ class WallboardRelay:
         tmp.replace(self.cache_html_path)
         return True
 
-    @staticmethod
-    def standby_state_dict(now_ms: int | None = None) -> dict[str, Any]:
+    def standby_state_dict(self, now_ms: int | None = None) -> dict[str, Any]:
         ts = now_ms if now_ms is not None else int(time.time() * 1000)
         dt = datetime.fromtimestamp(ts / 1000.0)
         hour12 = dt.strftime("%I").lstrip("0") or "12"
+        ymd = dt.strftime("%Y-%m-%d")
+        with self.cond:
+            saved = dict(self.saved_standby) if self.saved_standby else None
+        synced = bool(saved and saved.get("ymd") == ymd)
         return {
             "ts": ts,
             "mode": "standby",
@@ -1657,17 +1692,23 @@ class WallboardRelay:
             "standby": {
                 "dateLabel": dt.strftime("%a, %b ") + str(dt.day),
                 "timeLabel": f"{hour12}:{dt.strftime('%M %p')}",
-                "weekLabel": "",
-                "todayItems": [],
+                "weekLabel": str(saved.get("weekLabel") or "") if synced and saved else "",
+                "todayItems": list(saved.get("todayItems") or []) if synced and saved else [],
+                "scheduleSynced": synced,
             },
         }
 
     def current_state_json(self, stale_ms: int = 900_000) -> str:
         with self.cond:
             now_ms = int(time.time() * 1000)
-            if self.latest_json and self.last_push_ms > 0 and (now_ms - self.last_push_ms) <= stale_ms:
+            if (
+                self.mode != "standby"
+                and self.latest_json
+                and self.last_push_ms > 0
+                and (now_ms - self.last_push_ms) <= stale_ms
+            ):
                 return self.latest_json
-        return json.dumps(self.standby_state_dict(), separators=(",", ":"))
+        return json.dumps(self.standby_state_dict(now_ms), separators=(",", ":"))
 
     def update_state(
         self,
@@ -1676,9 +1717,23 @@ class WallboardRelay:
         source_url: str = "",
     ) -> None:
         now_ms = int(time.time() * 1000)
-        payload = state_obj if isinstance(state_obj, dict) else self.standby_state_dict(now_ms)
+        payload = dict(state_obj) if isinstance(state_obj, dict) else self.standby_state_dict(now_ms)
+        saved_rec: dict[str, Any] | None = None
+        if payload.get("mode") == "standby" and isinstance(payload.get("standby"), dict):
+            sb = dict(payload["standby"])
+            if sb.get("scheduleSynced") is not False:
+                ymd = datetime.fromtimestamp(now_ms / 1000.0).strftime("%Y-%m-%d")
+                saved_rec = self._save_standby_schedule(
+                    ymd,
+                    str(sb.get("weekLabel") or ""),
+                    list(sb.get("todayItems") or []),
+                )
+                sb["scheduleSynced"] = True
+                payload["standby"] = sb
         compact = json.dumps(payload, separators=(",", ":")).replace("\r", " ").replace("\n", " ")
         with self.cond:
+            if saved_rec is not None:
+                self.saved_standby = saved_rec
             self.latest_json = compact
             self.workout_active = bool(workout_active)
             self.mode = str(payload.get("mode") or ("lift" if workout_active else "standby"))

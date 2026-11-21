@@ -402,6 +402,7 @@ describe('wallboard snapshot & routing', () => {
     expect(WALLBOARD_HTML).not.toContain('Connect Polar H10');
     expect(WALLBOARD_HTML).not.toContain('Waiting for chest strap');
     expect(WALLBOARD_HTML).not.toContain('Say “Armory close video”');
+    expect(WALLBOARD_HTML).toContain('scheduleSynced === false');
 
     expect(TV_W).toBe(1600);
     expect(TV_H).toBe(900);

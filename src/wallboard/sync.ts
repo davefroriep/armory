@@ -39,6 +39,8 @@ class WallboardController {
   private relayHtmlSynced = false;
   private lastRelayJson = '';
   private lastRelayPushMs = 0;
+  private lastStandbySig = '';
+  private lastStandbyPushMs = 0;
 
   private relayBaseUrl(): string {
     return (getSettings().gymCamUrl || 'http://192.168.1.152:8766').trim().replace(/\/+$/, '');
@@ -244,6 +246,27 @@ class WallboardController {
     await this.postRelayJson('/api/wallboard/sleep', { reason, delaySec, state }, 2000);
   }
 
+  private async pushRelayStandby(state: WallboardState, sig: string, now: number): Promise<void> {
+    this.relayBusy = true;
+    try {
+      const r = await this.postRelayJson('/api/wallboard/state', {
+        state,
+        workoutActive: false,
+        sourceUrl: this.status.running ? this.status.url : '',
+      }, 1500);
+      if (r?.ok) {
+        this.setRelayOnline(true);
+        this.lastStandbySig = sig;
+        this.lastStandbyPushMs = now;
+      } else {
+        this.setRelayOnline(false);
+        this.relayBackoffUntil = Date.now() + 15_000;
+      }
+    } finally {
+      this.relayBusy = false;
+    }
+  }
+
   pushNow(): void {
     if (this.pushTimer) { clearTimeout(this.pushTimer); this.pushTimer = null; }
     this.flushPush(Date.now(), true);
@@ -299,11 +322,19 @@ class WallboardController {
         }
       } else if (this.relayWasActive) {
         this.relayWasActive = false;
+        this.lastStandbySig = '';
         if (!this.desiredOn) this.stopHeartbeat();
         void this.pushRelaySleep(next, next.mode === 'standby' ? 'workout_finished' : 'workout_paused', 30);
+      } else if (next.mode === 'standby' && next.standby) {
+        const sig = JSON.stringify({ d: next.standby.dateLabel, w: next.standby.weekLabel, i: next.standby.todayItems });
+        if (!this.relayBusy && now >= this.relayBackoffUntil
+          && (sig !== this.lastStandbySig || (forceRelay && now - this.lastStandbyPushMs >= 5000))) {
+          void this.pushRelayStandby(next, sig, now);
+        }
       }
     } else if (this.relayWasActive) {
       this.relayWasActive = false;
+      this.lastStandbySig = '';
       if (!this.desiredOn) this.stopHeartbeat();
     }
   }

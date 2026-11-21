@@ -136,6 +136,7 @@ if (isNative()) {
       calendar.checkDayRollover(true);
       ensureDailyBackup();
       void wallboard.refreshStatus();
+      wallboard.pushNow();
     }
   });
   void App.addListener('backButton', () => {

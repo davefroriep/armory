@@ -525,8 +525,11 @@ function render(st) {
       + '<section class="card"><div class="kicker">SESSION TOTALS</div><div class="cur-head"><span class="cur-name">' + Math.round(k.kcal || 0) + ' kcal</span><span class="cur-meta">Z5 Bank: ' + mmss(k.z5Sec || 0) + '</span></div></section></div></div>';
   } else if (st.standby) {
     const sb = st.standby;
-    const items = (sb.todayItems || []).map((it) => '<div class="sb-item"><b>' + esc(it.title) + (it.carried ? ' · Carry-over' : '') + '</b><span>' + esc(it.equipmentLabel) + (it.preview ? ' · ' + esc(it.preview) : '') + '</span></div>').join('')
-      || '<div class="sb-item"><b>Rest Day</b></div>';
+    const items = (sb.todayItems && sb.todayItems.length)
+      ? sb.todayItems.map((it) => '<div class="sb-item"><b>' + esc(it.title) + (it.carried ? ' · Carry-over' : '') + '</b><span>' + esc(it.equipmentLabel) + (it.preview ? ' · ' + esc(it.preview) : '') + '</span></div>').join('')
+      : (sb.scheduleSynced === false
+        ? '<div class="sb-item"><b>—</b></div>'
+        : '<div class="sb-item"><b>Rest Day</b></div>');
     main = '<div class="grid"><div class="col"><section class="card hero"><div class="kicker">THE ARMORY · ' + esc(sb.dateLabel) + '</div><div class="standby-big">' + esc(sb.timeLabel || nowStr) + '</div>' + (sb.weekLabel ? '<div class="cur-meta">' + esc(sb.weekLabel) + '</div>' : '') + '</section></div>'
       + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker">TODAY ON THE SCHEDULE</div>' + items + '</section></div></div>';
   }
@@ -579,6 +582,11 @@ const keepAwake = () => { navigator.wakeLock?.request?.('screen').catch(() => {}
 keepAwake();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) keepAwake(); });
 document.addEventListener('click', keepAwake);
+
+setInterval(() => {
+  const t = new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+  document.querySelectorAll('.clk, .standby-big').forEach((el) => { el.textContent = t; });
+}, 15000);
 
 // Optional LAN browser speech relay (available in Chrome on OptiPlex/tablets; hidden on Silk/devices without Web Speech)
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
