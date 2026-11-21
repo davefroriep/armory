@@ -2736,6 +2736,14 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertIn("Walk-Ins &amp; PR Drop-Ins (Show Lab)", dash)
             self.assertIn("devRyderBox", dash)
             self.assertIn("shStopAllBtn", dash)
+            for fn_sig in (
+                "function syncShowActiveBadge(",
+                "function populateFxHookInputs(",
+                "function populateTtsProviders(",
+                "function populateRyderDevPanel(",
+                "function renderShows(",
+            ):
+                self.assertIn(fn_sig, dash)
 
             v_resp = client.get("/api/shows/voices")
             self.assertEqual(v_resp.status_code, 200)

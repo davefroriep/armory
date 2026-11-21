@@ -8323,6 +8323,28 @@ async function startLocalRyderSim(jumpToSec) {
   vid.load();
 }
 
+function syncShowActiveBadge(active) {
+  const b = $('shBadge');
+  if (!b) return;
+  if (active && active.active) {
+    b.textContent = `LIVE · ${active.showName || active.showId} (${active.phase || 'running'})`;
+    b.className = 'pill warn';
+  } else {
+    b.textContent = 'IDLE';
+    b.className = 'pill ok';
+  }
+}
+
+function populateFxHookInputs(fx) {
+  if (!fx) return;
+  if ($('fxLightsHost')) $('fxLightsHost').value = fx.lightsHost || '';
+  if ($('fxLightsOffUrl')) $('fxLightsOffUrl').value = fx.lightsOffUrl || '';
+  if ($('fxLightsOnUrl')) $('fxLightsOnUrl').value = fx.lightsOnUrl || '';
+  if ($('fxFogHost')) $('fxFogHost').value = fx.fogHost || '';
+  if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
+  if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 30);
+}
+
 function populateTtsProviders(p) {
   if (!p) return;
   if ($('ttsElHint')) $('ttsElHint').textContent = p.hasElevenlabsKey ? `(Saved ${p.elevenlabsHint})` : '';
@@ -8459,7 +8481,9 @@ async function loadShows() {
   try {
     const r = await fetch('/api/shows').then(x => x.json());
     renderShows(r);
-  } catch {}
+  } catch (e) {
+    console.error('loadShows error:', e);
+  }
 }
 
 function previewShow(id) {
