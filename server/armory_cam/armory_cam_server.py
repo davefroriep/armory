@@ -123,6 +123,7 @@ try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { t
 WALLBOARD_STAGE_OVERLAY_SNIPPET = """
 <div id="armoryShowStage" style="display:none;position:fixed;inset:0;z-index:999999;background:#000;overflow:hidden">
   <video id="armoryStageVid" playsinline muted preload="auto" style="width:100%;height:100%;object-fit:contain;background:#000"></video>
+  <div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:#fff;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
 </div>
 <script>
 (function(){
@@ -130,6 +131,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
   window._armoryStageInit = true;
   var box = document.getElementById('armoryShowStage');
   var vid = document.getElementById('armoryStageVid');
+  var flashEl = document.getElementById('armoryStageFlash');
   if (!box || !vid) return;
   var role = 'wallboard';
   var clockOffsetMs = 0;
@@ -137,7 +139,44 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
   var readyAcked = false;
   var startTimer = null;
   var syncIv = null;
+  var flashRaf = null;
+  var flashWindows = [];
   var activeStartMs = 0;
+
+  function buildFlashWindows(list){
+    var out = [];
+    if (!Array.isArray(list)) return out;
+    for (var i = 0; i < list.length; i++){
+      var item = list[i] || {};
+      var at = Number(item.atSec || 0);
+      var dur = Math.max(0.08, Number(item.durSec || 0.2));
+      var cnt = Math.max(1, Math.min(6, Number(item.count || 1)));
+      for (var k = 0; k < cnt; k++){
+        var t0 = at + k * (dur + 0.15);
+        out.push({ t0: t0, t1: t0 + dur });
+      }
+    }
+    return out;
+  }
+
+  function clearFlash(){
+    if (flashRaf){ cancelAnimationFrame(flashRaf); flashRaf = null; }
+    if (flashEl) flashEl.style.opacity = '0';
+  }
+
+  function tickFlash(){
+    if (!curRunId || vid.paused || vid.ended){
+      clearFlash();
+      return;
+    }
+    var t = vid.currentTime || 0;
+    var lit = false;
+    for (var i = 0; i < flashWindows.length; i++){
+      if (t >= flashWindows[i].t0 && t < flashWindows[i].t1){ lit = true; break; }
+    }
+    if (flashEl) flashEl.style.opacity = lit ? '0.95' : '0';
+    flashRaf = requestAnimationFrame(tickFlash);
+  }
 
   function syncClock(){
     var bestRtt = 999999;
@@ -170,10 +209,12 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
   function clearPlayTimers(){
     if (startTimer){ clearTimeout(startTimer); startTimer = null; }
     if (syncIv){ clearInterval(syncIv); syncIv = null; }
+    clearFlash();
   }
 
   function stopStage(){
     clearPlayTimers();
+    flashWindows = [];
     curRunId = 0;
     readyAcked = false;
     activeStartMs = 0;
@@ -186,6 +227,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     curRunId = Number(ev.runId || 0);
     readyAcked = false;
     activeStartMs = 0;
+    flashWindows = buildFlashWindows(ev.flashEvents);
     box.style.display = 'block';
     vid.muted = true;
     vid.volume = 0;
@@ -228,6 +270,10 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     vid.playbackRate = 1.0;
     var p = vid.play();
     if (p && typeof p.catch === 'function') p.catch(function(){});
+    if (flashWindows.length){
+      clearFlash();
+      flashRaf = requestAnimationFrame(tickFlash);
+    }
     if (syncIv) clearInterval(syncIv);
     syncIv = setInterval(function(){
       if (!activeStartMs || vid.paused || vid.ended) return;
@@ -250,6 +296,8 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     var url = String(ev.videoUrl || '');
     if (Number(ev.runId || 0) !== curRunId || !vid.getAttribute('src')) {
       prepareStage(ev);
+    } else if (Array.isArray(ev.flashEvents)) {
+      flashWindows = buildFlashWindows(ev.flashEvents);
     }
     clearPlayTimers();
     curRunId = Number(ev.runId || 0);
@@ -287,12 +335,14 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
 </style></head>
 <body>
 <video id="stVid" playsinline preload="auto"></video>
+<div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:#fff;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
 <script>
 (function(){
   var q = new URLSearchParams(location.search);
   var role = (q.get('role') || 'cube').toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'cube';
   var useAudio = (q.get('audio') === '1' || (q.get('muted') !== '1' && role === 'cube'));
   var vid = document.getElementById('stVid');
+  var flashEl = document.getElementById('armoryStageFlash');
   vid.muted = !useAudio;
   vid.volume = useAudio ? 1.0 : 0.0;
 
@@ -301,7 +351,44 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
   var readyAcked = false;
   var startTimer = null;
   var syncIv = null;
+  var flashRaf = null;
+  var flashWindows = [];
   var activeStartMs = 0;
+
+  function buildFlashWindows(list){
+    var out = [];
+    if (!Array.isArray(list)) return out;
+    for (var i = 0; i < list.length; i++){
+      var item = list[i] || {};
+      var at = Number(item.atSec || 0);
+      var dur = Math.max(0.08, Number(item.durSec || 0.2));
+      var cnt = Math.max(1, Math.min(6, Number(item.count || 1)));
+      for (var k = 0; k < cnt; k++){
+        var t0 = at + k * (dur + 0.15);
+        out.push({ t0: t0, t1: t0 + dur });
+      }
+    }
+    return out;
+  }
+
+  function clearFlash(){
+    if (flashRaf){ cancelAnimationFrame(flashRaf); flashRaf = null; }
+    if (flashEl) flashEl.style.opacity = '0';
+  }
+
+  function tickFlash(){
+    if (!curRunId || vid.paused || vid.ended){
+      clearFlash();
+      return;
+    }
+    var t = vid.currentTime || 0;
+    var lit = false;
+    for (var i = 0; i < flashWindows.length; i++){
+      if (t >= flashWindows[i].t0 && t < flashWindows[i].t1){ lit = true; break; }
+    }
+    if (flashEl) flashEl.style.opacity = lit ? '0.95' : '0';
+    flashRaf = requestAnimationFrame(tickFlash);
+  }
 
   function syncClock(){
     var bestRtt = 999999;
@@ -335,10 +422,12 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
   function clearPlayTimers(){
     if (startTimer){ clearTimeout(startTimer); startTimer = null; }
     if (syncIv){ clearInterval(syncIv); syncIv = null; }
+    clearFlash();
   }
 
   function stopStage(){
     clearPlayTimers();
+    flashWindows = [];
     curRunId = 0;
     readyAcked = false;
     activeStartMs = 0;
@@ -350,6 +439,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     curRunId = Number(ev.runId || 0);
     readyAcked = false;
     activeStartMs = 0;
+    flashWindows = buildFlashWindows(ev.flashEvents);
     vid.muted = !useAudio;
     vid.volume = useAudio ? 1.0 : 0.0;
     vid.playbackRate = 1.0;
@@ -388,6 +478,10 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
         if (!vid.muted) { vid.muted = true; vid.play().catch(function(){}); }
       });
     }
+    if (flashWindows.length){
+      clearFlash();
+      flashRaf = requestAnimationFrame(tickFlash);
+    }
     if (!useAudio) {
       if (syncIv) clearInterval(syncIv);
       syncIv = setInterval(function(){
@@ -412,6 +506,8 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     var url = String(ev.videoUrl || '');
     if (Number(ev.runId || 0) !== curRunId || !vid.getAttribute('src')) {
       prepareStage(ev);
+    } else if (Array.isArray(ev.flashEvents)) {
+      flashWindows = buildFlashWindows(ev.flashEvents);
     }
     clearPlayTimers();
     curRunId = Number(ev.runId || 0);
@@ -4859,7 +4955,11 @@ class ArmoryCamService:
         return self.adb.schedule_sleep(cfg, delay_sec=0.0, reason="display_off")
 
     def _handle_local_voice_command(self, transcript: str) -> dict[str, Any] | None:
-        show_match = self.shows.match_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
+        show_match = self.shows.match_voice_command(
+            transcript,
+            wake_word=self.voice.cfg.wake_word,
+            workout_active=bool(self.voice.context_active),
+        )
         if show_match:
             if show_match.get("action") == "stop":
                 self.shows.stop_active_show()
@@ -5018,6 +5118,10 @@ DASHBOARD_HTML = """<!doctype html>
   .tag-bar{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
   .tag-chip{background:#16202c;border:1px solid #2b3d54;color:#9cc7f5;border-radius:7px;padding:3px 8px;font:700 11px/1.3 ui-monospace,Consolas,monospace;cursor:pointer}
   .tag-chip:hover{background:#1d2b3c;border-color:#7cc4ff;color:#fff}
+  .cue-list{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+  .cue-row{background:#0e151f;border:1px solid #213044;border-radius:9px;padding:8px;display:flex;flex-direction:column;gap:6px}
+  .cue-row-top{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .cue-row-top select,.cue-row-top input[type=text],.cue-row-top input[type=number]{width:auto;padding:5px 8px;font-size:12px}
   .btn{background:var(--blue);color:#00131f;border:0;border-radius:9px;padding:7px 12px;font-weight:800;font-size:12px;cursor:pointer;transition:transform .08s ease,background-color .15s ease,border-color .15s ease,box-shadow .15s ease,filter .15s ease,color .15s ease;user-select:none}
   .btn:hover:not(:disabled){filter:brightness(1.12);box-shadow:0 2px 10px rgba(0,0,0,.35)}
   .btn:active:not(:disabled){transform:translateY(2px) scale(.96);filter:brightness(.92);box-shadow:inset 0 2px 5px rgba(0,0,0,.45)}
@@ -5442,9 +5546,12 @@ DASHBOARD_HTML = """<!doctype html>
         <div class="ctrl-row" style="margin-top:0">
           <button class="btn sm ok" id="devSimFullBtn" type="button">🎬 Simulate Full Show (Local)</button>
           <button class="btn sm sec" id="devSimJumpBtn" type="button">⏩ Jump to 1:16 (Test 1:20 Overlay)</button>
-          <button class="btn sm red" id="devSimStopBtn" type="button">⏹ Stop Sim</button>
+          <button class="btn sm red" id="devSimStopBtn" type="button">⏹ Stop Sim / Live</button>
           <button class="btn sm sec" id="devSimFsBtn" type="button">⤢ Fullscreen</button>
-          <button class="btn sm" id="devFireLiveBtn" type="button">🔥 Fire Ryder LIVE (3 Screens + Denon 70)</button>
+          <button class="btn sm" id="devFireLiveBtn" type="button">🔥 Fire Ryder LIVE (Screens + Denon 70)</button>
+          <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:700;margin:0;cursor:pointer">
+            <input id="devRyExcludeMainTv" type="checkbox" style="width:auto;margin:0"> Exclude Main TV (Coding)
+          </label>
         </div>
       </div>
 
@@ -5458,6 +5565,17 @@ DASHBOARD_HTML = """<!doctype html>
         </div>
         <div class="dev-yt-wrap" id="devYtWrap">
           <video id="devRyVideo" controls playsinline preload="metadata" style="width:100%;height:100%;background:#000;border-radius:8px"></video>
+          <div id="devVidFlash" style="pointer-events:none;position:absolute;inset:0;background:#fff;opacity:0;border-radius:8px;transition:opacity 0.05s linear;z-index:4"></div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;z-index:2">
+          <span id="devScrubClock" class="pill" style="font-family:ui-monospace,Consolas,monospace;font-size:12px">MP4 0:00.0 · Intro 0:00.0</span>
+          <button class="btn sm sec" type="button" data-scrub="-5">-5s</button>
+          <button class="btn sm sec" type="button" data-scrub="-1">-1s</button>
+          <button class="btn sm sec" type="button" data-scrub="-0.1">-0.1s</button>
+          <button class="btn sm ok" id="devScrubPlayBtn" type="button">▶/⏸</button>
+          <button class="btn sm sec" type="button" data-scrub="0.1">+0.1s</button>
+          <button class="btn sm sec" type="button" data-scrub="1">+1s</button>
+          <button class="btn sm sec" type="button" data-scrub="5">+5s</button>
         </div>
         <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch the pre-baked 1080p MP4 + synchronized TV stage cues.</div>
         <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
@@ -5468,36 +5586,36 @@ DASHBOARD_HTML = """<!doctype html>
           <label>Audition Intro (Thunder + Announcer + Crowd)</label>
           <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
           <div class="ctrl-row" style="margin-top:4px">
-            <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice (~1s)</button>
+            <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice</button>
             <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
               <input id="devRyTestFxChk" type="checkbox" style="width:auto;margin:0"> + Thunder &amp; Crowd
             </label>
           </div>
         </div>
         <div>
-          <label>Audition 1:20 Mid-Video Overlay (&ldquo;Welcome to The Armory…&rdquo;)</label>
+          <label>Audition Speech Box (Dry / Fast Test)</label>
           <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
           <div class="ctrl-row" style="margin-top:4px">
-            <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1:20 Overlay (~1s)</button>
+            <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1st Speech Box</button>
           </div>
         </div>
       </div>
 
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:8px">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-top:8px">
         <div><label>Studio Voice Engine</label><select id="devRyVoice"></select></div>
+        <div><label>Intro Voice Start (s)</label><input id="devRyIntroStart" type="number" min="0" max="15" step="0.1" value="2.3"></div>
         <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.06"></div>
         <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
         <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
         <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
-        <div><label>1:20 Overlay → Denon Vol</label><input id="devRyPostVol" type="number" min="30" max="75" value="55"></div>
       </div>
       <div style="margin-top:6px">
         <label>Voice Acting Style / Direction (used by Gemini 2.5 Flash TTS &amp; OpenAI gpt-4o-mini-tts)</label>
         <input id="devRyStyle" type="text" placeholder="Electric HBO championship boxing ring announcer in a packed arena...">
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px;margin-top:6px">
-        <div><label>HBO-Style Intro Script (supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label><textarea id="devRyIntroTxt" rows="3"></textarea></div>
-        <div><label>1:20 Video Overlay Script</label><textarea id="devRyOvTxt" rows="3"></textarea></div>
+      <div style="margin-top:6px">
+        <label>Main HBO Intro Script (starts at Intro Voice Start; supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label>
+        <textarea id="devRyIntroTxt" rows="3"></textarea>
       </div>
       <div class="tag-bar" id="devRyTagBar">
         <span style="font-size:11px;color:var(--mut);font-weight:700">Insert Inline Tag:</span>
@@ -5510,8 +5628,23 @@ DASHBOARD_HTML = """<!doctype html>
         <button class="tag-chip" type="button" data-tag=" [shouting] ">+[shouting] (EL v3)</button>
         <button class="tag-chip" type="button" data-tag=" [excited] ">+[excited] (EL v3)</button>
       </div>
-      <div class="ctrl-row" style="margin-top:8px">
+      <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-weight:800;font-size:12px;color:#7cc4ff">Timed Speech Boxes (Intro or Entrance Video · 📍 Stamp from Scrubber)</span>
+          <button class="btn sm sec" id="devRyAddSpeechBtn" type="button">+ Add Speech Box</button>
+        </div>
+        <div id="devRySpeechList" class="cue-list"></div>
+      </div>
+      <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <span style="font-weight:800;font-size:12px;color:#fde047">Timed FX / Screen Flash Cues (Zero MP4 Rebuild Required)</span>
+          <button class="btn sm sec" id="devRyAddFxBtn" type="button">+ Add FX Cue</button>
+        </div>
+        <div id="devRyFxCueList" class="cue-list"></div>
+      </div>
+      <div class="ctrl-row" style="margin-top:10px">
         <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Bake Into Show MP4</button>
+        <button class="btn sm ok" id="devRySaveQuickBtn" type="button">Save Timings / FX Only (No MP4 Rebuild)</button>
         <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
         <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
         <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
@@ -8137,7 +8270,36 @@ $('dpFindRokuBtn').onclick = async () => {
 };
 
 let devRyderSpec = null;
-let rySimState = { running: false, timers: [], iv: null, ytPlayer: null, introEl: null, ovEl: null, fogLeft: 0 };
+let devRyVoicesCache = [];
+let rySimState = { running: false, timers: [], iv: null, ytPlayer: null, introEl: null, ovEl: null, fogLeft: 0, cueFlags: null, flashTimer: null };
+let ryScrubRaf = null;
+
+function parseTimeSec(val) {
+  const s = String(val == null ? '' : val).trim();
+  if (!s) return 0;
+  const parts = s.split(':');
+  let sec = 0;
+  if (parts.length === 2) {
+    sec = (parseFloat(parts[0]) || 0) * 60 + (parseFloat(parts[1]) || 0);
+  } else if (parts.length === 3) {
+    sec = (parseFloat(parts[0]) || 0) * 3600 + (parseFloat(parts[1]) || 0) * 60 + (parseFloat(parts[2]) || 0);
+  } else {
+    sec = parseFloat(s) || 0;
+  }
+  return Math.max(0, Math.min(300, Math.round(sec * 100) / 100));
+}
+
+function fmtTimeSec(sec) {
+  const s = Math.max(0, Number(sec || 0));
+  const mm = Math.floor(s / 60);
+  const rem = s - mm * 60;
+  const remStr = rem.toFixed(1).padStart(4, '0');
+  return `${mm}:${remStr}`;
+}
+
+function getRyIntroSec() {
+  return Number((devRyderSpec && devRyderSpec.introDurationSec) || 9.9);
+}
 
 function logDevCue(msg) {
   const el = $('devLog');
@@ -8171,7 +8333,8 @@ function fxFlash(label, durMs) {
   if (!st) return;
   st.classList.add('flashing');
   if (fh) { fh.textContent = label || '(FLASH)'; fh.className = 'fx-tag flash'; }
-  setTimeout(() => {
+  if (rySimState.flashTimer) clearTimeout(rySimState.flashTimer);
+  rySimState.flashTimer = setTimeout(() => {
     st.classList.remove('flashing');
     if (fh) { fh.textContent = 'FLASH: READY'; fh.className = 'fx-tag'; }
   }, Math.max(120, Number(durMs || 220)));
@@ -8203,27 +8366,162 @@ function ensureShowSse() {
     es.onmessage = (msg) => {
       try {
         const d = JSON.parse(msg.data);
-        if (d && d.type === 'cue') fxApplyCue(d);
+        if (!d) return;
+        if (d.type === 'cue') fxApplyCue(d);
+        else if (d.type === 'stage_stop') {
+          stopLocalRyderSim();
+          if ($('shMsg')) $('shMsg').textContent = '⏹ Show stopped safely.';
+        }
       } catch {}
     };
     window._showSse = es;
   } catch {}
 }
 
+function buildRyFlashWindows() {
+  const introSec = getRyIntroSec();
+  const wins = [];
+  const rows = document.querySelectorAll('#devRyFxCueList .ry-fx-row');
+  rows.forEach(row => {
+    const type = row.querySelector('.ry-fx-type').value;
+    const screen = row.querySelector('.ry-fx-screen').checked;
+    if (type !== 'flash' || !screen) return;
+    const tgt = row.querySelector('.ry-fx-target').value;
+    const at = parseTimeSec(row.querySelector('.ry-fx-at').value);
+    const dur = Math.max(0.08, Number(row.querySelector('.ry-fx-dur').value || 0.2));
+    const cnt = Math.max(1, Math.min(6, Number(row.querySelector('.ry-fx-cnt').value || 1)));
+    const showAt = tgt === 'intro' ? at : (introSec + at);
+    for (let k = 0; k < cnt; k++) {
+      const t0 = showAt + k * (dur + 0.15);
+      wins.push({ t0, t1: t0 + dur });
+    }
+  });
+  return wins;
+}
+
+function updateRyScrubAndFlash() {
+  const vid = $('devRyVideo');
+  if (!vid) return;
+  const t = vid.currentTime || 0;
+  const introSec = getRyIntroSec();
+  if ($('devScrubClock')) {
+    const rel = t < introSec ? `Intro ${fmtTimeSec(t)}` : `Video +${fmtTimeSec(t - introSec)}`;
+    $('devScrubClock').textContent = `MP4 ${fmtTimeSec(t)} · ${rel}`;
+  }
+  const vf = $('devVidFlash');
+  if (vf) {
+    if (!vid.paused && !vid.ended) {
+      const wins = buildRyFlashWindows();
+      const lit = wins.some(w => t >= w.t0 && t < w.t1);
+      vf.style.opacity = lit ? '0.95' : '0';
+    } else {
+      vf.style.opacity = '0';
+    }
+  }
+  if (!rySimState.running || !rySimState.cueFlags) return;
+  const cf = rySimState.cueFlags;
+  const spec = cf.spec;
+  const mm = Math.floor(t / 60), ss = String(Math.floor(t % 60)).padStart(2, '0');
+  if ($('devSimClock')) $('devSimClock').textContent = `MP4 ${mm}:${ss}`;
+  if (!cf.lightning && t >= (spec.lightningFlashSec || 0.75)) {
+    cf.lightning = true;
+    fxApplyCue({ tag: 'flash', label: '(FLASH · LIGHTNING CRACK)', durationMs: 180 });
+  }
+  if (!cf.flash1 && t >= Math.max(0.5, introSec - 0.92)) {
+    cf.flash1 = true;
+    fxApplyCue({ tag: 'flash', label: '(FLASH 1/2)', durationMs: 200 });
+  }
+  if (!cf.flash2 && t >= Math.max(0.8, introSec - 0.48)) {
+    cf.flash2 = true;
+    fxApplyCue({ tag: 'flash', label: '(FLASH 2/2)', durationMs: 240 });
+  }
+  if (!cf.screens && t >= introSec) {
+    cf.screens = true;
+    fxApplyCue({ tag: 'screens', label: `(SCREENS LIVE · DENON ${spec.denonVol || 70})`, denonVol: spec.denonVol || 70 });
+  }
+  const pulseEnd = introSec + Number(spec.lightsPulseDurationSec || 20);
+  if (t >= introSec && t < pulseEnd) {
+    const iv = Number(spec.lightsPulseIntervalSec || 2);
+    const pIdx = Math.floor((t - introSec) / iv) + 1;
+    if (pIdx > cf.lastPulse) {
+      cf.lastPulse = pIdx;
+      fxFlash(`(FLASH 0.25s · Pulse ${pIdx})`, 250);
+    }
+  }
+  if (!cf.lightsOn && t >= pulseEnd) {
+    cf.lightsOn = true;
+    fxApplyCue({ tag: 'lights_on', label: '(FULL HOUSE LIGHTS ON)' });
+  }
+  (cf.speechCues || []).forEach((sc, idx) => {
+    const key = 'sp_' + idx;
+    if (!cf.fired[key] && t >= sc.showAt) {
+      cf.fired[key] = true;
+      fxApplyCue({ tag: 'overlay', label: `(DUCK + SPEECH · "${sc.text}")`, caption: sc.text });
+    }
+    const dKey = 'dn_' + idx;
+    if (sc.postDenonVol > 0 && !cf.fired[dKey] && t >= sc.showAt + sc.durSec) {
+      cf.fired[dKey] = true;
+      fxApplyCue({ tag: 'denon_drop', label: `(RESTORE · DENON → ${sc.postDenonVol})`, denonVol: sc.postDenonVol });
+    }
+  });
+  (cf.fxCues || []).forEach((fc, idx) => {
+    const key = 'fx_' + idx;
+    if (!cf.fired[key] && t >= fc.showAt) {
+      cf.fired[key] = true;
+      if (fc.type === 'flash') fxFlash(`(FX FLASH ×${fc.count})`, fc.durationSec * 1000);
+      else if (fc.type === 'lights_off') fxApplyCue({ tag: 'lights_off', label: '(LIGHTS OFF · FX)' });
+      else if (fc.type === 'lights_on') fxApplyCue({ tag: 'lights_on', label: '(LIGHTS ON · FX)' });
+      else if (fc.type === 'fog') fxApplyCue({ tag: 'fog', label: `(TRIGGER FOG · ${fc.durationSec}s)`, fogSec: fc.durationSec });
+    }
+  });
+}
+
+function initRyderScrubber() {
+  const vid = $('devRyVideo');
+  if (!vid || vid._ryScrubInit) return;
+  vid._ryScrubInit = true;
+  const tickLoop = () => {
+    updateRyScrubAndFlash();
+    if (!vid.paused && !vid.ended) {
+      ryScrubRaf = requestAnimationFrame(tickLoop);
+    } else {
+      ryScrubRaf = null;
+    }
+  };
+  vid.addEventListener('play', () => {
+    if (!ryScrubRaf) ryScrubRaf = requestAnimationFrame(tickLoop);
+  });
+  ['pause', 'seeking', 'seeked', 'timeupdate', 'loadedmetadata'].forEach(evName => {
+    vid.addEventListener(evName, updateRyScrubAndFlash);
+  });
+  vid.addEventListener('ended', () => {
+    if (rySimState.running) {
+      logDevCue('(SHOW COMPLETE)');
+      stopLocalRyderSim();
+    }
+  });
+}
+
 function stopLocalRyderSim() {
   rySimState.running = false;
+  rySimState.cueFlags = null;
   (rySimState.timers || []).forEach(id => clearTimeout(id));
   rySimState.timers = [];
   if (rySimState.iv) { clearInterval(rySimState.iv); rySimState.iv = null; }
-  [rySimState.introEl, rySimState.ovEl].forEach(a => {
+  if (rySimState.flashTimer) { clearTimeout(rySimState.flashTimer); rySimState.flashTimer = null; }
+  if (ryScrubRaf) { cancelAnimationFrame(ryScrubRaf); ryScrubRaf = null; }
+  [rySimState.introEl, rySimState.ovEl, $('shAudio_ryder_walkin'), $('shOvAudio_ryder_walkin')].forEach(a => {
     if (a) { try { a.pause(); a.currentTime = 0; } catch {} }
   });
   const vid = $('devRyVideo');
   if (vid) {
+    vid.onloadedmetadata = null;
     try { vid.pause(); } catch {}
-    vid.ontimeupdate = null;
-    vid.onended = null;
   }
+  const vf = $('devVidFlash');
+  if (vf) vf.style.opacity = '0';
+  if ($('devStage')) $('devStage').classList.remove('flashing');
+  if ($('devFlashHud')) { $('devFlashHud').textContent = 'FLASH: READY'; $('devFlashHud').className = 'fx-tag'; }
   rySimState.fogLeft = 0;
   if ($('devFogHud')) { $('devFogHud').textContent = 'FOG: OFF'; $('devFogHud').className = 'fx-tag'; }
   if ($('devDenonHud')) $('devDenonHud').textContent = 'DENON: STANDBY';
@@ -8232,12 +8530,11 @@ function stopLocalRyderSim() {
 
 async function startLocalRyderSim(jumpToSec) {
   stopLocalRyderSim();
+  initRyderScrubber();
   rySimState.running = true;
-  const spec = devRyderSpec || { denonVol: 70, postOverlayDenonVol: 55, fogBurstSec: 30, lightningFlashSec: 0.75, lightsPulseDurationSec: 20, lightsPulseIntervalSec: 2.0, lightsPulseOnSec: 0.25, overlayAtSec: 80, introDurationSec: 9.9, overlayDurationSec: 4.5, announcerText: '', overlayText: '' };
+  const spec = devRyderSpec || { denonVol: 70, fogBurstSec: 30, lightningFlashSec: 0.75, lightsPulseDurationSec: 20, lightsPulseIntervalSec: 2.0, lightsPulseOnSec: 0.25, introDurationSec: 9.9, announcerText: '' };
   const vid = $('devRyVideo');
   const introSec = Number(spec.introDurationSec || 9.9);
-  const ovAtSec = introSec + Number(spec.overlayAtSec || 80);
-  const ovDur = Number(spec.overlayDurationSec || 4.5);
 
   if (!vid || !spec.showVideoReady) {
     const introEl = $('shAudio_ryder_walkin');
@@ -8252,7 +8549,29 @@ async function startLocalRyderSim(jumpToSec) {
     return;
   }
 
-  let cueFlags = { lightning: false, flash1: false, flash2: false, screens: false, lightsOn: false, overlay: false, drop: false, lastPulse: 0 };
+  const spRows = collectRySpeechCues().filter(c => c.target === 'video' && c.text).map(c => ({
+    showAt: introSec + c.atSec,
+    durSec: 4.0,
+    text: c.text,
+    postDenonVol: c.postDenonVol || 0,
+  }));
+  const fxRows = collectRyFxCues().map(fc => ({
+    ...fc,
+    showAt: fc.target === 'intro' ? fc.atSec : (introSec + fc.atSec),
+  }));
+
+  rySimState.cueFlags = {
+    spec,
+    lightning: false,
+    flash1: false,
+    flash2: false,
+    screens: false,
+    lightsOn: false,
+    lastPulse: 0,
+    fired: {},
+    speechCues: spRows,
+    fxCues: fxRows,
+  };
   rySimState.iv = setInterval(() => {
     if (!rySimState.running) return;
     if (rySimState.fogLeft > 0) {
@@ -8268,62 +8587,15 @@ async function startLocalRyderSim(jumpToSec) {
   if (jumpToSec != null) {
     fxSetLights('on');
     $('devDenonHud').textContent = `DENON: VOL ${spec.denonVol || 70}`;
-    cueFlags.lightning = cueFlags.flash1 = cueFlags.flash2 = cueFlags.screens = cueFlags.lightsOn = true;
-    logDevCue(`⏩ Jumped MP4 to ${jumpToSec}s past intro (${seekTarget.toFixed(1)}s) — awaiting 1:20 overlay…`);
+    rySimState.cueFlags.lightning = rySimState.cueFlags.flash1 = rySimState.cueFlags.flash2 = rySimState.cueFlags.screens = rySimState.cueFlags.lightsOn = true;
+    logDevCue(`⏩ Jumped MP4 to ${jumpToSec}s past intro (${seekTarget.toFixed(1)}s)…`);
   } else {
     fxApplyCue({ tag: 'lights_off', label: '(LIGHTS OFF) · (TRIGGER FOG · 30s)', fogSec: spec.fogBurstSec || 30, denonVol: spec.denonVol || 70, caption: spec.announcerText || 'Thunder rumbling…' });
   }
 
-  vid.ontimeupdate = () => {
-    if (!rySimState.running) return;
-    const t = vid.currentTime || 0;
-    const mm = Math.floor(t / 60), ss = String(Math.floor(t % 60)).padStart(2, '0');
-    if ($('devSimClock')) $('devSimClock').textContent = `MP4 ${mm}:${ss}`;
-    if (!cueFlags.lightning && t >= (spec.lightningFlashSec || 0.75)) {
-      cueFlags.lightning = true;
-      fxApplyCue({ tag: 'flash', label: '(FLASH · LIGHTNING CRACK)', durationMs: 180 });
-    }
-    if (!cueFlags.flash1 && t >= Math.max(0.5, introSec - 0.92)) {
-      cueFlags.flash1 = true;
-      fxApplyCue({ tag: 'flash', label: '(FLASH 1/2)', durationMs: 200 });
-    }
-    if (!cueFlags.flash2 && t >= Math.max(0.8, introSec - 0.48)) {
-      cueFlags.flash2 = true;
-      fxApplyCue({ tag: 'flash', label: '(FLASH 2/2)', durationMs: 240 });
-    }
-    if (!cueFlags.screens && t >= introSec) {
-      cueFlags.screens = true;
-      fxApplyCue({ tag: 'screens', label: `(ALL 3 SCREENS LIVE · DENON ${spec.denonVol || 70})`, denonVol: spec.denonVol || 70 });
-    }
-    const pulseEnd = introSec + Number(spec.lightsPulseDurationSec || 20);
-    if (t >= introSec && t < pulseEnd) {
-      const iv = Number(spec.lightsPulseIntervalSec || 2);
-      const pIdx = Math.floor((t - introSec) / iv) + 1;
-      if (pIdx > cueFlags.lastPulse) {
-        cueFlags.lastPulse = pIdx;
-        fxFlash(`(FLASH 0.25s · Pulse ${pIdx})`, 250);
-      }
-    }
-    if (!cueFlags.lightsOn && t >= pulseEnd) {
-      cueFlags.lightsOn = true;
-      fxApplyCue({ tag: 'lights_on', label: '(FULL HOUSE LIGHTS ON)' });
-    }
-    if (!cueFlags.overlay && spec.overlayText && t >= ovAtSec) {
-      cueFlags.overlay = true;
-      fxApplyCue({ tag: 'overlay', label: `(DUCK + OVERLAY · "${spec.overlayText}")`, caption: spec.overlayText });
-    }
-    if (!cueFlags.drop && spec.postOverlayDenonVol && t >= ovAtSec + ovDur) {
-      cueFlags.drop = true;
-      fxApplyCue({ tag: 'denon_drop', label: `(RESTORE · DENON ${spec.denonVol || 70} → ${spec.postOverlayDenonVol || 55})`, denonVol: spec.postOverlayDenonVol || 55 });
-    }
-  };
-  vid.onended = () => {
-    logDevCue('(SHOW COMPLETE)');
-    stopLocalRyderSim();
-  };
-
   const wantUrl = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
   const startPlay = () => {
+    if (!rySimState.running) return;
     try { vid.currentTime = seekTarget; } catch {}
     vid.play().catch(() => {});
   };
@@ -8387,6 +8659,7 @@ function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProvide
     sp.className = (ry.showVideoReady && ry.hasSourceVideo) ? 'pill ok' : 'pill warn';
   }
   const vSel = $('devRyVoice');
+  if (Array.isArray(voices) && voices.length) devRyVoicesCache = voices;
   if (vSel && Array.isArray(voices) && voices.length) {
     const TOP_VOICES = new Set([
       'elevenlabs:nPczCjzI2devNBz1zQrb',
@@ -8420,21 +8693,182 @@ function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProvide
   if (!ry) return;
   devRyderSpec = ry;
   if (vSel) vSel.value = ry.announcerVoice || 'kokoro:onyx_fenrir_epic';
+  if ($('devRyExcludeMainTv')) $('devRyExcludeMainTv').checked = Boolean(ry.excludeMainTv);
+  if ($('devRyIntroStart')) $('devRyIntroStart').value = String(ry.introStartSec != null ? ry.introStartSec : 2.3);
   if ($('devRyRev')) $('devRyRev').value = String(ry.voiceReverbWet != null ? ry.voiceReverbWet : 0.06);
   if ($('devRyBoost')) $('devRyBoost').value = String(ry.voiceBoostDb != null ? ry.voiceBoostDb : 2.0);
   if ($('devRyFog')) $('devRyFog').value = String(ry.fogBurstSec || 30);
-  if ($('devRyPostVol')) $('devRyPostVol').value = String(ry.postOverlayDenonVol || 55);
   if ($('devRyStyle')) $('devRyStyle').value = ry.voiceStyle || '';
   if ($('devRyIntroTxt')) $('devRyIntroTxt').value = ry.announcerText || '';
-  if ($('devRyOvTxt')) $('devRyOvTxt').value = ry.overlayText || '';
   if ($('devRyIntroVoiceClr')) $('devRyIntroVoiceClr').hidden = !ry.customIntroVoiceFile;
   if ($('devRyOvVoiceClr')) $('devRyOvVoiceClr').hidden = !ry.customOverlayVoiceFile;
+  renderRySpeechRows(Array.isArray(ry.speechCues) ? ry.speechCues : [], devRyVoicesCache);
+  renderRyFxRows(Array.isArray(ry.fxCues) ? ry.fxCues : []);
   if ($('shAudio_ryder_walkin')) $('shAudio_ryder_walkin').src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
   if ($('shOvAudio_ryder_walkin')) $('shOvAudio_ryder_walkin').src = `/api/shows/ryder_walkin/overlay.wav?t=${Date.now()}`;
+  initRyderScrubber();
   const vid = $('devRyVideo');
   if (vid && ry.showVideoReady && !rySimState.running && (!vid.getAttribute('src') || !vid.currentSrc)) {
     vid.src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
   }
+  updateRyScrubAndFlash();
+}
+
+function buildVoiceOverrideOptions(voices, selected) {
+  let out = `<option value="" ${!selected ? 'selected' : ''}>Show Default Voice</option>`;
+  (Array.isArray(voices) ? voices : []).forEach(v => {
+    const sel = selected === v.id ? 'selected' : '';
+    out += `<option value="${escHtml(v.id)}" ${sel}>${escHtml(v.label)}</option>`;
+  });
+  return out;
+}
+
+function makeRySpeechRowHtml(c, voices, idx) {
+  const cid = escHtml(c.id || `sc_${idx + 1}`);
+  const tgt = c.target === 'intro' ? 'intro' : 'video';
+  const atStr = escHtml(fmtTimeSec(c.atSec != null ? c.atSec : 80));
+  const pvol = c.postDenonVol ? String(c.postDenonVol) : '';
+  const txt = escHtml(c.text || '');
+  return `
+    <div class="cue-row ry-sp-row" data-cueid="${cid}">
+      <div class="cue-row-top">
+        <select class="ry-sp-target" title="Stage segment">
+          <option value="video" ${tgt==='video'?'selected':''}>Entrance Video</option>
+          <option value="intro" ${tgt==='intro'?'selected':''}>Intro Sequence</option>
+        </select>
+        <label style="margin:0;font-size:11px">At</label>
+        <input class="ry-sp-at" type="text" value="${atStr}" style="width:76px" title="mm:ss.s or seconds">
+        <button class="btn sm sec ry-sp-stamp" type="button" title="Capture current scrubber timestamp">📍 Stamp</button>
+        <button class="btn sm sec ry-sp-jump" type="button" title="Seek video to 2s before cue">⏩ Jump</button>
+        <label style="margin:0;font-size:11px">Denon After</label>
+        <input class="ry-sp-vol" type="number" min="0" max="75" value="${escHtml(pvol)}" placeholder="—" style="width:62px" title="Optional Denon volume after speech">
+        <select class="ry-sp-voice" style="max-width:210px">${buildVoiceOverrideOptions(voices, c.voice || '')}</select>
+        <button class="btn sm ok ry-sp-test" type="button">▶ Test</button>
+        <button class="btn sm red ry-sp-del" type="button" title="Remove speech box">✕</button>
+      </div>
+      <textarea class="ry-sp-txt" rows="2" placeholder="Enter speech box script (supports [pause:100ms], [speed:+10%], [shouting])">${txt}</textarea>
+    </div>`;
+}
+
+function renderRySpeechRows(cues, voices) {
+  const list = $('devRySpeechList');
+  if (!list) return;
+  const rows = Array.isArray(cues) ? cues : [];
+  if (!rows.length) {
+    list.innerHTML = '<div class="ry-empty" style="font-size:11px;color:var(--mut)">No timed speech boxes yet — click <b>+ Add Speech Box</b> to drop one onto the Intro or Entrance Video.</div>';
+    return;
+  }
+  list.innerHTML = rows.map((c, idx) => makeRySpeechRowHtml(c, voices, idx)).join('');
+}
+
+function addRySpeechRow(cue) {
+  const list = $('devRySpeechList');
+  if (!list) return;
+  const emptyEl = list.querySelector('.ry-empty');
+  if (emptyEl) emptyEl.remove();
+  const vid = $('devRyVideo');
+  const t = (vid && Number.isFinite(vid.currentTime)) ? vid.currentTime : 0;
+  const introSec = getRyIntroSec();
+  const def = cue || (t > 0.1
+    ? (t < introSec ? { target: 'intro', atSec: t } : { target: 'video', atSec: t - introSec })
+    : { target: 'video', atSec: 80 });
+  const idx = list.querySelectorAll('.ry-sp-row').length;
+  list.insertAdjacentHTML('beforeend', makeRySpeechRowHtml(def, devRyVoicesCache, idx));
+}
+
+function collectRySpeechCues() {
+  const rows = [];
+  document.querySelectorAll('#devRySpeechList .ry-sp-row').forEach((row, idx) => {
+    const pvRaw = row.querySelector('.ry-sp-vol').value.trim();
+    const pvNum = pvRaw === '' ? 0 : Math.round(Number(pvRaw) || 0);
+    rows.push({
+      id: row.getAttribute('data-cueid') || `sc_${idx + 1}`,
+      target: row.querySelector('.ry-sp-target').value === 'intro' ? 'intro' : 'video',
+      atSec: parseTimeSec(row.querySelector('.ry-sp-at').value),
+      text: row.querySelector('.ry-sp-txt').value.trim(),
+      voice: row.querySelector('.ry-sp-voice').value || '',
+      postDenonVol: pvNum,
+      duckGain: 0.22,
+    });
+  });
+  return rows;
+}
+
+function makeRyFxRowHtml(fc, idx) {
+  const cid = escHtml(fc.id || `fx_${idx + 1}`);
+  const tgt = fc.target === 'intro' ? 'intro' : 'video';
+  const ftype = fc.type || 'flash';
+  const atStr = escHtml(fmtTimeSec(fc.atSec != null ? fc.atSec : 0));
+  const dur = fc.durationSec != null ? fc.durationSec : (ftype === 'fog' ? 4.0 : 0.2);
+  const cnt = fc.count != null ? fc.count : 1;
+  const scr = fc.screenFlash !== false;
+  return `
+    <div class="cue-row ry-fx-row" data-fxid="${cid}">
+      <div class="cue-row-top">
+        <select class="ry-fx-target">
+          <option value="video" ${tgt==='video'?'selected':''}>Entrance Video</option>
+          <option value="intro" ${tgt==='intro'?'selected':''}>Intro Sequence</option>
+        </select>
+        <label style="margin:0;font-size:11px">At</label>
+        <input class="ry-fx-at" type="text" value="${atStr}" style="width:76px">
+        <button class="btn sm sec ry-fx-stamp" type="button" title="Capture current scrubber timestamp">📍 Stamp</button>
+        <button class="btn sm sec ry-fx-jump" type="button" title="Seek video to 2s before FX cue">⏩ Jump</button>
+        <select class="ry-fx-type">
+          <option value="flash" ${ftype==='flash'?'selected':''}>Flash (Screen + Lights)</option>
+          <option value="lights_off" ${ftype==='lights_off'?'selected':''}>Lights OFF</option>
+          <option value="lights_on" ${ftype==='lights_on'?'selected':''}>Lights ON</option>
+          <option value="fog" ${ftype==='fog'?'selected':''}>Fog Burst</option>
+        </select>
+        <label style="margin:0;font-size:11px">Dur(s)</label>
+        <input class="ry-fx-dur" type="number" min="0.1" max="60" step="0.1" value="${escHtml(String(dur))}" style="width:64px">
+        <label style="margin:0;font-size:11px">Count</label>
+        <input class="ry-fx-cnt" type="number" min="1" max="6" step="1" value="${escHtml(String(cnt))}" style="width:52px">
+        <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+          <input class="ry-fx-screen" type="checkbox" ${scr?'checked':''} style="width:auto;margin:0"> Screen Flash
+        </label>
+        <button class="btn sm red ry-fx-del" type="button" title="Remove FX cue">✕</button>
+      </div>
+    </div>`;
+}
+
+function renderRyFxRows(cues) {
+  const list = $('devRyFxCueList');
+  if (!list) return;
+  const rows = Array.isArray(cues) ? cues : [];
+  if (!rows.length) {
+    list.innerHTML = '<div class="ry-empty" style="font-size:11px;color:var(--mut)">No custom FX cues yet — scrub to an exact moment, click <b>+ Add FX Cue</b>, then hit <b>📍 Stamp</b>.</div>';
+    return;
+  }
+  list.innerHTML = rows.map((fc, idx) => makeRyFxRowHtml(fc, idx)).join('');
+}
+
+function addRyFxRow(cue) {
+  const list = $('devRyFxCueList');
+  if (!list) return;
+  const emptyEl = list.querySelector('.ry-empty');
+  if (emptyEl) emptyEl.remove();
+  const vid = $('devRyVideo');
+  const t = (vid && Number.isFinite(vid.currentTime)) ? vid.currentTime : 0;
+  const introSec = getRyIntroSec();
+  const def = cue || (t < introSec ? { target: 'intro', atSec: t, type: 'flash' } : { target: 'video', atSec: t - introSec, type: 'flash' });
+  const idx = list.querySelectorAll('.ry-fx-row').length;
+  list.insertAdjacentHTML('beforeend', makeRyFxRowHtml(def, idx));
+}
+
+function collectRyFxCues() {
+  const rows = [];
+  document.querySelectorAll('#devRyFxCueList .ry-fx-row').forEach((row, idx) => {
+    rows.push({
+      id: row.getAttribute('data-fxid') || `fx_${idx + 1}`,
+      target: row.querySelector('.ry-fx-target').value === 'intro' ? 'intro' : 'video',
+      atSec: parseTimeSec(row.querySelector('.ry-fx-at').value),
+      type: row.querySelector('.ry-fx-type').value || 'flash',
+      durationSec: Math.max(0.1, Math.min(60, Number(row.querySelector('.ry-fx-dur').value || 0.2))),
+      count: Math.max(1, Math.min(6, Math.round(Number(row.querySelector('.ry-fx-cnt').value || 1)))),
+      screenFlash: Boolean(row.querySelector('.ry-fx-screen').checked),
+    });
+  });
+  return rows;
 }
 
 function renderShows(data) {
@@ -8616,14 +9050,66 @@ async function saveFxHooks(extraBody) {
 if ($('shStopAllBtn')) $('shStopAllBtn').onclick = () => { stopLocalRyderSim(); stopShow(); };
 if ($('devSimFullBtn')) $('devSimFullBtn').onclick = () => startLocalRyderSim(null);
 if ($('devSimJumpBtn')) $('devSimJumpBtn').onclick = () => startLocalRyderSim(76);
-if ($('devSimStopBtn')) $('devSimStopBtn').onclick = () => stopLocalRyderSim();
+if ($('devSimStopBtn')) $('devSimStopBtn').onclick = () => { stopLocalRyderSim(); stopShow(); };
 if ($('devSimFsBtn')) $('devSimFsBtn').onclick = () => { if ($('devStage')) $('devStage').classList.toggle('fs'); };
-if ($('devFireLiveBtn')) $('devFireLiveBtn').onclick = () => fireShow('ryder_walkin');
-let activeRyTextarea = null;
-['devRyIntroTxt', 'devRyOvTxt'].forEach(tid => {
-  const ta = $(tid);
-  if (ta) ta.addEventListener('focus', () => { activeRyTextarea = ta; });
+if ($('devFireLiveBtn')) $('devFireLiveBtn').onclick = async () => {
+  if ($('shOut_ryder_walkin')) $('shOut_ryder_walkin').textContent = 'Firing live…';
+  try {
+    const r = await fetch('/api/shows/ryder_walkin/fire', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ excludeMainTv: Boolean($('devRyExcludeMainTv') && $('devRyExcludeMainTv').checked) }),
+    }).then(x => x.json());
+    if ($('shOut_ryder_walkin')) $('shOut_ryder_walkin').textContent = r.ok ? `🔥 Fired (${r.showName || 'Ryder'})` : `✗ ${r.error || 'Failed'}`;
+    await pollStatus();
+  } catch {
+    if ($('shOut_ryder_walkin')) $('shOut_ryder_walkin').textContent = '✗ Fire failed';
+  }
+};
+if ($('devRyExcludeMainTv')) $('devRyExcludeMainTv').onchange = async () => {
+  const checked = Boolean($('devRyExcludeMainTv').checked);
+  if (devRyderSpec) devRyderSpec.excludeMainTv = checked;
+  try {
+    await fetch('/api/shows/ryder_walkin/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ excludeMainTv: checked, rebuild: false }),
+    });
+    if ($('shOut_ryder_walkin')) $('shOut_ryder_walkin').textContent = checked ? '✓ Main TV excluded (coding mode)' : '✓ Main TV included';
+  } catch {}
+};
+
+document.querySelectorAll('#devRyderBox [data-scrub]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const vid = $('devRyVideo');
+    if (!vid) return;
+    if (!vid.getAttribute('src') && devRyderSpec && devRyderSpec.showVideoReady) {
+      vid.src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+    }
+    try { vid.pause(); } catch {}
+    const delta = Number(btn.getAttribute('data-scrub') || 0);
+    const maxD = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 9999;
+    try { vid.currentTime = Math.max(0, Math.min(maxD, (vid.currentTime || 0) + delta)); } catch {}
+    updateRyScrubAndFlash();
+  });
 });
+if ($('devScrubPlayBtn')) $('devScrubPlayBtn').onclick = () => {
+  const vid = $('devRyVideo');
+  if (!vid) return;
+  initRyderScrubber();
+  if (!vid.getAttribute('src') && devRyderSpec && devRyderSpec.showVideoReady) {
+    vid.src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  }
+  if (vid.paused) vid.play().catch(() => {});
+  else vid.pause();
+};
+
+let activeRyTextarea = null;
+if ($('devRyderBox')) {
+  $('devRyderBox').addEventListener('focusin', (ev) => {
+    if (ev.target && ev.target.tagName === 'TEXTAREA') activeRyTextarea = ev.target;
+  });
+}
 if ($('devRyTagBar')) $('devRyTagBar').addEventListener('click', (ev) => {
   const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-tag],button[data-wrap]') : null;
   if (!btn) return;
@@ -8645,19 +9131,105 @@ if ($('devRyTagBar')) $('devRyTagBar').addEventListener('click', (ev) => {
   ta.focus();
   ta.selectionStart = ta.selectionEnd = s0 + ins.length;
 });
+if ($('devRyAddSpeechBtn')) $('devRyAddSpeechBtn').onclick = () => addRySpeechRow(null);
+if ($('devRyAddFxBtn')) $('devRyAddFxBtn').onclick = () => addRyFxRow(null);
+
+function jumpVideoToCue(target, atVal) {
+  const vid = $('devRyVideo');
+  if (!vid) return;
+  initRyderScrubber();
+  if (!vid.getAttribute('src') && devRyderSpec && devRyderSpec.showVideoReady) {
+    vid.src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  }
+  const atSec = parseTimeSec(atVal);
+  const absT = target === 'intro' ? atSec : (getRyIntroSec() + atSec);
+  const seekT = Math.max(0, absT - 2.0);
+  try { vid.currentTime = seekT; } catch {}
+  vid.play().catch(() => {});
+}
+
+if ($('devRySpeechList')) {
+  $('devRySpeechList').addEventListener('click', (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (!btn) return;
+    const row = btn.closest('.ry-sp-row');
+    if (!row) return;
+    if (btn.classList.contains('ry-sp-del')) {
+      row.remove();
+      return;
+    }
+    if (btn.classList.contains('ry-sp-stamp')) {
+      const vid = $('devRyVideo');
+      const t = (vid && Number.isFinite(vid.currentTime)) ? vid.currentTime : 0;
+      const introSec = getRyIntroSec();
+      if (t < introSec) {
+        row.querySelector('.ry-sp-target').value = 'intro';
+        row.querySelector('.ry-sp-at').value = fmtTimeSec(t);
+      } else {
+        row.querySelector('.ry-sp-target').value = 'video';
+        row.querySelector('.ry-sp-at').value = fmtTimeSec(t - introSec);
+      }
+      return;
+    }
+    if (btn.classList.contains('ry-sp-jump')) {
+      jumpVideoToCue(row.querySelector('.ry-sp-target').value, row.querySelector('.ry-sp-at').value);
+      return;
+    }
+    if (btn.classList.contains('ry-sp-test')) {
+      const tgt = row.querySelector('.ry-sp-target').value;
+      const txt = row.querySelector('.ry-sp-txt').value.trim();
+      const vOver = row.querySelector('.ry-sp-voice').value || '';
+      auditionRyderVoice(tgt === 'intro' ? 'intro' : 'overlay', { text: txt, voice: vOver, btn, playerId: 'shOvAudio_ryder_walkin' });
+    }
+  });
+}
+
+if ($('devRyFxCueList')) {
+  $('devRyFxCueList').addEventListener('click', (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('button') : null;
+    if (!btn) return;
+    const row = btn.closest('.ry-fx-row');
+    if (!row) return;
+    if (btn.classList.contains('ry-fx-del')) {
+      row.remove();
+      return;
+    }
+    if (btn.classList.contains('ry-fx-stamp')) {
+      const vid = $('devRyVideo');
+      const t = (vid && Number.isFinite(vid.currentTime)) ? vid.currentTime : 0;
+      const introSec = getRyIntroSec();
+      if (t < introSec) {
+        row.querySelector('.ry-fx-target').value = 'intro';
+        row.querySelector('.ry-fx-at').value = fmtTimeSec(t);
+      } else {
+        row.querySelector('.ry-fx-target').value = 'video';
+        row.querySelector('.ry-fx-at').value = fmtTimeSec(t - introSec);
+      }
+      return;
+    }
+    if (btn.classList.contains('ry-fx-jump')) {
+      jumpVideoToCue(row.querySelector('.ry-fx-target').value, row.querySelector('.ry-fx-at').value);
+    }
+  });
+}
+
 const ryAuditionBlobUrls = { intro: null, overlay: null };
-async function auditionRyderVoice(slot) {
+async function auditionRyderVoice(slot, opts) {
+  const cfg = opts || {};
   const isOv = slot === 'overlay';
-  const btn = $(isOv ? 'devRyTestOvBtn' : 'devRyTestIntroBtn');
-  const txtEl = $(isOv ? 'devRyOvTxt' : 'devRyIntroTxt');
-  const audioEl = $(isOv ? 'shOvAudio_ryder_walkin' : 'shAudio_ryder_walkin');
+  const btn = cfg.btn || $(isOv ? 'devRyTestOvBtn' : 'devRyTestIntroBtn');
+  const firstRow = document.querySelector('#devRySpeechList .ry-sp-row');
+  const defaultTxt = isOv ? (firstRow ? firstRow.querySelector('.ry-sp-txt').value.trim() : '') : (($('devRyIntroTxt') && $('devRyIntroTxt').value.trim()) || '');
+  const text = cfg.text !== undefined ? String(cfg.text).trim() : defaultTxt;
+  const audioEl = $(cfg.playerId || (isOv ? 'shOvAudio_ryder_walkin' : 'shAudio_ryder_walkin'));
   const outEl = $('shOut_ryder_walkin');
-  const text = (txtEl && txtEl.value.trim()) || '';
   if (!text) {
-    if (outEl) outEl.textContent = `✗ Enter ${isOv ? '1:20 overlay' : 'intro'} text first`;
+    if (outEl) outEl.textContent = `✗ Enter ${isOv ? 'speech box' : 'intro'} text first`;
     return;
   }
-  const withFx = !isOv && Boolean($('devRyTestFxChk') && $('devRyTestFxChk').checked);
+  const withFx = !isOv && !cfg.text && Boolean($('devRyTestFxChk') && $('devRyTestFxChk').checked);
+  const defaultRowVoice = isOv && firstRow ? (firstRow.querySelector('.ry-sp-voice').value || '') : '';
+  const chosenVoice = (cfg.voice || defaultRowVoice || ($('devRyVoice') && $('devRyVoice').value) || '');
   if (btn) btn.disabled = true;
   if (outEl) outEl.textContent = `Auditioning ${slot} voice (no MP4 rebuild)…`;
   try {
@@ -8667,7 +9239,7 @@ async function auditionRyderVoice(slot) {
       body: JSON.stringify({
         slot,
         text,
-        voice: ($('devRyVoice') && $('devRyVoice').value) || '',
+        voice: chosenVoice,
         voiceStyle: ($('devRyStyle') && $('devRyStyle').value.trim()) || '',
         voiceReverbWet: Number(($('devRyRev') && $('devRyRev').value) || 0.06),
         voiceBoostDb: Number(($('devRyBoost') && $('devRyBoost').value) || 2.0),
@@ -8686,10 +9258,11 @@ async function auditionRyderVoice(slot) {
     const durHdr = resp.headers.get('X-Armory-Duration-Sec') || '?';
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
-    if (ryAuditionBlobUrls[slot]) {
-      try { URL.revokeObjectURL(ryAuditionBlobUrls[slot]); } catch {}
+    const cacheKey = cfg.playerId === 'shOvAudio_ryder_walkin' ? 'overlay' : slot;
+    if (ryAuditionBlobUrls[cacheKey]) {
+      try { URL.revokeObjectURL(ryAuditionBlobUrls[cacheKey]); } catch {}
     }
-    ryAuditionBlobUrls[slot] = url;
+    ryAuditionBlobUrls[cacheKey] = url;
     if (audioEl) {
       audioEl.src = url;
       audioEl.load();
@@ -8704,27 +9277,37 @@ async function auditionRyderVoice(slot) {
 }
 if ($('devRyTestIntroBtn')) $('devRyTestIntroBtn').onclick = () => auditionRyderVoice('intro');
 if ($('devRyTestOvBtn')) $('devRyTestOvBtn').onclick = () => auditionRyderVoice('overlay');
-if ($('devRySaveBtn')) $('devRySaveBtn').onclick = async () => {
+
+async function saveRyderConfig(rebuildFlag) {
   const body = {
+    excludeMainTv: Boolean($('devRyExcludeMainTv') && $('devRyExcludeMainTv').checked),
+    introStartSec: Number(($('devRyIntroStart') && $('devRyIntroStart').value) || 2.3),
     announcerVoice: $('devRyVoice').value,
     voiceReverbWet: Number($('devRyRev').value || 0.06),
     voiceBoostDb: Number($('devRyBoost').value || 2.0),
     fogBurstSec: Number($('devRyFog').value || 30),
-    postOverlayDenonVol: Number($('devRyPostVol').value || 55),
     voiceStyle: ($('devRyStyle') && $('devRyStyle').value.trim()) || '',
     announcerText: $('devRyIntroTxt').value.trim(),
-    overlayText: $('devRyOvTxt').value.trim(),
+    speechCues: collectRySpeechCues(),
+    fxCues: collectRyFxCues(),
+    rebuild: Boolean(rebuildFlag),
   };
-  $('shOut_ryder_walkin').textContent = 'Synthesizing voice & updating Show MP4…';
+  $('shOut_ryder_walkin').textContent = rebuildFlag ? 'Synthesizing voices & updating Show MP4…' : 'Saving timings & FX (no MP4 rebuild)…';
   try {
-    const r = await fetch('/api/shows/ryder_walkin/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    const r = await fetch('/api/shows/ryder_walkin/config', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    }).then(x => x.json());
     if (r.status) renderShows(r.status);
-    $('shOut_ryder_walkin').textContent = r.ok ? `✓ Rebuilt Show MP4` : `✗ ${r.error || 'Failed'}`;
-    if (r.ok && $('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+    $('shOut_ryder_walkin').textContent = r.ok ? (rebuildFlag ? '✓ Rebuilt Show MP4' : '✓ Saved timings & FX (MP4 untouched)') : `✗ ${r.error || 'Failed'}`;
+    if (rebuildFlag && r.ok && $('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
   } catch {
-    $('shOut_ryder_walkin').textContent = '✗ Render failed';
+    $('shOut_ryder_walkin').textContent = '✗ Save failed';
   }
-};
+}
+if ($('devRySaveBtn')) $('devRySaveBtn').onclick = () => saveRyderConfig(true);
+if ($('devRySaveQuickBtn')) $('devRySaveQuickBtn').onclick = () => saveRyderConfig(false);
 if ($('ttsSaveKeysBtn')) $('ttsSaveKeysBtn').onclick = async () => {
   const payload = {
     elevenlabsModel: ($('ttsElModel') && $('ttsElModel').value) || 'eleven_v3',
@@ -9601,8 +10184,9 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         if not isinstance(body, dict):
             return jsonify({"ok": False, "error": "Invalid show payload"}), 400
+        rebuild = bool(body.get("rebuild", True))
         try:
-            res = service.shows.update_show(show_id, body, rebuild=True)
+            res = service.shows.update_show(show_id, body, rebuild=rebuild)
             return jsonify(res)
         except KeyError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
@@ -9659,7 +10243,9 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.post("/api/shows/<show_id>/fire")
     def api_show_fire(show_id: str) -> Response:
-        res = service.shows.fire_show(show_id, async_run=True)
+        body = request.get_json(silent=True)
+        excl = bool(body["excludeMainTv"]) if isinstance(body, dict) and "excludeMainTv" in body else None
+        res = service.shows.fire_show(show_id, async_run=True, exclude_main_tv=excl)
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.post("/api/shows/stop")

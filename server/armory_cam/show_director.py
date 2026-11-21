@@ -360,6 +360,185 @@ class SmartFxConfig:
         return f"http://{host}/rpc/Switch.Set?id=0&on=true&toggle_after={sec_str}"
 
 
+VALID_FX_CUE_TYPES = ("flash", "lights_off", "lights_on", "fog")
+_CUBE_MEDIA_IGNORE_PKGS = frozenset({
+    "com.froriep.armorywallboard",
+    "com.froriep.armoryaudio",
+    "com.android.bluetooth",
+    "com.amazon.vizzini",
+})
+
+
+def _normalize_speech_cues(raw_list: Any) -> list[dict[str, Any]]:
+    """Normalize ordered timed speech cues (`target`: 'intro'|'video', `atSec`, `text`, optional `voice`/`postDenonVol`)."""
+    if not isinstance(raw_list, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(raw_list):
+        if not isinstance(item, dict):
+            continue
+        tgt_raw = str(item.get("target") or "video").strip().lower()
+        target = "intro" if tgt_raw == "intro" else "video"
+        try:
+            at_raw = item.get("atSec", 0.0)
+            at_sec = round(_clamp(float(0.0 if at_raw is None or at_raw == "" else at_raw), 0.0, 300.0), 2)
+        except (TypeError, ValueError):
+            at_sec = 0.0
+        text = str(item.get("text") or "").strip()
+        voice_raw = str(item.get("voice") or "").strip()
+        voice = resolve_voice_id(voice_raw) if voice_raw else ""
+        try:
+            pv_raw = item.get("postDenonVol", 0)
+            pv = int(round(float(0 if pv_raw is None or pv_raw == "" else pv_raw)))
+        except (TypeError, ValueError):
+            pv = 0
+        if pv != 0:
+            pv = max(MIN_SHOW_DENON_VOL, min(MAX_SHOW_DENON_VOL, pv))
+        try:
+            dg_raw = item.get("duckGain", 0.22)
+            dg = round(_clamp(float(0.22 if dg_raw is None or dg_raw == "" else dg_raw), 0.05, 0.85), 2)
+        except (TypeError, ValueError):
+            dg = 0.22
+        raw_id = re.sub(r"[^a-zA-Z0-9_-]+", "", str(item.get("id") or ""))
+        cid = raw_id or f"sc_{idx + 1}"
+        if cid in seen_ids:
+            cid = f"{cid}_{idx + 1}"
+        seen_ids.add(cid)
+        out.append({
+            "id": cid,
+            "target": target,
+            "atSec": at_sec,
+            "text": text,
+            "voice": voice,
+            "postDenonVol": pv,
+            "duckGain": dg,
+        })
+    return out
+
+
+def _normalize_fx_cues(raw_list: Any) -> list[dict[str, Any]]:
+    """Normalize ordered timed lighting/fog FX cues (`flash`, `lights_off`, `lights_on`, `fog`)."""
+    if not isinstance(raw_list, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for idx, item in enumerate(raw_list):
+        if not isinstance(item, dict):
+            continue
+        tgt_raw = str(item.get("target") or "video").strip().lower()
+        target = "intro" if tgt_raw == "intro" else "video"
+        fx_type = str(item.get("type") or "flash").strip().lower()
+        if fx_type not in VALID_FX_CUE_TYPES:
+            fx_type = "flash"
+        try:
+            at_raw = item.get("atSec", 0.0)
+            at_sec = round(_clamp(float(0.0 if at_raw is None or at_raw == "" else at_raw), 0.0, 300.0), 2)
+        except (TypeError, ValueError):
+            at_sec = 0.0
+        try:
+            cnt_raw = item.get("count", 1)
+            cnt = max(1, min(6, int(round(float(1 if cnt_raw is None or cnt_raw == "" else cnt_raw)))))
+        except (TypeError, ValueError):
+            cnt = 1
+        default_dur = 4.0 if fx_type == "fog" else 0.2
+        try:
+            dur_raw = item.get("durationSec", default_dur)
+            dur = round(_clamp(float(default_dur if dur_raw is None or dur_raw == "" else dur_raw), 0.1, 60.0), 2)
+        except (TypeError, ValueError):
+            dur = default_dur
+        raw_id = re.sub(r"[^a-zA-Z0-9_-]+", "", str(item.get("id") or ""))
+        cid = raw_id or f"fx_{idx + 1}"
+        if cid in seen_ids:
+            cid = f"{cid}_{idx + 1}"
+        seen_ids.add(cid)
+        out.append({
+            "id": cid,
+            "target": target,
+            "atSec": at_sec,
+            "type": fx_type,
+            "count": cnt,
+            "durationSec": dur,
+            "screenFlash": bool(item.get("screenFlash", True)),
+        })
+    return out
+
+
+def parse_cube_media_snapshot(raw_output: str) -> dict[str, Any]:
+    """Parse combined `dumpsys media_session` + window focus output from Fire TV Cube."""
+    raw = str(raw_output or "")
+    if "---ARMORY_WIN---" in raw:
+        media_part, win_part = raw.split("---ARMORY_WIN---", 1)
+    else:
+        media_part, win_part = raw, raw
+
+    sessions: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+    for line in media_part.splitlines():
+        if re.match(r"^\s{4}\S+\s+[A-Za-z0-9_.]+/\S+", line):
+            cur = {"package": "", "active": False, "state": None}
+            sessions.append(cur)
+            continue
+        m_pkg = re.search(r"\bpackage=([A-Za-z0-9_.]+)", line)
+        if m_pkg:
+            pkg = m_pkg.group(1).strip()
+            if cur is None or cur["package"]:
+                cur = {"package": pkg, "active": False, "state": None}
+                sessions.append(cur)
+            else:
+                cur["package"] = pkg
+            continue
+        if cur is None:
+            continue
+        m_act = re.search(r"\bactive=(true|false)\b", line, re.I)
+        if m_act:
+            cur["active"] = m_act.group(1).lower() == "true"
+        m_st = re.search(r"PlaybackState\s*\{[^}]*\bstate=(\d+)", line)
+        if m_st:
+            cur["state"] = int(m_st.group(1))
+
+    non_ignored = [s for s in sessions if s.get("package") and s["package"] not in _CUBE_MEDIA_IGNORE_PKGS]
+    was_playing = False
+    media_pkg = ""
+    media_state = 0
+    for s in non_ignored:
+        st_val = s.get("state")
+        if s.get("active") and st_val in (3, 6):
+            was_playing = True
+            media_pkg = str(s["package"])
+            media_state = int(st_val)
+            break
+    if not was_playing and non_ignored:
+        first_s = non_ignored[0]
+        media_pkg = str(first_s.get("package") or "")
+        media_state = 2 if first_s.get("state") == 2 else 0
+
+    focused_component = ""
+    focused_package = ""
+    focus_lines = [ln for ln in win_part.splitlines() if "mCurrentFocus" in ln or "mFocusedApp" in ln]
+    if not focus_lines:
+        focus_lines = win_part.splitlines()
+    for ln in focus_lines:
+        for m_cmp in re.finditer(r"([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)", ln):
+            comp = m_cmp.group(1)
+            pkg = comp.split("/", 1)[0]
+            if pkg in _CUBE_MEDIA_IGNORE_PKGS:
+                continue
+            focused_component = comp
+            focused_package = pkg
+            break
+        if focused_component:
+            break
+
+    return {
+        "wasPlaying": was_playing,
+        "mediaPackage": media_pkg,
+        "mediaState": media_state,
+        "focusedComponent": focused_component,
+        "focusedPackage": focused_package,
+    }
+
+
 @dataclass
 class ShowSpec:
     """Declarative specification for one Armory Walk-In or PR Drop-In show cue."""
@@ -407,6 +586,24 @@ class ShowSpec:
     voice_style: str = ""
     custom_intro_voice_file: str = ""
     custom_overlay_voice_file: str = ""
+    intro_start_sec: float = 2.3
+    exclude_main_tv: bool = False
+    speech_cues: list[dict[str, Any]] = field(default_factory=list)
+    fx_cues: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.speech_cues and self.overlay_text and float(self.overlay_at_sec or 0.0) > 0.0:
+            self.speech_cues = [
+                {
+                    "id": "sc_1",
+                    "target": "video",
+                    "atSec": round(float(self.overlay_at_sec), 2),
+                    "text": str(self.overlay_text).strip(),
+                    "voice": "",
+                    "postDenonVol": int(self.post_overlay_denon_vol or 0),
+                    "duckGain": 0.22,
+                }
+            ]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -453,6 +650,10 @@ class ShowSpec:
             "voiceStyle": self.voice_style,
             "customIntroVoiceFile": self.custom_intro_voice_file,
             "customOverlayVoiceFile": self.custom_overlay_voice_file,
+            "introStartSec": round(float(self.intro_start_sec), 2),
+            "excludeMainTv": bool(self.exclude_main_tv),
+            "speechCues": list(self.speech_cues),
+            "fxCues": list(self.fx_cues),
         }
 
     @classmethod
@@ -497,9 +698,43 @@ class ShowSpec:
         vid_valid = validate_video_filename(str(raw.get("videoSourceFile", "") or "")) or ""
         ci_valid = validate_song_filename(str(raw.get("customIntroVoiceFile", "") or "")) or ""
         co_valid = validate_song_filename(str(raw.get("customOverlayVoiceFile", "") or "")) or ""
+        ov_at = _clamp(_f("overlayAtSec", 0.0), 0.0, 300.0)
+        ov_txt = str(raw.get("overlayText", "") or "").strip()
         post_vol = _i("postOverlayDenonVol", 0)
         if post_vol != 0:
             post_vol = max(MIN_SHOW_DENON_VOL, min(MAX_SHOW_DENON_VOL, post_vol))
+
+        if "speechCues" in raw:
+            speech_cues = _normalize_speech_cues(raw.get("speechCues"))
+            first_vid = next(
+                (c for c in speech_cues if c.get("target") == "video" and c.get("text")),
+                None,
+            )
+            if first_vid is not None:
+                ov_txt = str(first_vid["text"])
+                ov_at = float(first_vid["atSec"])
+                post_vol = int(first_vid.get("postDenonVol") or 0)
+            else:
+                ov_txt = ""
+                ov_at = 0.0
+                post_vol = 0
+        else:
+            speech_cues = []
+            if ov_txt and ov_at > 0.0:
+                speech_cues = [
+                    {
+                        "id": "sc_1",
+                        "target": "video",
+                        "atSec": round(ov_at, 2),
+                        "text": ov_txt,
+                        "voice": "",
+                        "postDenonVol": post_vol,
+                        "duckGain": 0.22,
+                    }
+                ]
+
+        fx_cues = _normalize_fx_cues(raw.get("fxCues") or [])
+
         return cls(
             id=sid,
             name=str(raw.get("name") or sid).strip(),
@@ -536,14 +771,18 @@ class ShowSpec:
             lights_pulse_duration_sec=_clamp(_f("lightsPulseDurationSec", 0.0), 0.0, 120.0),
             lights_pulse_interval_sec=_clamp(_f("lightsPulseIntervalSec", 2.0), 0.5, 15.0),
             lights_pulse_on_sec=_clamp(_f("lightsPulseOnSec", 0.25), 0.1, 2.0),
-            overlay_at_sec=_clamp(_f("overlayAtSec", 0.0), 0.0, 300.0),
-            overlay_text=str(raw.get("overlayText", "") or "").strip(),
+            overlay_at_sec=ov_at,
+            overlay_text=ov_txt,
             post_overlay_denon_vol=post_vol,
             voice_reverb_wet=_clamp(_f("voiceReverbWet", 0.06), 0.0, 0.30),
             voice_boost_db=_clamp(_f("voiceBoostDb", 2.0), -4.0, 6.0),
             voice_style=str(raw.get("voiceStyle", "") or "").strip(),
             custom_intro_voice_file=ci_valid,
             custom_overlay_voice_file=co_valid,
+            intro_start_sec=_clamp(_f("introStartSec", 2.3), 0.0, 15.0),
+            exclude_main_tv=bool(raw.get("excludeMainTv", False)),
+            speech_cues=speech_cues,
+            fx_cues=fx_cues,
         )
 
 
@@ -2706,6 +2945,7 @@ class ShowDirector:
                     "showVideoDurationSec": float(meta.get("totalDurationSec") or 0.0),
                     "introDurationSec": float(meta.get("introDurationSec") or dur),
                     "hasSourceVideo": bool(meta.get("hasSourceVideo", False)),
+                    "speechCueTimings": list(meta.get("speechCueTimings") or []),
                     "videoUploaded": bool(
                         spec.video_source_file and (self.sources_dir / spec.video_source_file).is_file()
                     ),
@@ -2782,6 +3022,10 @@ class ShowDirector:
                     for line in re.split(r"[\r\n,]+", patch["triggersText"])
                     if line.strip()
                 ]
+            if patch and "speechCues" not in patch and any(
+                k in patch for k in ("overlayText", "overlayAtSec", "postOverlayDenonVol")
+            ):
+                merged.pop("speechCues", None)
             updated = ShowSpec.from_dict(merged)
             self.shows[sid] = updated
             self._save_locked()
@@ -2925,13 +3169,15 @@ class ShowDirector:
             has_src_vid = bool(src_vid and src_vid.is_file() and src_vid.stat().st_size > 1000)
 
             sig_parts = [
-                f"v1",
+                "v2",
                 f"p={p_wav.stat().st_size}:{int(p_wav.stat().st_mtime_ns)}" if p_wav.is_file() else "p=0",
                 f"o={o_wav.stat().st_size}:{int(o_wav.stat().st_mtime_ns)}" if o_wav.is_file() else "o=0",
                 f"vid={src_vid.name}:{src_vid.stat().st_size}:{int(src_vid.stat().st_mtime_ns)}" if has_src_vid else "vid=none",
                 f"l={spec.lightning_flash_sec:.2f}",
+                f"is={spec.intro_start_sec:.2f}",
                 f"fc={spec.lights_flash_count}",
                 f"ov={spec.overlay_at_sec:.2f}:{spec.overlay_text}",
+                f"sc={json.dumps(spec.speech_cues, sort_keys=True)}",
             ]
             sig = hashlib.sha1("|".join(sig_parts).encode("utf-8")).hexdigest()[:16]
 
@@ -2976,6 +3222,7 @@ class ShowDirector:
 
                 src_dur = 0.0
                 overlay_dur = 0.0
+                speech_cue_timings: list[dict[str, Any]] = []
                 if has_src_vid and src_vid is not None:
                     # Decode entrance video's audio track cleanly to 48 kHz stereo PCM
                     ext_proc = subprocess.run(
@@ -3020,22 +3267,59 @@ class ShowDirector:
                         scale = min(0.22 / cur_rms, 0.88 / cur_peak)
                         ent_pcm = np.tanh(ent_pcm * scale * 1.05).astype(np.float32) * 0.92
 
-                    # Bake sample-accurate 1:20 duck + personal overlay voice directly into entrance track
-                    if spec.overlay_text and spec.overlay_at_sec > 0.0 and o_wav.is_file() and src_dur > (spec.overlay_at_sec + 0.5):
-                        ov_44k = read_wav_stereo_float(o_wav, target_sr=SHOW_SR)
-                        ov_48k = resample_stereo_pcm(ov_44k, SHOW_SR, STAGE_VIDEO_SR)
-                        overlay_dur = round(float(ov_48k.shape[0]) / float(STAGE_VIDEO_SR), 2)
-                        ent_pcm = apply_timed_duck_stereo(
-                            ent_pcm,
-                            sr=STAGE_VIDEO_SR,
-                            duck_start_sec=float(spec.overlay_at_sec),
-                            duck_hold_sec=max(0.4, overlay_dur),
-                            duck_gain=0.22,
-                            attack_sec=0.25,
-                            release_sec=0.45,
-                        )
-                        ov_off = int(round(float(spec.overlay_at_sec) * STAGE_VIDEO_SR))
-                        mix_into(ent_pcm, ov_48k, ov_off, gain=1.0)
+                    # Bake all timed video speech cues (duck soundtrack + mix voice cleanly at exact timestamps)
+                    vid_cues = sorted(
+                        (c for c in spec.speech_cues if c.get("target") == "video" and c.get("text")),
+                        key=lambda c: float(c.get("atSec") or 0.0),
+                    )
+                    mixed_any_vid_cue = False
+                    for v_idx, cue in enumerate(vid_cues):
+                        if v_idx == 0 and spec.custom_overlay_voice_file:
+                            v_pcm_44k = self._get_announcer_stem(
+                                spec,
+                                suffix="overlay",
+                                text_override=cue["text"],
+                                reverb_override=min(spec.voice_reverb_wet, 0.03),
+                                voice_override=str(cue.get("voice") or ""),
+                            )
+                        else:
+                            v_pcm_44k = self._get_announcer_stem(
+                                spec,
+                                suffix=f"vcue_{v_idx}",
+                                text_override=cue["text"],
+                                reverb_override=min(spec.voice_reverb_wet, 0.03),
+                                voice_override=str(cue.get("voice") or ""),
+                            )
+                        if v_pcm_44k is None or v_pcm_44k.shape[0] == 0:
+                            continue
+                        ov_48k = resample_stereo_pcm(v_pcm_44k, SHOW_SR, STAGE_VIDEO_SR)
+                        cue_dur = round(float(ov_48k.shape[0]) / float(STAGE_VIDEO_SR), 2)
+                        if v_idx == 0:
+                            overlay_dur = cue_dur
+                        cue_at = float(cue.get("atSec") or 0.0)
+                        if src_dur > (cue_at + 0.25):
+                            ent_pcm = apply_timed_duck_stereo(
+                                ent_pcm,
+                                sr=STAGE_VIDEO_SR,
+                                duck_start_sec=cue_at,
+                                duck_hold_sec=max(0.4, cue_dur),
+                                duck_gain=float(cue.get("duckGain") or 0.22),
+                                attack_sec=0.25,
+                                release_sec=0.45,
+                            )
+                            ov_off = int(round(cue_at * STAGE_VIDEO_SR))
+                            mix_into(ent_pcm, ov_48k, ov_off, gain=1.0)
+                            mixed_any_vid_cue = True
+                            speech_cue_timings.append({
+                                "id": str(cue.get("id") or f"sc_{v_idx + 1}"),
+                                "target": "video",
+                                "atSec": round(cue_at, 2),
+                                "showAtSec": round(intro_video_dur + cue_at, 2),
+                                "durSec": cue_dur,
+                                "text": str(cue["text"]),
+                                "postDenonVol": int(cue.get("postDenonVol") or 0),
+                            })
+                    if mixed_any_vid_cue:
                         pk_ent = float(np.max(np.abs(ent_pcm)))
                         if pk_ent > 0.94:
                             ent_pcm = ent_pcm * (0.92 / pk_ent)
@@ -3260,6 +3544,7 @@ class ShowDirector:
                     "totalDurationSec": total_dur,
                     "overlayDurationSec": overlay_dur,
                     "hasSourceVideo": has_src_vid,
+                    "speechCueTimings": speech_cue_timings,
                     "builtAt": _utc_iso_now(),
                 }
                 tmp_meta = meta_path.with_name(f"{meta_path.stem}.tmp{meta_path.suffix}")
@@ -3289,10 +3574,14 @@ class ShowDirector:
         suffix: str = "announcer",
         text_override: str | None = None,
         reverb_override: float | None = None,
+        voice_override: str = "",
     ) -> np.ndarray | None:
-        custom_name = (
-            spec.custom_overlay_voice_file if suffix == "overlay" else spec.custom_intro_voice_file
-        )
+        custom_name = ""
+        if not voice_override:
+            if suffix == "overlay":
+                custom_name = spec.custom_overlay_voice_file
+            elif suffix == "announcer":
+                custom_name = spec.custom_intro_voice_file
         if custom_name:
             c_path = self.sources_dir / custom_name
             if c_path.is_file() and c_path.stat().st_size > 100:
@@ -3314,7 +3603,7 @@ class ShowDirector:
         txt = str(text_override if text_override is not None else spec.announcer_text).strip()
         if not txt:
             return None
-        voice_id = resolve_voice_id(spec.announcer_voice)
+        voice_id = resolve_voice_id(voice_override or spec.announcer_voice)
         reverb = spec.voice_reverb_wet if reverb_override is None else float(reverb_override)
         sec = self.load_tts_secrets()
         el_model = str(sec.get("elevenlabsModel") or DEFAULT_ELEVENLABS_MODEL)
@@ -3369,12 +3658,26 @@ class ShowDirector:
         *,
         lightning_flash_sec: float = 0.75,
         add_cheer: bool = True,
+        intro_start_sec: float = 2.3,
+        extra_intro_cues: Sequence[tuple[float, np.ndarray]] = (),
     ) -> np.ndarray:
-        """Mix announcer speech over ducked thunder rumble, crack, and stadium crowd cheer."""
-        pre_thunder_n = int(round(2.3 * SHOW_SR))
+        """Mix main + extra intro speech over ducked thunder rumble, crack, and stadium crowd cheer."""
+        pre_thunder_n = int(round(max(0.0, float(intro_start_sec)) * SHOW_SR))
         post_tail_n = int(round(1.6 * SHOW_SR))
-        total_n = pre_thunder_n + ann_pcm.shape[0] + post_tail_n
+        max_speech_end = pre_thunder_n + ann_pcm.shape[0]
+        extra_offsets: list[tuple[int, np.ndarray]] = []
+        for at_s, cue_pcm in extra_intro_cues:
+            if cue_pcm is not None and cue_pcm.shape[0] > 0:
+                off = max(0, int(round(float(at_s) * SHOW_SR)))
+                extra_offsets.append((off, cue_pcm))
+                max_speech_end = max(max_speech_end, off + cue_pcm.shape[0])
+        total_n = max(int(round(3.0 * SHOW_SR)), max_speech_end + post_tail_n)
         total_sec = float(total_n) / float(SHOW_SR)
+        speech_bus = np.zeros((total_n, 2), dtype=np.float32)
+        mix_into(speech_bus, ann_pcm, pre_thunder_n, gain=1.0)
+        for off, cue_pcm in extra_offsets:
+            mix_into(speech_bus, cue_pcm, off, gain=1.0)
+
         crack_sec = lightning_flash_sec or 0.75
         thunder_raw = load_studio_fx_stereo(
             self.fx_dir,
@@ -3405,15 +3708,18 @@ class ShowDirector:
             mix_into(thunder_raw, crack_pcm, crack_off, gain=0.82)
         bed = duck_bed_under_speech(
             thunder_raw,
-            ann_pcm,
-            pre_thunder_n,
+            speech_bus,
+            0,
             sr=SHOW_SR,
             duck_gain=0.14,
             base_gain=0.88,
         )
         if add_cheer:
             cheer_full = np.zeros((total_n, 2), dtype=np.float32)
-            c_start = pre_thunder_n + int(ann_pcm.shape[0] * 0.52)
+            c_start = min(
+                max(0, pre_thunder_n + int(ann_pcm.shape[0] * 0.52)),
+                max(0, total_n - int(1.5 * SHOW_SR)),
+            )
             c_len = max(1.5, float(total_n - c_start) / float(SHOW_SR))
             cheer = load_studio_fx_stereo(
                 self.fx_dir,
@@ -3429,14 +3735,14 @@ class ShowDirector:
             mix_into(cheer_full, cheer, c_start, gain=0.82)
             bed += duck_bed_under_speech(
                 cheer_full,
-                ann_pcm,
-                pre_thunder_n,
+                speech_bus,
+                0,
                 sr=SHOW_SR,
                 duck_gain=0.16,
                 base_gain=0.92,
             )
         mix = bed
-        mix_into(mix, ann_pcm, pre_thunder_n, gain=1.0)
+        mix_into(mix, speech_bus, 0, gain=1.0)
         mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(1.25, float(post_tail_n) / SHOW_SR))
         # Soft true-peak protection after mixing thunder+crowd+speech
         pk_mix = float(np.max(np.abs(mix)))
@@ -3575,10 +3881,23 @@ class ShowDirector:
             ann_pcm = self._get_announcer_stem(spec, suffix="announcer")
             if ann_pcm is None:
                 ann_pcm = np.zeros((int(2.0 * SHOW_SR), 2), dtype=np.float32)
+            extra_intro: list[tuple[float, np.ndarray]] = []
+            for idx_ic, ic in enumerate(spec.speech_cues):
+                if ic.get("target") == "intro" and ic.get("text"):
+                    ic_pcm = self._get_announcer_stem(
+                        spec,
+                        suffix=f"icue_{idx_ic}",
+                        text_override=str(ic["text"]),
+                        voice_override=str(ic.get("voice") or ""),
+                    )
+                    if ic_pcm is not None and ic_pcm.shape[0] > 0:
+                        extra_intro.append((float(ic.get("atSec") or 0.0), ic_pcm))
             mix = self._mix_debut_intro_stereo(
                 ann_pcm,
                 lightning_flash_sec=spec.lightning_flash_sec or 0.75,
                 add_cheer=spec.add_cheer,
+                intro_start_sec=spec.intro_start_sec,
+                extra_intro_cues=extra_intro,
             )
 
         else:  # "walkin": announcer intro -> tight crossfade into walk-in song
@@ -3647,14 +3966,32 @@ class ShowDirector:
 
     # ---------- Voice Matching ----------
 
-    def match_voice_command(self, transcript: str, wake_word: str = "armory") -> dict[str, Any] | None:
-        """Match spoken show triggers (`Matt just hit a PR`, `Matt just got here`, `stop show`, etc.)."""
+    def match_voice_command(
+        self,
+        transcript: str,
+        wake_word: str = "armory",
+        *,
+        workout_active: bool = False,
+    ) -> dict[str, Any] | None:
+        """Match spoken show triggers (`Matt just hit a PR`, `stop show`, bare `stop`/`enough`/`end`/`cancel`, etc.)."""
         cmd = _strip_optional_wake(transcript, wake_word=wake_word)
         if not cmd:
             return None
 
-        if re.search(r"\b(?:stop|kill|cancel|abort)\s+(?:the\s+)?(?:show|walk\s*in|drop\s*in|entrance)\b", cmd):
+        if re.search(
+            r"\b(?:stop|kill|cancel|abort|end|enough)\s+(?:the\s+)?(?:show|walk\s*in|drop\s*in|entrance|sim|simulation|intro)\b",
+            cmd,
+        ):
             return {"action": "stop"}
+
+        if re.match(r"^(?:stop|enough|end|abort|kill)(?:\s+(?:it|that|now|please|everything|all))?$", cmd):
+            return {"action": "stop"}
+
+        if re.match(r"^cancel(?:\s+(?:it|that|now|please))?$", cmd):
+            with self._lock:
+                show_active = bool(self._active_state.get("active"))
+            if show_active or not workout_active:
+                return {"action": "stop"}
 
         best: tuple[int, ShowSpec] | None = None
         with self._lock:
@@ -3786,7 +4123,7 @@ class ShowDirector:
 
     # ---------- 3-Screen Synchronized YouTube Launch ----------
 
-    def _launch_three_screen_youtube(self, youtube_url: str) -> dict[str, Any]:
+    def _launch_three_screen_youtube(self, youtube_url: str, *, exclude_main_tv: bool = False) -> dict[str, Any]:
         url = normalize_youtube_tv_url(youtube_url)
         if not url:
             return {"ok": False, "error": "Empty YouTube URL"}
@@ -3802,10 +4139,13 @@ class ShowDirector:
                 results["avrMonitor"] = self.displays.set_denon_monitor_out("AUTO")
             except Exception as exc:
                 results["avrMonitor"] = {"ok": False, "error": str(exc)}
-            try:
-                results["tv"] = self.displays._control_primary("hdmi2")
-            except Exception as exc:
-                results["tv"] = {"ok": False, "error": str(exc)}
+            if exclude_main_tv:
+                results["tv"] = {"ok": True, "skipped": True, "excluded": True}
+            else:
+                try:
+                    results["tv"] = self.displays._control_primary("hdmi2")
+                except Exception as exc:
+                    results["tv"] = {"ok": False, "error": str(exc)}
             try:
                 if self.displays.get_config().spin.host:
                     results["spin"] = self.displays._control_spin("on")
@@ -3889,6 +4229,8 @@ class ShowDirector:
         mp4_path: Path,
         meta: dict[str, Any],
         fx: SmartFxConfig,
+        *,
+        exclude_main_tv: bool = False,
     ) -> dict[str, Any]:
         """Run unified local 1080p MP4 show across Cube + Hisense + SmartSpin + Wallboard with T=0 pre-staging."""
         prev_db = -35.0
@@ -3898,6 +4240,7 @@ class ShowDirector:
         denon_restored = False
         cube_ser = ""
         cube_stage_launched = False
+        prev_media: dict[str, Any] = {}
         out_res: dict[str, Any] = {"ok": True, "showId": spec.id, "multimedia": True}
 
         intro_dur = float(meta.get("introDurationSec") or 0.0)
@@ -3912,6 +4255,17 @@ class ShowDirector:
             o_wav = self.overlay_wav_path(spec.id)
             overlay_dur = wav_duration_sec(o_wav) if o_wav.is_file() else 4.0
 
+        flash_events: list[dict[str, Any]] = []
+        for fc in spec.fx_cues:
+            if fc.get("type") == "flash" and fc.get("screenFlash", True):
+                base_t = float(fc.get("atSec") or 0.0)
+                show_t = base_t if fc.get("target") == "intro" else (intro_dur + base_t)
+                flash_events.append({
+                    "atSec": round(show_t, 2),
+                    "durSec": float(fc.get("durationSec") or 0.2),
+                    "count": int(fc.get("count") or 1),
+                })
+
         try:
             # 1. Snapshot Denon AVR baseline BEFORE raising volume or changing inputs
             if self.house_audio is not None:
@@ -3925,7 +4279,7 @@ class ShowDirector:
                 self._active_state["phase"] = "prestage_displays"
             self._emit_cue(
                 "prestage",
-                "(PRE-STAGING ALL 3 TVS + DENON + FOG)",
+                "(PRE-STAGING SCREENS + DENON + FOG)" if exclude_main_tv else "(PRE-STAGING ALL 3 TVS + DENON + FOG)",
                 show_id=spec.id,
                 duration_ms=3000,
             )
@@ -3963,9 +4317,10 @@ class ShowDirector:
                 videoUrl=video_url,
                 introDurationSec=round(intro_dur, 2),
                 totalDurationSec=round(total_dur, 2),
+                flashEvents=flash_events,
             )
 
-            # 4. Pre-stage all hardware targets IN PARALLEL (Denon + Hisense + SmartSpin + Cube + Wallboard)
+            # 4. Pre-stage hardware targets IN PARALLEL (Denon + Hisense [unless excluded] + SmartSpin + Cube + Wallboard)
             wb_cfg = self._wallboard_cfg_fn() if self._wallboard_cfg_fn is not None else None
             wb_host = str(getattr(wb_cfg, "fire_tv_host", "") or "").strip() if wb_cfg else ""
             wb_port = int(getattr(wb_cfg, "adb_port", 5555) or 5555) if wb_cfg else 5555
@@ -4000,6 +4355,8 @@ class ShowDirector:
                 return res_d
 
             def _prep_hisense() -> dict[str, Any]:
+                if exclude_main_tv:
+                    return {"ok": True, "skipped": True, "excluded": True, "switched": False}
                 if self.displays is None:
                     return {"ok": False, "skipped": True}
                 if hasattr(self.displays, "ensure_primary_hdmi_ready"):
@@ -4022,6 +4379,27 @@ class ShowDirector:
                 if st != "device":
                     return {"ok": False, "state": st, "error": detail}
                 try:
+                    snap_info: dict[str, Any] = {
+                        "wasPlaying": False,
+                        "mediaPackage": "",
+                        "mediaState": 0,
+                        "focusedComponent": "",
+                        "focusedPackage": "",
+                    }
+                    try:
+                        rc_snap, snap_out, _ = self.adb._run(
+                            [
+                                "-s",
+                                cube_ser,
+                                "shell",
+                                "dumpsys media_session; echo ---ARMORY_WIN---; dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'",
+                            ],
+                            timeout=4.5,
+                        )
+                        if rc_snap == 0 and snap_out:
+                            snap_info = parse_cube_media_snapshot(snap_out)
+                    except Exception:
+                        pass
                     self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "224"], timeout=4.0)
                     self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "127"], timeout=4.0)
                     stage_url = f"{base_url}/stage?role=cube&audio=1"
@@ -4030,7 +4408,7 @@ class ShowDirector:
                         "-n com.froriep.armorywallboard/.WallboardActivity"
                     )
                     rc, out, err = self.adb._run(["-s", cube_ser, "shell", cmd], timeout=6.0)
-                    return {"ok": rc == 0, "url": stage_url, "out": (out or err).strip()}
+                    return {"ok": rc == 0, "url": stage_url, "out": (out or err).strip(), "prevMedia": snap_info}
                 finally:
                     if hasattr(self.adb, "disconnect_serial"):
                         try:
@@ -4094,6 +4472,7 @@ class ShowDirector:
             switch_done_mono = time.monotonic()
             out_res["prestage"] = prestage
             cube_stage_launched = bool(prestage.get("cube", {}).get("ok"))
+            prev_media = dict(prestage.get("cube", {}).get("prevMedia") or {})
 
             if cancel_ev.is_set():
                 return {"ok": False, "canceled": True}
@@ -4119,7 +4498,7 @@ class ShowDirector:
                 if rem_settle > 0.0 and self._wait_cancelable(cancel_ev, rem_settle):
                     return {"ok": False, "canceled": True}
 
-            # 6. Ramp Denon to MV70, then fire clock-synced `stage_play` across ALL 3 SCREENS!
+            # 6. Ramp Denon to MV70, then fire clock-synced `stage_play` across stage screens!
             if self.house_audio is not None:
                 self.house_audio.denon._ramp_volume(prev_db, target_db, steps=4, step_ms=35)
                 current_db = target_db
@@ -4137,6 +4516,7 @@ class ShowDirector:
                 startAtMs=start_at_ms,
                 introDurationSec=round(intro_dur, 2),
                 totalDurationSec=round(total_dur, 2),
+                flashEvents=flash_events,
             )
             self._emit_cue(
                 "intro",
@@ -4163,97 +4543,188 @@ class ShowDirector:
                 wait_s = max(0.0, (play_t0 + tgt) - time.monotonic())
                 return self._wait_cancelable(cancel_ev, wait_s)
 
-            # 7. Sync house-light choreography cleanly alongside pre-baked MP4 playback
+            # 7. Unified monotonic sorted timeline (lights, strobes, timed speech overlays, custom FX cues)
+            timeline: list[tuple[float, int, str, dict[str, Any]]] = []
             if spec.lightning_flash_sec > 0.0 and spec.lightning_flash_sec < (intro_dur - 0.8):
-                if _wait_until_show_sec(spec.lightning_flash_sec):
-                    return {"ok": False, "canceled": True}
-                self._flash_lights(
-                    1,
-                    cancel_ev=cancel_ev,
-                    show_id=spec.id,
-                    end_on=False,
-                    on_sec=0.16,
-                    off_sec=0.05,
-                    tag_prefix="FLASH · LIGHTNING",
-                )
-                sim_clock += 0.21
-
+                timeline.append((float(spec.lightning_flash_sec), 10, "lightning", {"on_sec": 0.16, "off_sec": 0.05}))
             if spec.lights_flash_count > 0:
                 strobe_at = max(0.5, intro_dur - 0.92)
-                if _wait_until_show_sec(strobe_at):
-                    return {"ok": False, "canceled": True}
-                self._flash_lights(
-                    spec.lights_flash_count,
-                    cancel_ev=cancel_ev,
-                    show_id=spec.id,
-                    end_on=True,
-                    tag_prefix="FLASH",
-                )
+                timeline.append((strobe_at, 15, "intro_strobe", {"count": spec.lights_flash_count}))
 
-            if _wait_until_show_sec(intro_dur):
-                return {"ok": False, "canceled": True}
-
-            with self._lock:
-                self._active_state["phase"] = "video_screens"
-            self._emit_cue(
-                "screens",
-                f"(ALL 3 SCREENS LIVE · DENON {spec.denon_vol})",
-                show_id=spec.id,
-                duration_ms=4000,
-                denonVol=spec.denon_vol,
-                youtubeUrl=spec.youtube_url,
-            )
+            timeline.append((intro_dur, 20, "video_screens", {}))
 
             if spec.lights_pulse_duration_sec > 0.0:
-                with self._lock:
-                    self._active_state["phase"] = "strobe_video"
-                if self._pulse_lights_loop(spec, cancel_ev):
-                    return {"ok": False, "canceled": True}
-                sim_clock += float(spec.lights_pulse_duration_sec)
-                self._fire_lights_state(
-                    True,
-                    tag="lights_on",
-                    label="(FULL HOUSE LIGHTS ON)",
-                    show_id=spec.id,
-                    duration_ms=2500,
-                )
+                p_dur = float(spec.lights_pulse_duration_sec)
+                p_interval = max(0.5, float(spec.lights_pulse_interval_sec or 2.0))
+                p_on = max(0.1, min(p_interval - 0.1, float(spec.lights_pulse_on_sec or 0.25)))
+                n_pulses = max(1, int(round(p_dur / p_interval)))
+                for idx_p in range(1, n_pulses + 1):
+                    t_p = intro_dur + (idx_p - 1) * p_interval
+                    timeline.append((t_p, 25, "pulse_on", {"index": idx_p, "total": n_pulses, "on_sec": p_on}))
+                    timeline.append((t_p + p_on, 26, "pulse_off", {}))
+                timeline.append((intro_dur + n_pulses * p_interval, 30, "lights_full_on", {}))
             elif spec.lights_out:
-                self._fire_lights_state(
-                    True,
-                    tag="lights_on",
-                    label="(FULL HOUSE LIGHTS ON)",
-                    show_id=spec.id,
-                    duration_ms=2500,
-                )
+                timeline.append((intro_dur, 30, "lights_full_on", {}))
 
-            # 8. Mid-video 1:20 overlay HUD cue + Denon drop (audio overlay is pre-baked cleanly in MP4!)
-            if spec.overlay_text and spec.overlay_at_sec > 0.0 and total_dur > (intro_dur + spec.overlay_at_sec):
-                if _wait_until_show_sec(intro_dur + float(spec.overlay_at_sec)):
+            raw_vid_timings = meta.get("speechCueTimings")
+            if isinstance(raw_vid_timings, list) and raw_vid_timings:
+                active_vid_timings = [dict(x) for x in raw_vid_timings if isinstance(x, dict)]
+            else:
+                active_vid_timings = []
+                for sc in spec.speech_cues:
+                    if sc.get("target") == "video" and sc.get("text"):
+                        active_vid_timings.append({
+                            "id": sc.get("id") or "",
+                            "target": "video",
+                            "atSec": float(sc.get("atSec") or 0.0),
+                            "showAtSec": round(intro_dur + float(sc.get("atSec") or 0.0), 2),
+                            "durSec": float(overlay_dur or 3.5),
+                            "text": str(sc.get("text") or ""),
+                            "postDenonVol": int(sc.get("postDenonVol") or 0),
+                        })
+
+            any_post_denon = False
+            for sc in active_vid_timings:
+                show_at = float(sc.get("showAtSec") or 0.0)
+                dur_s = max(0.5, float(sc.get("durSec") or 3.5))
+                if show_at < total_dur:
+                    timeline.append((show_at, 40, "speech_cue", sc))
+                    p_vol = int(sc.get("postDenonVol") or 0)
+                    if p_vol > 0:
+                        any_post_denon = True
+                        timeline.append((show_at + dur_s, 45, "denon_drop", {"vol": p_vol}))
+
+            for fc in spec.fx_cues:
+                base_t = float(fc.get("atSec") or 0.0)
+                show_t = base_t if fc.get("target") == "intro" else (intro_dur + base_t)
+                if show_t < total_dur:
+                    timeline.append((show_t, 35, "fx_cue", dict(fc)))
+
+            timeline.sort(key=lambda item: (item[0], item[1]))
+
+            for evt_sec, _prio, kind, payload in timeline:
+                if _wait_until_show_sec(evt_sec):
                     return {"ok": False, "canceled": True}
-                with self._lock:
-                    self._active_state["phase"] = "overlay_duck"
-                self._emit_cue(
-                    "overlay",
-                    f"(DUCK + OVERLAY · \"{spec.overlay_text}\")",
-                    show_id=spec.id,
-                    duration_ms=int((overlay_dur + 1.0) * 1000),
-                    caption=spec.overlay_text,
-                )
-                if _wait_until_show_sec(intro_dur + float(spec.overlay_at_sec) + max(0.5, overlay_dur)):
-                    return {"ok": False, "canceled": True}
-                if spec.post_overlay_denon_vol > 0:
-                    post_db = _clamp(float(spec.post_overlay_denon_vol) - 80.0, -50.0, -5.0)
+                if kind == "lightning":
+                    self._flash_lights(
+                        1,
+                        cancel_ev=cancel_ev,
+                        show_id=spec.id,
+                        end_on=False,
+                        on_sec=float(payload.get("on_sec") or 0.16),
+                        off_sec=float(payload.get("off_sec") or 0.05),
+                        tag_prefix="FLASH · LIGHTNING",
+                    )
+                    sim_clock += float(payload.get("on_sec") or 0.16) + float(payload.get("off_sec") or 0.05)
+                elif kind == "intro_strobe":
+                    cnt = int(payload.get("count") or 1)
+                    self._flash_lights(
+                        cnt,
+                        cancel_ev=cancel_ev,
+                        show_id=spec.id,
+                        end_on=True,
+                        tag_prefix="FLASH",
+                    )
+                    sim_clock += cnt * 0.18 + max(0, cnt - 1) * 0.16
+                elif kind == "video_screens":
+                    with self._lock:
+                        self._active_state["phase"] = "strobe_video" if spec.lights_pulse_duration_sec > 0.0 else "video_screens"
+                    self._emit_cue(
+                        "screens",
+                        f"(ALL 3 SCREENS LIVE · DENON {spec.denon_vol})",
+                        show_id=spec.id,
+                        duration_ms=4000,
+                        denonVol=spec.denon_vol,
+                        youtubeUrl=spec.youtube_url,
+                    )
+                elif kind == "pulse_on":
+                    idx_p = int(payload.get("index") or 1)
+                    tot_p = int(payload.get("total") or 1)
+                    on_s = float(payload.get("on_sec") or 0.25)
+                    self._emit_cue(
+                        "pulse",
+                        f"(FLASH {on_s:.2f}s · Pulse {idx_p}/{tot_p})",
+                        show_id=spec.id,
+                        duration_ms=int(on_s * 1000),
+                        pulseIndex=idx_p,
+                        pulseTotal=tot_p,
+                    )
+                    on_u = fx.resolve_lights_url(True)
+                    if on_u:
+                        self._fire_http_hook(on_u)
+                elif kind == "pulse_off":
+                    off_u = fx.resolve_lights_url(False)
+                    if off_u:
+                        self._fire_http_hook(off_u)
+                elif kind == "lights_full_on":
+                    self._fire_lights_state(
+                        True,
+                        tag="lights_on",
+                        label="(FULL HOUSE LIGHTS ON)",
+                        show_id=spec.id,
+                        duration_ms=2500,
+                    )
+                elif kind == "speech_cue":
+                    with self._lock:
+                        self._active_state["phase"] = "overlay_duck"
+                    c_txt = str(payload.get("text") or "")
+                    c_dur = float(payload.get("durSec") or 3.5)
+                    self._emit_cue(
+                        "overlay",
+                        f"(DUCK + OVERLAY · \"{c_txt}\")",
+                        show_id=spec.id,
+                        duration_ms=int((c_dur + 1.0) * 1000),
+                        caption=c_txt,
+                    )
+                elif kind == "denon_drop":
+                    p_vol = int(payload.get("vol") or 55)
+                    post_db = _clamp(float(p_vol) - 80.0, -50.0, -5.0)
                     self._restore_denon_down(current_db, post_db, fast=False)
                     current_db = post_db
                     self._emit_cue(
                         "denon_drop",
-                        f"(RESTORE VIDEO · DENON {spec.denon_vol} → {spec.post_overlay_denon_vol} · FULL LIGHTS ON)",
+                        f"(RESTORE VIDEO · DENON {spec.denon_vol} → {p_vol} · FULL LIGHTS ON)",
                         show_id=spec.id,
                         duration_ms=3000,
-                        denonVol=spec.post_overlay_denon_vol,
+                        denonVol=p_vol,
                     )
+                elif kind == "fx_cue":
+                    fx_type = str(payload.get("type") or "flash")
+                    dur_fx = float(payload.get("durationSec") or 0.2)
+                    cnt_fx = int(payload.get("count") or 1)
+                    if fx_type == "flash":
+                        self._flash_lights(
+                            cnt_fx,
+                            cancel_ev=cancel_ev,
+                            show_id=spec.id,
+                            end_on=True,
+                            on_sec=max(0.1, min(2.0, dur_fx)),
+                            off_sec=0.14,
+                            tag_prefix="FLASH · CUSTOM",
+                        )
+                        sim_clock += cnt_fx * max(0.1, min(2.0, dur_fx)) + max(0, cnt_fx - 1) * 0.14
+                    elif fx_type == "lights_off":
+                        self._fire_lights_state(
+                            False, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
+                        )
+                    elif fx_type == "lights_on":
+                        self._fire_lights_state(
+                            True, tag="lights_on", label="(LIGHTS ON · FX)", show_id=spec.id, duration_ms=1200
+                        )
+                    elif fx_type == "fog":
+                        b_str = f"{dur_fx:.1f}".rstrip("0").rstrip(".")
+                        self._emit_cue(
+                            "fog",
+                            f"(TRIGGER FOG · {b_str}s)",
+                            show_id=spec.id,
+                            duration_ms=int(dur_fx * 1000),
+                            fogSec=dur_fx,
+                        )
+                        fog_u = fx.resolve_fog_url(burst_sec=dur_fx)
+                        if fog_u:
+                            self._fire_http_hook(fog_u)
 
-            # 9. Hold until video ends (either Cube ACK `ended` or full MP4 duration)
+            # 8. Hold until video ends (either Cube ACK `ended` or full MP4 duration)
             with self._lock:
                 self._active_state["phase"] = "video_finish"
             if self._has_custom_sleep:
@@ -4273,7 +4744,7 @@ class ShowDirector:
                 if cancel_ev.is_set():
                     return {"ok": False, "canceled": True}
 
-            if spec.post_overlay_denon_vol <= 0 and denon_raised:
+            if not any_post_denon and spec.post_overlay_denon_vol <= 0 and denon_raised:
                 self._restore_denon_down(current_db, prev_db, fast=False)
             denon_restored = True
             self._emit_cue("ended", "(SHOW COMPLETE)", show_id=spec.id, duration_ms=1200)
@@ -4296,6 +4767,53 @@ class ShowDirector:
                     st, _ = self.adb._connect_and_status(cube_ser)
                     if st == "device":
                         self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "4"], timeout=4.0)
+                        self.adb._run(["-s", cube_ser, "shell", "am", "force-stop", "com.froriep.armorywallboard"], timeout=4.0)
+                        target_comp = str(prev_media.get("focusedComponent") or "").strip()
+                        target_pkg = str(prev_media.get("focusedPackage") or prev_media.get("mediaPackage") or "").strip()
+                        if target_comp or target_pkg:
+                            _, win_out, _ = self.adb._run(
+                                ["-s", cube_ser, "shell", "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'"],
+                                timeout=4.0,
+                            )
+                            cur_win = parse_cube_media_snapshot("---ARMORY_WIN---\n" + (win_out or ""))
+                            cur_pkg = str(cur_win.get("focusedPackage") or "")
+                            if target_pkg and cur_pkg != target_pkg:
+                                if target_comp:
+                                    self.adb._run(
+                                        ["-s", cube_ser, "shell", f"am start -n {shlex.quote(target_comp)}"],
+                                        timeout=5.0,
+                                    )
+                                elif target_pkg:
+                                    self.adb._run(
+                                        [
+                                            "-s",
+                                            cube_ser,
+                                            "shell",
+                                            f"monkey -p {shlex.quote(target_pkg)} -c android.intent.category.LAUNCHER 1",
+                                        ],
+                                        timeout=5.0,
+                                    )
+                        if prev_media.get("wasPlaying"):
+                            if not self._has_custom_sleep:
+                                self._sleep(0.7)
+                            _, ms_out, _ = self.adb._run(
+                                ["-s", cube_ser, "shell", "dumpsys", "media_session"], timeout=4.5
+                            )
+                            cur_ms = parse_cube_media_snapshot(ms_out or "")
+                            if not cur_ms.get("wasPlaying"):
+                                self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "126"], timeout=4.0)
+                                if not self._has_custom_sleep:
+                                    self._sleep(0.75)
+                                _, ms_out2, _ = self.adb._run(
+                                    ["-s", cube_ser, "shell", "dumpsys", "media_session"], timeout=4.5
+                                )
+                                cur_ms2 = parse_cube_media_snapshot(ms_out2 or "")
+                                if not cur_ms2.get("wasPlaying") and cur_ms2.get("mediaState") == 2:
+                                    rc_disp, _, _ = self.adb._run(
+                                        ["-s", cube_ser, "shell", "cmd media_session dispatch play"], timeout=4.0
+                                    )
+                                    if rc_disp != 0:
+                                        self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "85"], timeout=4.0)
                 except Exception:
                     pass
                 finally:
@@ -4316,15 +4834,32 @@ class ShowDirector:
                     }
                     self._last_result = {**out_res, "finishedAt": _utc_iso_now()}
 
-    def _run_show_sequence(self, spec: ShowSpec, run_id: int, cancel_ev: threading.Event) -> dict[str, Any]:
+    def _run_show_sequence(
+        self,
+        spec: ShowSpec,
+        run_id: int,
+        cancel_ev: threading.Event,
+        *,
+        exclude_main_tv: bool | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             fx = SmartFxConfig.from_dict(self.fx_hooks.to_dict())
+
+        eff_exclude_main = spec.exclude_main_tv if exclude_main_tv is None else bool(exclude_main_tv)
 
         if spec.three_screen_video:
             mp4_path = self.show_mp4_path(spec.id)
             meta = self._read_show_meta(spec.id)
             if mp4_path.is_file() and mp4_path.stat().st_size > 1000 and meta.get("hasSourceVideo"):
-                return self._run_multimedia_show_sequence(spec, run_id, cancel_ev, mp4_path, meta, fx)
+                return self._run_multimedia_show_sequence(
+                    spec,
+                    run_id,
+                    cancel_ev,
+                    mp4_path,
+                    meta,
+                    fx,
+                    exclude_main_tv=eff_exclude_main,
+                )
 
         prev_db = -35.0
         target_db = _clamp(float(spec.denon_vol) - 80.0, -50.0, -5.0)
@@ -4455,7 +4990,9 @@ class ShowDirector:
                         end_on=True,
                         tag_prefix="FLASH",
                     )
-                out_res["threeScreen"] = self._launch_three_screen_youtube(spec.youtube_url)
+                out_res["threeScreen"] = self._launch_three_screen_youtube(
+                    spec.youtube_url, exclude_main_tv=eff_exclude_main
+                )
                 self._emit_cue(
                     "screens",
                     f"(ALL 3 SCREENS LIVE · DENON {spec.denon_vol})",
@@ -4601,14 +5138,20 @@ class ShowDirector:
                     }
                     self._last_result = {**out_res, "finishedAt": _utc_iso_now()}
 
-    def fire_show(self, show_id: str, *, async_run: bool = True) -> dict[str, Any]:
+    def fire_show(
+        self,
+        show_id: str,
+        *,
+        async_run: bool = True,
+        exclude_main_tv: bool | None = None,
+    ) -> dict[str, Any]:
         spec = self.get_show(show_id)
         if spec is None:
             return {"ok": False, "error": f"Unknown show: {show_id}"}
         if not spec.enabled:
             return {"ok": False, "error": f"Show '{spec.name}' is disabled"}
 
-        self.stop_active_show()
+        self.stop_active_show(broadcast_stop=False)
         with self._lock:
             self._active_run_id += 1
             run_id = self._active_run_id
@@ -4624,11 +5167,12 @@ class ShowDirector:
             }
 
         if not async_run:
-            return self._run_show_sequence(spec, run_id, cancel_ev)
+            return self._run_show_sequence(spec, run_id, cancel_ev, exclude_main_tv=exclude_main_tv)
 
         t = threading.Thread(
             target=self._run_show_sequence,
             args=(spec, run_id, cancel_ev),
+            kwargs={"exclude_main_tv": exclude_main_tv},
             name=f"ArmoryShow-{spec.id}",
             daemon=True,
         )
@@ -4637,11 +5181,12 @@ class ShowDirector:
         t.start()
         return {"ok": True, "started": True, "showId": spec.id, "showName": spec.name}
 
-    def stop_active_show(self, *, wait_timeout: float = 2.0) -> dict[str, Any]:
+    def stop_active_show(self, *, wait_timeout: float = 2.0, broadcast_stop: bool = True) -> dict[str, Any]:
         with self._lock:
             ev = self._active_cancel
             t = self._active_thread
             was_active = bool(self._active_state.get("active"))
+            run_id = int(self._active_run_id)
         if ev is not None:
             ev.set()
         with self._stage_ack_cond:
@@ -4656,4 +5201,6 @@ class ShowDirector:
                     self.house_audio.cube.stop(cfg_ha.cube_host, cfg_ha.cube_port)
             except Exception:
                 pass
+        if broadcast_stop:
+            self._broadcast_stage_event("stage_stop", runId=run_id, showId="")
         return {"ok": True, "stopped": was_active}

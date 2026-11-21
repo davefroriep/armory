@@ -3579,6 +3579,239 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_cube_media_snapshot_parser_and_bare_voice_stop_commands(self) -> None:
+        # 1. Active Fire TV Cube YouTube session + mCurrentFocus
+        sample_playing = (
+            "  Sessions Stack - have 3 sessions:\n"
+            "    starboard_media com.amazon.firetv.youtube/starboard_media (userId=0)\n"
+            "      package=com.amazon.firetv.youtube\n"
+            "      active=true\n"
+            "      state=PlaybackState {state=3, position=243199, speed=1.0}\n"
+            "    A2dpMediaBrowserService com.android.bluetooth/A2dpMediaBrowserService (userId=0)\n"
+            "      package=com.android.bluetooth\n"
+            "      active=true\n"
+            "      state=null\n"
+            "---ARMORY_WIN---\n"
+            "  mCurrentFocus=Window{4518633 u0 com.amazon.firetv.youtube/dev.cobalt.app.MainActivity}\n"
+        )
+        snap1 = sd.parse_cube_media_snapshot(sample_playing)
+        self.assertTrue(snap1["wasPlaying"])
+        self.assertEqual(snap1["mediaPackage"], "com.amazon.firetv.youtube")
+        self.assertEqual(snap1["mediaState"], 3)
+        self.assertEqual(snap1["focusedComponent"], "com.amazon.firetv.youtube/dev.cobalt.app.MainActivity")
+        self.assertEqual(snap1["focusedPackage"], "com.amazon.firetv.youtube")
+
+        # 2. Paused session (state=2) + ignored Armory Wallboard focus
+        sample_paused = (
+            "    MediaBrowserService com.amazon.bueller.music/MediaBrowserService (userId=0)\n"
+            "      package=com.amazon.bueller.music\n"
+            "      active=false\n"
+            "      state=PlaybackState {state=2, position=205313}\n"
+            "---ARMORY_WIN---\n"
+            "  mCurrentFocus=Window{999 u0 com.froriep.armorywallboard/.WallboardActivity}\n"
+        )
+        snap2 = sd.parse_cube_media_snapshot(sample_paused)
+        self.assertFalse(snap2["wasPlaying"])
+        self.assertEqual(snap2["mediaPackage"], "com.amazon.bueller.music")
+        self.assertEqual(snap2["mediaState"], 2)
+        self.assertEqual(snap2["focusedComponent"], "")
+
+        # 3. Bare voice stop commands ("stop", "enough", "end", "cancel") + workout undo preservation
+        tmp = Path(tempfile.mkdtemp(prefix="armory_vstop_"))
+        try:
+            sd_dir = sd.ShowDirector(root_dir=tmp, allow_network=False)
+            for phrase in ("Armory, stop", "Armory, enough", "Armory, end", "Armory cancel", "Armory stop sim"):
+                res = sd_dir.match_voice_command(phrase, workout_active=False)
+                self.assertEqual(res, {"action": "stop"}, msg=phrase)
+            # During an active Strength workout with NO running show, bare "Armory, cancel" yields to workout undo!
+            self.assertIsNone(sd_dir.match_voice_command("Armory, cancel", workout_active=True))
+            # While a show IS active, bare "Armory, cancel" stops the show even during a workout!
+            sd_dir._active_state["active"] = True
+            self.assertEqual(sd_dir.match_voice_command("Armory, cancel", workout_active=True), {"action": "stop"})
+            # But explicit "Armory, stop" ALWAYS stops stage/show
+            sd_dir._active_state["active"] = False
+            self.assertEqual(sd_dir.match_voice_command("Armory, stop", workout_active=True), {"action": "stop"})
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_timed_speech_fx_cues_exclude_main_tv_and_cube_auto_resume(self) -> None:
+        ffmpeg_bin = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        if not ffmpeg_bin:
+            self.skipTest("FFmpeg binary not present")
+        tmp = Path(tempfile.mkdtemp(prefix="armory_fx_resume_"))
+        try:
+            src_vid = tmp / "shows" / "sources" / "ryder_walkin_video.mp4"
+            src_vid.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    ffmpeg_bin, "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=4.5",
+                    "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=48000:duration=4.5",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src_vid),
+                ],
+                capture_output=True,
+                timeout=30,
+                check=True,
+            )
+
+            adb_cmds: list[list[str]] = []
+            http_calls: list[str] = []
+            cube_state = {"playing": True, "stage_open": False}
+
+            def fake_runner(cmd: list[str], _to: float) -> tuple[int, str, str]:
+                adb_cmds.append(cmd)
+                joined = " ".join(cmd)
+                if "devices" in cmd:
+                    return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n192.168.1.151:5555\tdevice\n192.168.1.204:5555\tdevice\n", ""
+                if "dumpsys media_session" in joined and "ARMORY_WIN" in joined:
+                    st_num = 3 if cube_state["playing"] else 2
+                    act_str = "true" if cube_state["playing"] else "false"
+                    return 0, (
+                        f"    starboard_media com.amazon.firetv.youtube/starboard_media (userId=0)\n"
+                        f"      package=com.amazon.firetv.youtube\n      active={act_str}\n"
+                        f"      state=PlaybackState {{state={st_num}, position=5000}}\n"
+                        f"---ARMORY_WIN---\n"
+                        f"  mCurrentFocus=Window{{111 u0 com.amazon.firetv.youtube/dev.cobalt.app.MainActivity}}\n"
+                    ), ""
+                if "am start" in joined and "armorywallboard" in joined:
+                    cube_state["stage_open"] = True
+                    return 0, "ok", ""
+                if "am force-stop com.froriep.armorywallboard" in joined:
+                    cube_state["stage_open"] = False
+                    return 0, "ok", ""
+                if "dumpsys window windows" in joined:
+                    pkg = "com.froriep.armorywallboard/.WallboardActivity" if cube_state["stage_open"] else "com.amazon.firetv.youtube/dev.cobalt.app.MainActivity"
+                    return 0, f"mCurrentFocus=Window{{222 u0 {pkg}}}", ""
+                if "dumpsys media_session" in joined:
+                    # Simulate paused right after force-stop, then playing after keyevent 126!
+                    st_num = 2 if cube_state["playing"] else 0
+                    return 0, (
+                        f"    starboard_media com.amazon.firetv.youtube/starboard_media (userId=0)\n"
+                        f"      package=com.amazon.firetv.youtube\n      active=false\n"
+                        f"      state=PlaybackState {{state={st_num}, position=5000}}\n"
+                    ), ""
+                if "input keyevent 126" in joined:
+                    cube_state["playing"] = True
+                return 0, "ok", ""
+
+            def fake_http_get(url: str, _to: float) -> tuple[int, bytes]:
+                http_calls.append(url)
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, b"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect><MasterVolume><value>-30.0</value></MasterVolume></item>"
+                if "d_video.asp" in url:
+                    return 200, b'<FORM name="video"><input type="radio" name="radioMonitorOut" value="1" checked></FORM>'
+                if "192.168.1.220:8060/query/device-info" in url:
+                    return 200, b"<device-info><power-mode>Ready</power-mode></device-info>"
+                return 200, b"ok"
+
+            fake_adb = ac.FireTvAdbController(adb_bin="adb.exe", runner=fake_runner, settle_sec=0.0)
+            ham = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15", cube_enabled=True, cube_host="192.168.1.151"),
+                allow_network=False,
+                denon_http_get=fake_http_get,
+                cube_http_post=lambda _u, _b, _h, _t: (200, b"ok"),
+                sleep_fn=lambda _s: None,
+            )
+            wb_cfg = ac.WallboardConfig(fire_tv_host="192.168.1.204")
+            disp = dc.GymDisplayController(
+                config=dc.GymDisplaysConfig(
+                    primary=dc.PrimaryDisplayConfig(host="192.168.1.230"),
+                    spin=dc.SpinDisplayConfig(host="192.168.1.220", auto_denon_dual=True),
+                    cube_host="192.168.1.151",
+                ),
+                adb_controller=fake_adb,
+                denon_client=ham.denon,
+                http_get=fake_http_get,
+                http_post=lambda _u, _b, _h, _t: (200, b"ok"),
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+            )
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.shows = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                displays=disp,
+                adb_controller=fake_adb,
+                wallboard_cfg_fn=lambda: wb_cfg,
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                http_get=fake_http_get,
+                sleep_fn=lambda _s: None,
+            )
+            svc.shows.update_fx_hooks({"lightsHost": "192.168.1.60", "fogHost": "192.168.1.61"})
+
+            # 1. Multi-speech cues (1 intro + 2 video) + custom fxCues bake cleanly
+            svc.shows.update_show(
+                "ryder_walkin",
+                {
+                    "videoSourceFile": "ryder_walkin_video.mp4",
+                    "introStartSec": 1.0,
+                    "excludeMainTv": True,
+                    "speechCues": [
+                        {"id": "ic1", "target": "intro", "atSec": 3.5, "text": "Here comes Ryder!"},
+                        {"id": "vc1", "target": "video", "atSec": 0.5, "text": "Part one!", "postDenonVol": 60},
+                        {"id": "vc2", "target": "video", "atSec": 2.2, "text": "Part two!", "postDenonVol": 52},
+                    ],
+                    "fxCues": [
+                        {"id": "fx1", "target": "video", "atSec": 1.0, "type": "flash", "durationSec": 0.25, "count": 2, "screenFlash": True},
+                        {"id": "fx2", "target": "video", "atSec": 1.5, "type": "fog", "durationSec": 5.0, "count": 1, "screenFlash": False},
+                    ],
+                },
+                rebuild=True,
+            )
+            mm_meta = svc.shows._read_show_meta("ryder_walkin")
+            self.assertEqual(len(mm_meta.get("speechCueTimings") or []), 2)
+
+            # 2. Live config update with rebuild=False preserves MP4 mtime!
+            app = ac.create_app(svc)
+            client = app.test_client()
+            mp4_mtime = svc.shows.show_mp4_path("ryder_walkin").stat().st_mtime_ns
+            r_quick = client.post(
+                "/api/shows/ryder_walkin/config",
+                json={"excludeMainTv": True, "fxCues": [{"id": "fx1", "target": "video", "atSec": 1.1, "type": "flash", "durationSec": 0.25, "count": 2, "screenFlash": True}, {"id": "fx2", "target": "video", "atSec": 1.5, "type": "fog", "durationSec": 5.0, "count": 1, "screenFlash": False}], "rebuild": False},
+            )
+            self.assertEqual(r_quick.status_code, 200)
+            self.assertEqual(svc.shows.show_mp4_path("ryder_walkin").stat().st_mtime_ns, mp4_mtime)
+
+            # 3. Fire show with exclude_main_tv=True and prev_media playing=True -> verify skip Hisense + flashEvents + auto-resume!
+            q = svc.shows.subscribe_events(role="test_obs")
+            res1 = svc.shows.fire_show("ryder_walkin", async_run=False, exclude_main_tv=True)
+            self.assertTrue(res1["ok"])
+            self.assertTrue(res1["prestage"]["tv"].get("excluded"))
+            evts = []
+            while not q.empty():
+                evts.append(q.get_nowait())
+            svc.shows.unsubscribe_events(q, role="test_obs")
+
+            play_evt = next(e for e in evts if e.get("type") == "stage_play")
+            self.assertEqual(len(play_evt.get("flashEvents") or []), 1)
+            self.assertTrue(any("192.168.1.61/rpc/Switch.Set?id=0&on=true&toggle_after=5" in u for u in http_calls))
+
+            joined_adb = [" ".join(c) for c in adb_cmds]
+            # Primary Hisense (192.168.1.230) must NOT receive any ADB commands
+            self.assertFalse(any("192.168.1.230" in s for s in joined_adb))
+            # Cube must force-stop overlay + refocus YouTube + send keyevent 126
+            self.assertTrue(any("192.168.1.151:5555" in s and "am force-stop com.froriep.armorywallboard" in s for s in joined_adb))
+            self.assertTrue(any("192.168.1.151:5555" in s and "input keyevent 126" in s for s in joined_adb))
+
+            # 4. When Cube was previously PAUSED (wasPlaying=False), MUST NOT send keyevent 126!
+            adb_cmds.clear()
+            cube_state["playing"] = False
+            res2 = svc.shows.fire_show("ryder_walkin", async_run=False, exclude_main_tv=True)
+            self.assertTrue(res2["ok"])
+            joined_adb2 = [" ".join(c) for c in adb_cmds]
+            self.assertFalse(any("192.168.1.151:5555" in s and "input keyevent 126" in s for s in joined_adb2))
+
+            # 5. Dashboard HTML includes new Show Lab UI controls + Stage flash overlay
+            dash = client.get("/").get_data(as_text=True)
+            for tok in ("devRyExcludeMainTv", "devRyAddSpeechBtn", "devRyAddFxBtn", "devScrubClock", "devVidFlash", "devRySaveQuickBtn", "devRyIntroStart"):
+                self.assertIn(tok, dash)
+            self.assertIn("armoryStageFlash", client.get("/stage").get_data(as_text=True))
+
+            svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
