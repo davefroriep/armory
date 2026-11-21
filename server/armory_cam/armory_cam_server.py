@@ -60,6 +60,11 @@ try:
 except ImportError:
     from display_control import GymDisplayController, GymDisplaysConfig, parse_display_voice_command
 
+try:
+    from .show_director import ShowDirector
+except ImportError:
+    from show_director import ShowDirector
+
 DEFAULT_PORT = 8766
 DEFAULT_RETENTION_DAYS = 14
 DEFAULT_PRE_ROLL_SEC = 120
@@ -1827,6 +1832,15 @@ class ArmoryCamService:
             wol_sender=send_wol_magic_packet if self._voice_autostart else None,
             allow_network=self._voice_autostart,
         )
+        self.shows = ShowDirector(
+            root_dir=self.root,
+            house_audio=self.house_audio,
+            displays=self.displays,
+            adb_controller=self.adb,
+            wallboard_cfg_fn=lambda: self.wallboard_cfg,
+            ffmpeg_bin=self.ffmpeg,
+            allow_network=self._voice_autostart,
+        )
         self.lock = threading.RLock()
         self.port = DEFAULT_PORT
         self.retention_days = DEFAULT_RETENTION_DAYS
@@ -2220,6 +2234,7 @@ class ArmoryCamService:
 
     def stop_background(self) -> None:
         self._stop_event.set()
+        self.shows.stop_active_show()
         self.voice.stop()
         self.room_audio.stop()
         self.live_hub.stop_all()
@@ -4410,6 +4425,7 @@ class ArmoryCamService:
                 "voice": self.voice.status_dict(),
                 "houseAudio": self.house_audio.status_dict(live_probe=False),
                 "displays": self.displays.status_dict(live_probe=False),
+                "shows": self.shows.status_dict(),
             }
 
     def _wake_wallboard_sync(self, force: bool = True) -> dict[str, Any]:
@@ -4424,6 +4440,31 @@ class ArmoryCamService:
         return self.adb.schedule_sleep(cfg, delay_sec=0.0, reason="display_off")
 
     def _handle_local_voice_command(self, transcript: str) -> dict[str, Any] | None:
+        show_match = self.shows.match_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
+        if show_match:
+            if show_match.get("action") == "stop":
+                self.shows.stop_active_show()
+                return {
+                    "handled": True,
+                    "ok": True,
+                    "target": "show",
+                    "action": "stop",
+                    "speech": "Show stopped",
+                    "ackText": "⏹ Show stopped",
+                }
+            res = self.shows.fire_show(str(show_match.get("showId") or ""), async_run=True)
+            ok = bool(res.get("ok"))
+            return {
+                "handled": True,
+                "ok": ok,
+                "target": "show",
+                "showId": show_match.get("showId", ""),
+                "action": "fire",
+                "speech": "",  # Keep S330 TTS silent so drop-in audio hits uninterrupted
+                "ackText": f"🔥 {show_match.get('showName', 'Show')}" if ok else f"✗ {res.get('error', 'Show failed')}",
+                "result": res,
+            }
+
         parsed = parse_display_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
         if not parsed:
             return None
@@ -4533,7 +4574,12 @@ DASHBOARD_HTML = """<!doctype html>
   .mbar-fill.hot{background:var(--green)}
   .mbar-th{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
   label{display:block;font-size:12px;color:var(--mut);margin:8px 0 4px}
-  input[type=text],input[type=number],select{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:#0d1218;color:var(--fg);font:inherit}
+  input[type=text],input[type=number],select,textarea{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:#0d1218;color:var(--fg);font:inherit}
+  .show-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin-top:10px}
+  .show-item{background:#0d1218;border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}
+  .show-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap}
+  .show-trigs{font-size:11px;color:var(--mut);line-height:1.5}
+  .show-audio{width:100%;height:34px;border-radius:8px;background:#131a22}
   .btn{background:var(--blue);color:#00131f;border:0;border-radius:9px;padding:7px 12px;font-weight:800;font-size:12px;cursor:pointer;transition:transform .08s ease,background-color .15s ease,border-color .15s ease,box-shadow .15s ease,filter .15s ease,color .15s ease;user-select:none}
   .btn:hover:not(:disabled){filter:brightness(1.12);box-shadow:0 2px 10px rgba(0,0,0,.35)}
   .btn:active:not(:disabled){transform:translateY(2px) scale(.96);filter:brightness(.92);box-shadow:inset 0 2px 5px rgba(0,0,0,.45)}
@@ -4934,6 +4980,39 @@ DASHBOARD_HTML = """<!doctype html>
       <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
     </div>
     <div id="dpRokuList" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h2>
+      <span>Walk-Ins &amp; PR Drop-Ins (Show Lab)</span>
+      <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <button class="btn red sm" id="shStopAllBtn" type="button">⏹ Stop Active Show</button>
+        <span id="shBadge" class="pill">IDLE</span>
+      </span>
+    </h2>
+    <div id="shMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
+      Preview locally in your browser before firing live on Denon (zero fade roller-coaster: Cube ducks before Denon ramps up, then Denon steps down during silent tail before un-duck). Swap any <code>.mp3</code> / <code>.wav</code> track anytime.
+    </div>
+    <div id="shGrid" class="show-grid">
+      <div style="color:var(--mut);font-size:12px">Loading shows…</div>
+    </div>
+    <details style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
+      <summary style="cursor:pointer;font-weight:800;font-size:13px;color:#7cc4ff">Smart FX Hooks (Lights Switch &amp; Fog Machine — Future Ready)</summary>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:8px">
+        <div><label>House Lights IP (Shelly Plus 1 / Gen3)</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
+        <div><label>Lights OFF URL (optional override)</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+        <div><label>Lights ON URL (optional override)</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+        <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
+        <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
+        <div><label>Fog Burst Duration (1–10s)</label><input id="fxFogBurst" type="number" min="1" max="10" step="0.5" value="4.0"></div>
+      </div>
+      <div class="ctrl-row" style="margin-top:10px">
+        <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
+        <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Lights Flash</button>
+        <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
+        <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
+      </div>
+    </details>
   </div>
 
   <div class="card" style="margin-top:14px">
@@ -6997,6 +7076,9 @@ async function pollStatus() {
     if (st.displays) {
       syncDisplaysUI(st.displays);
     }
+    if (st.shows && st.shows.active) {
+      syncShowActiveBadge(st.shows.active);
+    }
   } catch {}
 }
 
@@ -7302,7 +7384,7 @@ async function init() {
   renderCameras();
   wireMaskModal();
   setInterval(drawAllCanvases, 100);
-  await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips()]);
+  await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips(), loadShows()]);
   setInterval(pollStatus, 1000);
   setInterval(pollVoiceStatus, 3000);
   setInterval(pollAudioStatus, 3000);
@@ -7483,6 +7565,207 @@ $('dpFindRokuBtn').onclick = async () => {
     $('dpOut').textContent = 'Roku discovery failed';
   }
 };
+
+function syncShowActiveBadge(active) {
+  const b = $('shBadge');
+  if (!b) return;
+  if (active && active.active) {
+    b.textContent = `LIVE · ${active.showName || active.showId} (${active.phase || 'running'})`;
+    b.className = 'pill warn';
+  } else {
+    b.textContent = 'IDLE';
+    b.className = 'pill ok';
+  }
+}
+
+function populateFxHookInputs(fx) {
+  if (!fx) return;
+  if ($('fxLightsHost')) $('fxLightsHost').value = fx.lightsHost || '';
+  if ($('fxLightsOffUrl')) $('fxLightsOffUrl').value = fx.lightsOffUrl || '';
+  if ($('fxLightsOnUrl')) $('fxLightsOnUrl').value = fx.lightsOnUrl || '';
+  if ($('fxFogHost')) $('fxFogHost').value = fx.fogHost || '';
+  if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
+  if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 4.0);
+}
+
+function renderShows(data) {
+  const grid = $('shGrid');
+  if (!grid || !data) return;
+  syncShowActiveBadge(data.active || {});
+  populateFxHookInputs(data.fxHooks || {});
+  const shows = Array.isArray(data.shows) ? data.shows : [];
+  if (!shows.length) {
+    grid.innerHTML = '<div style="color:var(--mut);font-size:12px">No shows configured.</div>';
+    return;
+  }
+  grid.innerHTML = shows.map(s => {
+    const id = escHtml(s.id);
+    const trigs = (s.triggers || []).map(t => `<code>"Armory, ${escHtml(t)}"</code>`).join(' ');
+    const srcTag = s.sourceUploaded ? `<span class="pill ok">CUSTOM: ${escHtml(s.sourceFile)}</span>` : '<span class="pill">DEMO TRACK</span>';
+    const durTag = s.previewReady ? `${s.previewDurationSec}s ready` : 'Not built';
+    const hasMusic = s.kind !== 'debut_video';
+    return `
+      <div class="show-item" data-showid="${id}">
+        <div class="show-head">
+          <div>
+            <div style="font-weight:900;font-size:14px">${escHtml(s.name)}</div>
+            <div class="show-trigs">${trigs}</div>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center">${srcTag}<span class="pill live">${durTag}</span></div>
+        </div>
+        <audio class="show-audio" id="shAudio_${id}" controls preload="none" src="/api/shows/${id}/preview.wav"></audio>
+        <div class="ctrl-row" style="margin-top:0">
+          <button class="btn sm ok" type="button" onclick="previewShow('${id}')">▶ Preview Locally</button>
+          <button class="btn sm" type="button" onclick="fireShow('${id}')">🔥 Fire Live (Denon ${s.denonVol})</button>
+          <button class="btn sm sec" type="button" onclick="rebuildShow('${id}')">↻ Rebuild</button>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:6px">
+          <div><label>Denon Vol</label><input id="shVol_${id}" type="number" min="30" max="75" value="${s.denonVol}"></div>
+          <div><label>Cube Mode</label><select id="shMode_${id}">
+            <option value="duck" ${s.cubeMode==='duck'?'selected':''}>duck</option>
+            <option value="takeover" ${s.cubeMode==='takeover'?'selected':''}>takeover</option>
+            <option value="overlay" ${s.cubeMode==='overlay'?'selected':''}>overlay</option>
+          </select></div>
+          <div><label>Start (s)</label><input id="shStart_${id}" type="number" min="0" step="0.25" value="${s.songStartSec}"></div>
+          <div><label>Dur (s)</label><input id="shDur_${id}" type="number" min="0" max="50" step="0.5" value="${s.songDurationSec}"></div>
+          <div><label>Fade (s)</label><input id="shFade_${id}" type="number" min="0.3" max="10" step="0.2" value="${s.fadeOutSec}"></div>
+        </div>
+        ${s.kind !== 'pr_drop' ? `<div><label>Announcer Script</label><textarea id="shAnn_${id}" rows="2">${escHtml(s.announcerText || '')}</textarea></div>` : ''}
+        ${s.threeScreenVideo ? `<div><label>3-Screen YouTube URL</label><input id="shYt_${id}" type="text" value="${escHtml(s.youtubeUrl || '')}"></div>` : ''}
+        ${hasMusic ? `
+        <div class="ctrl-row" style="margin-top:2px">
+          <label style="margin:0;flex:1;min-width:170px">Swap Song (.mp3/.wav): <input id="shFile_${id}" type="file" accept=".mp3,.wav,.m4a,.ogg" onchange="uploadShowSong('${id}', this)"></label>
+          ${s.sourceUploaded ? `<button class="btn sm sec" type="button" onclick="clearShowSong('${id}')">Revert Demo</button>` : ''}
+        </div>` : ''}
+        <div class="ctrl-row" style="margin-top:2px">
+          <button class="btn sm sec" type="button" onclick="saveShowConfig('${id}', this)">Save &amp; Rebuild Mix</button>
+          <span id="shOut_${id}" style="color:var(--mut);font-size:11px"></span>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function loadShows() {
+  try {
+    const r = await fetch('/api/shows').then(x => x.json());
+    renderShows(r);
+  } catch {}
+}
+
+function previewShow(id) {
+  const el = $('shAudio_' + id);
+  if (!el) return;
+  el.src = `/api/shows/${encodeURIComponent(id)}/preview.wav?t=${Date.now()}`;
+  el.load();
+  el.play().catch(() => {});
+  if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Playing locally in browser';
+}
+
+async function fireShow(id) {
+  if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Firing live on Denon…';
+  try {
+    const r = await fetch(`/api/shows/${encodeURIComponent(id)}/fire`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = r.ok ? `🔥 Fired (${r.showName || id})` : `✗ ${r.error || 'Failed'}`;
+    await pollStatus();
+  } catch {
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = '✗ Fire failed';
+  }
+}
+
+async function stopShow() {
+  try {
+    await fetch('/api/shows/stop', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+    $('shMsg').textContent = '⏹ Show stopped safely (Denon restored first).';
+    await pollStatus();
+  } catch {}
+}
+
+async function rebuildShow(id) {
+  if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Building mix…';
+  try {
+    const r = await fetch(`/api/shows/${encodeURIComponent(id)}/rebuild`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = r.ok ? `✓ Rebuilt (${r.durationSec}s)` : `✗ ${r.error || 'Failed'}`;
+  } catch {
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = '✗ Rebuild failed';
+  }
+}
+
+async function saveShowConfig(id, btn) {
+  const body = {
+    denonVol: Number($('shVol_' + id).value || 70),
+    cubeMode: $('shMode_' + id).value || 'duck',
+    songStartSec: Number($('shStart_' + id).value || 0),
+    songDurationSec: Number($('shDur_' + id).value || 15),
+    fadeOutSec: Number($('shFade_' + id).value || 2.5),
+  };
+  if ($('shAnn_' + id)) body.announcerText = $('shAnn_' + id).value.trim();
+  if ($('shYt_' + id)) body.youtubeUrl = $('shYt_' + id).value.trim();
+  if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Saving & rendering…';
+  try {
+    const r = await fetch(`/api/shows/${encodeURIComponent(id)}/config`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = r.ok ? '✓ Saved & rebuilt' : `✗ ${r.error || 'Failed'}`;
+    if (btn) setBtnFeedback(btn, 'saved', '✓ Saved', 1800);
+  } catch {
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = '✗ Save failed';
+  }
+}
+
+async function uploadShowSong(id, inputEl) {
+  const file = inputEl && inputEl.files && inputEl.files[0];
+  if (!file) return;
+  if ($('shOut_' + id)) $('shOut_' + id).textContent = `Uploading & trimming ${file.name}…`;
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    if ($('shStart_' + id)) fd.append('songStartSec', $('shStart_' + id).value || '0');
+    if ($('shDur_' + id)) fd.append('songDurationSec', $('shDur_' + id).value || '15');
+    const r = await fetch(`/api/shows/${encodeURIComponent(id)}/upload`, { method: 'POST', body: fd }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = r.ok ? `✓ Swapped to ${file.name}` : `✗ ${r.error || 'Upload failed'}`;
+  } catch {
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = '✗ Upload failed';
+  }
+}
+
+async function clearShowSong(id) {
+  const r = await fetch(`/api/shows/${encodeURIComponent(id)}/config`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ clearSource: true }),
+  }).then(x => x.json());
+  if (r.status) renderShows(r.status);
+}
+
+async function saveFxHooks(extraBody) {
+  const body = {
+    lightsHost: ($('fxLightsHost') && $('fxLightsHost').value.trim()) || '',
+    lightsOffUrl: ($('fxLightsOffUrl') && $('fxLightsOffUrl').value.trim()) || '',
+    lightsOnUrl: ($('fxLightsOnUrl') && $('fxLightsOnUrl').value.trim()) || '',
+    fogHost: ($('fxFogHost') && $('fxFogHost').value.trim()) || '',
+    fogTriggerUrl: ($('fxFogUrl') && $('fxFogUrl').value.trim()) || '',
+    fogBurstSec: Number(($('fxFogBurst') && $('fxFogBurst').value) || 4.0),
+    ...(extraBody || {}),
+  };
+  const r = await fetch('/api/shows/fx-hooks', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  }).then(x => x.json());
+  if ($('fxOut')) $('fxOut').textContent = r.ok ? '✓ FX hooks saved' : `✗ ${r.error || 'Failed'}`;
+  return r;
+}
+
+if ($('shStopAllBtn')) $('shStopAllBtn').onclick = () => stopShow();
+if ($('fxSaveBtn')) $('fxSaveBtn').onclick = () => saveFxHooks();
+if ($('fxTestFlashBtn')) $('fxTestFlashBtn').onclick = () => saveFxHooks({ test: 'lights_flash' });
+if ($('fxTestFogBtn')) $('fxTestFogBtn').onclick = () => saveFxHooks({ test: 'fog' });
+
 init();
 </script>
 </body>
@@ -8065,6 +8348,121 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_displays_discover_roku() -> Response:
         devices = service.displays.discover_roku_tvs()
         return jsonify({"ok": True, "devices": devices})
+
+    @app.get("/api/shows")
+    def api_shows_list() -> Response:
+        resp = jsonify({"ok": True, **service.shows.status_dict()})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/shows/<show_id>/preview.wav")
+    def api_show_preview_wav(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None:
+            return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
+        p_wav = service.shows.preview_wav_path(spec.id)
+        if not p_wav.is_file() or p_wav.stat().st_size < 100:
+            res = service.shows.build_show_preview(spec.id, force=True)
+            if not res.get("ok") or not p_wav.is_file():
+                return jsonify({"ok": False, "error": res.get("error") or "Preview build failed"}), 500
+        resp = Response(p_wav.read_bytes(), mimetype="audio/wav")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/shows/<show_id>/rebuild")
+    def api_show_rebuild(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None:
+            return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
+        res = service.shows.build_show_preview(spec.id, force=True)
+        return jsonify({**res, "status": service.shows.status_dict()}), (200 if res.get("ok") else 500)
+
+    @app.post("/api/shows/<show_id>/config")
+    def api_show_config(show_id: str) -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid show payload"}), 400
+        try:
+            res = service.shows.update_show(show_id, body, rebuild=True)
+            return jsonify(res)
+        except KeyError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.post("/api/shows/<show_id>/upload")
+    def api_show_upload(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None:
+            return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
+
+        raw_name = ""
+        file_bytes = b""
+        song_start: float | None = None
+        song_dur: float | None = None
+        trim_sil: bool | None = None
+
+        def _opt_float(val: Any) -> float | None:
+            if val is None or val == "":
+                return None
+            return float(val)
+
+        if "file" in request.files:
+            up = request.files["file"]
+            raw_name = str(up.filename or request.form.get("filename") or "track.mp3")
+            file_bytes = up.read()
+            song_start = _opt_float(request.form.get("songStartSec") or request.args.get("songStartSec"))
+            song_dur = _opt_float(request.form.get("songDurationSec") or request.args.get("songDurationSec"))
+            if "trimLeadingSilence" in request.form:
+                trim_sil = str(request.form.get("trimLeadingSilence")).lower() not in ("0", "false", "no")
+        else:
+            raw_name = str(request.args.get("filename") or request.headers.get("X-Filename") or "")
+            file_bytes = request.get_data() or b""
+            song_start = _opt_float(request.args.get("songStartSec"))
+            song_dur = _opt_float(request.args.get("songDurationSec"))
+            if "trimLeadingSilence" in request.args:
+                trim_sil = str(request.args.get("trimLeadingSilence")).lower() not in ("0", "false", "no")
+
+        try:
+            res = service.shows.save_uploaded_song(
+                spec.id,
+                raw_name,
+                file_bytes,
+                song_start_sec=song_start,
+                song_duration_sec=song_dur,
+                trim_leading_silence=trim_sil,
+            )
+            return jsonify(res)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.post("/api/shows/<show_id>/fire")
+    def api_show_fire(show_id: str) -> Response:
+        res = service.shows.fire_show(show_id, async_run=True)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/shows/stop")
+    def api_shows_stop() -> Response:
+        res = service.shows.stop_active_show()
+        return jsonify({**res, "status": service.shows.status_dict()})
+
+    @app.post("/api/shows/fx-hooks")
+    def api_shows_fx_hooks() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid FX payload"}), 400
+        res = service.shows.update_fx_hooks(body)
+        test_kind = str(body.get("test") or "").strip().lower()
+        if test_kind == "lights_flash":
+            service.shows._flash_lights(2)
+            res["tested"] = "lights_flash"
+        elif test_kind == "fog":
+            fog_url = service.shows.fx_hooks.resolve_fog_url()
+            res["tested"] = "fog"
+            res["hookResult"] = service.shows._fire_http_hook(fog_url) if fog_url else {"ok": False, "error": "Fog IP/URL not set"}
+        return jsonify(res)
 
     @app.get("/api/clips")
     def api_clips() -> Response:

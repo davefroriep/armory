@@ -207,6 +207,16 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "pause music",
         "next song",
         "skip song",
+        "Matt just hit a PR",
+        "Matt just got here",
+        "Matt is here",
+        "Matt is in the gym",
+        "Ryder is here",
+        "Ryder debut",
+        "Gabe is here",
+        "Josh is here",
+        "Jared and Mark",
+        "stop show",
     ]
     seen = {x.lower() for x in core}
     extras: list[str] = []

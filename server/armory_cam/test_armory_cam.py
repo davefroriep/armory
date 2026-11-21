@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -24,6 +25,7 @@ import display_control as dc  # noqa: E402
 import house_audio as ha  # noqa: E402
 import room_audio as ra  # noqa: E402
 import room_voice as rv  # noqa: E402
+import show_director as sd  # noqa: E402
 
 
 class ArmoryCamTests(unittest.TestCase):
@@ -2486,6 +2488,287 @@ class ArmoryCamTests(unittest.TestCase):
             # 5. 14-day prune drops expired room audio chunks automatically
             svc.room_audio.prune((base_ms / 1000.0) + (15 * 86_400), retention_days=14)
             self.assertFalse(flushed.exists())
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class ShowDirectorTests(unittest.TestCase):
+    def test_voice_triggers_prompt_and_local_interception(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_show_trig_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            tts_spoken: list[str] = []
+            svc.voice._speak_fn = lambda txt: (tts_spoken.append(txt), True)[1]
+
+            prompt, hotwords = rv.build_whisper_prompt("armory")
+            self.assertIn("Matt just hit a PR", prompt)
+            self.assertIn("Matt just got here", prompt)
+            self.assertIn("Ryder is here", prompt)
+            self.assertIn("Jared and Mark", prompt)
+
+            sd_dir = svc.shows
+            self.assertEqual(sd_dir.match_voice_command("Armory, Matt just hit a PR")["showId"], "matt_pr")
+            self.assertEqual(sd_dir.match_voice_command("Hey Armory matt hit a p.r.")["showId"], "matt_pr")
+            self.assertEqual(sd_dir.match_voice_command("Armory Matt just got here")["showId"], "matt_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory Matt's in the gym")["showId"], "matt_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory, Matt is here")["showId"], "matt_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory Ryder is here")["showId"], "ryder_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory Rider debut")["showId"], "ryder_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory Jared and Mark are here")["showId"], "jared_mark_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory Gabe is here")["showId"], "gabe_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory Josh is here")["showId"], "josh_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Armory stop show")["action"], "stop")
+            self.assertIsNone(sd_dir.match_voice_command("Armory 225 for 8"))
+            self.assertIsNone(sd_dir.match_voice_command("Armory open the gym"))
+
+            # Voice injection for matt_pr fires locally, stays off Pixel SSE, and suppresses S330 TTS readback
+            with mock.patch.object(svc.shows, "fire_show", return_value={"ok": True, "showId": "matt_pr", "showName": "Matt PR Drop-In"}) as m_fire:
+                svc.voice._stop_event.clear()
+                ev = svc.voice.inject_transcript("Armory, Matt just hit a PR")
+                self.assertTrue(ev["localHandled"])
+                m_fire.assert_called_once_with("matt_pr", async_run=True)
+                self.assertEqual(tts_spoken, [])
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_anti_roller_coaster_ordering_and_emergency_stop(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_show_arc_"))
+        try:
+            events: list[tuple[str, Any]] = []
+            denon_db = {"val": -30.0}  # MV50
+
+            def fake_denon_get(url: str, _to: float) -> tuple[int, bytes]:
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, (
+                        f"<item><Power><value>ON</value></Power>"
+                        f"<InputFuncSelect><value>MPLAY</value></InputFuncSelect>"
+                        f"<MasterVolume><value>{denon_db['val']:.1f}</value></MasterVolume>"
+                        f"<Mute><value>off</value></Mute></item>"
+                    ).encode("ascii")
+                if "formiPhoneAppDirect.xml?" in url:
+                    cmd = url.split("?", 1)[1]
+                    events.append(("denon", cmd))
+                    return 200, b""
+                return 404, b""
+
+            def fake_cube_post(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                events.append(("cube_play" if "/play" in url else "cube_stop", url, len(body)))
+                return 200, b'{"ok":true,"queued":true}'
+
+            ha_cfg = ha.HouseAudioConfig(
+                denon_enabled=True,
+                denon_host="192.168.1.15",
+                cube_enabled=True,
+                cube_host="192.168.1.151",
+                cube_port=8767,
+            )
+            ham = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha_cfg,
+                allow_network=False,
+                denon_http_get=fake_denon_get,
+                cube_http_post=fake_cube_post,
+                sleep_fn=lambda _s: None,
+            )
+            director = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                allow_network=False,
+                sleep_fn=lambda _s: None,
+            )
+            res = director.fire_show("matt_pr", async_run=False)
+            self.assertTrue(res["ok"])
+
+            # Verify strict ordering: Cube duck play BEFORE first upward Denon MV ramp
+            cube_idx = next(i for i, e in enumerate(events) if e[0] == "cube_play")
+            mv_indices = [i for i, e in enumerate(events) if e[0] == "denon" and str(e[1]).startswith("MV")]
+            self.assertGreater(len(mv_indices), 2)
+            self.assertLess(cube_idx, mv_indices[0])
+            cube_url = events[cube_idx][1]
+            self.assertIn("mode=duck", cube_url)
+            self.assertIn("gain=1.00", cube_url)
+            self.assertIn("sync=0", cube_url)
+
+            # Denon ramps up to MV70 (-10 dB) and then BACK DOWN to MV50 (-30 dB), never exceeding MV70
+            mv_cmds = [events[i][1] for i in mv_indices]
+            self.assertIn("MV70", mv_cmds)
+            self.assertEqual(mv_cmds[-1], "MV50")
+            self.assertFalse(any(c > "MV75" for c in mv_cmds if len(c) == 4))
+
+            # Emergency cancel mid-show MUST restore Denon down BEFORE calling cube.stop()
+            events.clear()
+            cancel_ev = threading.Event()
+
+            def cancel_during_play(sec: float) -> None:
+                if sec > 1.0:
+                    cancel_ev.set()
+
+            director_cancel = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                allow_network=False,
+                sleep_fn=cancel_during_play,
+            )
+            spec = director_cancel.get_show("matt_pr")
+            assert spec is not None
+            director_cancel._active_run_id = 99
+            c_res = director_cancel._run_show_sequence(spec, 99, cancel_ev)
+            self.assertTrue(c_res.get("canceled"))
+            stop_idx = next(i for i, e in enumerate(events) if e[0] == "cube_stop")
+            restore_mv50_idx = max(i for i, e in enumerate(events) if e == ("denon", "MV50"))
+            self.assertLess(restore_mv50_idx, stop_idx)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_ryder_three_screen_and_fx_hooks_choreography(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_ryder_"))
+        try:
+            trace: list[tuple[str, str]] = []
+            adb_cmds: list[list[str]] = []
+
+            def fake_runner(cmd: list[str], _timeout: float) -> tuple[int, str, str]:
+                adb_cmds.append(cmd)
+                if "devices" in cmd:
+                    return 0, (
+                        "List of devices attached\n"
+                        "192.168.1.230:5555\tdevice\n"
+                        "192.168.1.151:5555\tdevice\n"
+                        "192.168.1.204:5555\tdevice\n"
+                    ), ""
+                return 0, "ok", ""
+
+            fake_adb = ac.FireTvAdbController(adb_bin="adb", runner=fake_runner, settle_sec=0.0)
+
+            def fake_http_get(url: str, _to: float) -> tuple[int, bytes]:
+                trace.append(("http_get", url))
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, b"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect><MasterVolume><value>-30.0</value></MasterVolume><Mute><value>off</value></Mute></item>"
+                if "192.168.1.88:8060/query/device-info" in url:
+                    return 200, b"<device-info><power-mode>Ready</power-mode></device-info>"
+                return 200, b"ok"
+
+            def fake_http_post(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                trace.append(("http_post", url))
+                return 200, b'{"ok":true,"queued":true}'
+
+            ha_cfg = ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15", cube_enabled=True, cube_host="192.168.1.151")
+            ham = ha.HouseAudioManager(root_dir=tmp, config=ha_cfg, allow_network=False, denon_http_get=fake_http_get, cube_http_post=fake_http_post, sleep_fn=lambda _s: None)
+            wb_cfg = ac.WallboardConfig(fire_tv_host="192.168.1.204")
+            disp = dc.GymDisplayController(
+                config=dc.GymDisplaysConfig(
+                    primary=dc.PrimaryDisplayConfig(host="192.168.1.230"),
+                    spin=dc.SpinDisplayConfig(host="192.168.1.88", auto_denon_dual=True),
+                    cube_host="192.168.1.151",
+                ),
+                adb_controller=fake_adb,
+                denon_client=ham.denon,
+                wake_wallboard_fn=lambda force=True: (trace.append(("wb", "wake")), {"ok": True})[1],
+                http_get=fake_http_get,
+                http_post=fake_http_post,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+            )
+            director = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                displays=disp,
+                adb_controller=fake_adb,
+                wallboard_cfg_fn=lambda: wb_cfg,
+                allow_network=False,
+                http_get=fake_http_get,
+                sleep_fn=lambda _s: None,
+            )
+            director.update_fx_hooks({"lightsHost": "192.168.1.60", "fogHost": "192.168.1.61", "fogBurstSec": 4.5})
+            res = director.fire_show("ryder_walkin", async_run=False)
+            self.assertTrue(res["ok"])
+
+            urls = [u for k, u in trace if k == "http_get"]
+            self.assertIn("http://192.168.1.60/rpc/Switch.Set?id=0&on=false", urls)
+            self.assertIn("http://192.168.1.61/rpc/Switch.Set?id=0&on=true&toggle_after=4.5", urls)
+            # 2x light flash sequence includes on/off cycles
+            self.assertGreaterEqual(urls.count("http://192.168.1.60/rpc/Switch.Set?id=0&on=true"), 2)
+            # Denon Dual HDMI Out (AUTO) + MV70 + SmartSpin PowerOn & InputHDMI1
+            self.assertTrue(any("VSMONIAUTO" in u for u in urls))
+            self.assertTrue(any("MV70" in u for u in urls))
+            posts = [u for k, u in trace if k == "http_post"]
+            self.assertIn("http://192.168.1.88:8060/keypress/PowerOn", posts)
+            self.assertIn("http://192.168.1.88:8060/keypress/InputHDMI1", posts)
+            # Wallboard woken, muted cleanly via media volume 0, and both Wallboard & Cube launched Cody Rhodes URL
+            self.assertIn(("wb", "wake"), trace)
+            joined_adb = [" ".join(c) for c in adb_cmds]
+            self.assertTrue(any("192.168.1.204:5555" in s and "media volume --stream 3 --set 0" in s for s in joined_adb))
+            self.assertTrue(any("192.168.1.204:5555" in s and "05vwKMySzKw" in s for s in joined_adb))
+            self.assertTrue(any("192.168.1.151:5555" in s and "05vwKMySzKw" in s for s in joined_adb))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_show_api_preview_onset_and_song_upload_trim(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_show_api_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash = client.get("/").get_data(as_text=True)
+            self.assertIn("Walk-Ins &amp; PR Drop-Ins (Show Lab)", dash)
+            self.assertIn("shStopAllBtn", dash)
+
+            lst = client.get("/api/shows")
+            self.assertEqual(lst.status_code, 200)
+            j_lst = lst.get_json()
+            self.assertTrue(j_lst["ok"])
+            ids = {s["id"] for s in j_lst["shows"]}
+            self.assertEqual(ids, {"matt_pr", "matt_walkin", "ryder_walkin", "jared_mark_walkin", "gabe_walkin", "josh_walkin"})
+
+            # Preview WAV builds cleanly, has instant non-silent onset in first 150ms and clean faded tail
+            prev = client.get("/api/shows/matt_pr/preview.wav")
+            self.assertEqual(prev.status_code, 200)
+            self.assertEqual(prev.mimetype, "audio/wav")
+            prev_path = tmp / "shows" / "rendered" / "matt_pr_preview.wav"
+            arr = sd.read_wav_stereo_float(prev_path)
+            self.assertGreater(arr.shape[0], 10 * sd.SHOW_SR)
+            first_rms = float(np.sqrt(np.mean(arr[: int(0.15 * sd.SHOW_SR)] ** 2)))
+            tail_rms = float(np.sqrt(np.mean(arr[-int(0.15 * sd.SHOW_SR) :] ** 2)))
+            self.assertGreater(first_rms, 0.05)
+            self.assertLess(tail_rms, 0.04)
+
+            # Path traversal upload MUST be rejected with HTTP 400
+            bad_up = client.post(
+                "/api/shows/matt_pr/upload?filename=../evil.wav",
+                data=b"RIFF0000WAVE",
+                content_type="application/octet-stream",
+            )
+            self.assertEqual(bad_up.status_code, 400)
+
+            # Synthetic WAV with 0.6s dead leading silence + 2.5s loud tone -> upload strips leading silence!
+            sr = sd.SHOW_SR
+            sil = np.zeros((int(0.6 * sr), 2), dtype=np.float32)
+            t = np.linspace(0.0, 2.5, int(2.5 * sr), endpoint=False, dtype=np.float32)
+            tone = np.stack([0.8 * np.sin(2.0 * np.pi * 440.0 * t), 0.8 * np.sin(2.0 * np.pi * 440.0 * t)], axis=1)
+            synth_wav = sd.encode_stereo_pcm16_wav(np.concatenate([sil, tone], axis=0), sr=sr)
+
+            up = client.post(
+                "/api/shows/matt_pr/upload?filename=custom_best.wav&songStartSec=0&songDurationSec=3&trimLeadingSilence=1",
+                data=synth_wav,
+                content_type="audio/wav",
+            )
+            self.assertEqual(up.status_code, 200)
+            j_up = up.get_json()
+            self.assertTrue(j_up["ok"])
+            self.assertEqual(j_up["show"]["sourceFile"], "matt_pr_custom_best.wav")
+            self.assertTrue((tmp / "shows" / "sources" / "matt_pr_custom_best.wav").is_file())
+            rebuilt = sd.read_wav_stereo_float(prev_path)
+            onset_rms = float(np.sqrt(np.mean(rebuilt[: int(0.10 * sr)] ** 2)))
+            self.assertGreater(onset_rms, 0.05)
+
+            # Config update persists across reload
+            cfg_res = client.post("/api/shows/matt_pr/config", json={"denonVol": 68, "songStartSec": 1.25})
+            self.assertEqual(cfg_res.status_code, 200)
+            reloaded = sd.ShowDirector(root_dir=tmp, allow_network=False)
+            self.assertEqual(reloaded.get_show("matt_pr").denon_vol, 68)
+            self.assertAlmostEqual(reloaded.get_show("matt_pr").song_start_sec, 1.25)
         finally:
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
