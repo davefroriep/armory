@@ -203,6 +203,10 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "SmartSpin TV",
         "wallboard",
         "all TVs",
+        "play music",
+        "pause music",
+        "next song",
+        "skip song",
     ]
     seen = {x.lower() for x in core}
     extras: list[str] = []
@@ -1092,6 +1096,7 @@ class RoomVoiceService:
         root_dir: Path | None = None,
         house_audio_router: Callable[..., dict[str, Any] | None] | None = None,
         local_command_handler: Callable[[str], dict[str, Any] | None] | None = None,
+        on_pcm_chunk: Callable[[np.ndarray, int, float], None] | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
@@ -1101,6 +1106,7 @@ class RoomVoiceService:
         self._allow_hardware_audio = allow_hardware_audio
         self._house_audio_router = house_audio_router
         self._local_command_handler = local_command_handler
+        self._on_pcm_chunk = on_pcm_chunk
 
         self.log = logging.getLogger("armory-voice")
         self.lock = threading.RLock()
@@ -1711,6 +1717,11 @@ class RoomVoiceService:
                 if self._stop_event.is_set():
                     return
                 mono = indata.mean(axis=1) if indata.ndim > 1 and indata.shape[1] > 1 else indata.reshape(-1)
+                if self._on_pcm_chunk is not None:
+                    try:
+                        self._on_pcm_chunk(mono.copy(), sr, time.time())
+                    except Exception:
+                        pass
                 pcm16 = resample_to_mono_16k(mono, sr)
                 muted = time.monotonic() < self._mute_until_mono
                 utterances = self._detector.push_samples(pcm16, muted=muted)

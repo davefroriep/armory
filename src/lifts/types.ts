@@ -178,6 +178,8 @@ export interface VideoMeta {
   /** Non-destructive in-app trim start/end in seconds within the clip. */
   trimStartSec?: number;
   trimEndSec?: number;
+  /** True when the saved Gym-Cam MP4 contains baked room audio (PowerConf S330). */
+  hasAudio?: boolean;
   /** True for Guest / Buddy clips stored outside set.vids tracking. */
   guest?: boolean;
 }

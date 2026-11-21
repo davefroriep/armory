@@ -79,7 +79,8 @@ class SpinDisplayConfig:
     mac: str = ""
     ecp_port: int = 8060
     hdmi_input: str = "InputHDMI1"
-    auto_denon_dual: bool = False
+    auto_denon_dual: bool = True
+    primary_denon_monitor: str = "1"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +90,7 @@ class SpinDisplayConfig:
             "ecpPort": int(self.ecp_port),
             "hdmiInput": self.hdmi_input,
             "autoDenonDual": bool(self.auto_denon_dual),
+            "primaryDenonMonitor": self.primary_denon_monitor,
         }
 
     @classmethod
@@ -99,13 +101,15 @@ class SpinDisplayConfig:
             ecp_port = max(1, min(65535, int(raw.get("ecpPort", 8060))))
         except (TypeError, ValueError):
             ecp_port = 8060
+        mon = str(raw.get("primaryDenonMonitor", "1") or "1").strip()
         return cls(
             enabled=bool(raw.get("enabled", True)),
             host=str(raw.get("host", "") or "").strip(),
             mac=str(raw.get("mac", "") or "").strip(),
             ecp_port=ecp_port,
             hdmi_input=str(raw.get("hdmiInput", "InputHDMI1") or "InputHDMI1").strip(),
-            auto_denon_dual=bool(raw.get("autoDenonDual", False)),
+            auto_denon_dual=bool(raw.get("autoDenonDual", True)),
+            primary_denon_monitor=mon if mon in ("1", "2") else "1",
         )
 
 
@@ -159,6 +163,39 @@ def normalize_youtube_tv_url(url: str) -> str:
     if not raw:
         return ""
     return re.sub(r"^https?://music\.youtube\.com\b", "https://www.youtube.com", raw, flags=re.I)
+
+
+def resolve_youtube_music_url(
+    query: str,
+    http_get: Callable[[str, float], tuple[int, bytes]] | None = None,
+) -> str:
+    """Look up top YouTube video ID for `query` and return an auto-playing Radio Mix URL."""
+    q = str(query or "").strip() or DEFAULT_OPEN_GYM_MUSIC_QUERY
+    search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(q)}"
+    try:
+        if http_get is not None:
+            code, raw = http_get(search_url, 4.0)
+        else:
+            req = urllib.request.Request(
+                search_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=4.5) as resp:
+                code, raw = int(resp.status), resp.read()
+        if code >= 400:
+            return ""
+        html = raw.decode("utf-8", errors="ignore")
+        m = re.search(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', html)
+        if not m:
+            return ""
+        vid = m.group(1)
+        return f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+    except Exception:
+        return ""
 
 
 _HDMI_INPUT_KEYCODES: dict[str, str] = {
@@ -327,6 +364,35 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
             "action": "run",
             "speech": "Closing the gym",
         }
+
+    # 1b. Music playback commands on Fire TV Cube / Denon AVR (skip if user said clip/video/replay)
+    if not re.search(r"\b(?:clip|video|replay)\b", cmd):
+        if re.search(
+            r"\b(?:play\s+(?:some\s+)?(?:music|songs?|tracks?|tunes|radio|playlist|mix)|(?:start|turn\s+on|put\s+on)\s+(?:some\s+|the\s+)?music)\b",
+            cmd,
+        ):
+            return {"target": "music", "targets": ["music"], "action": "play", "speech": "Playing music"}
+        q_m = re.search(
+            r"\bplay\s+(?:some\s+)?(.+?)\s+(?:music|songs?|tracks?|tunes|radio|playlist|mix|on\s+youtube|on\s+cube)\b",
+            cmd,
+        )
+        if q_m:
+            query_txt = re.sub(r"\b(?:on\s+(?:the\s+)?(?:cube|tv|fire\s*tv|youtube|speakers))\b", "", q_m.group(1)).strip()
+            if query_txt:
+                return {
+                    "target": "music",
+                    "targets": ["music"],
+                    "action": f"play:{query_txt}",
+                    "speech": f"Playing {query_txt}",
+                }
+        if re.search(r"\b(?:pause|stop)\s+(?:the\s+)?(?:music|song|track|tunes)\b", cmd):
+            return {"target": "music", "targets": ["music"], "action": "pause", "speech": "Music paused"}
+        if re.search(r"\b(?:resume|unpause|continue)\s+(?:the\s+)?(?:music|song|track|tunes)\b", cmd):
+            return {"target": "music", "targets": ["music"], "action": "resume", "speech": "Resuming music"}
+        if re.search(r"\b(?:next|skip)\s+(?:this\s+|the\s+)?(?:song|track|music)\b", cmd):
+            return {"target": "music", "targets": ["music"], "action": "next", "speech": "Next track"}
+        if re.search(r"\b(?:previous|last|back)\s+(?:the\s+)?(?:song|track|music)\b", cmd):
+            return {"target": "music", "targets": ["music"], "action": "prev", "speech": "Previous track"}
 
     # Ignore lifting/cardio cues outright if there are no display/TV/AVR/HDMI words
     if not re.search(
@@ -528,6 +594,21 @@ class GymDisplayController:
         res = self.denon.send_command(cmd)
         return {**res, "monitorOut": m, "via": "direct"}
 
+    def sync_denon_monitor_for_spin(self, *, spin_expected_on: bool | None = None) -> dict[str, Any]:
+        """Keep Denon on single sink when TCL SmartSpin is OFF so Hisense never blacks out."""
+        cfg = self.get_config().spin
+        if not cfg.auto_denon_dual or self.denon is None:
+            return {"ok": True, "skipped": True}
+        if spin_expected_on is not None:
+            spin_on = bool(spin_expected_on)
+        elif cfg.host:
+            info = self.get_roku_info(cfg.host, cfg.ecp_port)
+            spin_on = bool(info.get("ok") and info.get("powerMode") == "PowerOn")
+        else:
+            spin_on = False
+        target = "AUTO" if spin_on else (cfg.primary_denon_monitor if cfg.primary_denon_monitor in ("1", "2") else "1")
+        return self.set_denon_monitor_out(target)
+
     def probe_primary(self) -> dict[str, Any]:
         cfg = self.get_config().primary
         ser = self._adb_serial(cfg.host, cfg.adb_port)
@@ -623,12 +704,14 @@ class GymDisplayController:
                 ["-s", ser, "shell", "input", "keyevent", keycode],
                 timeout=4.0,
             )
+            denon_res = self.sync_denon_monitor_for_spin() if (rc == 0 and not is_hdmi1) else None
             return {
                 "ok": rc == 0,
                 "target": "tv",
                 "action": action,
                 "keycode": keycode,
                 "inputId": input_id,
+                **({"denonMonitor": denon_res} if denon_res is not None else {}),
                 "message": (
                     f"Switched TV to {'HDMI 1 (PC)' if is_hdmi1 else 'HDMI 2 (Fire TV)'} (keyevent {keycode})"
                     if rc == 0
@@ -638,7 +721,7 @@ class GymDisplayController:
 
         return {"ok": False, "target": "tv", "action": action, "error": f"Unsupported action: {action}"}
 
-    def _launch_cube_youtube_music(self) -> dict[str, Any]:
+    def _launch_cube_youtube_music(self, query_override: str | None = None) -> dict[str, Any]:
         cfg = self.get_config()
         ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
         if not ser or self.adb is None:
@@ -647,43 +730,46 @@ class GymDisplayController:
         if st != "device":
             return {"ok": False, "state": st, "error": f"Cube ADB {st}: {detail}"}
         self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
-        if cfg.open_gym_music_url:
+        q_over = str(query_override or "").strip()
+        if not q_over and cfg.open_gym_music_url:
             yt_url = normalize_youtube_tv_url(cfg.open_gym_music_url)
-            rc, out, err = self.adb._run(
-                ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(yt_url), "com.amazon.firetv.youtube"],
-                timeout=6.0,
-            )
+            shell_cmd = f"am start -a android.intent.action.VIEW -d {shlex.quote(yt_url)} com.amazon.firetv.youtube"
+            rc, out, err = self.adb._run(["-s", ser, "shell", shell_cmd], timeout=6.0)
             return {
                 "ok": rc == 0,
                 "mode": "url",
                 "url": yt_url,
-                "message": f"Launched YouTube playlist on Cube" if rc == 0 else (err or out).strip(),
+                "message": "Launched YouTube playlist on Cube" if rc == 0 else (err or out).strip(),
             }
-        query = cfg.open_gym_music_query or DEFAULT_OPEN_GYM_MUSIC_QUERY
-        rc, out, err = self.adb._run(
-            [
-                "-s",
-                ser,
-                "shell",
-                "am",
-                "start",
-                "-a",
-                "android.media.action.MEDIA_PLAY_FROM_SEARCH",
-                "-e",
-                "query",
-                shlex.quote(query),
-                "com.amazon.firetv.youtube",
-            ],
-            timeout=6.0,
+        query = q_over or cfg.open_gym_music_query or DEFAULT_OPEN_GYM_MUSIC_QUERY
+        yt_url = (
+            resolve_youtube_music_url(query, http_get=self._http_get)
+            if (self._allow_network or self._http_get is not None)
+            else ""
         )
+        if yt_url:
+            shell_cmd = f"am start -a android.intent.action.VIEW -d {shlex.quote(yt_url)} com.amazon.firetv.youtube"
+            rc, out, err = self.adb._run(["-s", ser, "shell", shell_cmd], timeout=6.0)
+            return {
+                "ok": rc == 0,
+                "mode": "mix_url",
+                "query": query,
+                "url": yt_url,
+                "message": f"Playing YouTube mix ({query}) on Cube" if rc == 0 else (err or out).strip(),
+            }
+        shell_cmd = (
+            f"am start -a android.media.action.MEDIA_PLAY_FROM_SEARCH -d 'youtube://search' "
+            f"-e query {shlex.quote(query)} com.amazon.firetv.youtube"
+        )
+        rc, out, err = self.adb._run(["-s", ser, "shell", shell_cmd], timeout=6.0)
         return {
             "ok": rc == 0,
             "mode": "search",
             "query": query,
-            "message": f"Launched YouTube music ({query}) on Cube" if rc == 0 else (err or out).strip(),
+            "message": f"Launched YouTube search ({query}) on Cube" if rc == 0 else (err or out).strip(),
         }
 
-    def _pause_cube_media(self) -> dict[str, Any]:
+    def _cube_media_keyevent(self, keycode: str, label: str) -> dict[str, Any]:
         cfg = self.get_config()
         ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
         if not ser or self.adb is None:
@@ -691,11 +777,38 @@ class GymDisplayController:
         st, detail = self.adb._connect_and_status(ser)
         if st != "device":
             return {"ok": False, "state": st, "error": f"Cube ADB {st}: {detail}"}
-        rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "127"], timeout=4.0)
+        rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", keycode], timeout=4.0)
         return {
             "ok": rc == 0,
-            "message": "Paused Fire TV Cube media" if rc == 0 else (err or out).strip(),
+            "keycode": keycode,
+            "message": label if rc == 0 else (err or out).strip(),
         }
+
+    def _pause_cube_media(self) -> dict[str, Any]:
+        return self._cube_media_keyevent("127", "Paused Fire TV Cube media")
+
+    def _control_music(self, action: str) -> dict[str, Any]:
+        raw_act = str(action or "").strip()
+        low = raw_act.lower()
+        if low == "play" or low.startswith("play:"):
+            q_over = raw_act.split(":", 1)[1].strip() if ":" in raw_act else ""
+            if self.denon is not None:
+                self._control_avr("on")
+                self.denon.send_command("MSMCH STEREO")
+                self.sync_denon_monitor_for_spin()
+            res = self._launch_cube_youtube_music(query_override=q_over or None)
+            return {**res, "target": "music", "action": raw_act}
+        key_map = {
+            "pause": ("127", "Music paused"),
+            "resume": ("126", "Resuming music"),
+            "next": ("87", "Next track"),
+            "prev": ("88", "Previous track"),
+        }
+        if low in key_map:
+            kc, msg = key_map[low]
+            res = self._cube_media_keyevent(kc, msg)
+            return {**res, "target": "music", "action": low}
+        return {"ok": False, "target": "music", "action": raw_act, "error": f"Unsupported music action: {raw_act}"}
 
     def get_roku_info(self, host: str, port: int = 8060) -> dict[str, Any]:
         clean = str(host or "").strip()
@@ -761,7 +874,7 @@ class GymDisplayController:
                 if cfg.hdmi_input:
                     self._sleep(0.5)
                     self._do_post(f"{base}/keypress/{urllib.parse.quote(cfg.hdmi_input, safe='')}", b"", {}, 2.0)
-                denon_res = self.set_denon_monitor_out("AUTO") if (cfg.auto_denon_dual and self.denon is not None) else None
+                denon_res = self.sync_denon_monitor_for_spin(spin_expected_on=True)
                 return {
                     "ok": True,
                     "target": "spin",
@@ -777,7 +890,7 @@ class GymDisplayController:
                 code, _ = self._do_post(f"{base}/keypress/PowerOff", b"", {}, 2.0)
                 if code >= 400:
                     return {"ok": False, "target": "spin", "action": "off", "error": f"HTTP {code}"}
-                denon_res = self.set_denon_monitor_out("1") if (cfg.auto_denon_dual and self.denon is not None) else None
+                denon_res = self.sync_denon_monitor_for_spin(spin_expected_on=False)
                 return {
                     "ok": True,
                     "target": "spin",
@@ -849,6 +962,8 @@ class GymDisplayController:
             return self._control_spin(act)
         if tgt == "avr":
             return self._control_avr(act)
+        if tgt == "music":
+            return self._control_music(str(action or "").strip())
         if tgt == "wallboard":
             if act == "on":
                 if self._wake_wallboard_fn is None:
@@ -870,6 +985,7 @@ class GymDisplayController:
             results["avr"] = self._control_avr("on")
             if self.denon is not None:
                 results["avr_mode"] = self.denon.send_command("MSMCH STEREO")
+                results["avr_monitor"] = self.sync_denon_monitor_for_spin()
             if self._wake_wallboard_fn is not None:
                 results["wallboard"] = self._wake_wallboard_fn(True)
             if cfg.open_gym_play_music:

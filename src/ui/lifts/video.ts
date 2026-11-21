@@ -690,6 +690,68 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   let burstPlayTimer: ReturnType<typeof setInterval> | null = null;
   let wantBurstAutoPlay = false;
 
+  let previewAudioOn = false;
+  let saveWithSound = false;
+  let scrubListenOn = false;
+  let previewAudioEl: HTMLAudioElement | null = null;
+  let previewAudioKey = '';
+
+  const stopPreviewAudio = (resetSrc = false): void => {
+    scrubListenOn = false;
+    if (previewAudioEl) {
+      try {
+        previewAudioEl.pause();
+      } catch {
+        // ignore pause errors
+      }
+      if (resetSrc) {
+        previewAudioEl.removeAttribute('src');
+        previewAudioEl.load();
+        previewAudioKey = '';
+      }
+    }
+    const lbtn = sh?.body.querySelector<HTMLButtonElement>('[data-slisten]');
+    if (lbtn) lbtn.textContent = '▶ Listen';
+  };
+
+  const playPreviewAudioRange = (startMs: number, endMs: number, atMs = startMs): void => {
+    if (!previewAudioOn || !gymCam.online || endMs <= startMs) return;
+    if (!previewAudioEl) {
+      previewAudioEl = document.createElement('audio');
+      previewAudioEl.preload = 'auto';
+      previewAudioEl.addEventListener('ended', () => {
+        scrubListenOn = false;
+        const lbtn = sh?.body.querySelector<HTMLButtonElement>('[data-slisten]');
+        if (lbtn) lbtn.textContent = '▶ Listen';
+      });
+    }
+    const key = `${Math.round(startMs)}|${Math.round(endMs)}`;
+    const url = gymCam.roomAudioUrl(startMs, endMs);
+    if (previewAudioKey !== key || previewAudioEl.getAttribute('src') !== url) {
+      previewAudioKey = key;
+      previewAudioEl.src = url;
+      previewAudioEl.load();
+    }
+    const offsetSec = clamp((atMs - startMs) / 1000, 0, Math.max(0, (endMs - startMs) / 1000 - 0.1));
+    const applyTime = () => {
+      if (!previewAudioEl) return;
+      try {
+        if (Math.abs((previewAudioEl.currentTime || 0) - offsetSec) > 0.35) {
+          previewAudioEl.currentTime = offsetSec;
+        }
+      } catch {
+        // ignore seek before metadata
+      }
+      void previewAudioEl.play().catch(() => {});
+    };
+    if (previewAudioEl.readyState >= 1) {
+      applyTime();
+    } else {
+      previewAudioEl.addEventListener('loadedmetadata', applyTime, { once: true });
+      void previewAudioEl.play().catch(() => {});
+    }
+  };
+
   const clearPack = (): void => {
     packAbort?.abort();
     packAbort = null;
@@ -712,6 +774,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       burstPlayTimer = null;
     }
     wantBurstAutoPlay = false;
+    stopPreviewAudio(false);
     const btn = sh?.body.querySelector<HTMLButtonElement>('[data-bplay]');
     if (btn) {
       btn.classList.remove('on');
@@ -737,6 +800,8 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   const cleanupResources = (): void => {
     clearPack();
     clearBurstPacks();
+    stopPreviewAudio(true);
+    previewAudioEl = null;
   };
 
   sh = openSheet(
@@ -819,6 +884,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     if (btn) {
       btn.classList.add('on');
       btn.textContent = '⏸';
+    }
+    if (previewAudioOn) {
+      playPreviewAudioRange(b.startMs, b.endMs, burstCursorMs || b.startMs);
     }
     burstPlayTimer = setInterval(() => {
       const activeB = currentBurst();
@@ -1072,7 +1140,11 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
             <button class="btn sm" type="button" data-bnav="-1" ${burstIdx <= 0 ? 'disabled' : ''}>◀ Older</button>
             <button class="btn sm" type="button" data-bnav="1" ${burstIdx >= bursts.length - 1 ? 'disabled' : ''}>Newer ▶</button>
           </div>` : ''}
-          <button class="btn primary big" type="button" data-bsave>Save Clip (${b.durationSec}s) to ${esc(setLabel)}</button>
+          <div class="vsnd-opts">
+            <label class="vsnd-chk"><input type="checkbox" data-vsnd-prev${previewAudioOn ? ' checked' : ''}><span>🔊 Preview sound</span></label>
+            <label class="vsnd-chk"><input type="checkbox" data-vsnd-save${saveWithSound ? ' checked' : ''}><span>🎙 Include room audio</span></label>
+          </div>
+          <button class="btn primary big" type="button" data-bsave>${saveWithSound ? `Save Clip w/ Sound (${b.durationSec}s)` : `Save Clip (${b.durationSec}s)`} to ${esc(setLabel)}</button>
           <button class="btn sm" type="button" data-bscrub>Adjust IN/OUT Trim ▸</button>
         </div>`;
       ensureBurstPack(b);
@@ -1155,7 +1227,12 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
         </div>
 
         <div class="vscrub-sum">Clip: <b>${fmtEpochClock(inMs)} → ${fmtEpochClock(outMs)}</b> · <b>${clipSec}s</b></div>
-        <button class="btn primary big" type="button" data-ssave>Save Clip (${clipSec}s) to ${esc(setLabel)}</button>
+        <div class="vsnd-opts">
+          <label class="vsnd-chk"><input type="checkbox" data-vsnd-prev${previewAudioOn ? ' checked' : ''}><span>🔊 Preview sound</span></label>
+          <button class="btn sm" type="button" data-slisten${previewAudioOn ? '' : ' hidden'}>${scrubListenOn ? '⏸ Stop Audio' : '▶ Listen'}</button>
+          <label class="vsnd-chk"><input type="checkbox" data-vsnd-save${saveWithSound ? ' checked' : ''}><span>🎙 Include room audio</span></label>
+        </div>
+        <button class="btn primary big" type="button" data-ssave>${saveWithSound ? `Save Clip w/ Sound (${clipSec}s)` : `Save Clip (${clipSec}s)`} to ${esc(setLabel)}</button>
       </div>`;
 
     ensurePackForCurrentWindow();
@@ -1482,13 +1559,15 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       const b = bursts[burstIdx];
       bsave.disabled = true;
       bsave.textContent = 'Saving…';
-      const meta = await gymCam.saveWindowClip(t, selectedCam, b.startMs, b.endMs);
+      const meta = await gymCam.saveWindowClip(t, selectedCam, b.startMs, b.endMs, {
+        includeAudio: saveWithSound,
+      });
       if (meta) {
-        toast('Clip saved & linked');
+        toast(meta.hasAudio ? 'Clip + room audio saved & linked' : 'Clip saved & linked');
         sh.close();
       } else {
         bsave.disabled = false;
-        bsave.textContent = `Save Clip (${b.durationSec}s) to ${setLabel}`;
+        bsave.textContent = `${saveWithSound ? `Save Clip w/ Sound (${b.durationSec}s)` : `Save Clip (${b.durationSec}s)`} to ${setLabel}`;
         toast('Could not save clip from Gym Cam');
       }
       return;
@@ -1496,17 +1575,32 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const ssave = el.closest<HTMLButtonElement>('[data-ssave]');
     if (ssave && selectedCam && minMs && maxMs) {
+      stopPreviewAudio(false);
       const dur = Math.max(1, Math.round((outMs - inMs) / 1000));
       ssave.disabled = true;
       ssave.textContent = 'Saving…';
-      const meta = await gymCam.saveWindowClip(t, selectedCam, inMs, outMs);
+      const meta = await gymCam.saveWindowClip(t, selectedCam, inMs, outMs, {
+        includeAudio: saveWithSound,
+      });
       if (meta) {
-        toast('Clip saved & linked');
+        toast(meta.hasAudio ? 'Clip + room audio saved & linked' : 'Clip saved & linked');
         sh.close();
       } else {
         ssave.disabled = false;
-        ssave.textContent = `Save Clip (${dur}s) to ${setLabel}`;
+        ssave.textContent = `${saveWithSound ? `Save Clip w/ Sound (${dur}s)` : `Save Clip (${dur}s)`} to ${setLabel}`;
         toast('Could not save clip from Gym Cam');
+      }
+      return;
+    }
+
+    const sListen = el.closest<HTMLButtonElement>('[data-slisten]');
+    if (sListen && minMs && maxMs) {
+      if (scrubListenOn) {
+        stopPreviewAudio(false);
+      } else {
+        scrubListenOn = true;
+        sListen.textContent = '⏸ Stop Audio';
+        playPreviewAudioRange(inMs, outMs, inMs);
       }
       return;
     }
@@ -1564,6 +1658,35 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       if (meta) { toast(`Linked ${meta.fileName ?? 'video'}`); sh.close(); }
     } else if (el.closest('[data-vok]')) {
       sh.close();
+    }
+  });
+
+  sh.body.addEventListener('change', (e) => {
+    const inp = e.target as HTMLInputElement;
+    if (inp.matches('[data-vsnd-prev]')) {
+      previewAudioOn = inp.checked;
+      const lbtn = sh.body.querySelector<HTMLButtonElement>('[data-slisten]');
+      if (lbtn) lbtn.hidden = !previewAudioOn;
+      if (!previewAudioOn) {
+        stopPreviewAudio(false);
+      } else if (viewMode === 'bursts' && burstPlayTimer != null) {
+        const b = currentBurst();
+        if (b) playPreviewAudioRange(b.startMs, b.endMs, burstCursorMs || b.startMs);
+      }
+      return;
+    }
+    if (inp.matches('[data-vsnd-save]')) {
+      saveWithSound = inp.checked;
+      const b = currentBurst();
+      const bsave = sh.body.querySelector<HTMLButtonElement>('[data-bsave]');
+      if (bsave && b && !bsave.disabled) {
+        bsave.textContent = `${saveWithSound ? `Save Clip w/ Sound (${b.durationSec}s)` : `Save Clip (${b.durationSec}s)`} to ${setLabel}`;
+      }
+      const ssave = sh.body.querySelector<HTMLButtonElement>('[data-ssave]');
+      if (ssave && minMs && maxMs && !ssave.disabled) {
+        const dur = Math.max(1, Math.round((outMs - inMs) / 1000));
+        ssave.textContent = `${saveWithSound ? `Save Clip w/ Sound (${dur}s)` : `Save Clip (${dur}s)`} to ${setLabel}`;
+      }
     }
   });
   await closed;
@@ -1802,6 +1925,9 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   let restoreAfterLoad: { time: number; paused: boolean } | null = null;
   let tapeAnglesChecked = false;
   let tapeAngles: string[] = [];
+  let tapeAudioAvail = false;
+  let soundPreviewOn = false;
+  let loadedAudUrl = '';
   let lastAnglesSig = '';
   const angleCache = new Map<string, { playUrl: string; objectUrl: string; blob: Blob | null; lanUrl: string; fileName: string }>();
 
@@ -1852,7 +1978,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
        </div>
      </div>
      <div class="vp-stage">
-       ${canHaveDeck ? `<video class="pv" id="vpVid"${primaryPlayUrl ? ` src="${esc(primaryPlayUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video>` : ''}
+       ${canHaveDeck ? `<video class="pv" id="vpVid"${primaryPlayUrl ? ` src="${esc(primaryPlayUrl)}"` : ' hidden'} playsinline muted autoplay loop preload="auto"></video><audio id="vpAud" preload="none" hidden></audio>` : ''}
        ${posterHtml}
        <p class="hint" id="vpLoadMsg"${needsLanLoad ? '' : ' hidden'} style="text-align:center">Loading from OptiPlex on Gym Wi-Fi…</p>
        <p class="hint" id="vpLanErr" hidden style="text-align:center">Away from Gym Wi-Fi — stream this clip from Google Drive below.</p>
@@ -1862,6 +1988,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
        <div class="vp-readout">
          <span><span class="vp-time" id="vpTime">0:00.00 / 0:00.00</span> · <span class="vp-frame" id="vpFrame">f 0</span></span>
          <span class="vp-rbtns">
+           <label class="vp-snd-chk" id="vpSoundLbl" hidden><input type="checkbox" id="vpSoundChk"><span>🔊 Sound</span></label>
            <button class="vp-zoom" type="button" id="vpZoomBtn" data-vzoom hidden>⤢ Full</button>
            <button class="vp-focus" type="button" id="vpFocus" data-vfocus-cycle>Full clip</button>
          </span>
@@ -1916,12 +2043,17 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
          <button class="vp-nbtn" type="button" data-vtape="5:0">−5s Earlier</button>
          <button class="vp-nbtn" type="button" data-vtape="0:5">+5s Later</button>
        </div>
+       <div class="vp-audio-row" id="vpAudioRow" hidden>
+         <small id="vpAudioLbl">🔇 Silent clip</small>
+         <button class="vp-nbtn pri" type="button" id="vpAudioToggle" data-vaudio>+ Add Room Audio</button>
+       </div>
      </div>` : ''}
      <div class="vp-drawer" id="vpShareBox" hidden>
        <div class="vp-dr-head">
          <span>Export &amp; Share</span>
          <button type="button" data-vp="share" aria-label="Close share">✕</button>
        </div>
+       <div class="vp-share-aud" id="vpShareAudioBadge">🔇 Silent MP4 — safe to share</div>
        <button class="btn primary big" type="button" data-vexp="share">Share Video…</button>
        <button class="btn big" type="button" data-vexp="save">Save MP4 to Gallery</button>
        ${driveUrl ? `<a class="btn big" href="${esc(driveUrl)}" target="_blank" rel="noopener" data-vdrive>${driveBtnLabel}</a>` : ''}
@@ -1940,6 +2072,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         closed = true;
         dlCtrl.abort();
         if (uiTicker) clearInterval(uiTicker);
+        const a = sh.body.querySelector<HTMLAudioElement>('#vpAud');
+        if (a) {
+          a.pause();
+          a.removeAttribute('src');
+          a.load();
+        }
         if (primaryObjectUrl) URL.revokeObjectURL(primaryObjectUrl);
         clearAngleCache();
       },
@@ -1947,7 +2085,59 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   );
 
   const vid = sh.body.querySelector<HTMLVideoElement>('#vpVid');
+  const aud = sh.body.querySelector<HTMLAudioElement>('#vpAud');
   const q = <T extends HTMLElement>(sel: string): T | null => sh.body.querySelector<T>(sel);
+
+  const activeClipMeta = (): VideoMeta => (!viewIsPreview && viewSiblingMeta ? viewSiblingMeta : meta!);
+  const activeHasBakedAudio = (): boolean => {
+    if (viewIsPreview) return false;
+    const am = activeClipMeta();
+    return am.source !== 'gymcam' || am.hasAudio === true;
+  };
+  const activeLegacyMaybeAudio = (): boolean => {
+    if (viewIsPreview || viewSiblingMeta) return false;
+    return meta!.source === 'gymcam' && meta!.hasAudio === undefined;
+  };
+  const syncSoundPlayback = (forceSeek = false): void => {
+    if (!vid) return;
+    if (!soundPreviewOn) {
+      vid.muted = true;
+      if (aud && !aud.paused) aud.pause();
+      return;
+    }
+    if (activeHasBakedAudio() || activeLegacyMaybeAudio()) {
+      vid.muted = false;
+      if (aud && !aud.paused) aud.pause();
+      return;
+    }
+    vid.muted = true;
+    const cStart = meta!.clipStartMs;
+    const cEnd = meta!.clipEndMs ?? (cStart != null ? cStart + Math.max(5, meta!.durationSec ?? 20) * 1000 : null);
+    if (!aud || !gymCam.online || cStart == null || cEnd == null || !tapeAudioAvail) {
+      if (aud && !aud.paused) aud.pause();
+      return;
+    }
+    const url = gymCam.roomAudioUrl(cStart, cEnd);
+    if (loadedAudUrl !== url || aud.getAttribute('src') !== url) {
+      loadedAudUrl = url;
+      aud.src = url;
+      aud.load();
+    }
+    aud.playbackRate = speed;
+    const targetT = Math.max(0, vid.currentTime || 0);
+    if (forceSeek || Math.abs((aud.currentTime || 0) - targetT) > 0.25) {
+      try {
+        if (aud.readyState >= 1) aud.currentTime = targetT;
+      } catch {
+        // ignore seek before ready
+      }
+    }
+    if (vid.paused) {
+      if (!aud.paused) aud.pause();
+    } else if (aud.paused) {
+      void aud.play().catch(() => {});
+    }
+  };
 
   let pendingSeekSec: number | null = null;
   const seekVid = (sec: number): void => {
@@ -1958,6 +2148,13 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       vid.currentTime = target;
     } else {
       pendingSeekSec = target;
+    }
+    if (soundPreviewOn && aud && loadedAudUrl && aud.readyState >= 1) {
+      try {
+        aud.currentTime = target;
+      } catch {
+        // ignore seek before ready
+      }
     }
   };
 
@@ -2023,16 +2220,18 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
   const refreshTapeAngles = async (): Promise<void> => {
     if (meta!.source !== 'gymcam' || !gymCam.online || meta!.clipStartMs == null || !withinRetention()) {
       tapeAngles = [];
+      tapeAudioAvail = false;
       tapeAnglesChecked = false;
       syncUi();
       return;
     }
     const sid = s?.camSessionId ?? meta!.sessionId;
     const endMs = meta!.clipEndMs ?? (meta!.clipStartMs + Math.max(5, meta!.durationSec ?? 20) * 1000);
-    const res = await gymCam.getTapeAngles(sid, meta!.clipStartMs, endMs);
+    const res = await gymCam.getTapeMediaInfo(sid, meta!.clipStartMs, endMs);
     if (closed) return;
     if (res !== null) {
-      tapeAngles = res;
+      tapeAngles = res.cameras;
+      tapeAudioAvail = res.audioAvailable;
       tapeAnglesChecked = true;
       syncUi();
     }
@@ -2318,6 +2517,50 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     if (angleActs) angleActs.hidden = !viewIsPreview;
     if (angleNote && viewIsPreview) angleNote.textContent = `Temp preview · expires in ${daysLeft}d`;
     if (saveBothBtn) saveBothBtn.hidden = !resolvedTarget;
+
+    const soundLbl = q<HTMLElement>('#vpSoundLbl');
+    const soundChk = q<HTMLInputElement>('#vpSoundChk');
+    const hasBaked = activeHasBakedAudio();
+    const legacyMaybe = activeLegacyMaybeAudio();
+    const canListen = hasBaked || legacyMaybe || (tapeAvail() && tapeAudioAvail);
+    if (soundLbl) soundLbl.hidden = !canListen;
+    if (soundChk) soundChk.checked = soundPreviewOn;
+    if (soundPreviewOn) syncSoundPlayback(false);
+    else if (vid) {
+      vid.muted = true;
+      if (aud && !aud.paused) aud.pause();
+    }
+
+    const audioRow = q<HTMLElement>('#vpAudioRow');
+    const audioLbl = q<HTMLElement>('#vpAudioLbl');
+    const audioBtn = q<HTMLButtonElement>('#vpAudioToggle');
+    const am = activeClipMeta();
+    const canToggleAudio = !viewIsPreview && am.source === 'gymcam' && gymCam.online && !!(am.lanUrl || am.fileName);
+    const canAddRoom = !hasBaked && !legacyMaybe && tapeAvail() && tapeAudioAvail;
+    const canStrip = hasBaked || legacyMaybe;
+    if (audioRow) audioRow.hidden = !(canToggleAudio && (canAddRoom || canStrip));
+    if (audioLbl && audioBtn && canToggleAudio) {
+      if (canStrip) {
+        audioLbl.textContent = hasBaked ? '🔊 Includes room audio' : '🔊 Legacy clip may have audio';
+        audioBtn.classList.remove('pri');
+        audioBtn.textContent = 'Strip Sound';
+      } else if (canAddRoom) {
+        audioLbl.textContent = `🔇 Silent clip · ${daysLeft}d audio left`;
+        audioBtn.classList.add('pri');
+        audioBtn.textContent = '+ Add Room Audio';
+      }
+    }
+
+    const shareAudBadge = q<HTMLElement>('#vpShareAudioBadge');
+    if (shareAudBadge) {
+      shareAudBadge.textContent = viewIsPreview
+        ? '🔇 Temp angle preview — silent MP4'
+        : hasBaked
+          ? '🔊 MP4 includes room audio'
+          : legacyMaybe
+            ? '⚠ Legacy MP4 may include mic audio (tap Strip Sound first to silence)'
+            : '🔇 Silent MP4 — safe to share';
+    }
   };
 
   if (vid) {
@@ -2353,6 +2596,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         if (st.start > 0.015 && vid.currentTime < st.start) seekVid(st.start);
       }
       vid.playbackRate = speed;
+      syncSoundPlayback(true);
       syncUi();
     };
     vid.onerror = () => {
@@ -2388,13 +2632,17 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       if (vid.paused) return;
       if (isTrimmed(st) && vid.currentTime >= st.end - 0.025) {
         vid.currentTime = st.start;
+        if (soundPreviewOn) syncSoundPlayback(true);
       }
       st = { ...st, playhead: st.dur > 0 ? clamp(vid.currentTime, 0, st.dur) : vid.currentTime };
       syncUi();
     };
     uiTicker = setInterval(() => {
       if (closed || !vid || vid.paused) return;
-      if (isTrimmed(st) && vid.currentTime >= st.end - 0.025) vid.currentTime = st.start;
+      if (isTrimmed(st) && vid.currentTime >= st.end - 0.025) {
+        vid.currentTime = st.start;
+        if (soundPreviewOn) syncSoundPlayback(true);
+      }
       st = { ...st, playhead: st.dur > 0 ? clamp(vid.currentTime, 0, st.dur) : vid.currentTime };
       syncUi();
     }, 45);
@@ -2596,6 +2844,12 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
   syncUi();
 
+  q<HTMLInputElement>('#vpSoundChk')?.addEventListener('change', (e) => {
+    soundPreviewOn = (e.target as HTMLInputElement).checked;
+    syncSoundPlayback(true);
+    syncUi();
+  });
+
   sh.body.addEventListener('click', async (e) => {
     const t = e.target as HTMLElement;
     if (t.closest('[data-ok]')) { sh.close(); return; }
@@ -2689,6 +2943,53 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     const angleBtn = t.closest<HTMLButtonElement>('[data-vangle]');
     if (angleBtn?.dataset.vangle) {
       void switchToAngle(angleBtn.dataset.vangle);
+      return;
+    }
+
+    if (t.closest('[data-vaudio]') && vid && !viewIsPreview) {
+      const targetMeta = activeClipMeta();
+      const currentlyBaked = targetMeta.hasAudio === true || (targetMeta.source === 'gymcam' && targetMeta.hasAudio === undefined && targetMeta.id === meta!.id);
+      const nextInclude = !currentlyBaked;
+      const btn = t.closest<HTMLButtonElement>('button');
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = nextInclude ? 'Muxing…' : 'Stripping…';
+      }
+      try {
+        const updated = await gymCam.setClipAudio(targetMeta, nextInclude);
+        if (closed) return;
+        if (updated?.lanUrl) {
+          if (targetMeta.id === meta!.id) meta = updated;
+          else viewSiblingMeta = updated;
+          sessionFiles.delete(updated.id);
+          clearAngleCache();
+          const resumeTime = Number.isFinite(vid.currentTime) ? vid.currentTime : st.playhead;
+          const wasPaused = vid.paused;
+          const freshUrl = await fetchBlobUrl(`${updated.lanUrl}?v=${Date.now()}`, updated.bytes);
+          if (!closed && freshUrl) {
+            if (targetMeta.id === meta!.id) {
+              if (freshUrl.objectUrl) {
+                if (primaryObjectUrl && primaryObjectUrl !== freshUrl.objectUrl) URL.revokeObjectURL(primaryObjectUrl);
+                primaryObjectUrl = freshUrl.objectUrl;
+              }
+              primaryBlob = freshUrl.blob;
+              primaryPlayUrl = freshUrl.playUrl;
+            }
+            viewBlob = freshUrl.blob;
+            viewLanUrl = updated.lanUrl;
+            restoreAfterLoad = { time: resumeTime, paused: wasPaused };
+            vid.autoplay = !wasPaused;
+            vid.src = freshUrl.playUrl;
+            vid.load();
+          }
+          toast(updated.hasAudio ? 'Room audio added to clip' : 'Sound stripped — silent MP4 saved');
+        } else {
+          toast(nextInclude ? 'Room audio unavailable for this clip' : 'Could not strip audio');
+        }
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+      syncUi();
       return;
     }
 

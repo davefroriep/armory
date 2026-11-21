@@ -362,6 +362,14 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .vp-dr-head button { color: var(--mut); font-weight: 900; padding: 2px 6px; }
 .vp-tape-row { display: flex; align-items: center; gap: 4px; background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 5px 7px; }
 .vp-tape-row small { flex: 1; font-size: .7rem; font-weight: 800; color: var(--mut); }
+.vp-audio-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 5px 8px; }
+.vp-audio-row small { font-size: .7rem; font-weight: 800; color: var(--mut); }
+.vp-snd-chk { display: inline-flex; align-items: center; gap: 4px; height: 24px; padding: 0 8px; border-radius: 999px; background: var(--card2); border: 1px solid var(--line); font-size: .7rem; font-weight: 800; color: var(--fg); cursor: pointer; user-select: none; }
+.vp-snd-chk input { width: 13px; height: 13px; accent-color: var(--blue); margin: 0; }
+.vp-share-aud { font-size: .74rem; font-weight: 700; color: var(--mut); padding: 6px 8px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); }
+.vsnd-opts { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); }
+.vsnd-chk { display: inline-flex; align-items: center; gap: 6px; font-size: .75rem; font-weight: 700; color: var(--fg); cursor: pointer; user-select: none; }
+.vsnd-chk input { width: 15px; height: 15px; accent-color: var(--blue); margin: 0; }
 .vp-nbtn { height: 30px; padding: 0 8px; border-radius: 8px; background: var(--card); border: 1px solid var(--line); font-size: .74rem; font-weight: 800; font-variant-numeric: tabular-nums; }
 .vp-nbtn.pri { background: rgba(30, 155, 255, .18); border-color: rgba(30, 155, 255, .5); color: #7cc4ff; }
 .vp-nbtn:active, .vp-qbtn:active, .vp-btn:active, .vp-ang:active { opacity: .82; }

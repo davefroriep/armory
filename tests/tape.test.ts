@@ -351,4 +351,81 @@ describe('tape linking & scrubbing helpers', () => {
       });
     }
   });
+
+  it('defaults Gym-Cam clip saves to silent (includeAudio=false) and supports opt-in room audio + muxing', async () => {
+    const origFetch = globalThis.fetch;
+    const origSettings = getSettings();
+    const calls: { url: string; body?: Record<string, unknown> }[] = [];
+    try {
+      updateSettings({ gymCamEnabled: true, gymCamUrl: 'http://192.168.1.152:8766' });
+      gymCam.online = true;
+
+      globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        calls.push({ url, body });
+        if (url.includes('/api/tape/angles')) {
+          return new Response(
+            JSON.stringify({ ok: true, retentionDays: 14, cameras: ['Rack Cam', 'Smith Cam'], audioAvailable: true }),
+            { status: 200 },
+          );
+        }
+        if (url.includes('/api/clip/audio')) {
+          return new Response(
+            JSON.stringify({
+              ok: true,
+              lanUrl: '/clips/2026-11-21/bench_01.mp4',
+              fileName: 'bench_01.mp4',
+              bytes: body?.includeAudio ? 450_000 : 380_000,
+              hasAudio: !!body?.includeAudio,
+              audioSource: body?.includeAudio ? 'powerconf' : 'none',
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            lanUrl: '/clips/2026-11-21/bench_01.mp4',
+            fileName: 'bench_01.mp4',
+            camera: 'Rack Cam',
+            durationSec: 12,
+            startMs: 1_000_000,
+            endMs: 1_012_000,
+            bytes: body?.includeAudio ? 450_000 : 380_000,
+            hasAudio: !!body?.includeAudio,
+          }),
+          { status: 200 },
+        );
+      }) as unknown as typeof fetch;
+
+      const target = {
+        session: { id: 's1', name: 'Upper', routineId: null, eventId: null, startMs: 990_000, endMs: null, status: 'active' as const, exs: [], rpe: null, bwKg: null },
+        se: { uid: 'se1', exId: 'bench', sets: [] },
+        set: { id: 'st1', w: 100, r: 5, done: true, kind: 'n' as const, vids: [] },
+      };
+
+      const silentMeta = await gymCam.saveWindowClip(target, 'Rack Cam', 1_000_000, 1_012_000);
+      expect(calls[calls.length - 1].body?.includeAudio).toBe(false);
+      expect(silentMeta?.hasAudio).toBe(false);
+
+      const soundMeta = await gymCam.saveWindowClip(target, 'Rack Cam', 1_000_000, 1_012_000, { includeAudio: true });
+      expect(calls[calls.length - 1].body?.includeAudio).toBe(true);
+      expect(soundMeta?.hasAudio).toBe(true);
+
+      const mediaInfo = await gymCam.getTapeMediaInfo('s1', 1_000_000, 1_012_000);
+      expect(mediaInfo).toEqual({ cameras: ['Rack Cam', 'Smith Cam'], audioAvailable: true });
+      expect(gymCam.roomAudioUrl(1_000_000, 1_012_000)).toBe(
+        'http://192.168.1.152:8766/api/audio/clip?startMs=1000000&endMs=1012000',
+      );
+
+      const stripped = await gymCam.setClipAudio(soundMeta!, false);
+      expect(stripped?.hasAudio).toBe(false);
+      expect(stripped?.bytes).toBe(380_000);
+    } finally {
+      gymCam.online = false;
+      globalThis.fetch = origFetch;
+      updateSettings({ gymCamEnabled: origSettings.gymCamEnabled, gymCamUrl: origSettings.gymCamUrl });
+    }
+  });
 });

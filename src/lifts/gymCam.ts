@@ -134,6 +134,8 @@ interface ClipApiResponse {
   startMs?: number;
   endMs?: number;
   bytes?: number;
+  hasAudio?: boolean;
+  audioSource?: string;
   driveFileId?: string;
   driveUrl?: string;
 }
@@ -483,6 +485,7 @@ class GymCamController {
         ...(res.durationSec ? { durationSec: res.durationSec } : {}),
         ...(res.startMs != null ? { clipStartMs: res.startMs } : {}),
         ...(res.endMs != null ? { clipEndMs: res.endMs } : {}),
+        ...(res.hasAudio !== undefined ? { hasAudio: !!res.hasAudio } : {}),
         ...(res.driveUrl ? { uri: res.driveUrl } : {}),
       };
       await lifts.addVideo(meta);
@@ -514,6 +517,7 @@ class GymCamController {
       ...(clip.durationSec ? { durationSec: clip.durationSec } : {}),
       ...(clip.startMs != null ? { clipStartMs: clip.startMs } : {}),
       ...(clip.endMs != null ? { clipEndMs: clip.endMs } : {}),
+      ...(clip.hasAudio !== undefined ? { hasAudio: !!clip.hasAudio } : {}),
       ...(clip.driveUrl ? { uri: clip.driveUrl } : {}),
     };
     await lifts.addVideo(meta);
@@ -694,12 +698,14 @@ class GymCamController {
     startDeltaSec = 0,
     endDeltaSec = 0,
     cameraOverride?: string,
+    opts?: { includeAudio?: boolean },
   ): Promise<VideoMeta | null> {
     return this.saveWindowClip(
       target,
       cameraOverride || burst.camera,
       burst.startMs + startDeltaSec * 1000,
       burst.endMs + endDeltaSec * 1000,
+      opts,
     );
   }
 
@@ -708,6 +714,7 @@ class GymCamController {
     camera: string,
     startMs: number,
     endMs: number,
+    opts?: { includeAudio?: boolean },
   ): Promise<VideoMeta | null> {
     if (!this.online) return null;
     const res = await this.postJson<ClipApiResponse>('/api/clip', {
@@ -718,6 +725,7 @@ class GymCamController {
       startMs: Math.round(startMs),
       endMs: Math.round(endMs),
       camera,
+      includeAudio: !!opts?.includeAudio,
     }, 45_000);
     return res?.lanUrl ? this.persistClipFromServer(target, res) : null;
   }
@@ -734,6 +742,7 @@ class GymCamController {
       setId: meta.setId,
       startMs: nextStartMs,
       endMs: nextEndMs,
+      includeAudio: !!meta.hasAudio,
       ...(meta.camera ? { camera: meta.camera } : {}),
     }, 45_000);
     if (!res?.lanUrl) return null;
@@ -746,6 +755,7 @@ class GymCamController {
       durationSec: res.durationSec ?? meta.durationSec,
       clipStartMs: res.startMs ?? nextStartMs,
       clipEndMs: res.endMs ?? nextEndMs,
+      ...(res.hasAudio !== undefined ? { hasAudio: !!res.hasAudio } : {}),
       ...(res.driveUrl ? { uri: res.driveUrl } : {}),
     };
     if (addBeforeSec !== 0) {
@@ -781,6 +791,7 @@ class GymCamController {
       startMs: meta.clipStartMs,
       endMs: meta.clipEndMs,
       camera: cam,
+      includeAudio: !!meta.hasAudio,
     }, 45_000);
     if (!res?.lanUrl) return null;
     const next: VideoMeta = {
@@ -791,6 +802,7 @@ class GymCamController {
       thumb: res.thumb || meta.thumb,
       bytes: res.bytes ?? meta.bytes,
       durationSec: res.durationSec ?? meta.durationSec,
+      ...(res.hasAudio !== undefined ? { hasAudio: !!res.hasAudio } : {}),
       ...(res.driveUrl ? { uri: res.driveUrl } : {}),
     };
     await lifts.saveVideoMeta(next);
@@ -801,7 +813,41 @@ class GymCamController {
     return next;
   }
 
-  async getTapeAngles(sessionId: string, startMs: number, endMs: number): Promise<string[] | null> {
+  roomAudioUrl(startMs: number, endMs: number): string {
+    return `${this.baseUrl()}/api/audio/clip?startMs=${Math.round(startMs)}&endMs=${Math.round(endMs)}`;
+  }
+
+  async checkRoomAudio(startMs: number, endMs: number): Promise<boolean> {
+    if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return false;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3500);
+    try {
+      const q = new URLSearchParams({
+        startMs: String(Math.round(startMs)),
+        endMs: String(Math.round(endMs)),
+      });
+      const res = await fetch(`${this.baseUrl()}/api/audio/availability?${q.toString()}`, {
+        signal: ctrl.signal,
+        cache: 'no-store',
+      });
+      if (!res.ok) return false;
+      const data = (await res.json()) as { available?: boolean; retentionDays?: number };
+      if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays) && data.retentionDays >= 1) {
+        this.retentionDays = Math.round(data.retentionDays);
+      }
+      return !!data.available;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async getTapeMediaInfo(
+    sessionId: string,
+    startMs: number,
+    endMs: number,
+  ): Promise<{ cameras: string[]; audioAvailable: boolean } | null> {
     if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 3500);
@@ -816,16 +862,51 @@ class GymCamController {
         cache: 'no-store',
       });
       if (!res.ok) return null;
-      const data = (await res.json()) as { retentionDays?: number; cameras?: string[] };
+      const data = (await res.json()) as { retentionDays?: number; cameras?: string[]; audioAvailable?: boolean };
       if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays) && data.retentionDays >= 1) {
         this.retentionDays = Math.round(data.retentionDays);
       }
-      return Array.isArray(data.cameras) ? data.cameras : [];
+      return {
+        cameras: Array.isArray(data.cameras) ? data.cameras : [],
+        audioAvailable: !!data.audioAvailable,
+      };
     } catch {
       return null;
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  async getTapeAngles(sessionId: string, startMs: number, endMs: number): Promise<string[] | null> {
+    const info = await this.getTapeMediaInfo(sessionId, startMs, endMs);
+    return info ? info.cameras : null;
+  }
+
+  async setClipAudio(meta: VideoMeta, includeAudio: boolean): Promise<VideoMeta | null> {
+    if (!this.online || meta.source !== 'gymcam' || (!meta.lanUrl && !meta.fileName)) return null;
+    const res = await this.postJson<ClipApiResponse>(
+      '/api/clip/audio',
+      {
+        lanUrl: meta.lanUrl ?? '',
+        fileName: meta.fileName ?? '',
+        ...(meta.clipStartMs != null ? { startMs: meta.clipStartMs } : {}),
+        ...(meta.clipEndMs != null ? { endMs: meta.clipEndMs } : {}),
+        includeAudio,
+      },
+      45_000,
+    );
+    if (!res?.ok) return null;
+    const next: VideoMeta = {
+      ...meta,
+      ...(res.lanUrl ? { lanUrl: this.resolveLanUrl(res.lanUrl) } : {}),
+      ...(res.fileName ? { fileName: res.fileName } : {}),
+      bytes: res.bytes ?? meta.bytes,
+      hasAudio: !!res.hasAudio,
+      ...(res.driveUrl ? { uri: res.driveUrl } : {}),
+    };
+    await lifts.saveVideoMeta(next);
+    this.changed.emit();
+    return next;
   }
 
   async previewClipCamera(meta: VideoMeta, nextCamera: string): Promise<GymCamPreviewResult | null> {
@@ -859,7 +940,9 @@ class GymCamController {
   async saveAdditionalAngle(target: GymCamTarget, meta: VideoMeta, nextCamera: string): Promise<VideoMeta | null> {
     const cam = nextCamera.trim();
     if (!this.online || !cam || meta.clipStartMs == null || meta.clipEndMs == null) return null;
-    const saved = await this.saveWindowClip(target, cam, meta.clipStartMs, meta.clipEndMs);
+    const saved = await this.saveWindowClip(target, cam, meta.clipStartMs, meta.clipEndMs, {
+      includeAudio: !!meta.hasAudio,
+    });
     if (saved && (meta.trimStartSec != null || meta.trimEndSec != null)) {
       if (meta.trimStartSec != null) saved.trimStartSec = meta.trimStartSec;
       if (meta.trimEndSec != null) saved.trimEndSec = meta.trimEndSec;

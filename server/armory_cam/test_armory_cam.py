@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import armory_cam_server as ac  # noqa: E402
 import display_control as dc  # noqa: E402
 import house_audio as ha  # noqa: E402
+import room_audio as ra  # noqa: E402
 import room_voice as rv  # noqa: E402
 
 
@@ -2045,8 +2046,23 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertEqual(dc.parse_display_voice_command("Armory switch TV to Fire TV")["action"], "hdmi2")
         self.assertEqual(dc.parse_display_voice_command("Armory sleep wallboard"), {"target": "wallboard", "targets": ["wallboard"], "action": "off", "speech": "Wallboard off"})
         self.assertEqual(dc.parse_display_voice_command("Armory turn off denon")["target"], "avr")
+        self.assertEqual(dc.parse_display_voice_command("Armory, play music"), {"target": "music", "targets": ["music"], "action": "play", "speech": "Playing music"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, play 90s hip hop music"), {"target": "music", "targets": ["music"], "action": "play:90s hip hop", "speech": "Playing 90s hip hop"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, pause music"), {"target": "music", "targets": ["music"], "action": "pause", "speech": "Music paused"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, resume music"), {"target": "music", "targets": ["music"], "action": "resume", "speech": "Resuming music"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, next song"), {"target": "music", "targets": ["music"], "action": "next", "speech": "Next track"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, previous track"), {"target": "music", "targets": ["music"], "action": "prev", "speech": "Previous track"})
+        self.assertIsNone(dc.parse_display_voice_command("Armory play replay video"))
         self.assertEqual(dc.normalize_youtube_tv_url("https://music.youtube.com/playlist?list=PL123"), "https://www.youtube.com/playlist?list=PL123")
-        self.assertFalse(dc.SpinDisplayConfig().auto_denon_dual)
+        self.assertEqual(
+            dc.resolve_youtube_music_url(
+                "workout music mix",
+                http_get=lambda _u, _t: (200, b'<html>"videoId":"ld8nm6rcOm0"</html>'),
+            ),
+            "https://www.youtube.com/watch?v=ld8nm6rcOm0&list=RDld8nm6rcOm0",
+        )
+        self.assertTrue(dc.SpinDisplayConfig().auto_denon_dual)
+        self.assertEqual(dc.SpinDisplayConfig().primary_denon_monitor, "1")
 
         # 2. Controller: Primary ADB discrete keyevents + Roku ECP + Denon + Wallboard + Open/Close Gym
         adb_cmds: list[list[str]] = []
@@ -2069,10 +2085,15 @@ class ArmoryCamTests(unittest.TestCase):
         roku_posts: list[str] = []
         denon_posts: list[tuple[str, bytes]] = []
         mock_denon_video = {"serve_html": False}
+        mock_roku_power = {"mode": "Ready"}
 
         def fake_ctrl_get(url: str, _to: float) -> tuple[int, bytes]:
             if mock_denon_video["serve_html"] and "d_video.asp" in url:
                 return 200, b'<FORM name="video"><INPUT type="radio" name="radioMonitorOut" value="AUTO" checked><INPUT type="radio" name="radioVideoConvMode" value="OFF" checked></FORM>'
+            if "192.168.1.88:8060/query/device-info" in url:
+                return 200, f"<device-info><power-mode>{mock_roku_power['mode']}</power-mode></device-info>".encode("ascii")
+            if "youtube.com/results" in url:
+                return 200, b'{"videoId":"ld8nm6rcOm0"}'
             return 404, b""
 
         def fake_ctrl_post(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
@@ -2109,8 +2130,17 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertTrue(ctrl.execute("primary", "hdmi1")["ok"])
         self.assertTrue(any(c[-3:] == ["input", "keyevent", "243"] for c in adb_cmds))
         self.assertFalse(any("android.media.tv/passthrough/" in " ".join(c) for c in adb_cmds))
+        denon_cmds.clear()
         self.assertTrue(ctrl.execute("tv", "hdmi2")["ok"])
         self.assertTrue(any(c[-3:] == ["input", "keyevent", "244"] for c in adb_cmds))
+        # SmartSpin is Ready (OFF), so tv:hdmi2 syncs Denon to Monitor 1 automatically
+        self.assertIn("VSMONI1", denon_cmds)
+
+        mock_roku_power["mode"] = "PowerOn"
+        denon_cmds.clear()
+        self.assertTrue(ctrl.sync_denon_monitor_for_spin()["ok"])
+        self.assertIn("VSMONIAUTO", denon_cmds)
+        mock_roku_power["mode"] = "Ready"
 
         # Test Roku ECP + Denon VSMONIAUTO / VSMONI1 fallback
         self.assertTrue(ctrl.execute("spin", "on")["ok"])
@@ -2155,6 +2185,18 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "127"] for c in adb_cmds))
         self.assertIn("PWSTANDBY", denon_cmds)
         self.assertEqual(wb_calls, ["sleep"])
+
+        adb_cmds.clear()
+        denon_cmds.clear()
+        ctrl.update_config({"openGymMusicUrl": ""})
+        m_play = ctrl.execute("music", "play:90s hip hop")
+        self.assertTrue(m_play["ok"])
+        self.assertIn("PWON", denon_cmds)
+        self.assertIn("MSMCH%20STEREO", denon_cmds)
+        self.assertTrue(any("ld8nm6rcOm0" in " ".join(c) and "192.168.1.151:5555" in c for c in adb_cmds))
+        self.assertTrue(ctrl.execute("music", "next")["ok"])
+        self.assertTrue(any("keyevent 87" in " ".join(c) for c in adb_cmds))
+        self.assertTrue(ctrl.execute("music", "pause")["ok"])
 
         # 3. RoomVoiceService local command interception + Flask display endpoints
         tmp = Path(tempfile.mkdtemp(prefix="armory_disp_test_"))
@@ -2215,6 +2257,141 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertEqual(multi_res.status_code, 200)
             self.assertTrue(multi_res.get_json()["ok"])
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_room_audio_recorder_silent_clips_and_mux_endpoints(self) -> None:
+        ffmpeg = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        ffprobe = ac.resolve_tool_bin("ffprobe", "ARMORY_CAM_FFPROBE")
+        if not shutil.which(ffmpeg) and not Path(ffmpeg).is_file():
+            self.skipTest("ffmpeg unavailable")
+
+        def audio_stream_count(mp4_path: Path) -> int:
+            res = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(mp4_path)],
+                capture_output=True, text=True, timeout=8,
+            )
+            return len([ln for ln in res.stdout.splitlines() if ln.strip()])
+
+        def video_stream_count(mp4_path: Path) -> int:
+            res = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(mp4_path)],
+                capture_output=True, text=True, timeout=8,
+            )
+            return len([ln for ln in res.stdout.splitlines() if ln.strip()])
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_audio_clip_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp, voice_autostart=False)
+            svc.update_config({
+                "retentionDays": 14,
+                "cameras": [{"name": "Rack Cam", "rtspUrl": "rtsp://127.0.0.1/none", "enabled": True, "primary": True}],
+            })
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # Build synthetic 4s TS segment WITH embedded camera audio (simulating Wyze pinhole mic)
+            base_ms = (int(time.time()) - 8) * 1000
+            day_dir = svc.tapes_root / "sess_a" / "rack_cam"
+            day_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.fromtimestamp(base_ms / 1000.0).strftime("%Y%m%d_%H%M%S")
+            seg_ts = day_dir / f"seg_{stamp}.ts"
+            gen_cmd = [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=c=black:s=320x240:r=15:d=4",
+                "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=4",
+                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "96k",
+                str(seg_ts),
+            ]
+            subprocess.run(gen_cmd, check=True, timeout=20)
+            (svc.tapes_root / "sess_a" / "motion.jsonl").write_text(
+                json.dumps({
+                    "slug": "rack_cam",
+                    "camera": "Rack Cam",
+                    "file": seg_ts.name,
+                    "startMs": base_ms,
+                    "endMs": base_ms + 4000,
+                    "energy": 8.0,
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            # Feed matching 4s PowerConf S330 PCM into RoomAudioRecorder and flush to audio_tapes
+            sr = 16_000
+            t_arr = np.linspace(0.0, 4.0, sr * 4, endpoint=False, dtype=np.float32)
+            pcm = 0.25 * np.sin(2.0 * np.pi * 440.0 * t_arr)
+            svc.room_audio.push_pcm(pcm, sr, wall_end_s=(base_ms + 4000) / 1000.0)
+            flushed = svc.room_audio.flush_now(blocking=True)
+            self.assertIsNotNone(flushed)
+            self.assertTrue(svc.room_audio.has_audio(base_ms, base_ms + 4000))
+
+            # 1. Default POST /api/clip MUST strip Wyze audio (silent MP4)
+            c_silent = client.post("/api/clip", json={
+                "sessionId": "sess_a",
+                "exName": "Squat",
+                "startMs": base_ms,
+                "endMs": base_ms + 3000,
+                "camera": "Rack Cam",
+            })
+            self.assertEqual(c_silent.status_code, 200)
+            j_silent = c_silent.get_json()
+            self.assertFalse(j_silent["hasAudio"])
+            self.assertEqual(j_silent["audioSource"], "none")
+            silent_mp4 = svc.clips_root / j_silent["lanUrl"].split("/clips/", 1)[1]
+            self.assertEqual(video_stream_count(silent_mp4), 1)
+            self.assertEqual(audio_stream_count(silent_mp4), 0)
+
+            # 2. Auto-PR MUST also default to silent (-an)
+            c_pr = client.post("/api/clip/auto-pr", json={
+                "sessionId": "sess_a",
+                "exName": "Squat",
+                "setAtMs": base_ms + 3000,
+                "camera": "Rack Cam",
+            })
+            self.assertEqual(c_pr.status_code, 200)
+            j_pr = c_pr.get_json()
+            self.assertFalse(j_pr["hasAudio"])
+            pr_mp4 = svc.clips_root / j_pr["lanUrl"].split("/clips/", 1)[1]
+            self.assertEqual(audio_stream_count(pr_mp4), 0)
+
+            # 3. Availability & Preview Audio endpoint
+            ang = client.get(f"/api/tape/angles?sessionId=sess_a&startMs={base_ms}&endMs={base_ms + 3000}")
+            self.assertEqual(ang.status_code, 200)
+            self.assertTrue(ang.get_json()["audioAvailable"])
+
+            av = client.get(f"/api/audio/availability?startMs={base_ms}&endMs={base_ms + 3000}")
+            self.assertEqual(av.status_code, 200)
+            self.assertTrue(av.get_json()["available"])
+
+            aud_resp = client.get(f"/api/audio/clip?startMs={base_ms}&endMs={base_ms + 3000}")
+            self.assertEqual(aud_resp.status_code, 200)
+            self.assertGreater(len(aud_resp.data), 500)
+
+            # 4. Losslessly Add Room Audio -> Verify AAC stream added; then Strip -> Verify silent again
+            mux_resp = client.post("/api/clip/audio", json={
+                "lanUrl": j_silent["lanUrl"],
+                "fileName": j_silent["fileName"],
+                "includeAudio": True,
+            })
+            self.assertEqual(mux_resp.status_code, 200)
+            self.assertTrue(mux_resp.get_json()["hasAudio"])
+            self.assertEqual(video_stream_count(silent_mp4), 1)
+            self.assertEqual(audio_stream_count(silent_mp4), 1)
+
+            strip_resp = client.post("/api/clip/audio", json={
+                "lanUrl": j_silent["lanUrl"],
+                "fileName": j_silent["fileName"],
+                "includeAudio": False,
+            })
+            self.assertEqual(strip_resp.status_code, 200)
+            self.assertFalse(strip_resp.get_json()["hasAudio"])
+            self.assertEqual(audio_stream_count(silent_mp4), 0)
+
+            # 5. 14-day prune drops expired room audio chunks automatically
+            svc.room_audio.prune((base_ms / 1000.0) + (15 * 86_400), retention_days=14)
+            self.assertFalse(flushed.exists())
+        finally:
+            svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
 

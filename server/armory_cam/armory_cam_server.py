@@ -46,6 +46,11 @@ except ImportError:
     from room_voice import RoomVoiceConfig, RoomVoiceService
 
 try:
+    from .room_audio import RoomAudioRecorder
+except ImportError:
+    from room_audio import RoomAudioRecorder
+
+try:
     from .house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
 except ImportError:
     from house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
@@ -1838,6 +1843,14 @@ class ArmoryCamService:
             wol_sender=send_wol_magic_packet if self._voice_autostart else None,
             allow_network=self._voice_autostart,
         )
+        self.lock = threading.RLock()
+        self.port = DEFAULT_PORT
+        self.retention_days = DEFAULT_RETENTION_DAYS
+        self.room_audio = RoomAudioRecorder(
+            self.root,
+            ffmpeg_bin=self.ffmpeg,
+            retention_days=self.retention_days,
+        )
         self.voice_cfg = RoomVoiceConfig()
         self.voice = RoomVoiceService(
             config=self.voice_cfg,
@@ -1846,11 +1859,8 @@ class ArmoryCamService:
             root_dir=self.root,
             house_audio_router=self.house_audio.try_route_voice_pcm,
             local_command_handler=self._handle_local_voice_command,
+            on_pcm_chunk=self.room_audio.push_pcm,
         )
-
-        self.lock = threading.RLock()
-        self.port = DEFAULT_PORT
-        self.retention_days = DEFAULT_RETENTION_DAYS
         self.pre_roll_sec = DEFAULT_PRE_ROLL_SEC
         if drive_backup_dir is not None:
             self.drive_backup_dir = str(drive_backup_dir).strip()
@@ -2142,6 +2152,7 @@ class ArmoryCamService:
             prev_by_slug = {c.slug: c for c in self.cameras}
             if "retentionDays" in raw:
                 self.retention_days = max(1, min(90, int(raw["retentionDays"])))
+                self.room_audio.retention_days = self.retention_days
             if "preRollSec" in raw:
                 self.pre_roll_sec = max(30, min(600, int(raw["preRollSec"])))
             drive_changed = False
@@ -2241,12 +2252,14 @@ class ArmoryCamService:
             backfill_t = threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True)
             backfill_t.start()
             self._worker_threads.append(backfill_t)
+            self.room_audio.start()
             if self._voice_autostart:
                 self.voice.start()
 
     def stop_background(self) -> None:
         self._stop_event.set()
         self.voice.stop()
+        self.room_audio.stop()
         self.live_hub.stop_all()
         with self.lock:
             for slug in list(self._procs.keys()):
@@ -2625,6 +2638,8 @@ class ArmoryCamService:
                             dir_p.rmdir()
                     except OSError:
                         pass
+
+        self.room_audio.prune(now_s, self.retention_days)
 
         if self.previews_root.exists():
             for tmp_p in self.previews_root.glob(".*.mp4"):
@@ -3336,6 +3351,9 @@ class ArmoryCamService:
         start_ms: int,
         end_ms: int,
         out_path: Path,
+        *,
+        include_audio: bool = False,
+        audio_path: Path | None = None,
     ) -> bool:
         if not segs:
             return False
@@ -3344,8 +3362,10 @@ class ArmoryCamService:
         first_start_ms = segs[0].start_ms
         ss_sec = max(0.0, (start_ms - first_start_ms) / 1000.0)
         dur_sec = max(0.5, (end_ms - start_ms) / 1000.0)
-        concat_path = out_path.parent / f".concat_{uuid.uuid4().hex[:8]}.txt"
-        tmp_out = out_path.with_name(f".{out_path.stem}.{uuid.uuid4().hex[:6]}.mp4")
+        tag = uuid.uuid4().hex[:8]
+        concat_path = out_path.parent / f".concat_{tag}.txt"
+        tmp_vid = out_path.with_name(f".{out_path.stem}.{tag}.vid.mp4")
+        tmp_mux = out_path.with_name(f".{out_path.stem}.{tag}.mux.mp4")
         try:
             lines = []
             for s in segs:
@@ -3353,6 +3373,7 @@ class ArmoryCamService:
                 lines.append(f"file '{posix_p}'")
             concat_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+            # Always strip Wyze pinhole camera mic audio (-an); only mux PowerConf audio when explicitly requested
             cmd = [
                 self.ffmpeg,
                 "-y",
@@ -3386,24 +3407,55 @@ class ArmoryCamService:
                 "25",
                 "-pix_fmt",
                 "yuv420p",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "96k",
+                "-an",
                 "-movflags",
                 "+faststart",
-                str(tmp_out),
+                str(tmp_vid),
             ]
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if res.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
+            if res.returncode != 0 or not tmp_vid.exists() or tmp_vid.stat().st_size == 0:
                 self.log.warning("FFmpeg clip failed: %s", res.stderr.strip())
-                tmp_out.unlink(missing_ok=True)
+                tmp_vid.unlink(missing_ok=True)
                 return False
-            tmp_out.replace(out_path)
+
+            if include_audio and audio_path is not None and audio_path.is_file():
+                mux_cmd = [
+                    self.ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(tmp_vid),
+                    "-i",
+                    str(audio_path),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    str(tmp_mux),
+                ]
+                mres = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=45)
+                if mres.returncode != 0 or not tmp_mux.exists() or tmp_mux.stat().st_size == 0:
+                    self.log.warning("FFmpeg audio mux failed: %s", mres.stderr.strip())
+                    tmp_mux.unlink(missing_ok=True)
+                    return False
+                tmp_mux.replace(out_path)
+                return True
+
+            tmp_vid.replace(out_path)
             return True
         finally:
             concat_path.unlink(missing_ok=True)
-            tmp_out.unlink(missing_ok=True)
+            tmp_vid.unlink(missing_ok=True)
+            tmp_mux.unlink(missing_ok=True)
 
     def tape_angles_for_window(self, session_id: str, start_ms: int, end_ms: int) -> list[str]:
         norm_end = max(int(start_ms) + 1000, int(end_ms))
@@ -3477,6 +3529,8 @@ class ArmoryCamService:
         start_ms: int,
         end_ms: int,
         camera_override: str | None = None,
+        *,
+        include_audio: bool = False,
     ) -> dict[str, Any] | None:
         if end_ms <= start_ms:
             end_ms = start_ms + 5000
@@ -3514,8 +3568,28 @@ class ArmoryCamService:
         out_name = f"{safe_slug(ex_name or 'lift')}_{time_str}_{uuid.uuid4().hex[:6]}.mp4"
         out_path = day_dir / out_name
 
-        if not self._encode_segments_mp4(segs, cam_cfg, int(start_ms), int(end_ms), out_path):
-            return None
+        tmp_aud: Path | None = None
+        has_aud = False
+        try:
+            if include_audio:
+                tmp_aud = day_dir / f".aud_{out_path.stem}_{uuid.uuid4().hex[:6]}.m4a"
+                has_aud = self.room_audio.extract_window_m4a(int(start_ms), int(end_ms), tmp_aud)
+                if not has_aud:
+                    tmp_aud.unlink(missing_ok=True)
+                    tmp_aud = None
+            if not self._encode_segments_mp4(
+                segs,
+                cam_cfg,
+                int(start_ms),
+                int(end_ms),
+                out_path,
+                include_audio=has_aud,
+                audio_path=tmp_aud,
+            ):
+                return None
+        finally:
+            if tmp_aud is not None:
+                tmp_aud.unlink(missing_ok=True)
 
         bytes_len = out_path.stat().st_size
         thumb = extract_video_thumb(out_path)
@@ -3532,6 +3606,8 @@ class ArmoryCamService:
             "startMs": int(start_ms),
             "endMs": int(end_ms),
             "bytes": bytes_len,
+            "hasAudio": bool(has_aud),
+            "audioSource": "powerconf" if has_aud else "none",
             "exName": ex_name,
             "createdAtMs": int(time.time() * 1000),
             **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
@@ -3829,20 +3905,182 @@ class ArmoryCamService:
                 break
         return out
 
-    def delete_clip(self, lan_url: str = "", file_name: str = "") -> dict[str, Any]:
-        """Delete a saved MP4 from local `clips_root`, Google Drive mirror, and `index.jsonl` (preserves raw tapes)."""
-        base_resolved = self.clips_root.resolve()
-        rel_path = ""
+    def _resolve_clip_candidates(
+        self, lan_url: str = "", file_name: str = ""
+    ) -> tuple[str, str, list[str], list[Path]]:
         raw_url = str(lan_url or "").strip()
+        rel_path = ""
         if "/clips/" in raw_url:
             rel_path = raw_url.split("/clips/", 1)[1].split("?", 1)[0].strip("/")
         parts = [p for p in rel_path.split("/") if p] if rel_path else []
-        target_name = Path(parts[-1]).name if parts else Path(str(file_name or "").strip()).name
+        clean_fname = Path(str(file_name or "").strip()).name
+        target_name = Path(parts[-1]).name if parts else clean_fname
         candidates: list[Path] = []
         if len(parts) >= 2 and target_name:
             candidates.append(self.clips_root / parts[-2] / target_name)
         elif target_name:
             candidates.extend(self.clips_root.glob(f"*/{target_name}"))
+        return raw_url, target_name, parts, candidates
+
+    def _find_clip_index_row(self, target_name: str) -> dict[str, Any] | None:
+        if not target_name or not self.clips_index_path.exists():
+            return None
+        for line in reversed(self.clips_index_path.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            fname = str(obj.get("fileName") or "")
+            lurl = str(obj.get("lanUrl") or "")
+            if fname == target_name or lurl.endswith(f"/{target_name}"):
+                return obj
+        return None
+
+    def set_clip_audio(
+        self,
+        lan_url: str = "",
+        file_name: str = "",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        *,
+        include_audio: bool = False,
+    ) -> tuple[dict[str, Any], int]:
+        """Losslessly strip or mux 14-day PowerConf S330 room audio on an existing saved MP4 clip."""
+        base_resolved = self.clips_root.resolve()
+        _raw_url, target_name, _parts, candidates = self._resolve_clip_candidates(lan_url, file_name)
+        target: Path | None = None
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+                resolved.relative_to(base_resolved)
+            except Exception:
+                continue
+            if resolved.is_file():
+                target = resolved
+                break
+        if target is None:
+            return {"ok": False, "error": "Clip file not found"}, 404
+
+        idx_row = self._find_clip_index_row(target.name) or {}
+        if start_ms is None and idx_row.get("startMs") is not None:
+            start_ms = int(idx_row["startMs"])
+        if end_ms is None and idx_row.get("endMs") is not None:
+            end_ms = int(idx_row["endMs"])
+
+        day_str = target.parent.name
+        rel_url = f"/clips/{day_str}/{target.name}"
+        tag = uuid.uuid4().hex[:8]
+        tmp_out = target.with_name(f".{target.stem}.{tag}.mp4")
+        tmp_aud: Path | None = None
+        try:
+            if not include_audio:
+                cmd = [
+                    self.ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(target),
+                    "-map",
+                    "0:v:0",
+                    "-c:v",
+                    "copy",
+                    "-an",
+                    "-movflags",
+                    "+faststart",
+                    str(tmp_out),
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                if res.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                    return {"ok": False, "error": res.stderr.strip() or "Failed to strip audio"}, 500
+                tmp_out.replace(target)
+                aud_src = "none"
+            else:
+                if start_ms is None or end_ms is None or int(end_ms) <= int(start_ms):
+                    return {"ok": False, "error": "Clip timestamps unavailable for audio mux"}, 400
+                tmp_aud = target.with_name(f".aud_{target.stem}_{tag}.m4a")
+                if not self.room_audio.extract_window_m4a(int(start_ms), int(end_ms), tmp_aud):
+                    return {"ok": False, "error": "Room audio unavailable or expired (>14d)"}, 404
+                cmd = [
+                    self.ffmpeg,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(target),
+                    "-i",
+                    str(tmp_aud),
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
+                    "-c:v",
+                    "copy",
+                    "-c:a",
+                    "copy",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    str(tmp_out),
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                if res.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
+                    return {"ok": False, "error": res.stderr.strip() or "Failed to mux room audio"}, 500
+                tmp_out.replace(target)
+                aud_src = "powerconf"
+        finally:
+            tmp_out.unlink(missing_ok=True)
+            if tmp_aud is not None:
+                tmp_aud.unlink(missing_ok=True)
+
+        bytes_len = target.stat().st_size
+        drive_info = self.mirror_clip_to_drive(target, day_str)
+        updated = {
+            **idx_row,
+            "ok": True,
+            "lanUrl": rel_url,
+            "fileName": target.name,
+            "bytes": bytes_len,
+            "hasAudio": bool(include_audio),
+            "audioSource": aud_src,
+            **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
+            **({"driveUrl": drive_info["driveUrl"]} if drive_info.get("driveUrl") else {}),
+        }
+        with self.lock:
+            lines: list[str] = []
+            replaced = False
+            if self.clips_index_path.exists():
+                for line in self.clips_index_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        lines.append(line)
+                        continue
+                    fname = str(obj.get("fileName") or "")
+                    lurl = str(obj.get("lanUrl") or "")
+                    if fname == target.name or lurl == rel_url or lurl.endswith(f"/{target.name}"):
+                        if not replaced:
+                            lines.append(json.dumps({k: v for k, v in updated.items() if k != "thumb"}))
+                            replaced = True
+                        continue
+                    lines.append(line)
+            if not replaced:
+                lines.append(json.dumps({k: v for k, v in updated.items() if k != "thumb"}))
+            tmp_idx = self.clips_index_path.with_suffix(".jsonl.tmp")
+            tmp_idx.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            tmp_idx.replace(self.clips_index_path)
+        return updated, 200
+
+    def delete_clip(self, lan_url: str = "", file_name: str = "") -> dict[str, Any]:
+        """Delete a saved MP4 from local `clips_root`, Google Drive mirror, and `index.jsonl` (preserves raw tapes)."""
+        base_resolved = self.clips_root.resolve()
+        raw_url, target_name, parts, candidates = self._resolve_clip_candidates(lan_url, file_name)
 
         local_deleted = False
         drive_deleted = False
@@ -4870,6 +5108,8 @@ DASHBOARD_HTML = """<!doctype html>
       <button class="btn ok sm" type="button" data-dpact="avr:on">Denon ON</button>
       <button class="btn sec sm" type="button" data-dpact="avr:off">Denon OFF</button>
       <button class="btn sec sm" type="button" data-dpact="avr:mch_stereo">Denon Multi-Ch</button>
+      <button class="btn sec sm" type="button" data-dpact="avr:monitor1">Denon Monitor 1</button>
+      <button class="btn sec sm" type="button" data-dpact="avr:monitor_auto">Denon Dual</button>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
       <div><label>TV IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
@@ -4881,7 +5121,11 @@ DASHBOARD_HTML = """<!doctype html>
       <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
       <div>
         <label>Auto Denon Monitor 1 / Dual</label>
-        <select id="dpSpinDual"><option value="0">No (Keep Denon on Auto Dual)</option><option value="1">Yes (Single Sink when Spin OFF)</option></select>
+        <select id="dpSpinDual"><option value="1">Yes (Single Sink when Spin OFF)</option><option value="0">No (Keep Denon on Auto Dual)</option></select>
+      </div>
+      <div>
+        <label>Primary Denon Monitor</label>
+        <select id="dpPrimDenonMon"><option value="1">Monitor 1 (Hisense)</option><option value="2">Monitor 2</option></select>
       </div>
       <div>
         <label>Open Gym Music (Cube)</label>
@@ -7378,7 +7622,8 @@ function populateDisplaysInputs(dc) {
   $('dpSpinHost').value = s.host || '';
   $('dpSpinMac').value = s.mac || '';
   $('dpSpinHdmi').value = s.hdmiInput || 'InputHDMI1';
-  $('dpSpinDual').value = s.autoDenonDual === true ? '1' : '0';
+  $('dpSpinDual').value = s.autoDenonDual === false ? '0' : '1';
+  if ($('dpPrimDenonMon')) $('dpPrimDenonMon').value = s.primaryDenonMonitor === '2' ? '2' : '1';
   if ($('dpOpenMusic')) $('dpOpenMusic').value = dc.openGymPlayMusic === false ? '0' : '1';
   if ($('dpCubeHost')) $('dpCubeHost').value = dc.cubeHost || '192.168.1.151';
   if ($('dpMusicUrl')) $('dpMusicUrl').value = dc.openGymMusicUrl || '';
@@ -7416,7 +7661,8 @@ async function saveDisplaysConfig(triggerBtn) {
       host: $('dpSpinHost').value.trim(),
       mac: $('dpSpinMac').value.trim(),
       hdmiInput: $('dpSpinHdmi').value.trim() || 'InputHDMI1',
-      autoDenonDual: $('dpSpinDual').value === '1',
+      autoDenonDual: $('dpSpinDual').value !== '0',
+      primaryDenonMonitor: $('dpPrimDenonMon') ? $('dpPrimDenonMon').value : '1',
     },
     cubeHost: ($('dpCubeHost') ? $('dpCubeHost').value.trim() : '') || '192.168.1.151',
     openGymPlayMusic: $('dpOpenMusic') ? ($('dpOpenMusic').value !== '0') : true,
@@ -7446,7 +7692,7 @@ async function runDisplayAction(target, action) {
       body: JSON.stringify({ target, action }),
     }).then(x => x.json());
     $('dpOut').textContent = r.ok ? `✓ ${r.message || 'Done'}` : `✗ ${r.error || r.message || 'Failed'}`;
-    if (target === 'avr' || target === 'gym' || target === 'open_gym' || target === 'close_gym' || target === 'spin') await pollAudioStatus();
+    if (target === 'avr' || target === 'gym' || target === 'open_gym' || target === 'close_gym' || target === 'spin' || target === 'music') await pollAudioStatus();
   } catch {
     $('dpOut').textContent = '✗ Display command failed';
   }
@@ -8512,7 +8758,50 @@ def create_app(service: ArmoryCamService) -> Flask:
         cams = service.tape_angles_for_window(sid, start_ms, end_ms)
         with service.lock:
             ret_days = service.retention_days
-        resp = jsonify({"ok": True, "retentionDays": ret_days, "cameras": cams})
+        audio_avail = service.room_audio.has_audio(start_ms, end_ms)
+        resp = jsonify({"ok": True, "retentionDays": ret_days, "cameras": cams, "audioAvailable": audio_avail})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/audio/availability")
+    def api_audio_availability() -> Response:
+        s_raw = request.args.get("startMs")
+        e_raw = request.args.get("endMs")
+        try:
+            if s_raw is None or s_raw == "":
+                raise ValueError("missing startMs")
+            start_ms = int(float(s_raw))
+            end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else start_ms + 5000
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Invalid startMs/endMs"}), 400
+        with service.lock:
+            ret_days = service.retention_days
+        resp = jsonify({
+            "ok": True,
+            "available": service.room_audio.has_audio(start_ms, end_ms),
+            "source": "powerconf",
+            "retentionDays": ret_days,
+        })
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/audio/clip")
+    def api_audio_clip() -> Response:
+        s_raw = request.args.get("startMs")
+        e_raw = request.args.get("endMs")
+        try:
+            if s_raw is None or s_raw == "":
+                raise ValueError("missing startMs")
+            s_ms = int(float(s_raw))
+            e_ms = min(s_ms + 300_000, max(s_ms + 500, int(float(e_raw)) if e_raw is not None and e_raw != "" else s_ms + 5000))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Invalid startMs/endMs"}), 400
+        fname = f"aud_{s_ms}_{e_ms}.m4a"
+        out_path = service.previews_root / fname
+        if not out_path.is_file() or out_path.stat().st_size < 128:
+            if not service.room_audio.extract_window_m4a(s_ms, e_ms, out_path):
+                return jsonify({"ok": False, "error": "Room audio unavailable for this timestamp"}), 404
+        resp = _serve_mp4_from_root(service.previews_root, fname, mimetype="audio/mp4")
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
@@ -8543,12 +8832,14 @@ def create_app(service: ArmoryCamService) -> Flask:
         start_ms = int(body.get("startMs") or (time.time() * 1000 - 20_000))
         end_ms = int(body.get("endMs") or time.time() * 1000)
         cam_override = body.get("camera")
+        include_audio = bool(body.get("includeAudio", False))
         clip = service.cut_clip(
             session_id=sid,
             ex_name=ex_name,
             start_ms=start_ms,
             end_ms=end_ms,
             camera_override=str(cam_override) if cam_override else None,
+            include_audio=include_audio,
         )
         if not clip:
             return jsonify({"ok": False, "error": "No matching video segments found"}), 404
@@ -8579,18 +8870,39 @@ def create_app(service: ArmoryCamService) -> Flask:
             resolve_overlap=(cam_override is None),
         )
         start_ms, end_ms, cam = select_pr_window(bursts, set_at_ms=set_at_ms, prev_set_at_ms=prev_ms)
+        include_audio = bool(body.get("includeAudio", False))
         clip = service.cut_clip(
             session_id=sid,
             ex_name=f"{ex_name}_PR",
             start_ms=start_ms,
             end_ms=end_ms,
             camera_override=(cam_override or cam),
+            include_audio=include_audio,
         )
         if not clip:
             return jsonify({"ok": False, "error": "No PR video segments found"}), 404
         return jsonify(clip)
 
-    def _serve_mp4_from_root(root: Path, relpath: str) -> Response:
+    @app.post("/api/clip/audio")
+    def api_clip_audio() -> Response:
+        body = request.get_json(silent=True) or {}
+        lan_url = str(body.get("lanUrl") or "")
+        file_name = str(body.get("fileName") or "")
+        include_audio = bool(body.get("includeAudio", False))
+        s_raw = body.get("startMs")
+        e_raw = body.get("endMs")
+        start_ms = int(float(s_raw)) if s_raw is not None and s_raw != "" else None
+        end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else None
+        payload, status_code = service.set_clip_audio(
+            lan_url=lan_url,
+            file_name=file_name,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            include_audio=include_audio,
+        )
+        return jsonify(payload), status_code
+
+    def _serve_mp4_from_root(root: Path, relpath: str, mimetype: str = "video/mp4") -> Response:
         base = root.resolve()
         target = (base / relpath).resolve()
         try:
@@ -8623,7 +8935,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                     yield chunk
 
         status = 200 if parsed is None else 206
-        resp = Response(generate(), status=status, mimetype="video/mp4", direct_passthrough=True)
+        resp = Response(generate(), status=status, mimetype=mimetype, direct_passthrough=True)
         resp.headers["Accept-Ranges"] = "bytes"
         resp.headers["Content-Length"] = str(length)
         if parsed is not None:
