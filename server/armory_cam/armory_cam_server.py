@@ -88,7 +88,7 @@ const paint = (d) => {
     sub.textContent = Math.round(d.cardio.watts || 0) + ' W · ' + (d.cardio.countdownText || '');
   } else {
     st.textContent = (d.standby && d.standby.timeLabel) ? ('Standby · ' + d.standby.timeLabel) : 'Standby';
-    sub.textContent = 'Start a workout on your Pixel to launch live telemetry.';
+    sub.textContent = '';
   }
 };
 fetch('/wallboard/state?t=' + Date.now()).then(r => r.json()).then(paint).catch(() => {});
@@ -1616,8 +1616,6 @@ class WallboardRelay:
             except Exception:
                 pass
 
-        if repo_html and cache_html:
-            return repo_html if repo_mtime >= cache_mtime else cache_html
         if repo_html:
             return repo_html
         if cache_html:
@@ -1659,7 +1657,7 @@ class WallboardRelay:
             "standby": {
                 "dateLabel": dt.strftime("%a, %b ") + str(dt.day),
                 "timeLabel": f"{hour12}:{dt.strftime('%M %p')}",
-                "weekLabel": "OptiPlex Wallboard Relay · Standby",
+                "weekLabel": "",
                 "todayItems": [],
             },
         }

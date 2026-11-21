@@ -289,6 +289,7 @@ class ArmoryCamTests(unittest.TestCase):
             # 2. GET /wallboard/state returns valid standby JSON before workout starts
             st0 = client.get("/wallboard/state").get_json()
             self.assertEqual(st0["mode"], "standby")
+            self.assertEqual(st0["standby"]["weekLabel"], "")
 
             # 3. POST /api/config persists wallboard settings without clobbering cameras
             cfg_res = client.post(

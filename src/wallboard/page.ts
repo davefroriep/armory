@@ -253,7 +253,7 @@ export const WALLBOARD_HTML = `<!doctype html>
     <div class="wb-rep-title"><b id="wbRepT">—</b><small id="wbRepSub">—</small></div>
     <div class="wb-rep-hud" id="wbRepHud"></div>
   </div>
-  <div class="wb-rep-foot"><span id="wbRepBadge">FORM REPLAY</span><span>Say “Armory close video” to return</span></div>
+  <div class="wb-rep-foot"><span id="wbRepBadge">FORM REPLAY</span></div>
 </div>
 <button class="ptt" id="ptt" hidden type="button">🎤 Voice Relay</button>
 <script>
@@ -369,7 +369,7 @@ function render(st) {
     ? '<span class="pill live">' + (st.lift.paused ? 'PAUSED' : 'LIVE · LIFT') + ' · ' + mmss(st.lift.elapsedSec) + '</span>'
     : st.mode === 'cardio'
       ? '<span class="pill cardio">LIVE · CARDIO</span>'
-      : '<span class="pill">STANDBY · ' + esc(st.standby?.weekLabel || '') + '</span>';
+      : '<span class="pill">STANDBY' + (st.standby?.weekLabel ? ' · ' + esc(st.standby.weekLabel) : '') + '</span>';
   const sincePill = st.mode === 'lift'
     ? '<span class="pill since">SINCE LAST SET ' + (st.lift.sinceLastSetSec != null ? mmss(st.lift.sinceLastSetSec) : '--:--') + '</span>'
     : '';
@@ -386,10 +386,10 @@ function render(st) {
     ready: ['ready', 'READY FOR SET', '≤ ' + (hr.readyLimitBpm || 130) + ' BPM' + (hr.drop60 ? ' · ↓' + hr.drop60 + ' / 60s' : '')],
     recovering: ['recovering', 'RECOVERING', 'TARGET ≤ ' + (hr.readyLimitBpm || 130) + ' BPM'],
     resting: ['resting', 'RESTING', 'Z' + (hr.zone || 1) + ' · ' + (hr.pctMax || 0) + '% MAX'],
-    idle: ['idle', 'NO STRAP', 'Connect Polar H10']
+    idle: ['idle', 'NO STRAP', '']
   };
   const rm = readyMap[hr.readiness || 'idle'];
-  const hrHtml = '<section class="card hr-card"><div><div class="kicker">POLAR H10 HEARTRATE</div><div class="hr-bpm" style="color:' + hrColor + '">' + (hr.fresh && hr.bpm ? hr.bpm : '--') + '</div><div class="cur-meta">' + (hr.fresh && hr.bpm ? 'Zone ' + hr.zone + ' · ' + hr.pctMax + '% HRmax' : 'Waiting for chest strap') + '</div></div><div class="hr-ready ' + rm[0] + '"><div>' + rm[1] + '</div><div style="font-size:.7em;opacity:.85;margin-top:4px">' + rm[2] + '</div></div></section>';
+  const hrHtml = '<section class="card hr-card"><div><div class="kicker">POLAR H10 HEARTRATE</div><div class="hr-bpm" style="color:' + hrColor + '">' + (hr.fresh && hr.bpm ? hr.bpm : '--') + '</div>' + (hr.fresh && hr.bpm ? '<div class="cur-meta">Zone ' + hr.zone + ' · ' + hr.pctMax + '% HRmax</div>' : '') + '</div><div class="hr-ready ' + rm[0] + '"><div>' + rm[1] + '</div>' + (rm[2] ? '<div style="font-size:.7em;opacity:.85;margin-top:4px">' + rm[2] + '</div>' : '') + '</div></section>';
   syncReplay(st, hr, hrColor);
 
   const renderSetRow = (slot, exType) => {
@@ -481,7 +481,7 @@ function render(st) {
     let leftStage = '';
     const sg = l.stage;
     if (!sg) {
-      leftStage = '<section class="card hero"><div class="cur-body" style="margin:auto 0"><div class="kicker">ALL ' + l.setsTotal + ' SETS COMPLETE</div><div class="cur-name" style="margin-top:8px">Finish workout on your Pixel to save &amp; sync</div><div class="cur-meta" style="margin-top:10px">Or say “' + esc((v.wakeWord || 'armory')) + ' finish workout”</div></div></section>';
+      leftStage = '<section class="card hero"><div class="cur-body" style="margin:auto 0"><div class="kicker">' + esc(l.title) + '</div><div class="cur-name" style="margin-top:8px">All ' + l.setsTotal + ' Sets Complete</div></div></section>';
     } else if (sg.kind === 'superset') {
       leftStage = '<section class="card ss-stage"><div class="ss-head"><div class="kicker">' + esc(sg.kicker) + '</div></div>'
         + '<div class="ss-pair">' + sg.stations.map((sc) => renderStation(sc, false)).join('') + '</div></section>';
@@ -526,8 +526,8 @@ function render(st) {
   } else if (st.standby) {
     const sb = st.standby;
     const items = (sb.todayItems || []).map((it) => '<div class="sb-item"><b>' + esc(it.title) + (it.carried ? ' · Carry-over' : '') + '</b><span>' + esc(it.equipmentLabel) + (it.preview ? ' · ' + esc(it.preview) : '') + '</span></div>').join('')
-      || '<div class="sb-item"><b>Rest / Unscheduled Day</b><span>Start any workout on your Pixel to switch live</span></div>';
-    main = '<div class="grid"><div class="col"><section class="card hero"><div class="kicker">THE ARMORY · ' + esc(sb.dateLabel) + '</div><div class="standby-big">' + esc(sb.timeLabel || nowStr) + '</div><div class="cur-meta">' + esc(sb.weekLabel) + ' · Start a workout on your Pixel or speak “' + esc(v.wakeWord || 'armory') + '” while Strength is open</div></section></div>'
+      || '<div class="sb-item"><b>Rest Day</b></div>';
+    main = '<div class="grid"><div class="col"><section class="card hero"><div class="kicker">THE ARMORY · ' + esc(sb.dateLabel) + '</div><div class="standby-big">' + esc(sb.timeLabel || nowStr) + '</div>' + (sb.weekLabel ? '<div class="cur-meta">' + esc(sb.weekLabel) + '</div>' : '') + '</section></div>'
       + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker">TODAY ON THE SCHEDULE</div>' + items + '</section></div></div>';
   }
 
@@ -582,7 +582,7 @@ document.addEventListener('click', keepAwake);
 
 // Optional LAN browser speech relay (available in Chrome on OptiPlex/tablets; hidden on Silk/devices without Web Speech)
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-if (SR && location.protocol.startsWith('http')) {
+if (SR && location.protocol.startsWith('http') && !/; wv\)|AFT/i.test(navigator.userAgent)) {
   const btn = document.getElementById('ptt');
   btn.hidden = false;
   let rec = null;
