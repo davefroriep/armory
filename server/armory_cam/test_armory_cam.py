@@ -4076,6 +4076,34 @@ class ShowDirectorTests(unittest.TestCase):
             v2._speaker_queue.put_nowait(("stop", None))
             worker.join(timeout=1.5)
 
+    def test_room_voice_cuda_warmup_fallback_and_end_silence_default(self) -> None:
+        cfg = rv.RoomVoiceConfig()
+        self.assertEqual(cfg.end_silence_ms, 380)
+        svc = rv.RoomVoiceService(config=cfg, allow_hardware_audio=False)
+        self.assertIn("asrDevice", svc.status_dict())
+
+        calls: list[tuple[str, str]] = []
+
+        class FakeWhisperModel:
+            def __init__(self, size: str, device: str = "cpu", compute_type: str = "int8", **kwargs):
+                self.device = device
+                self.compute_type = compute_type
+                calls.append((device, compute_type))
+
+            def transcribe(self, audio, **kwargs):
+                if self.device == "cuda":
+                    raise RuntimeError("cublas64_12.dll missing")
+                return iter([]), None
+
+        with (
+            mock.patch("faster_whisper.WhisperModel", FakeWhisperModel),
+            mock.patch("ctranslate2.get_cuda_device_count", return_value=1),
+        ):
+            model, asr_dev = rv._load_whisper_model("base.en")
+
+        self.assertEqual(asr_dev, "cpu/int8")
+        self.assertEqual(calls, [("cuda", "int8_float16"), ("cuda", "float16"), ("cpu", "int8")])
+
 
 if __name__ == "__main__":
     unittest.main()

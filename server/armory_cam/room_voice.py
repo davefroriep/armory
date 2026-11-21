@@ -19,9 +19,11 @@ import io
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import queue
 import re
+import site
 import subprocess
 import sys
 import threading
@@ -258,7 +260,7 @@ class RoomVoiceConfig:
     tts_voice: str = DEFAULT_TTS_VOICE
     vad_threshold: float = 0.42
     min_speech_ms: int = 280
-    end_silence_ms: int = 520
+    end_silence_ms: int = 380
     max_utterance_sec: float = 4.8
     rms_gate: float = 0.0025
 
@@ -302,10 +304,94 @@ class RoomVoiceConfig:
             tts_voice=tts_voice,
             vad_threshold=_clamp(float(raw.get("vadThreshold", 0.42) or 0.42), 0.15, 0.90),
             min_speech_ms=max(160, min(1200, int(raw.get("minSpeechMs", 280) or 280))),
-            end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 520) or 520))),
+            end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 380) or 380))),
             max_utterance_sec=_clamp(float(raw.get("maxUtteranceSec", 4.8) or 4.8), 2.5, 15.0),
             rms_gate=_clamp(float(raw.get("rmsGate", 0.0025) or 0.0025), 0.0005, 0.05),
         )
+
+
+_CUDA_DLL_HANDLES: list[Any] = []
+_CUDA_DLL_REGISTERED: set[str] = set()
+
+
+def _register_cuda_dll_dirs() -> list[str]:
+    """Register user/system pip NVIDIA CUDA 12 bin directories for ctranslate2 on Windows."""
+    added: list[str] = []
+    roots: list[str] = []
+    try:
+        user_site = site.getusersitepackages()
+        if user_site:
+            roots.append(str(user_site))
+    except Exception:
+        pass
+    try:
+        roots.extend(str(p) for p in site.getsitepackages())
+    except Exception:
+        pass
+    path_parts = os.environ.get("PATH", "").split(os.pathsep) if os.environ.get("PATH") else []
+    for root in roots:
+        nv = Path(root) / "nvidia"
+        if not nv.is_dir():
+            continue
+        for bin_dir in sorted(nv.glob("*/bin")):
+            if not bin_dir.is_dir():
+                continue
+            s_dir = str(bin_dir)
+            if s_dir not in _CUDA_DLL_REGISTERED:
+                _CUDA_DLL_REGISTERED.add(s_dir)
+                if hasattr(os, "add_dll_directory"):
+                    try:
+                        _CUDA_DLL_HANDLES.append(os.add_dll_directory(s_dir))
+                    except OSError:
+                        pass
+            if s_dir not in path_parts:
+                path_parts.insert(0, s_dir)
+            added.append(s_dir)
+    if path_parts:
+        os.environ["PATH"] = os.pathsep.join(path_parts)
+    return added
+
+
+def _load_whisper_model(model_size: str) -> tuple[Any, str]:
+    """Load `faster-whisper` on CUDA (verified via warmup) when available, else CPU `int8`."""
+    _register_cuda_dll_dirs()
+    from faster_whisper import WhisperModel
+
+    has_cuda = False
+    try:
+        import ctranslate2
+
+        has_cuda = int(ctranslate2.get_cuda_device_count()) > 0
+    except Exception:
+        has_cuda = False
+
+    if has_cuda:
+        warmup_pcm = np.zeros(SAMPLE_RATE_16K // 2, dtype=np.float32)
+        for ct in ("int8_float16", "float16"):
+            try:
+                model = WhisperModel(model_size, device="cuda", compute_type=ct)
+                segs, _ = model.transcribe(
+                    warmup_pcm,
+                    language="en",
+                    beam_size=1,
+                    best_of=1,
+                    temperature=0.0,
+                    condition_on_previous_text=False,
+                    vad_filter=False,
+                    max_new_tokens=4,
+                )
+                _ = list(segs)
+                return model, f"cuda/{ct}"
+            except Exception as exc:
+                logging.getLogger("armory-voice").warning(
+                    "CUDA faster-whisper %s (%s) unavailable, trying fallback: %s",
+                    model_size,
+                    ct,
+                    exc,
+                )
+
+    model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=4)
+    return model, "cpu/int8"
 
 
 _PORTAUDIO_LOCK = threading.RLock()
@@ -1430,6 +1516,7 @@ class RoomVoiceService:
 
         self._model: Any = None
         self._model_size_loaded: str = ""
+        self._model_device: str = ""
         self._model_loading = False
         self._model_error: str | None = None
 
@@ -1524,6 +1611,7 @@ class RoomVoiceService:
             if model_changed:
                 self._model = None
                 self._model_size_loaded = ""
+                self._model_device = ""
             if self._started and next_cfg.enabled:
                 self._ensure_model_loading_locked()
             self._bump_status_locked()
@@ -1548,19 +1636,18 @@ class RoomVoiceService:
 
     def _load_model_worker(self, model_size: str) -> None:
         try:
-            from faster_whisper import WhisperModel
-
             t0 = time.perf_counter()
-            model = WhisperModel(model_size, device="cpu", compute_type="int8", cpu_threads=4)
+            model, asr_dev = _load_whisper_model(model_size)
             dt = time.perf_counter() - t0
             with self.lock:
                 if self.cfg.model_size == model_size:
                     self._model = model
                     self._model_size_loaded = model_size
+                    self._model_device = asr_dev
                     self._model_loading = False
                     self._model_error = None
                     self._bump_status_locked()
-            self.log.info("Loaded faster-whisper %s (cpu/int8) in %.2fs", model_size, dt)
+            self.log.info("Loaded faster-whisper %s (%s) in %.2fs", model_size, asr_dev, dt)
         except Exception as exc:
             with self.lock:
                 self._model_loading = False
@@ -1655,6 +1742,7 @@ class RoomVoiceService:
                 "wantCapture": self.should_capture_now(now_mono),
                 "listenMode": self.cfg.listen_mode,
                 "modelSize": self.cfg.model_size,
+                "asrDevice": self._model_device,
                 "wakeWord": self._effective_wake_word_locked(),
                 "device": dev_label,
                 "hostApi": self._stream_host_api or (in_dev["hostApi"] if in_dev else ""),
