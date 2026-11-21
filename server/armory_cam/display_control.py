@@ -1171,17 +1171,22 @@ class GymDisplayController:
         if tgt == "open_gym":
             cfg = self.get_config()
             results: dict[str, Any] = {}
-            results["tv"] = self._control_primary("hdmi2")
+            results["tv"] = self.ensure_primary_hdmi_ready("hdmi2")
+            if cfg.spin.enabled and cfg.spin.host:
+                results["spin"] = self.ensure_spin_hdmi_ready()
             results["avr"] = self._control_avr("on")
             if self.denon is not None:
                 results["avr_mode"] = self.denon.send_command("MSMCH STEREO")
-                results["avr_monitor"] = self.sync_denon_monitor_for_spin()
+                if cfg.spin.enabled and cfg.spin.host:
+                    results["avr_monitor"] = self.set_denon_monitor_out("AUTO")
+                else:
+                    results["avr_monitor"] = self.sync_denon_monitor_for_spin()
             if self._wake_wallboard_fn is not None:
                 results["wallboard"] = self._wake_wallboard_fn(True)
             if cfg.open_gym_play_music:
                 results["music"] = self._launch_cube_youtube_music()
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
-            return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (TV, Denon, Wallboard, YouTube Music)"}
+            return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (All 3 TVs, Denon, YouTube Music)"}
         if tgt == "close_gym":
             results = {}
             results["media_pause"] = self._pause_cube_media()

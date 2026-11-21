@@ -3911,11 +3911,12 @@ class ShowDirector:
                 res_d: dict[str, Any] = {}
                 if self.house_audio is not None:
                     d_st = self.house_audio.denon.get_status()
+                    cur_inp = str(d_st.get("input") or "").strip().upper()
                     if d_st.get("ok") and d_st.get("power") != "ON":
                         self.house_audio.denon.send_command("PWON")
                         self._wait_cancelable(cancel_ev, 0.35)
                         self.house_audio.denon.send_command("SIMPLAY")
-                    else:
+                    elif not d_st.get("ok") or cur_inp != "MPLAY":
                         self.house_audio.denon.send_command("SIMPLAY")
                 if self.displays is not None:
                     res_d["avrMode"] = self.displays._control_avr("mch_stereo")

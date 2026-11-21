@@ -2266,6 +2266,7 @@ class ArmoryCamTests(unittest.TestCase):
         ctrl.update_config({"openGymMusicUrl": "https://music.youtube.com/playlist?list=PLgym99"})
         adb_cmds.clear()
         denon_cmds.clear()
+        roku_posts.clear()
         wb_calls.clear()
         og = ctrl.execute("open_gym", "run")
         self.assertTrue(og["ok"])
@@ -2273,6 +2274,9 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertIn("SIMPLAY", denon_cmds)
         self.assertIn("MSMCH%20STEREO", denon_cmds)
         self.assertEqual(wb_calls, ["wake"])
+        self.assertIn("http://192.168.1.88:8060/keypress/PowerOn", roku_posts)
+        self.assertIn("http://192.168.1.88:8060/keypress/InputHDMI1", roku_posts)
+        self.assertTrue(any("192.168.1.230:5555" in c and c[-3:] == ["input", "keyevent", "244"] for c in adb_cmds))
         self.assertTrue(any("https://www.youtube.com/playlist?list=PLgym99" in " ".join(c) and "192.168.1.151:5555" in c for c in adb_cmds))
 
         adb_cmds.clear()
