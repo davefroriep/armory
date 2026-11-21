@@ -57,17 +57,30 @@ _LEGACY_TTS_VOICE_MAP = {
     "en-US-AndrewNeural": "en-US-AndrewMultilingualNeural",
     "en-US-AvaNeural": "en-US-AvaMultilingualNeural",
 }
-PREWARM_TTS_PHRASES = (
+PREWARM_TTS_PHRASES: tuple[str, ...] = (
     "Armory room mic ready",
     "Armory mic on",
-    "225 for 8, check",
-    "225 for 8, got it",
-    "Set checked",
-    "Checked, got it",
     "Didn't catch that",
-    "Rest skipped",
-    "Set added",
+    "Need weight and reps",
+    "Start a workout first",
+    "Open a workout first",
+    "Open active workout",
+    "Didn't find that exercise",
+    "Could not log set",
+    "No rest running",
+    "Not running",
+    "Not paused",
+    "Nothing to undo",
+    "Undid last set",
     "Undid last",
+    "No empty sets",
+    "All sets logged",
+    "Workout complete",
+    "Rest skipped",
+    "Rest started",
+    "Added 30 seconds",
+    "Minus 30 seconds",
+    "Set added",
     "Next exercise",
     "Previous exercise",
     "Recording Rack",
@@ -258,6 +271,7 @@ class RoomVoiceConfig:
     wake_word: str = "armory"
     speaker_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
+    set_commit_mode: str = "chime"  # "chime" | "voice"
     vad_threshold: float = 0.42
     min_speech_ms: int = 280
     end_silence_ms: int = 380
@@ -274,6 +288,7 @@ class RoomVoiceConfig:
             "wakeWord": self.wake_word,
             "speakerReadback": bool(self.speaker_readback),
             "ttsVoice": self.tts_voice,
+            "setCommitMode": self.set_commit_mode,
             "vadThreshold": round(float(self.vad_threshold), 2),
             "minSpeechMs": int(self.min_speech_ms),
             "endSilenceMs": int(self.end_silence_ms),
@@ -293,6 +308,8 @@ class RoomVoiceConfig:
         tts_raw = str(raw.get("ttsVoice") or DEFAULT_TTS_VOICE).strip()
         tts_raw = _LEGACY_TTS_VOICE_MAP.get(tts_raw, tts_raw)
         tts_voice = tts_raw if tts_raw in TTS_VOICES else DEFAULT_TTS_VOICE
+        commit_raw = str(raw.get("setCommitMode", "chime")).strip().lower()
+        set_commit_mode = "voice" if commit_raw == "voice" else "chime"
         return cls(
             enabled=bool(raw.get("enabled", True)),
             device_match=str(raw.get("deviceMatch", "PowerConf S330") or "").strip(),
@@ -302,12 +319,82 @@ class RoomVoiceConfig:
             wake_word=wake,
             speaker_readback=bool(raw.get("speakerReadback", True)),
             tts_voice=tts_voice,
+            set_commit_mode=set_commit_mode,
             vad_threshold=_clamp(float(raw.get("vadThreshold", 0.42) or 0.42), 0.15, 0.90),
             min_speech_ms=max(160, min(1200, int(raw.get("minSpeechMs", 280) or 280))),
             end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 380) or 380))),
             max_utterance_sec=_clamp(float(raw.get("maxUtteranceSec", 4.8) or 4.8), 2.5, 15.0),
             rms_gate=_clamp(float(raw.get("rmsGate", 0.0025) or 0.0025), 0.0005, 0.05),
         )
+
+
+_SET_COMMIT_SPEECH_RE = re.compile(r"(?:,\s*(?:check|got it)|^set checked)$")
+
+
+def is_set_commit_ack(text: str = "", kind: str | None = None, speech: str = "") -> bool:
+    """Return True when an ack corresponds to a logged strength set (uses fast studio chime)."""
+    clean_text = str(text or "").strip()
+    if clean_text.startswith("✓"):
+        return True
+    clean_kind = str(kind or "").strip().lower()
+    clean_speech = str(speech or "").strip().lower()
+    return clean_kind == "ok" and bool(_SET_COMMIT_SPEECH_RE.search(clean_speech))
+
+
+def _load_commit_chime_pcm(root_dir: Path | None = None) -> tuple[np.ndarray, int]:
+    """Load the studio set-commit chime WAV (custom override or Windows 11 studio chime)."""
+    candidates: list[Path] = []
+    if root_dir is not None:
+        candidates.append(Path(root_dir) / "sfx" / "commit_chime.wav")
+    candidates.append(Path(r"C:\Windows\Media\Windows Default.wav"))
+
+    for wav_p in candidates:
+        if not wav_p.is_file():
+            continue
+        try:
+            with wave.open(str(wav_p), "rb") as wf:
+                sr = int(wf.getframerate() or 44_100)
+                ch = max(1, int(wf.getnchannels() or 1))
+                sw = int(wf.getsampwidth() or 2)
+                raw = wf.readframes(wf.getnframes())
+            if not raw:
+                continue
+            if sw == 1:
+                arr = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif sw == 2:
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sw == 4:
+                arr = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                continue
+            if ch > 1:
+                trim_len = (arr.size // ch) * ch
+                arr = arr[:trim_len].reshape(-1, ch).mean(axis=1)
+            arr = arr.astype(np.float32, copy=False)
+            max_samples = int(round(sr * 0.42))
+            if arr.size > int(round(sr * 0.38)):
+                nz = np.flatnonzero(np.abs(arr) > 0.004)
+                tail_end = int(nz[-1]) + int(round(sr * 0.03)) if nz.size else int(round(sr * 0.28))
+                keep = min(arr.size, max(min(tail_end, max_samples), int(round(sr * 0.25))))
+                if keep < arr.size:
+                    arr = arr[:keep].copy()
+                    fade_n = min(int(round(sr * 0.010)), arr.size)
+                    if fade_n > 1:
+                        arr[-fade_n:] *= np.linspace(1.0, 0.0, fade_n, dtype=np.float32)
+            if arr.size > 0:
+                return arr, sr
+        except Exception:
+            continue
+
+    sr = 48_000
+    n = int(round(sr * 0.22))
+    t = np.linspace(0.0, 0.22, n, endpoint=False, dtype=np.float32)
+    env = np.exp(-14.0 * t).astype(np.float32)
+    fade_in = min(int(round(sr * 0.004)), n)
+    if fade_in > 1:
+        env[:fade_in] *= np.linspace(0.0, 1.0, fade_in, dtype=np.float32)
+    tone = (0.65 * np.sin(2.0 * np.pi * 880.0 * t) + 0.35 * np.sin(2.0 * np.pi * 1318.5 * t)) * env
+    return tone.astype(np.float32), sr
 
 
 _CUDA_DLL_HANDLES: list[Any] = []
@@ -1495,9 +1582,13 @@ class RoomVoiceService:
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
+        self._root_dir = root_dir
         self.on_fallback_transcript = on_fallback_transcript
         self._asr_transcribe_fn = asr_transcribe_fn
         self._speak_fn = speak_fn
+        self._chime_fn: Callable[[str], bool] | None = None
+        self._commit_chime_cache: tuple[np.ndarray, int] | None = None
+        self._last_commit_chime_mono: float = 0.0
         self._allow_hardware_audio = allow_hardware_audio
         self._house_audio_router = house_audio_router
         self._local_command_handler = local_command_handler
@@ -1860,6 +1951,7 @@ class RoomVoiceService:
         armed: bool | None = None,
         speech: str | None = None,
         text: str | None = None,
+        kind: str | None = None,
     ) -> dict[str, Any]:
         now_ms = int(time.time() * 1000)
         with self.lock:
@@ -1873,14 +1965,20 @@ class RoomVoiceService:
                         item["ackText"] = str(text)
                         break
             do_readback = bool(self.cfg.speaker_readback and self.context_readback)
+            commit_mode = self.cfg.set_commit_mode
 
         spoke = False
+        chime_played = False
         clean_speech = str(speech or "").strip()
-        if clean_speech and do_readback:
-            spoke = self.speak_confirmation(clean_speech)
-        elif armed is True and not clean_speech and do_readback:
-            self.play_ready_chime()
-        return {"ok": True, "spoke": spoke}
+        if do_readback:
+            if commit_mode == "chime" and is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
+                chime_played = self.play_commit_chime()
+                spoke = bool(chime_played)
+            elif clean_speech:
+                spoke = self.speak_confirmation(clean_speech)
+            elif armed is True:
+                self.play_ready_chime()
+        return {"ok": True, "spoke": spoke, "chime": bool(chime_played)}
 
     def subscribe_sse(self, after_id: int | None = None):
         """Generator yielding SSE `data:` frames (`status` + `transcript`) and keepalive pings."""
@@ -2051,7 +2149,7 @@ class RoomVoiceService:
                     rendered = self._tts.synthesize(text, voice=voice)
                     if rendered:
                         pcm, sr = rendered
-                        self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84, kind="tts")
+                        self._play_pcm_blocking(pcm, sr, lead_ms=220, tail_ms=180, target_peak=0.84, kind="tts")
             except Exception as exc:
                 self.log.debug("Speaker worker error: %s", exc)
 
@@ -2095,6 +2193,35 @@ class RoomVoiceService:
                 return False
         return self._play_pcm_blocking(tone, sr, lead_ms=220, tail_ms=150, target_peak=0.28, kind="chime")
 
+    def play_commit_chime(self) -> bool:
+        """Play a crisp studio commit chime on PowerConf S330 / House Audio (~0.2-0.4s)."""
+        now_mono = time.monotonic()
+        with self.lock:
+            if (now_mono - self._last_commit_chime_mono) < 1.2:
+                return True
+            self._last_commit_chime_mono = now_mono
+        if self._chime_fn is not None:
+            return bool(self._chime_fn("commit"))
+        if not self._allow_hardware_audio and self._house_audio_router is None:
+            return False
+        if self._resolve_speaker() is None and self._house_audio_router is None:
+            return False
+        with self.lock:
+            cached = self._commit_chime_cache
+        if cached is None:
+            cached = _load_commit_chime_pcm(self._root_dir)
+            with self.lock:
+                self._commit_chime_cache = cached
+        pcm, sr = cached
+        if self._started:
+            try:
+                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.65)
+                self._speaker_queue.put_nowait(("pcm", (pcm, sr, 140, 80, 0.72)))
+                return True
+            except queue.Full:
+                return False
+        return self._play_pcm_blocking(pcm, sr, lead_ms=140, tail_ms=80, target_peak=0.72, kind="chime")
+
     def speak_confirmation(self, text: str) -> bool:
         """Synthesize natural neural confirmation speech and queue padded playback to House Audio / S330."""
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
@@ -2125,7 +2252,7 @@ class RoomVoiceService:
         if not rendered:
             return False
         pcm, sr = rendered
-        return self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84, kind="tts")
+        return self._play_pcm_blocking(pcm, sr, lead_ms=220, tail_ms=180, target_peak=0.84, kind="tts")
 
     # ---------- capture & ASR loops ----------
 

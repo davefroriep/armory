@@ -9933,7 +9933,8 @@ def create_app(service: ArmoryCamService) -> Flask:
         armed_arg = bool(body["armed"]) if "armed" in body and body["armed"] is not None else None
         speech_arg = str(body.get("speech") or "")
         text_arg = str(body.get("text") or "")
-        res = service.voice.handle_ack(armed=armed_arg, speech=speech_arg, text=text_arg)
+        kind_arg = str(body.get("kind") or "")
+        res = service.voice.handle_ack(armed=armed_arg, speech=speech_arg, text=text_arg, kind=kind_arg)
         return jsonify(res)
 
     @app.post("/api/voice/config")

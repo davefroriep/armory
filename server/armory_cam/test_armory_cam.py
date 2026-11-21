@@ -1825,16 +1825,68 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIn("Armory 225 for 8", second_frame)
             stream.close()
 
+            chimes: list[str] = []
+            svc.voice._chime_fn = lambda kind: chimes.append(kind) or True
+
             ack_res = client.post(
                 "/api/voice/ack",
-                json={"armed": False, "speech": "225 for 8, got it", "text": "✓ 1 Low Bar Squat · 225 lb × 8"},
+                json={
+                    "armed": False,
+                    "speech": "225 for 8, got it",
+                    "text": "✓ 1 Low Bar Squat · 225 lb × 8",
+                    "kind": "ok",
+                },
             )
             self.assertEqual(ack_res.status_code, 200)
-            self.assertTrue(ack_res.get_json()["spoke"])
-            self.assertEqual(spoken, ["225 for 8, got it"])
+            ack_json = ack_res.get_json()
+            self.assertTrue(ack_json["spoke"])
+            self.assertTrue(ack_json["chime"])
+            self.assertEqual(chimes, ["commit"])
+            self.assertEqual(spoken, [])
 
             st = client.get("/api/voice/status").get_json()
             self.assertEqual(st["recent"][0]["ackText"], "✓ 1 Low Bar Squat · 225 lb × 8")
+
+            # Errors and non-set commands still speak via Andrew TTS
+            err_res = client.post(
+                "/api/voice/ack",
+                json={"armed": False, "speech": "Didn't catch that", "text": "Didn’t catch “blah”", "kind": "warn"},
+            )
+            self.assertEqual(err_res.status_code, 200)
+            self.assertTrue(err_res.get_json()["spoke"])
+            self.assertFalse(err_res.get_json()["chime"])
+
+            act_res = client.post(
+                "/api/voice/ack",
+                json={"armed": False, "speech": "Rest skipped", "text": "Rest timer skipped", "kind": "info"},
+            )
+            self.assertEqual(act_res.status_code, 200)
+            self.assertTrue(act_res.get_json()["spoke"])
+            self.assertFalse(act_res.get_json()["chime"])
+            self.assertEqual(spoken, ["Didn't catch that", "Rest skipped"])
+
+            # Switching setCommitMode -> "voice" restores spoken readback for logged sets
+            vc_res = client.post("/api/voice/config", json={"setCommitMode": "voice"})
+            self.assertEqual(vc_res.status_code, 200)
+            self.assertEqual(vc_res.get_json()["config"]["setCommitMode"], "voice")
+            ack_v = client.post(
+                "/api/voice/ack",
+                json={
+                    "armed": False,
+                    "speech": "185 for 10, check",
+                    "text": "✓ 1 Low Bar Squat · 185 lb × 10",
+                    "kind": "ok",
+                },
+            )
+            self.assertTrue(ack_v.get_json()["spoke"])
+            self.assertFalse(ack_v.get_json()["chime"])
+            self.assertEqual(spoken[-1], "185 for 10, check")
+
+            # Commit chime PCM loader yields crisp normalized mono float32 audio (0.15s..0.55s)
+            chime_pcm, chime_sr = rv._load_commit_chime_pcm()
+            self.assertGreater(chime_sr, 8000)
+            self.assertGreaterEqual(len(chime_pcm) / float(chime_sr), 0.15)
+            self.assertLessEqual(len(chime_pcm) / float(chime_sr), 0.55)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
