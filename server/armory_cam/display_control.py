@@ -308,6 +308,26 @@ def parse_roku_device_info(xml_text: str) -> dict[str, Any]:
     }
 
 
+def parse_roku_active_app(xml_text: str) -> dict[str, Any]:
+    """Parse Roku ECP `/query/active-app` XML into structured app ID and name."""
+    text = (xml_text or "").strip()
+    if not text:
+        return {"ok": False, "error": "Empty Roku active-app XML"}
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        return {"ok": False, "error": f"Roku XML parse error: {exc}"}
+    app_el = root.find("app")
+    if app_el is None:
+        return {"ok": True, "appId": "", "appType": "", "name": ""}
+    return {
+        "ok": True,
+        "appId": str(app_el.attrib.get("id") or "").strip(),
+        "appType": str(app_el.attrib.get("type") or "").strip(),
+        "name": (app_el.text or "").strip(),
+    }
+
+
 def _strip_wake_prefix(text: str, wake_word: str = "armory") -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
     s = re.sub(r"\s+", " ", s).strip()
@@ -577,6 +597,8 @@ class GymDisplayController:
             if code < 400:
                 fields = _parse_denon_video_form(raw.decode("utf-8", errors="ignore"))
                 if "radioMonitorOut" in fields:
+                    if str(fields.get("radioMonitorOut") or "").strip().upper() == m:
+                        return {"ok": True, "monitorOut": m, "via": "noop_already_set"}
                     fields["radioMonitorOut"] = m
                     encoded = urllib.parse.urlencode(fields).encode("ascii")
                     pcode, _ = self._do_post(
@@ -725,6 +747,95 @@ class GymDisplayController:
 
         return {"ok": False, "target": "tv", "action": action, "error": f"Unsupported action: {action}"}
 
+    def ensure_primary_hdmi_ready(self, action: str = "hdmi2") -> dict[str, Any]:
+        """Ensure Hisense primary TV is ON and on the requested HDMI port without Denon monitor flips."""
+        cfg = self.get_config().primary
+        if not cfg.enabled:
+            return {"ok": False, "target": "tv", "action": action, "error": "Main TV disabled"}
+        ser = self._adb_serial(cfg.host, cfg.adb_port)
+        if not ser or self.adb is None:
+            return {"ok": False, "target": "tv", "action": action, "error": "Main TV IP or ADB missing"}
+
+        is_hdmi1 = str(action or "hdmi2").strip().lower() in ("hdmi1", "pc")
+        input_id = cfg.hdmi_optiplex_input if is_hdmi1 else cfg.hdmi_denon_input
+        if not input_id:
+            return {"ok": False, "target": "tv", "action": action, "error": "HDMI input ID not configured"}
+        keycode = resolve_hdmi_keyevent(input_id, "243" if is_hdmi1 else "244")
+
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device" and cfg.mac and self._wol_sender is not None:
+            self._wol_sender(cfg.mac)
+            self._sleep(0.8)
+            st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+
+        try:
+            def _sh(*args: str) -> str:
+                rc, out, _ = self.adb._run(["-s", ser, "shell", *args], timeout=4.5)
+                return out.strip() if rc == 0 else ""
+
+            pwr = _sh("dumpsys", "power")
+            disp_m = re.search(r"Display Power:\s*state=(\w+)", pwr)
+            display_power = disp_m.group(1) if disp_m else ""
+
+            tvin = _sh("dumpsys", "tv_input")
+            active_m = re.search(r"^\s*inputId:\s*(\S+)", tvin, re.M)
+            active_input = active_m.group(1) if active_m else ""
+            raw_hdmi_ids = set(re.findall(r"com\.mediatek\.tis/\.HdmiInputService/HW\d+", tvin))
+
+            def _hw_num(item: str) -> int:
+                m_hw = re.search(r"(\d+)$", item)
+                return int(m_hw.group(1)) if m_hw else 0
+
+            hdmi_ids = sorted(raw_hdmi_ids, key=_hw_num)
+            port_idx = {"243": 0, "244": 1, "245": 2, "246": 3}.get(keycode, 1)
+            target_hw = hdmi_ids[port_idx] if port_idx < len(hdmi_ids) else ""
+
+            if display_power == "ON" and target_hw and active_input == target_hw:
+                return {
+                    "ok": True,
+                    "target": "tv",
+                    "action": action,
+                    "alreadyReady": True,
+                    "switched": False,
+                    "displayPower": display_power,
+                    "activeInput": active_input,
+                    "targetInput": target_hw,
+                    "message": f"Main TV already ON on {target_hw}",
+                }
+
+            switched = False
+            if display_power != "ON":
+                self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+                self._sleep(0.35)
+                switched = True
+            rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", keycode], timeout=4.0)
+            if rc == 0 and (not target_hw or active_input != target_hw):
+                switched = True
+            return {
+                "ok": rc == 0,
+                "target": "tv",
+                "action": action,
+                "alreadyReady": False,
+                "switched": switched,
+                "keycode": keycode,
+                "displayPower": display_power,
+                "activeInput": active_input,
+                "targetInput": target_hw,
+                "message": (
+                    f"Pre-staged Main TV ({'HDMI 1' if is_hdmi1 else 'HDMI 2'})"
+                    if rc == 0
+                    else (err or out).strip()
+                ),
+            }
+        finally:
+            if hasattr(self.adb, "disconnect_serial"):
+                try:
+                    self.adb.disconnect_serial(ser)
+                except Exception:
+                    pass
+
     def _launch_cube_youtube_music(self, query_override: str | None = None) -> dict[str, Any]:
         cfg = self.get_config()
         ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
@@ -829,6 +940,19 @@ class GymDisplayController:
         self.last_spin_info = res
         return res
 
+    def get_roku_active_app(self, host: str, port: int = 8060) -> dict[str, Any]:
+        """Query Roku ECP `/query/active-app` to inspect the active HDMI/app ID."""
+        clean = str(host or "").strip()
+        if not clean:
+            return {"ok": False, "unconfigured": True, "error": "SmartSpin TV IP not set"}
+        try:
+            code, raw = self._do_get(f"http://{clean}:{int(port)}/query/active-app", 1.2)
+            if code >= 400:
+                return {"ok": False, "host": clean, "error": f"HTTP {code}"}
+            return {**parse_roku_active_app(raw.decode("utf-8", errors="ignore")), "host": clean, "port": int(port)}
+        except Exception as exc:
+            return {"ok": False, "host": clean, "error": str(exc)}
+
     def discover_roku_tvs(self, subnet_prefix: str = "192.168.1") -> list[dict[str, Any]]:
         """Fast LAN scan of `:8060/query/device-info` to discover Roku TVs (e.g. SmartSpin TV)."""
         if not self._allow_network and self._http_get is None:
@@ -906,6 +1030,60 @@ class GymDisplayController:
                 return {"ok": False, "target": "spin", "action": "off", "error": str(exc)}
 
         return {"ok": False, "target": "spin", "action": action, "error": f"Unsupported action: {action}"}
+
+    def ensure_spin_hdmi_ready(self) -> dict[str, Any]:
+        """Ensure TCL SmartSpin Roku TV is powered ON and on its Denon HDMI input without flipping Denon."""
+        cfg = self.get_config().spin
+        if not cfg.enabled:
+            return {"ok": False, "target": "spin", "error": "SmartSpin TV disabled"}
+        host = str(cfg.host or "").strip()
+        if not host:
+            return {"ok": True, "target": "spin", "skipped": True, "alreadyReady": True, "switched": False}
+
+        m_hdmi = re.search(r"hdmi\s*([1-4])", cfg.hdmi_input or "", re.I)
+        expected_id = f"tvinput.hdmi{m_hdmi.group(1)}" if m_hdmi else "tvinput.hdmi1"
+
+        info = self.get_roku_info(host, cfg.ecp_port)
+        app = self.get_roku_active_app(host, cfg.ecp_port)
+        power_mode = str(info.get("powerMode") or "")
+        active_id = str(app.get("appId") or "")
+        if info.get("ok") and power_mode == "PowerOn" and app.get("ok") and active_id == expected_id:
+            return {
+                "ok": True,
+                "target": "spin",
+                "alreadyReady": True,
+                "switched": False,
+                "powerMode": power_mode,
+                "activeAppId": active_id,
+                "message": f"SmartSpin TV already ON on {active_id}",
+            }
+
+        base = f"http://{host}:{int(cfg.ecp_port)}"
+        if cfg.mac and self._wol_sender is not None and not info.get("ok"):
+            self._wol_sender(cfg.mac)
+            self._sleep(0.5)
+        try:
+            switched = False
+            if power_mode != "PowerOn":
+                code, _ = self._do_post(f"{base}/keypress/PowerOn", b"", {}, 2.0)
+                if code >= 400:
+                    return {"ok": False, "target": "spin", "error": f"HTTP {code}"}
+                switched = True
+            if cfg.hdmi_input and active_id != expected_id:
+                self._sleep(0.5 if switched else 0.1)
+                self._do_post(f"{base}/keypress/{urllib.parse.quote(cfg.hdmi_input, safe='')}", b"", {}, 2.0)
+                switched = True
+            return {
+                "ok": True,
+                "target": "spin",
+                "alreadyReady": False,
+                "switched": switched,
+                "expectedAppId": expected_id,
+                "previousAppId": active_id,
+                "message": f"Pre-staged SmartSpin TV ({cfg.hdmi_input or 'PowerOn'})",
+            }
+        except Exception as exc:
+            return {"ok": False, "target": "spin", "error": str(exc)}
 
     def _control_avr(self, action: str) -> dict[str, Any]:
         if self.denon is None:

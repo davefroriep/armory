@@ -120,6 +120,334 @@ fetch('/wallboard/state?t=' + Date.now()).then(r => r.json()).then(paint).catch(
 try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { try { paint(JSON.parse(e.data)); } catch {} }; } catch {}
 </script></body></html>"""
 
+WALLBOARD_STAGE_OVERLAY_SNIPPET = """
+<div id="armoryShowStage" style="display:none;position:fixed;inset:0;z-index:999999;background:#000;overflow:hidden">
+  <video id="armoryStageVid" playsinline muted preload="auto" style="width:100%;height:100%;object-fit:contain;background:#000"></video>
+</div>
+<script>
+(function(){
+  if (window._armoryStageInit) return;
+  window._armoryStageInit = true;
+  var box = document.getElementById('armoryShowStage');
+  var vid = document.getElementById('armoryStageVid');
+  if (!box || !vid) return;
+  var role = 'wallboard';
+  var clockOffsetMs = 0;
+  var curRunId = 0;
+  var readyAcked = false;
+  var startTimer = null;
+  var syncIv = null;
+  var activeStartMs = 0;
+
+  function syncClock(){
+    var bestRtt = 999999;
+    function sample(left){
+      if (left <= 0) return;
+      var t0 = Date.now();
+      fetch('/api/shows/time?t=' + t0).then(function(r){ return r.json(); }).then(function(d){
+        var t1 = Date.now(), rtt = t1 - t0;
+        if (d && d.nowMs && rtt < bestRtt){
+          bestRtt = rtt;
+          clockOffsetMs = Number(d.nowMs) - (t0 + rtt * 0.5);
+        }
+        sample(left - 1);
+      }).catch(function(){});
+    }
+    sample(3);
+  }
+  syncClock();
+  setInterval(syncClock, 60000);
+
+  function postAck(state){
+    if (!curRunId) return;
+    fetch('/api/shows/stage/ack', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role: role, runId: curRunId, state: state })
+    }).catch(function(){});
+  }
+
+  function clearPlayTimers(){
+    if (startTimer){ clearTimeout(startTimer); startTimer = null; }
+    if (syncIv){ clearInterval(syncIv); syncIv = null; }
+  }
+
+  function stopStage(){
+    clearPlayTimers();
+    curRunId = 0;
+    readyAcked = false;
+    activeStartMs = 0;
+    try { vid.pause(); vid.playbackRate = 1.0; vid.removeAttribute('src'); vid.load(); } catch(e){}
+    box.style.display = 'none';
+  }
+
+  function prepareStage(ev){
+    clearPlayTimers();
+    curRunId = Number(ev.runId || 0);
+    readyAcked = false;
+    activeStartMs = 0;
+    box.style.display = 'block';
+    vid.muted = true;
+    vid.volume = 0;
+    vid.playbackRate = 1.0;
+    var url = String(ev.videoUrl || '');
+    if (!url) return;
+    var sendReady = function(){
+      if (readyAcked || !curRunId) return;
+      readyAcked = true;
+      postAck('ready');
+    };
+    var fallbackT = setTimeout(sendReady, 2600);
+    vid.oncanplay = function(){ clearTimeout(fallbackT); sendReady(); };
+    vid.onloadeddata = function(){ try { vid.currentTime = 0; } catch(e){} };
+    vid.onended = function(){
+      var rid = curRunId;
+      stopStage();
+      if (rid) {
+        fetch('/api/shows/stage/ack', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ role: role, runId: rid, state: 'ended' })
+        }).catch(function(){});
+      }
+    };
+    try { vid.pause(); } catch(e){}
+    vid.src = url;
+    vid.load();
+  }
+
+  function beginPlayback(){
+    if (!curRunId) return;
+    box.style.display = 'block';
+    vid.muted = true;
+    vid.volume = 0;
+    var expected = activeStartMs ? Math.max(0, (Date.now() + clockOffsetMs - activeStartMs) / 1000.0) : 0;
+    try {
+      if (Math.abs((vid.currentTime || 0) - expected) > 0.18) vid.currentTime = expected;
+    } catch(e){}
+    vid.playbackRate = 1.0;
+    var p = vid.play();
+    if (p && typeof p.catch === 'function') p.catch(function(){});
+    if (syncIv) clearInterval(syncIv);
+    syncIv = setInterval(function(){
+      if (!activeStartMs || vid.paused || vid.ended) return;
+      var exp = Math.max(0, (Date.now() + clockOffsetMs - activeStartMs) / 1000.0);
+      var drift = exp - (vid.currentTime || 0);
+      if (Math.abs(drift) >= 0.90) {
+        try { vid.currentTime = exp; } catch(e){}
+        vid.playbackRate = 1.0;
+      } else if (drift > 0.16) {
+        vid.playbackRate = 1.04;
+      } else if (drift < -0.16) {
+        vid.playbackRate = 0.96;
+      } else {
+        vid.playbackRate = 1.0;
+      }
+    }, 400);
+  }
+
+  function playStage(ev){
+    var url = String(ev.videoUrl || '');
+    if (Number(ev.runId || 0) !== curRunId || !vid.getAttribute('src')) {
+      prepareStage(ev);
+    }
+    clearPlayTimers();
+    curRunId = Number(ev.runId || 0);
+    activeStartMs = Number(ev.startAtMs || (Date.now() + clockOffsetMs));
+    var waitMs = (activeStartMs - clockOffsetMs) - Date.now();
+    if (waitMs > 18 && waitMs < 10000) {
+      startTimer = setTimeout(beginPlayback, waitMs);
+    } else {
+      beginPlayback();
+    }
+  }
+
+  try {
+    var es = new EventSource('/api/shows/events?role=' + encodeURIComponent(role));
+    es.onmessage = function(msg){
+      try {
+        var d = JSON.parse(msg.data);
+        if (!d || !d.type) return;
+        if (d.type === 'stage_prepare') prepareStage(d);
+        else if (d.type === 'stage_play') playStage(d);
+        else if (d.type === 'stage_stop') stopStage();
+      } catch(e){}
+    };
+  } catch(e){}
+})();
+</script>
+"""
+
+STAGE_PAGE_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Armory Fit · Live Show Stage</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden}
+#stVid{width:100%;height:100%;object-fit:contain;background:#000;display:block}
+</style></head>
+<body>
+<video id="stVid" playsinline preload="auto"></video>
+<script>
+(function(){
+  var q = new URLSearchParams(location.search);
+  var role = (q.get('role') || 'cube').toLowerCase().replace(/[^a-z0-9_-]/g, '') || 'cube';
+  var useAudio = (q.get('audio') === '1' || (q.get('muted') !== '1' && role === 'cube'));
+  var vid = document.getElementById('stVid');
+  vid.muted = !useAudio;
+  vid.volume = useAudio ? 1.0 : 0.0;
+
+  var clockOffsetMs = 0;
+  var curRunId = 0;
+  var readyAcked = false;
+  var startTimer = null;
+  var syncIv = null;
+  var activeStartMs = 0;
+
+  function syncClock(){
+    var bestRtt = 999999;
+    function sample(left){
+      if (left <= 0) return;
+      var t0 = Date.now();
+      fetch('/api/shows/time?t=' + t0).then(function(r){ return r.json(); }).then(function(d){
+        var t1 = Date.now(), rtt = t1 - t0;
+        if (d && d.nowMs && rtt < bestRtt){
+          bestRtt = rtt;
+          clockOffsetMs = Number(d.nowMs) - (t0 + rtt * 0.5);
+        }
+        sample(left - 1);
+      }).catch(function(){});
+    }
+    sample(3);
+  }
+  syncClock();
+  setInterval(syncClock, 60000);
+
+  function postAck(state, rid){
+    var targetId = Number(rid || curRunId || 0);
+    if (!targetId) return;
+    fetch('/api/shows/stage/ack', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role: role, runId: targetId, state: state })
+    }).catch(function(){});
+  }
+
+  function clearPlayTimers(){
+    if (startTimer){ clearTimeout(startTimer); startTimer = null; }
+    if (syncIv){ clearInterval(syncIv); syncIv = null; }
+  }
+
+  function stopStage(){
+    clearPlayTimers();
+    curRunId = 0;
+    readyAcked = false;
+    activeStartMs = 0;
+    try { vid.pause(); vid.playbackRate = 1.0; vid.removeAttribute('src'); vid.load(); } catch(e){}
+  }
+
+  function prepareStage(ev){
+    clearPlayTimers();
+    curRunId = Number(ev.runId || 0);
+    readyAcked = false;
+    activeStartMs = 0;
+    vid.muted = !useAudio;
+    vid.volume = useAudio ? 1.0 : 0.0;
+    vid.playbackRate = 1.0;
+    var url = String(ev.videoUrl || '');
+    if (!url) return;
+    var sendReady = function(){
+      if (readyAcked || !curRunId) return;
+      readyAcked = true;
+      postAck('ready', curRunId);
+    };
+    var fallbackT = setTimeout(sendReady, 2600);
+    vid.oncanplay = function(){ clearTimeout(fallbackT); sendReady(); };
+    vid.onloadeddata = function(){ try { vid.currentTime = 0; } catch(e){} };
+    vid.onended = function(){
+      var rid = curRunId;
+      stopStage();
+      postAck('ended', rid);
+    };
+    try { vid.pause(); } catch(e){}
+    vid.src = url;
+    vid.load();
+  }
+
+  function beginPlayback(){
+    if (!curRunId) return;
+    vid.muted = !useAudio;
+    vid.volume = useAudio ? 1.0 : 0.0;
+    var expected = activeStartMs ? Math.max(0, (Date.now() + clockOffsetMs - activeStartMs) / 1000.0) : 0;
+    try {
+      if (Math.abs((vid.currentTime || 0) - expected) > 0.18) vid.currentTime = expected;
+    } catch(e){}
+    vid.playbackRate = 1.0;
+    var p = vid.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch(function(){
+        if (!vid.muted) { vid.muted = true; vid.play().catch(function(){}); }
+      });
+    }
+    if (!useAudio) {
+      if (syncIv) clearInterval(syncIv);
+      syncIv = setInterval(function(){
+        if (!activeStartMs || vid.paused || vid.ended) return;
+        var exp = Math.max(0, (Date.now() + clockOffsetMs - activeStartMs) / 1000.0);
+        var drift = exp - (vid.currentTime || 0);
+        if (Math.abs(drift) >= 0.90) {
+          try { vid.currentTime = exp; } catch(e){}
+          vid.playbackRate = 1.0;
+        } else if (drift > 0.16) {
+          vid.playbackRate = 1.04;
+        } else if (drift < -0.16) {
+          vid.playbackRate = 0.96;
+        } else {
+          vid.playbackRate = 1.0;
+        }
+      }, 400);
+    }
+  }
+
+  function playStage(ev){
+    var url = String(ev.videoUrl || '');
+    if (Number(ev.runId || 0) !== curRunId || !vid.getAttribute('src')) {
+      prepareStage(ev);
+    }
+    clearPlayTimers();
+    curRunId = Number(ev.runId || 0);
+    activeStartMs = Number(ev.startAtMs || (Date.now() + clockOffsetMs));
+    var waitMs = (activeStartMs - clockOffsetMs) - Date.now();
+    if (waitMs > 18 && waitMs < 10000) {
+      startTimer = setTimeout(beginPlayback, waitMs);
+    } else {
+      beginPlayback();
+    }
+  }
+
+  var es = new EventSource('/api/shows/events?role=' + encodeURIComponent(role));
+  es.onmessage = function(msg){
+    try {
+      var d = JSON.parse(msg.data);
+      if (!d || !d.type) return;
+      if (d.type === 'stage_prepare') prepareStage(d);
+      else if (d.type === 'stage_play') playStage(d);
+      else if (d.type === 'stage_stop') stopStage();
+    } catch(e){}
+  };
+})();
+</script>
+</body></html>"""
+
+
+def inject_wallboard_stage_overlay(html: str) -> str:
+    """Inject muted SSE show-stage overlay into Wallboard HTML without modifying Android APK or src/."""
+    if not isinstance(html, str) or 'id="armoryShowStage"' in html:
+        return html
+    idx = html.lower().rfind("</body>")
+    if idx >= 0:
+        return html[:idx] + WALLBOARD_STAGE_OVERLAY_SNIPPET + html[idx:]
+    return html + WALLBOARD_STAGE_OVERLAY_SNIPPET
+
 
 DEFAULT_DRIVE_BACKUP_BASE = Path(r"J:\My Drive\Backups\ArmoryFit Backup")
 DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
@@ -1743,10 +2071,10 @@ class WallboardRelay:
                 pass
 
         if repo_html:
-            return repo_html
+            return inject_wallboard_stage_overlay(repo_html)
         if cache_html:
-            return cache_html
-        return FALLBACK_WALLBOARD_HTML
+            return inject_wallboard_stage_overlay(cache_html)
+        return inject_wallboard_stage_overlay(FALLBACK_WALLBOARD_HTML)
 
     def save_uploaded_html(self, html: str) -> bool:
         if not isinstance(html, str) or "<!doctype html" not in html[:200].lower():
@@ -1928,6 +2256,7 @@ class ArmoryCamService:
             displays=self.displays,
             adb_controller=self.adb,
             wallboard_cfg_fn=lambda: self.wallboard_cfg,
+            stage_base_url_fn=lambda: self.effective_wallboard_url(),
             ffmpeg_bin=self.ffmpeg,
             allow_network=self._voice_autostart,
         )
@@ -5105,6 +5434,7 @@ DASHBOARD_HTML = """<!doctype html>
           <span class="pill live" style="margin-right:6px">DEV DROP</span>
           <strong style="font-size:15px">Ryder Curry Armory Debut — Full FX &amp; 3-Screen Simulator</strong>
           <span id="devKokoroPill" class="pill ok" style="margin-left:6px">Checking Voices…</span>
+          <span id="devStagePill" class="pill" style="margin-left:6px">Checking MP4 &amp; Screens…</span>
         </div>
         <div class="ctrl-row" style="margin-top:0">
           <button class="btn sm ok" id="devSimFullBtn" type="button">🎬 Simulate Full Show (Local)</button>
@@ -5124,9 +5454,9 @@ DASHBOARD_HTML = """<!doctype html>
           <span id="devSimClock" class="fx-tag">0:00</span>
         </div>
         <div class="dev-yt-wrap" id="devYtWrap">
-          <div id="ryYtPlayer" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:12px">Cody Rhodes YouTube player activates during simulation (https://www.youtube.com/watch?v=05vwKMySzKw)</div>
+          <video id="devRyVideo" controls playsinline preload="metadata" style="width:100%;height:100%;background:#000;border-radius:8px"></video>
         </div>
-        <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch (LIGHTS OFF), (TRIGGER FOG · 30s), and (FLASH) cues live on screen.</div>
+        <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch the pre-baked 1080p MP4 + synchronized TV stage cues.</div>
         <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
       </div>
 
@@ -5154,7 +5484,9 @@ DASHBOARD_HTML = """<!doctype html>
         <div><label>1:20 Video Overlay Script</label><textarea id="devRyOvTxt" rows="2"></textarea></div>
       </div>
       <div class="ctrl-row" style="margin-top:8px">
-        <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Rebuild Ryder Voice</button>
+        <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Rebuild Ryder Show MP4</button>
+        <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
+        <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
         <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
       </div>
     </div>
@@ -7828,37 +8160,6 @@ function ensureShowSse() {
   } catch {}
 }
 
-function extractYtId(url) {
-  const m = String(url || '').match(/(?:v=|youtu[.]be[/])([A-Za-z0-9_-]{11})/);
-  return m ? m[1] : '05vwKMySzKw';
-}
-
-function getYtPlayer(videoId) {
-  return new Promise((resolve) => {
-    const wrap = $('devYtWrap');
-    if (!wrap) return resolve(null);
-    const createIt = () => {
-      if (rySimState.ytPlayer && typeof rySimState.ytPlayer.loadVideoById === 'function') {
-        return resolve(rySimState.ytPlayer);
-      }
-      wrap.innerHTML = '<div id="ryYtPlayer"></div>';
-      rySimState.ytPlayer = new YT.Player('ryYtPlayer', {
-        videoId,
-        playerVars: { autoplay: 0, controls: 1, modestbranding: 1, rel: 0 },
-        events: { onReady: () => resolve(rySimState.ytPlayer) },
-      });
-    };
-    if (window.YT && window.YT.Player) return createIt();
-    window.onYouTubeIframeAPIReady = createIt;
-    if (!document.getElementById('ytIframeApi')) {
-      const s = document.createElement('script');
-      s.id = 'ytIframeApi';
-      s.src = 'https://www.youtube.com/iframe_api';
-      document.head.appendChild(s);
-    }
-  });
-}
-
 function stopLocalRyderSim() {
   rySimState.running = false;
   (rySimState.timers || []).forEach(id => clearTimeout(id));
@@ -7867,8 +8168,11 @@ function stopLocalRyderSim() {
   [rySimState.introEl, rySimState.ovEl].forEach(a => {
     if (a) { try { a.pause(); a.currentTime = 0; } catch {} }
   });
-  if (rySimState.ytPlayer && typeof rySimState.ytPlayer.pauseVideo === 'function') {
-    try { rySimState.ytPlayer.pauseVideo(); rySimState.ytPlayer.setVolume(100); } catch {}
+  const vid = $('devRyVideo');
+  if (vid) {
+    try { vid.pause(); } catch {}
+    vid.ontimeupdate = null;
+    vid.onended = null;
   }
   rySimState.fogLeft = 0;
   if ($('devFogHud')) { $('devFogHud').textContent = 'FOG: OFF'; $('devFogHud').className = 'fx-tag'; }
@@ -7879,15 +8183,26 @@ function stopLocalRyderSim() {
 async function startLocalRyderSim(jumpToSec) {
   stopLocalRyderSim();
   rySimState.running = true;
-  const spec = devRyderSpec || { denonVol: 70, postOverlayDenonVol: 55, fogBurstSec: 30, lightningFlashSec: 0.75, lightsPulseDurationSec: 20, lightsPulseIntervalSec: 2.0, lightsPulseOnSec: 0.25, overlayAtSec: 80, youtubeUrl: 'https://www.youtube.com/watch?v=05vwKMySzKw', announcerText: '', overlayText: '' };
-  const ytId = extractYtId(spec.youtubeUrl);
-  const yt = await getYtPlayer(ytId);
-  if (!rySimState.running) return;
-  const sch = (ms, fn) => {
-    const id = setTimeout(() => { if (rySimState.running) fn(); }, Math.max(0, ms));
-    rySimState.timers.push(id);
-  };
-  let secClock = jumpToSec != null ? Number(jumpToSec) : 0;
+  const spec = devRyderSpec || { denonVol: 70, postOverlayDenonVol: 55, fogBurstSec: 30, lightningFlashSec: 0.75, lightsPulseDurationSec: 20, lightsPulseIntervalSec: 2.0, lightsPulseOnSec: 0.25, overlayAtSec: 80, introDurationSec: 9.9, overlayDurationSec: 4.5, announcerText: '', overlayText: '' };
+  const vid = $('devRyVideo');
+  const introSec = Number(spec.introDurationSec || 9.9);
+  const ovAtSec = introSec + Number(spec.overlayAtSec || 80);
+  const ovDur = Number(spec.overlayDurationSec || 4.5);
+
+  if (!vid || !spec.showVideoReady) {
+    const introEl = $('shAudio_ryder_walkin');
+    rySimState.introEl = introEl;
+    fxApplyCue({ tag: 'lights_off', label: '(LIGHTS OFF) · (TRIGGER FOG · 30s)', fogSec: spec.fogBurstSec || 30, denonVol: spec.denonVol || 70, caption: spec.announcerText || 'Thunder rumbling…' });
+    if (introEl) {
+      introEl.src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
+      introEl.load();
+      introEl.play().catch(() => {});
+    }
+    logDevCue('Playing intro WAV locally (upload/fetch entrance MP4 to preview full show video).');
+    return;
+  }
+
+  let cueFlags = { lightning: false, flash1: false, flash2: false, screens: false, lightsOn: false, overlay: false, drop: false, lastPulse: 0 };
   rySimState.iv = setInterval(() => {
     if (!rySimState.running) return;
     if (rySimState.fogLeft > 0) {
@@ -7897,106 +8212,90 @@ async function startLocalRyderSim(jumpToSec) {
         else { $('devFogHud').textContent = 'FOG: DONE'; $('devFogHud').className = 'fx-tag'; }
       }
     }
-    if (yt && typeof yt.getCurrentTime === 'function' && yt.getPlayerState && yt.getPlayerState() === 1) {
-      const ct = Math.floor(yt.getCurrentTime());
-      const mm = Math.floor(ct / 60), ss = String(ct % 60).padStart(2, '0');
-      if ($('devSimClock')) $('devSimClock').textContent = `VID ${mm}:${ss}`;
-    } else if ($('devSimClock')) {
-      $('devSimClock').textContent = `SIM ${Math.floor(secClock)}s`;
-    }
-    secClock += 1;
   }, 1000);
 
+  const seekTarget = jumpToSec != null ? Math.max(0, introSec + Number(jumpToSec)) : 0;
   if (jumpToSec != null) {
     fxSetLights('on');
     $('devDenonHud').textContent = `DENON: VOL ${spec.denonVol || 70}`;
-    if (yt && typeof yt.loadVideoById === 'function') {
-      yt.loadVideoById({ videoId: ytId, startSeconds: Number(jumpToSec) });
-      yt.setVolume(100);
-    }
-    logDevCue(`⏩ Jumped video to ${jumpToSec}s — waiting for 1:20 (80s) overlay cue…`);
-    const waitMs = Math.max(500, (80 - Number(jumpToSec)) * 1000);
-    sch(waitMs, () => triggerLocalOverlay(yt, spec));
-    return;
-  }
-
-  // Full local simulation: Lights Out -> Fog 30s -> Lightning Flash -> Kokoro Intro -> 2x Flash -> YouTube + 20s Pulses -> Lights On -> 1:20 Overlay -> Denon 55
-  const introEl = $('shAudio_ryder_walkin');
-  rySimState.introEl = introEl;
-  fxApplyCue({ tag: 'lights_off', label: '(LIGHTS OFF) · (TRIGGER FOG · 30s)', fogSec: spec.fogBurstSec || 30, denonVol: spec.denonVol || 70, caption: spec.announcerText || 'Thunder rumbling…' });
-  introEl.src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
-  introEl.load();
-  introEl.play().catch(() => {});
-
-  sch(Math.round((spec.lightningFlashSec || 0.75) * 1000), () => fxApplyCue({ tag: 'flash', label: '(FLASH · LIGHTNING CRACK)', durationMs: 180 }));
-
-  const onIntroDone = () => {
-    if (!rySimState.running) return;
-    fxApplyCue({ tag: 'flash', label: '(FLASH 1/2)', durationMs: 180 });
-    sch(340, () => fxApplyCue({ tag: 'flash', label: '(FLASH 2/2) · ALL 3 SCREENS LIVE (Cody Rhodes @ Vol 70)', durationMs: 220, denonVol: spec.denonVol || 70 }));
-    sch(650, () => {
-      if (yt && typeof yt.loadVideoById === 'function') {
-        yt.loadVideoById({ videoId: ytId, startSeconds: 0 });
-        yt.setVolume(100);
-      }
-      logDevCue('📺 Cody Rhodes video started (0:00) @ Denon 70');
-      const pulses = Math.round((spec.lightsPulseDurationSec || 20) / (spec.lightsPulseIntervalSec || 2));
-      for (let i = 0; i < pulses; i++) {
-        sch(i * (spec.lightsPulseIntervalSec || 2) * 1000, () => {
-          fxFlash(`(FLASH 0.25s · Pulse ${i + 1}/${pulses})`, 250);
-          logDevCue(`⚡ (FLASH 0.25s) Pulse ${i + 1}/${pulses}`);
-        });
-      }
-      sch((spec.lightsPulseDurationSec || 20) * 1000, () => fxApplyCue({ tag: 'lights_on', label: '(FULL HOUSE LIGHTS ON) — Playing to 1:20…' }));
-      sch((spec.overlayAtSec || 80) * 1000, () => triggerLocalOverlay(yt, spec));
-    });
-  };
-  introEl.onended = onIntroDone;
-}
-
-function triggerLocalOverlay(yt, spec) {
-  if (!rySimState.running) return;
-  const ovEl = $('shOvAudio_ryder_walkin');
-  rySimState.ovEl = ovEl;
-  fxApplyCue({ tag: 'overlay', label: `(DUCK YOUTUBE + OVERLAY · "${spec.overlayText || ''}")`, caption: spec.overlayText });
-  if (yt && typeof yt.setVolume === 'function') yt.setVolume(25);
-  ovEl.src = `/api/shows/ryder_walkin/overlay.wav?t=${Date.now()}`;
-  ovEl.load();
-  ovEl.play().catch(() => {});
-  ovEl.onended = () => {
-    if (!rySimState.running) return;
-    if (yt && typeof yt.setVolume === 'function') yt.setVolume(100);
-    fxApplyCue({ tag: 'denon_drop', label: `(RESTORE YOUTUBE · DENON ${spec.denonVol || 70} → ${spec.postOverlayDenonVol || 55} · FULL LIGHTS ON)`, denonVol: spec.postOverlayDenonVol || 55 });
-  };
-}
-
-function syncShowActiveBadge(active) {
-  const b = $('shBadge');
-  if (!b) return;
-  if (active && active.active) {
-    b.textContent = `LIVE · ${active.showName || active.showId} (${active.phase || 'running'})`;
-    b.className = 'pill warn';
+    cueFlags.lightning = cueFlags.flash1 = cueFlags.flash2 = cueFlags.screens = cueFlags.lightsOn = true;
+    logDevCue(`⏩ Jumped MP4 to ${jumpToSec}s past intro (${seekTarget.toFixed(1)}s) — awaiting 1:20 overlay…`);
   } else {
-    b.textContent = 'IDLE';
-    b.className = 'pill ok';
+    fxApplyCue({ tag: 'lights_off', label: '(LIGHTS OFF) · (TRIGGER FOG · 30s)', fogSec: spec.fogBurstSec || 30, denonVol: spec.denonVol || 70, caption: spec.announcerText || 'Thunder rumbling…' });
   }
+
+  vid.ontimeupdate = () => {
+    if (!rySimState.running) return;
+    const t = vid.currentTime || 0;
+    const mm = Math.floor(t / 60), ss = String(Math.floor(t % 60)).padStart(2, '0');
+    if ($('devSimClock')) $('devSimClock').textContent = `MP4 ${mm}:${ss}`;
+    if (!cueFlags.lightning && t >= (spec.lightningFlashSec || 0.75)) {
+      cueFlags.lightning = true;
+      fxApplyCue({ tag: 'flash', label: '(FLASH · LIGHTNING CRACK)', durationMs: 180 });
+    }
+    if (!cueFlags.flash1 && t >= Math.max(0.5, introSec - 0.92)) {
+      cueFlags.flash1 = true;
+      fxApplyCue({ tag: 'flash', label: '(FLASH 1/2)', durationMs: 200 });
+    }
+    if (!cueFlags.flash2 && t >= Math.max(0.8, introSec - 0.48)) {
+      cueFlags.flash2 = true;
+      fxApplyCue({ tag: 'flash', label: '(FLASH 2/2)', durationMs: 240 });
+    }
+    if (!cueFlags.screens && t >= introSec) {
+      cueFlags.screens = true;
+      fxApplyCue({ tag: 'screens', label: `(ALL 3 SCREENS LIVE · DENON ${spec.denonVol || 70})`, denonVol: spec.denonVol || 70 });
+    }
+    const pulseEnd = introSec + Number(spec.lightsPulseDurationSec || 20);
+    if (t >= introSec && t < pulseEnd) {
+      const iv = Number(spec.lightsPulseIntervalSec || 2);
+      const pIdx = Math.floor((t - introSec) / iv) + 1;
+      if (pIdx > cueFlags.lastPulse) {
+        cueFlags.lastPulse = pIdx;
+        fxFlash(`(FLASH 0.25s · Pulse ${pIdx})`, 250);
+      }
+    }
+    if (!cueFlags.lightsOn && t >= pulseEnd) {
+      cueFlags.lightsOn = true;
+      fxApplyCue({ tag: 'lights_on', label: '(FULL HOUSE LIGHTS ON)' });
+    }
+    if (!cueFlags.overlay && spec.overlayText && t >= ovAtSec) {
+      cueFlags.overlay = true;
+      fxApplyCue({ tag: 'overlay', label: `(DUCK + OVERLAY · "${spec.overlayText}")`, caption: spec.overlayText });
+    }
+    if (!cueFlags.drop && spec.postOverlayDenonVol && t >= ovAtSec + ovDur) {
+      cueFlags.drop = true;
+      fxApplyCue({ tag: 'denon_drop', label: `(RESTORE · DENON ${spec.denonVol || 70} → ${spec.postOverlayDenonVol || 55})`, denonVol: spec.postOverlayDenonVol || 55 });
+    }
+  };
+  vid.onended = () => {
+    logDevCue('(SHOW COMPLETE)');
+    stopLocalRyderSim();
+  };
+
+  const wantUrl = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  const startPlay = () => {
+    try { vid.currentTime = seekTarget; } catch {}
+    vid.play().catch(() => {});
+  };
+  vid.onloadedmetadata = startPlay;
+  vid.src = wantUrl;
+  vid.load();
 }
 
-function populateFxHookInputs(fx) {
-  if (!fx) return;
-  if ($('fxLightsHost')) $('fxLightsHost').value = fx.lightsHost || '';
-  if ($('fxLightsOffUrl')) $('fxLightsOffUrl').value = fx.lightsOffUrl || '';
-  if ($('fxLightsOnUrl')) $('fxLightsOnUrl').value = fx.lightsOnUrl || '';
-  if ($('fxFogHost')) $('fxFogHost').value = fx.fogHost || '';
-  if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
-  if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 30);
-}
-
-function populateRyderDevPanel(ry, voices, kokoroReady) {
+function populateRyderDevPanel(ry, voices, kokoroReady, stageClients) {
   const kp = $('devKokoroPill');
   if (kp) {
     kp.textContent = kokoroReady ? 'STUDIO NEURAL: KOKORO-82M FP32' : 'STUDIO HD EDGE VOICE';
     kp.className = kokoroReady ? 'pill ok' : 'pill live';
+  }
+  const sp = $('devStagePill');
+  if (sp && ry) {
+    const wbCnt = Number((stageClients && stageClients.wallboard) || 0);
+    const mp4Info = ry.showVideoReady && ry.hasSourceVideo
+      ? `MP4 READY (${Number(ry.showVideoDurationSec || 0).toFixed(0)}s)`
+      : (ry.videoUploaded ? 'MP4 NEEDS REBUILD' : 'NO ENTRANCE MP4');
+    sp.textContent = `${mp4Info} · WALLBOARD ${wbCnt > 0 ? 'CONNECTED' : 'IDLE'}`;
+    sp.className = (ry.showVideoReady && ry.hasSourceVideo) ? 'pill ok' : 'pill warn';
   }
   const vSel = $('devRyVoice');
   if (vSel && Array.isArray(voices) && voices.length) {
@@ -8013,6 +8312,10 @@ function populateRyderDevPanel(ry, voices, kokoroReady) {
   if ($('devRyOvTxt')) $('devRyOvTxt').value = ry.overlayText || '';
   if ($('shAudio_ryder_walkin')) $('shAudio_ryder_walkin').src = `/api/shows/ryder_walkin/preview.wav?t=${Date.now()}`;
   if ($('shOvAudio_ryder_walkin')) $('shOvAudio_ryder_walkin').src = `/api/shows/ryder_walkin/overlay.wav?t=${Date.now()}`;
+  const vid = $('devRyVideo');
+  if (vid && ry.showVideoReady && !rySimState.running && (!vid.getAttribute('src') || !vid.currentSrc)) {
+    vid.src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  }
 }
 
 function renderShows(data) {
@@ -8022,7 +8325,7 @@ function renderShows(data) {
   populateFxHookInputs(data.fxHooks || {});
   const allShows = Array.isArray(data.shows) ? data.shows : [];
   const ryder = allShows.find(s => s.id === 'ryder_walkin');
-  populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady));
+  populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady), data.stageClients || {});
   const others = allShows.filter(s => s.id !== 'ryder_walkin');
   if (!others.length) {
     grid.innerHTML = '<div style="color:var(--mut);font-size:12px">No other shows configured.</div>';
@@ -8209,9 +8512,36 @@ if ($('devRySaveBtn')) $('devRySaveBtn').onclick = async () => {
   try {
     const r = await fetch('/api/shows/ryder_walkin/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
     if (r.status) renderShows(r.status);
-    $('shOut_ryder_walkin').textContent = r.ok ? `✓ Rebuilt (${(r.build && r.build.durationSec) || '?'}s)` : `✗ ${r.error || 'Failed'}`;
+    $('shOut_ryder_walkin').textContent = r.ok ? `✓ Rebuilt Show MP4` : `✗ ${r.error || 'Failed'}`;
+    if ($('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
   } catch {
     $('shOut_ryder_walkin').textContent = '✗ Render failed';
+  }
+};
+if ($('devRyFetchVidBtn')) $('devRyFetchVidBtn').onclick = async () => {
+  $('shOut_ryder_walkin').textContent = 'Downloading YouTube video & encoding 1080p MP4…';
+  try {
+    const r = await fetch('/api/shows/ryder_walkin/fetch-video', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    $('shOut_ryder_walkin').textContent = r.ok ? '✓ Downloaded & built MP4' : `✗ ${r.error || 'Fetch failed'}`;
+    if (r.ok && $('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  } catch {
+    $('shOut_ryder_walkin').textContent = '✗ Fetch failed';
+  }
+};
+if ($('devRyVidFile')) $('devRyVidFile').onchange = async (ev) => {
+  const f = ev.target && ev.target.files && ev.target.files[0];
+  if (!f) return;
+  $('shOut_ryder_walkin').textContent = `Uploading ${f.name} & encoding show MP4…`;
+  try {
+    const fd = new FormData();
+    fd.append('file', f);
+    const r = await fetch('/api/shows/ryder_walkin/upload-video', { method: 'POST', body: fd }).then(x => x.json());
+    if (r.status) renderShows(r.status);
+    $('shOut_ryder_walkin').textContent = r.ok ? `✓ Built MP4 from ${f.name}` : `✗ ${r.error || 'Upload failed'}`;
+    if (r.ok && $('devRyVideo')) $('devRyVideo').src = `/api/shows/ryder_walkin/show.mp4?t=${Date.now()}`;
+  } catch {
+    $('shOut_ryder_walkin').textContent = '✗ Video upload failed';
   }
 };
 if ($('fxSaveBtn')) $('fxSaveBtn').onclick = () => saveFxHooks();
@@ -8802,11 +9132,39 @@ def create_app(service: ArmoryCamService) -> Flask:
         devices = service.displays.discover_roku_tvs()
         return jsonify({"ok": True, "devices": devices})
 
+    @app.get("/stage")
+    @app.get("/stage/")
+    def stage_page() -> Response:
+        resp = Response(STAGE_PAGE_HTML, mimetype="text/html; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     @app.get("/api/shows")
     def api_shows_list() -> Response:
         resp = jsonify({"ok": True, **service.shows.status_dict()})
         resp.headers["Cache-Control"] = "no-store"
         return resp
+
+    @app.get("/api/shows/time")
+    def api_shows_time() -> Response:
+        resp = jsonify({"nowMs": int(time.time() * 1000)})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/shows/stage/ack")
+    def api_shows_stage_ack() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid ACK payload"}), 400
+        try:
+            res = service.shows.record_stage_ack(
+                role=str(body.get("role") or ""),
+                run_id=int(body.get("runId") or 0),
+                state=str(body.get("state") or ""),
+            )
+            return jsonify(res), (200 if res.get("ok") else 400)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
 
     @app.get("/api/shows/voices")
     def api_shows_voices() -> Response:
@@ -8816,12 +9174,16 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.get("/api/shows/events")
     def api_shows_events() -> Response:
-        q = service.shows.subscribe_events()
+        role = str(request.args.get("role") or "dashboard").strip().lower() or "dashboard"
+        q = service.shows.subscribe_events(role=role)
 
         def generate():
             try:
                 init_ev = json.dumps({"type": "hello", **service.shows.list_voices()})
                 yield f"data: {init_ev}\n\n"
+                cur_stage = service.shows.current_stage_state()
+                if cur_stage.get("type") in ("stage_prepare", "stage_play") and cur_stage.get("videoUrl"):
+                    yield f"data: {json.dumps(cur_stage)}\n\n"
                 while True:
                     try:
                         ev = q.get(timeout=15.0)
@@ -8829,7 +9191,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                     except queue.Empty:
                         yield ": keepalive\n\n"
             finally:
-                service.shows.unsubscribe_events(q)
+                service.shows.unsubscribe_events(q, role=role)
 
         resp = Response(generate(), mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache"
@@ -8864,13 +9226,54 @@ def create_app(service: ArmoryCamService) -> Flask:
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
+    @app.get("/api/shows/<show_id>/show.mp4")
+    def api_show_mp4(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None:
+            return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
+        mp4 = service.shows.show_mp4_path(spec.id)
+        if not mp4.is_file() or mp4.stat().st_size < 1000:
+            res = service.shows.build_show_multimedia(spec.id, force=True)
+            if not res.get("ok") or not mp4.is_file():
+                return jsonify({"ok": False, "error": res.get("error") or "Show MP4 build failed"}), 500
+        resp = _serve_mp4_from_root(service.shows.rendered_dir, f"{spec.id}_show.mp4")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
     @app.post("/api/shows/<show_id>/rebuild")
     def api_show_rebuild(show_id: str) -> Response:
         spec = service.shows.get_show(show_id)
         if spec is None:
             return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
         res = service.shows.build_show_preview(spec.id, force=True)
+        if res.get("ok") and spec.three_screen_video and service.shows.ffmpeg_bin:
+            res["multimedia"] = service.shows.build_show_multimedia(spec.id, force=True)
         return jsonify({**res, "status": service.shows.status_dict()}), (200 if res.get("ok") else 500)
+
+    @app.post("/api/shows/<show_id>/fetch-video")
+    def api_show_fetch_video(show_id: str) -> Response:
+        res = service.shows.fetch_youtube_video_source(show_id)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/shows/<show_id>/upload-video")
+    def api_show_upload_video(show_id: str) -> Response:
+        spec = service.shows.get_show(show_id)
+        if spec is None:
+            return jsonify({"ok": False, "error": f"Unknown show: {show_id}"}), 404
+        if "file" in request.files:
+            up = request.files["file"]
+            raw_name = str(up.filename or request.form.get("filename") or "entrance.mp4")
+            file_bytes = up.read()
+        else:
+            raw_name = str(request.args.get("filename") or request.headers.get("X-Filename") or "")
+            file_bytes = request.get_data() or b""
+        try:
+            res = service.shows.save_uploaded_video(spec.id, raw_name, file_bytes)
+            return jsonify(res)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 500
 
     @app.post("/api/shows/<show_id>/config")
     def api_show_config(show_id: str) -> Response:

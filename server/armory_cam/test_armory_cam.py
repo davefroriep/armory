@@ -2991,6 +2991,285 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertEqual(rv._find_winmm_device_id("", wave_devices=winmm_devs), rv.WAVE_MAPPER_ID)
         self.assertIsNone(rv._find_winmm_device_id("NonExistentMic", wave_devices=winmm_devs))
 
+    def test_display_prestage_noop_and_hdmi_readiness(self) -> None:
+        # 1. set_denon_monitor_out("AUTO") no-ops when radioMonitorOut is already AUTO (zero POSTs)
+        posts: list[str] = []
+
+        def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+            if "d_video.asp" in url:
+                return 200, (
+                    '<FORM name="video">'
+                    '<input type="radio" name="radioMonitorOut" value="AUTO" checked>'
+                    '<input type="radio" name="radioMonitorOut" value="1">'
+                    "</FORM>"
+                ).encode("ascii")
+            if "192.168.1.220:8060/query/device-info" in url:
+                return 200, b"<device-info><power-mode>PowerOn</power-mode></device-info>"
+            if "192.168.1.220:8060/query/active-app" in url:
+                return 200, b'<active-app><app id="tvinput.hdmi1" type="tvin">Receiver</app></active-app>'
+            return 200, b"ok"
+
+        def fake_post(url: str, _b: bytes, _h: dict[str, str] | None, _t: float) -> tuple[int, bytes]:
+            posts.append(url)
+            return 200, b"ok"
+
+        adb_cmds: list[list[str]] = []
+        hisense_state = {"power": "ON", "input": "com.mediatek.tis/.HdmiInputService/HW3"}
+
+        def fake_runner(cmd: list[str], _to: float) -> tuple[int, str, str]:
+            adb_cmds.append(cmd)
+            joined = " ".join(cmd)
+            if "devices" in cmd:
+                return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n", ""
+            if "dumpsys power" in joined:
+                return 0, f"mWakefulness=Awake\nDisplay Power: state={hisense_state['power']}\n", ""
+            if "dumpsys tv_input" in joined:
+                return 0, (
+                    "com.mediatek.tis/.HdmiInputService/HW2\n"
+                    "com.mediatek.tis/.HdmiInputService/HW3\n"
+                    "com.mediatek.tis/.HdmiInputService/HW4\n"
+                    f"  inputId: {hisense_state['input']}\n"
+                ), ""
+            return 0, "ok", ""
+
+        fake_adb = ac.FireTvAdbController(adb_bin="adb.exe", runner=fake_runner, settle_sec=0.0)
+        ham = ha.HouseAudioManager(
+            root_dir=Path(tempfile.mkdtemp(prefix="armory_disp_ha_")),
+            config=ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15"),
+            allow_network=False,
+            denon_http_get=fake_get,
+            sleep_fn=lambda _s: None,
+        )
+        try:
+            ctrl = dc.GymDisplayController(
+                config=dc.GymDisplaysConfig(
+                    primary=dc.PrimaryDisplayConfig(host="192.168.1.230"),
+                    spin=dc.SpinDisplayConfig(host="192.168.1.220", auto_denon_dual=True),
+                ),
+                adb_controller=fake_adb,
+                denon_client=ham.denon,
+                http_get=fake_get,
+                http_post=fake_post,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+            )
+
+            mon = ctrl.set_denon_monitor_out("AUTO")
+            self.assertTrue(mon["ok"])
+            self.assertEqual(mon["via"], "noop_already_set")
+            self.assertEqual(posts, [])
+
+            # Hisense ON + HW3 (HDMI 2) -> alreadyReady=True, switched=False, zero keyevent, disconnects cleanly
+            r_tv1 = ctrl.ensure_primary_hdmi_ready("hdmi2")
+            self.assertTrue(r_tv1["ok"])
+            self.assertTrue(r_tv1["alreadyReady"])
+            self.assertFalse(r_tv1["switched"])
+            self.assertFalse(any("keyevent" in " ".join(c) for c in adb_cmds))
+            self.assertEqual(adb_cmds[-1][1:], ["disconnect", "192.168.1.230:5555"])
+
+            # Hisense OFF on HW2 -> wakes & switches to 244 (HDMI 2) with NO Denon flip POST
+            adb_cmds.clear()
+            hisense_state["power"] = "OFF"
+            hisense_state["input"] = "com.mediatek.tis/.HdmiInputService/HW2"
+            r_tv2 = ctrl.ensure_primary_hdmi_ready("hdmi2")
+            self.assertTrue(r_tv2["ok"])
+            self.assertFalse(r_tv2["alreadyReady"])
+            self.assertTrue(r_tv2["switched"])
+            flat_adb = [" ".join(c) for c in adb_cmds]
+            self.assertTrue(any("keyevent 224" in s for s in flat_adb))
+            self.assertTrue(any("keyevent 244" in s for s in flat_adb))
+            self.assertEqual(posts, [])
+
+            # SmartSpin ON + tvinput.hdmi1 -> alreadyReady=True, zero keypress POSTs
+            r_sp = ctrl.ensure_spin_hdmi_ready()
+            self.assertTrue(r_sp["ok"])
+            self.assertTrue(r_sp["alreadyReady"])
+            self.assertFalse(r_sp["switched"])
+            self.assertEqual(posts, [])
+        finally:
+            shutil.rmtree(ham.root_dir, ignore_errors=True)
+
+    def test_multimedia_show_build_stage_routes_and_prestage_orchestration(self) -> None:
+        ffmpeg_bin = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        if not ffmpeg_bin:
+            self.skipTest("FFmpeg binary not present")
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_mm_show_"))
+        try:
+            # Synthesize a crisp 3s 720p H.264 test source clip into shows/sources/
+            src_dir = tmp / "shows" / "sources"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            sample_vid = src_dir / "ryder_walkin_video.mp4"
+            proc = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=640x360:rate=30:duration=3.0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=330:sample_rate=48000:duration=3.0",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(sample_vid),
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr.decode("utf-8", "ignore"))
+
+            trace: list[tuple[str, str]] = []
+            adb_cmds: list[list[str]] = []
+
+            def fake_runner(cmd: list[str], _to: float) -> tuple[int, str, str]:
+                adb_cmds.append(cmd)
+                joined = " ".join(cmd)
+                if "devices" in cmd:
+                    return 0, (
+                        "List of devices attached\n"
+                        "192.168.1.230:5555\tdevice\n"
+                        "192.168.1.151:5555\tdevice\n"
+                        "192.168.1.204:5555\tdevice\n"
+                    ), ""
+                if "dumpsys power" in joined:
+                    return 0, "Display Power: state=ON\n", ""
+                if "dumpsys tv_input" in joined:
+                    return 0, (
+                        "com.mediatek.tis/.HdmiInputService/HW2\n"
+                        "com.mediatek.tis/.HdmiInputService/HW3\n"
+                        "  inputId: com.mediatek.tis/.HdmiInputService/HW3\n"
+                    ), ""
+                return 0, "ok", ""
+
+            fake_adb = ac.FireTvAdbController(adb_bin="adb.exe", runner=fake_runner, settle_sec=0.0)
+
+            def fake_http_get(url: str, _to: float) -> tuple[int, bytes]:
+                trace.append(("http_get", url))
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, b"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect><MasterVolume><value>-30.0</value></MasterVolume><Mute><value>off</value></Mute></item>"
+                if "d_video.asp" in url:
+                    return 200, b'<FORM name="video"><input type="radio" name="radioMonitorOut" value="1" checked></FORM>'
+                if "192.168.1.220:8060/query/device-info" in url:
+                    return 200, b"<device-info><power-mode>Ready</power-mode></device-info>"
+                if "192.168.1.220:8060/query/active-app" in url:
+                    return 200, b"<active-app><app id=\"Home\">Home</app></active-app>"
+                return 200, b"ok"
+
+            def fake_http_post(url: str, _b: bytes, _h: dict[str, str] | None, _t: float) -> tuple[int, bytes]:
+                trace.append(("http_post", url))
+                return 200, b"ok"
+
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            # Replace service controllers cleanly with offline mocked hardware + real ffmpeg ShowDirector
+            ham = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15", cube_enabled=True, cube_host="192.168.1.151"),
+                allow_network=False,
+                denon_http_get=fake_http_get,
+                cube_http_post=fake_http_post,
+                sleep_fn=lambda _s: None,
+            )
+            wb_cfg = ac.WallboardConfig(fire_tv_host="192.168.1.204")
+            disp = dc.GymDisplayController(
+                config=dc.GymDisplaysConfig(
+                    primary=dc.PrimaryDisplayConfig(host="192.168.1.230"),
+                    spin=dc.SpinDisplayConfig(host="192.168.1.220", auto_denon_dual=True),
+                    cube_host="192.168.1.151",
+                ),
+                adb_controller=fake_adb,
+                denon_client=ham.denon,
+                http_get=fake_http_get,
+                http_post=fake_http_post,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+            )
+            svc.shows = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                displays=disp,
+                adb_controller=fake_adb,
+                wallboard_cfg_fn=lambda: wb_cfg,
+                stage_base_url_fn=lambda: "http://192.168.1.152:8766",
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                http_get=fake_http_get,
+                sleep_fn=lambda _s: None,
+            )
+            svc.shows.update_show("ryder_walkin", {"overlayAtSec": 1.2}, rebuild=False)
+            svc.shows.update_fx_hooks({"lightsHost": "192.168.1.60", "fogHost": "192.168.1.61"})
+
+            mm_res = svc.shows.build_show_multimedia("ryder_walkin", force=True)
+            self.assertTrue(mm_res["ok"], msg=str(mm_res))
+            self.assertTrue(mm_res["hasSourceVideo"])
+            self.assertGreater(mm_res["introDurationSec"], 1.5)
+            self.assertGreater(mm_res["totalDurationSec"], mm_res["introDurationSec"] + 2.0)
+
+            mp4_out = svc.shows.show_mp4_path("ryder_walkin")
+            self.assertTrue(mp4_out.is_file())
+            ffprobe = sd._resolve_ffprobe_bin(ffmpeg_bin)
+            pr = subprocess.run(
+                [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,pix_fmt,sample_rate,channels", "-of", "json", str(mp4_out)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            streams = json.loads(pr.stdout)["streams"]
+            v_st = next(s for s in streams if s["codec_type"] == "video")
+            a_st = next(s for s in streams if s["codec_type"] == "audio")
+            self.assertEqual((v_st["codec_name"], v_st["width"], v_st["height"], v_st["pix_fmt"]), ("h264", 1920, 1080, "yuv420p"))
+            self.assertEqual((a_st["codec_name"], int(a_st["sample_rate"]), int(a_st["channels"])), ("aac", 48000, 2))
+
+            app = ac.create_app(svc)
+            client = app.test_client()
+            st_page = client.get("/stage")
+            self.assertEqual(st_page.status_code, 200)
+            self.assertIn("stVid", st_page.get_data(as_text=True))
+
+            wb_html = client.get("/wallboard").get_data(as_text=True)
+            self.assertIn("armoryShowStage", wb_html)
+
+            t_resp = client.get("/api/shows/time")
+            self.assertEqual(t_resp.status_code, 200)
+            self.assertIn("nowMs", t_resp.get_json())
+
+            ack_resp = client.post("/api/shows/stage/ack", json={"role": "wallboard", "runId": 7, "state": "ready"})
+            self.assertEqual(ack_resp.status_code, 200)
+
+            rng_resp = client.get("/api/shows/ryder_walkin/show.mp4", headers={"Range": "bytes=0-511"})
+            self.assertEqual(rng_resp.status_code, 206)
+            self.assertEqual(len(rng_resp.get_data()), 512)
+
+            # Subscribe to SSE stage queue BEFORE running sequence to assert exact stage event ordering
+            q = svc.shows.subscribe_events(role="test_observer")
+            res = svc.shows.fire_show("ryder_walkin", async_run=False)
+            self.assertTrue(res["ok"], msg=str(res))
+            self.assertTrue(res.get("multimedia"))
+
+            evts: list[dict[str, Any]] = []
+            while not q.empty():
+                evts.append(q.get_nowait())
+            svc.shows.unsubscribe_events(q, role="test_observer")
+            stage_types = [e.get("type") for e in evts if str(e.get("type", "")).startswith("stage_")]
+            self.assertEqual(stage_types, ["stage_prepare", "stage_play", "stage_stop"])
+
+            joined_adb = [" ".join(c) for c in adb_cmds]
+            self.assertTrue(any("192.168.1.151:5555" in s and "/stage?role=cube&audio=1" in s for s in joined_adb))
+            self.assertTrue(any("192.168.1.204:5555" in s and "media volume --stream 3 --set 0" in s for s in joined_adb))
+            self.assertTrue(any("192.168.1.204:5555" in s and "/wallboard" in s for s in joined_adb))
+            self.assertTrue(any("192.168.1.151:5555" in s and "input keyevent 4" in s for s in joined_adb))
+            self.assertFalse(any("com.amazon.firetv.youtube" in s for s in joined_adb))
+            svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

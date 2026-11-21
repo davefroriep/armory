@@ -9,6 +9,7 @@ local HTTP smart-home hooks (lighting flashes & fog machine triggers).
 from __future__ import annotations
 
 from collections import deque
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -21,6 +22,7 @@ import queue
 import re
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -40,11 +42,14 @@ except ImportError:
 
 
 SHOW_SR = 44_100
+STAGE_VIDEO_SR = 48_000
 MAX_CUBE_WAV_BYTES = 11 * 1024 * 1024  # Safe margin under Cube's 12 MB HTTP cap
 MAX_SHOW_DENON_VOL = 75                # -5.0 dB hard safety ceiling
 MIN_SHOW_DENON_VOL = 30                # -50.0 dB floor
 MAX_SONG_UPLOAD_BYTES = 30 * 1024 * 1024
+MAX_VIDEO_UPLOAD_BYTES = 250 * 1024 * 1024
 VALID_SHOW_EXTS = (".mp3", ".wav", ".m4a", ".ogg")
+VALID_VIDEO_EXTS = (".mp4", ".mkv", ".mov", ".webm")
 VALID_SHOW_KINDS = ("pr_drop", "walkin", "debut_video")
 VALID_CUBE_MODES = ("duck", "takeover", "overlay")
 VALID_DEMO_STYLES = ("anthem", "boombap", "thunder_only", "hype")
@@ -168,6 +173,33 @@ def sanitize_upload_filename(raw_name: str, show_id: str) -> str:
     return f"{sid}_{stem[:48]}{ext}"
 
 
+def validate_video_filename(name: str) -> str | None:
+    """Validate uploaded or cached entrance video filename safely."""
+    raw = str(name or "").strip()
+    if not raw or "/" in raw or "\\" in raw or ".." in raw:
+        return None
+    p = Path(raw)
+    if p.name != raw or p.suffix.lower() not in VALID_VIDEO_EXTS:
+        return None
+    if not all(c.isalnum() or c in "._- " for c in raw):
+        return None
+    return raw
+
+
+def sanitize_video_upload_filename(raw_name: str, show_id: str) -> str:
+    """Validate and namespace an uploaded entrance video into `shows/sources/` (rejects traversal)."""
+    raw = str(raw_name or "").strip()
+    if not raw or ".." in raw or "/" in raw or "\\" in raw:
+        raise ValueError("Invalid video filename (path separators and '..' are not allowed)")
+    base = Path(raw).name.strip()
+    ext = Path(base).suffix.lower()
+    if ext not in VALID_VIDEO_EXTS:
+        raise ValueError(f"Unsupported video format ({ext or 'none'}); use .mp4, .mkv, .mov, or .webm")
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "_", Path(base).stem).strip("_-") or "video"
+    sid = _safe_show_id(show_id) or "show"
+    return f"{sid}_video_{stem[:40]}{ext}"
+
+
 def _norm_trigger_text(text: str) -> str:
     s = str(text or "").lower()
     s = s.replace("’", "'")
@@ -275,6 +307,7 @@ class ShowSpec:
     lights_flash_count: int = 0
     trigger_fog: bool = False
     youtube_url: str = ""
+    video_source_file: str = ""
     three_screen_video: bool = False
     video_hold_sec: float = 45.0
     is_dev_drop: bool = False
@@ -317,6 +350,7 @@ class ShowSpec:
             "lightsFlashCount": int(self.lights_flash_count),
             "triggerFog": bool(self.trigger_fog),
             "youtubeUrl": self.youtube_url,
+            "videoSourceFile": self.video_source_file,
             "threeScreenVideo": bool(self.three_screen_video),
             "videoHoldSec": round(float(self.video_hold_sec), 1),
             "isDevDrop": bool(self.is_dev_drop),
@@ -371,6 +405,7 @@ class ShowSpec:
                 if nt and nt not in triggers:
                     triggers.append(nt)
         src_valid = validate_song_filename(str(raw.get("sourceFile", "") or "")) or ""
+        vid_valid = validate_video_filename(str(raw.get("videoSourceFile", "") or "")) or ""
         post_vol = _i("postOverlayDenonVol", 0)
         if post_vol != 0:
             post_vol = max(MIN_SHOW_DENON_VOL, min(MAX_SHOW_DENON_VOL, post_vol))
@@ -401,6 +436,7 @@ class ShowSpec:
             lights_flash_count=max(0, min(6, _i("lightsFlashCount", 0))),
             trigger_fog=bool(raw.get("triggerFog", False)),
             youtube_url=str(raw.get("youtubeUrl", "") or "").strip(),
+            video_source_file=vid_valid,
             three_screen_video=bool(raw.get("threeScreenVideo", False)),
             video_hold_sec=_clamp(_f("videoHoldSec", 45.0), 5.0, 300.0),
             is_dev_drop=bool(raw.get("isDevDrop", sid == "ryder_walkin")),
@@ -1352,11 +1388,259 @@ def decode_and_trim_song_file(
     return apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=fade_out_sec)
 
 
+def resample_stereo_pcm(pcm: np.ndarray, src_sr: int, target_sr: int) -> np.ndarray:
+    """High-accuracy rational resampling for stereo float32 PCM."""
+    arr = np.asarray(pcm, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = np.stack([arr, arr], axis=1)
+    if arr.shape[0] == 0 or int(src_sr) == int(target_sr):
+        return arr.astype(np.float32)
+    g = math.gcd(int(src_sr), int(target_sr))
+    up = int(target_sr) // g
+    down = int(src_sr) // g
+    l = resample_poly(arr[:, 0], up, down).astype(np.float32)
+    r = resample_poly(arr[:, 1], up, down).astype(np.float32)
+    return np.stack([l, r], axis=1).astype(np.float32)
+
+
+def apply_timed_duck_stereo(
+    pcm: np.ndarray,
+    *,
+    sr: int,
+    duck_start_sec: float,
+    duck_hold_sec: float,
+    duck_gain: float = 0.22,
+    attack_sec: float = 0.25,
+    release_sec: float = 0.45,
+) -> np.ndarray:
+    """Apply smooth cosine gain ducking over a specific `[duck_start_sec, duck_start_sec + duck_hold_sec]` window."""
+    out = pcm.copy()
+    n = out.shape[0]
+    if n == 0 or duck_hold_sec <= 0.0:
+        return out
+    env = np.ones(n, dtype=np.float32)
+    s0 = max(0, min(n, int(round(duck_start_sec * sr))))
+    s1 = max(s0, min(n, int(round((duck_start_sec + duck_hold_sec) * sr))))
+    atk_n = max(8, int(round(attack_sec * sr)))
+    rel_n = max(8, int(round(release_sec * sr)))
+
+    atk_start = max(0, s0 - atk_n // 2)
+    atk_end = min(n, atk_start + atk_n)
+    if atk_end > atk_start:
+        t_a = np.linspace(0.0, 1.0, atk_end - atk_start, dtype=np.float32)
+        env[atk_start:atk_end] = 1.0 - (1.0 - float(duck_gain)) * 0.5 * (1.0 - np.cos(np.pi * t_a))
+
+    hold_start = min(n, atk_end)
+    hold_end = min(n, s1)
+    if hold_end > hold_start:
+        env[hold_start:hold_end] = float(duck_gain)
+
+    rel_start = hold_end
+    rel_end = min(n, rel_start + rel_n)
+    if rel_end > rel_start:
+        t_r = np.linspace(0.0, 1.0, rel_end - rel_start, dtype=np.float32)
+        env[rel_start:rel_end] = float(duck_gain) + (1.0 - float(duck_gain)) * 0.5 * (1.0 - np.cos(np.pi * t_r))
+
+    out *= env[:, None]
+    return out
+
+
+def _resolve_ffprobe_bin(ffmpeg_bin: str) -> str:
+    if ffmpeg_bin:
+        p = Path(ffmpeg_bin)
+        cand = p.with_name("ffprobe.exe" if p.suffix.lower() == ".exe" else "ffprobe")
+        if cand.is_file():
+            return str(cand)
+    return "ffprobe"
+
+
+def _probe_media_duration_sec(media_path: Path, ffmpeg_bin: str) -> float:
+    """Return exact container/video duration in seconds via ffprobe (falling back to ffmpeg stderr)."""
+    ffprobe = _resolve_ffprobe_bin(ffmpeg_bin)
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(media_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            **_no_window_kwargs(),
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            val = float(proc.stdout.strip())
+            if val > 0.0:
+                return val
+    except Exception:
+        pass
+    if ffmpeg_bin:
+        try:
+            proc = subprocess.run(
+                [ffmpeg_bin, "-i", str(media_path)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                **_no_window_kwargs(),
+            )
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr or "")
+            if m:
+                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        except Exception:
+            pass
+    return 0.0
+
+
+def _generate_intro_pulse_video(
+    out_mp4: Path,
+    *,
+    duration_sec: float,
+    lightning_sec: float = 0.75,
+    flash_count: int = 2,
+    ffmpeg_bin: str,
+    width: int = 1920,
+    height: int = 1080,
+    fps: int = 30,
+) -> float:
+    """Render dramatic monochrome white-to-black arena pulse & strobe intro video matched to intro duration."""
+    if not ffmpeg_bin:
+        raise RuntimeError("FFmpeg is required to generate intro pulse video")
+    dur = max(1.5, float(duration_sec))
+    n_frames = max(15, int(round(dur * fps)))
+    actual_dur = float(n_frames) / float(fps)
+
+    gw, gh = 320, 180
+    yy, xx = np.mgrid[0:gh, 0:gw].astype(np.float32)
+    nx = (xx - (gw - 1) * 0.5) / ((gw - 1) * 0.5)
+    ny = (yy - (gh - 1) * 0.5) / ((gh - 1) * 0.5)
+    radial = np.clip(1.0 - 0.36 * (nx * nx + ny * ny), 0.55, 1.0).astype(np.float32)
+    flat = np.ones((gh, gw), dtype=np.float32)
+
+    strobe_guard = 1.05 if flash_count >= 2 else (0.55 if flash_count == 1 else 0.25)
+    t_pulse0 = (lightning_sec + 0.85) if lightning_sec > 0.0 else 0.90
+    period = 1.50
+
+    frames = bytearray()
+    for i in range(n_frames):
+        t = float(i) / float(fps)
+        rem = actual_dur - t
+        full_white = 0.0
+        radial_white = 0.0
+
+        # 1. Opening lightning crack during thunder rumble
+        if lightning_sec > 0.0:
+            dt = t - lightning_sec
+            if 0.0 <= dt < 0.08:
+                full_white = 1.0
+            elif 0.08 <= dt < 0.16:
+                full_white = 0.10
+            elif 0.16 <= dt < 0.24:
+                full_white = 0.86
+            elif 0.24 <= dt < 0.56:
+                full_white = 0.86 * math.exp(-(dt - 0.24) * 9.0)
+
+        # 2. Escalating rhythmic white-to-black pulses under announcer build
+        if t >= t_pulse0 and rem > strobe_guard:
+            p_pos = t - t_pulse0
+            idx = int(p_pos // period)
+            phase = p_pos - idx * period
+            cycle_end = t_pulse0 + (idx + 1) * period
+            if cycle_end <= actual_dur - strobe_guard + 0.35:
+                peak = min(0.92, 0.52 + 0.12 * idx)
+                if phase < 0.12:
+                    radial_white = max(radial_white, peak * ((phase / 0.12) ** 0.7))
+                elif phase < 0.96:
+                    radial_white = max(radial_white, peak * math.exp(-(phase - 0.12) * 3.8))
+
+        # 3. Final full-screen white->black strobes leading straight into entrance video
+        if flash_count >= 2:
+            if (actual_dur - 0.92) <= t < (actual_dur - 0.72):
+                full_white = 1.0
+                radial_white = 0.0
+            elif (actual_dur - 0.48) <= t < (actual_dur - 0.22):
+                full_white = 1.0
+                radial_white = 0.0
+            elif rem <= 0.22:
+                full_white = 0.0
+                radial_white = 0.0
+        elif flash_count == 1:
+            if (actual_dur - 0.48) <= t < (actual_dur - 0.22):
+                full_white = 1.0
+                radial_white = 0.0
+            elif rem <= 0.22:
+                full_white = 0.0
+                radial_white = 0.0
+
+        if full_white >= radial_white:
+            lum = flat * min(1.0, max(0.0, full_white))
+        else:
+            lum = radial * min(1.0, max(0.0, radial_white))
+        u8 = np.clip(np.round(lum * 255.0), 0, 255).astype(np.uint8)
+        frames.extend(u8.tobytes())
+
+    tmp_mp4 = out_mp4.with_name(f"{out_mp4.stem}.tmp{out_mp4.suffix}")
+    cmd = [
+        ffmpeg_bin,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-s",
+        f"{gw}x{gh}",
+        "-r",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-vf",
+        f"scale={width}:{height}:flags=bicubic,setsar=1,format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "main",
+        "-level:v",
+        "4.0",
+        "-r",
+        str(fps),
+        "-g",
+        str(fps * 2),
+        "-crf",
+        "20",
+        "-preset",
+        "veryfast",
+        "-an",
+        str(tmp_mp4),
+    ]
+    proc = subprocess.run(
+        cmd,
+        input=bytes(frames),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=90,
+        **_no_window_kwargs(),
+    )
+    if proc.returncode != 0 or not tmp_mp4.is_file():
+        err = (proc.stderr or b"").decode("utf-8", errors="ignore")[-280:]
+        try:
+            tmp_mp4.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(f"FFmpeg intro pulse video failed: {err}")
+    tmp_mp4.replace(out_mp4)
+    return round(actual_dur, 3)
+
+
 # ---------------- ShowDirector Orchestrator ----------------
 
 
 class ShowDirector:
-    """Manages show specs, custom song uploads, composite WAV rendering, voice triggers & live playback."""
+    """Manages show specs, custom song uploads, composite WAV/MP4 rendering, voice triggers & live playback."""
 
     def __init__(
         self,
@@ -1366,6 +1650,7 @@ class ShowDirector:
         displays: Any = None,
         adb_controller: Any = None,
         wallboard_cfg_fn: Callable[[], Any] | None = None,
+        stage_base_url_fn: Callable[[], str] | None = None,
         ffmpeg_bin: str = "",
         allow_network: bool = True,
         http_get: Callable[[str, float], tuple[int, bytes]] | None = None,
@@ -1373,6 +1658,7 @@ class ShowDirector:
         sleep_fn: Callable[[float], None] | None = None,
     ) -> None:
         self._lock = threading.RLock()
+        self._multimedia_build_lock = threading.Lock()
         self.root_dir = Path(root_dir)
         self.shows_dir = self.root_dir / "shows"
         self.sources_dir = self.shows_dir / "sources"
@@ -1387,6 +1673,7 @@ class ShowDirector:
         self.displays = displays
         self.adb = adb_controller
         self._wallboard_cfg_fn = wallboard_cfg_fn
+        self._stage_base_url_fn = stage_base_url_fn
         self.ffmpeg_bin = str(ffmpeg_bin or "").strip()
         self.allow_network = bool(allow_network)
         self._http_get = http_get
@@ -1400,7 +1687,11 @@ class ShowDirector:
         self._show_order: list[str] = []
 
         self._event_lock = threading.Lock()
-        self._event_subs: list[queue.Queue[dict[str, Any]]] = []
+        self._event_subs: list[tuple[str, queue.Queue[dict[str, Any]]]] = []
+        self._stage_roles: dict[str, int] = {}
+        self._stage_state: dict[str, Any] = {"type": "stage_stop", "state": "idle", "runId": 0}
+        self._stage_ack_cond = threading.Condition()
+        self._stage_acks: dict[tuple[int, str], str] = {}
         self.recent_cues: deque[dict[str, Any]] = deque(maxlen=30)
 
         self._run_lock = threading.Lock()
@@ -1419,20 +1710,98 @@ class ShowDirector:
 
         self._load_or_init()
 
-    # ---------- Cue Event Bus (SSE Live Simulator) ----------
+    # ---------- Cue & Synchronized Stage Event Bus (SSE) ----------
 
-    def subscribe_events(self) -> queue.Queue[dict[str, Any]]:
+    def subscribe_events(self, role: str = "dashboard") -> queue.Queue[dict[str, Any]]:
+        clean_role = re.sub(r"[^a-z0-9_-]+", "", str(role or "dashboard").strip().lower()) or "dashboard"
         q: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=64)
         with self._event_lock:
-            self._event_subs.append(q)
+            self._event_subs.append((clean_role, q))
+            self._stage_roles[clean_role] = self._stage_roles.get(clean_role, 0) + 1
         return q
 
-    def unsubscribe_events(self, q: queue.Queue[dict[str, Any]]) -> None:
+    def unsubscribe_events(self, q: queue.Queue[dict[str, Any]], role: str = "dashboard") -> None:
+        clean_role = re.sub(r"[^a-z0-9_-]+", "", str(role or "dashboard").strip().lower()) or "dashboard"
         with self._event_lock:
+            self._event_subs = [(r, sub_q) for (r, sub_q) in self._event_subs if sub_q is not q]
+            cnt = self._stage_roles.get(clean_role, 0)
+            if cnt <= 1:
+                self._stage_roles.pop(clean_role, None)
+            else:
+                self._stage_roles[clean_role] = cnt - 1
+
+    def connected_stage_roles(self) -> dict[str, int]:
+        with self._event_lock:
+            return dict(self._stage_roles)
+
+    def has_stage_client(self, role: str) -> bool:
+        clean_role = str(role or "").strip().lower()
+        with self._event_lock:
+            return self._stage_roles.get(clean_role, 0) > 0
+
+    def current_stage_state(self) -> dict[str, Any]:
+        with self._event_lock:
+            return dict(self._stage_state)
+
+    def _fanout_event_locked(self, evt: dict[str, Any], subs: list[tuple[str, queue.Queue[dict[str, Any]]]]) -> None:
+        for _r, q in subs:
             try:
-                self._event_subs.remove(q)
-            except ValueError:
-                pass
+                q.put_nowait(evt)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(evt)
+                except Exception:
+                    pass
+
+    def _broadcast_stage_event(self, evt_type: str, **payload: Any) -> None:
+        evt: dict[str, Any] = {
+            "type": evt_type,
+            "tsMs": int(time.time() * 1000),
+            **payload,
+        }
+        with self._event_lock:
+            if evt_type == "stage_stop":
+                self._stage_state = {"type": "stage_stop", "state": "idle", "runId": int(payload.get("runId") or 0)}
+            else:
+                self._stage_state = dict(evt)
+            subs = list(self._event_subs)
+        self._fanout_event_locked(evt, subs)
+
+    def record_stage_ack(self, *, role: str, run_id: int, state: str) -> dict[str, Any]:
+        clean_role = re.sub(r"[^a-z0-9_-]+", "", str(role or "").strip().lower())
+        clean_state = re.sub(r"[^a-z0-9_-]+", "", str(state or "").strip().lower())
+        if not clean_role:
+            return {"ok": False, "error": "Missing role"}
+        with self._stage_ack_cond:
+            self._stage_acks[(int(run_id), clean_role)] = clean_state
+            self._stage_ack_cond.notify_all()
+        return {"ok": True, "role": clean_role, "runId": int(run_id), "state": clean_state}
+
+    def _wait_for_stage_acks(
+        self,
+        run_id: int,
+        roles: Sequence[str],
+        *,
+        target_states: tuple[str, ...] = ("ready",),
+        cancel_ev: threading.Event | None = None,
+        timeout_sec: float = 5.5,
+    ) -> dict[str, bool]:
+        wanted = [str(r or "").strip().lower() for r in roles if str(r or "").strip()]
+        if not wanted:
+            return {}
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while True:
+            with self._stage_ack_cond:
+                status = {r: (self._stage_acks.get((int(run_id), r)) in target_states) for r in wanted}
+                if all(status.values()):
+                    return status
+                if cancel_ev and cancel_ev.is_set():
+                    return status
+                rem = deadline - time.monotonic()
+                if rem <= 0.0:
+                    return status
+                self._stage_ack_cond.wait(timeout=min(0.15, rem))
 
     def _emit_cue(self, tag: str, label: str, *, show_id: str = "", duration_ms: int = 1200, **extra: Any) -> None:
         evt: dict[str, Any] = {
@@ -1447,15 +1816,7 @@ class ShowDirector:
         with self._event_lock:
             self.recent_cues.append(evt)
             subs = list(self._event_subs)
-        for q in subs:
-            try:
-                q.put_nowait(evt)
-            except queue.Full:
-                try:
-                    q.get_nowait()
-                    q.put_nowait(evt)
-                except Exception:
-                    pass
+        self._fanout_event_locked(evt, subs)
 
     def list_voices(self) -> dict[str, Any]:
         return {
@@ -1522,6 +1883,13 @@ class ShowDirector:
                     dirty = True
             if dirty:
                 self._save_locked()
+            ry = self.shows.get("ryder_walkin")
+            default_ry_vid = self.sources_dir / "ryder_walkin_video.mp4"
+            if ry and not ry.video_source_file and default_ry_vid.is_file() and default_ry_vid.stat().st_size > 1000:
+                self.shows["ryder_walkin"] = ShowSpec.from_dict(
+                    {**ry.to_dict(), "videoSourceFile": "ryder_walkin_video.mp4"}
+                )
+                self._save_locked()
 
     def _save_locked(self) -> None:
         payload = {
@@ -1545,6 +1913,36 @@ class ShowDirector:
         sid = _safe_show_id(show_id)
         return self.rendered_dir / f"{sid}_overlay.wav"
 
+    def show_mp4_path(self, show_id: str) -> Path:
+        sid = _safe_show_id(show_id)
+        return self.rendered_dir / f"{sid}_show.mp4"
+
+    def show_meta_path(self, show_id: str) -> Path:
+        sid = _safe_show_id(show_id)
+        return self.rendered_dir / f"{sid}_show.meta.json"
+
+    def _read_show_meta(self, show_id: str) -> dict[str, Any]:
+        mp = self.show_meta_path(show_id)
+        if not mp.is_file():
+            return {}
+        try:
+            raw = json.loads(mp.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _resolve_stage_base_url(self) -> str:
+        if self._stage_base_url_fn is not None:
+            try:
+                raw = str(self._stage_base_url_fn() or "").strip().rstrip("/")
+                if raw:
+                    if raw.endswith("/wallboard"):
+                        raw = raw[:-10]
+                    return raw
+            except Exception:
+                pass
+        return "http://127.0.0.1:8766"
+
     def status_dict(self) -> dict[str, Any]:
         with self._lock:
             items: list[dict[str, Any]] = []
@@ -1558,6 +1956,9 @@ class ShowDirector:
                 o_wav = self.overlay_wav_path(sid)
                 o_ready = o_wav.is_file() and o_wav.stat().st_size > 100
                 o_dur = wav_duration_sec(o_wav) if o_ready else 0.0
+                s_mp4 = self.show_mp4_path(sid)
+                s_ready = s_mp4.is_file() and s_mp4.stat().st_size > 1000
+                meta = self._read_show_meta(sid) if s_ready else {}
                 items.append({
                     **spec.to_dict(),
                     "previewReady": ready,
@@ -1567,9 +1968,19 @@ class ShowDirector:
                     "overlayDurationSec": o_dur,
                     "overlayUrl": f"/api/shows/{sid}/overlay.wav" if spec.overlay_text else "",
                     "sourceUploaded": bool(spec.source_file and (self.sources_dir / spec.source_file).is_file()),
+                    "showVideoReady": s_ready,
+                    "showVideoUrl": f"/api/shows/{sid}/show.mp4" if s_ready else "",
+                    "showVideoDurationSec": float(meta.get("totalDurationSec") or 0.0),
+                    "introDurationSec": float(meta.get("introDurationSec") or dur),
+                    "hasSourceVideo": bool(meta.get("hasSourceVideo", False)),
+                    "videoUploaded": bool(
+                        spec.video_source_file and (self.sources_dir / spec.video_source_file).is_file()
+                    ),
                 })
             with self._event_lock:
                 cues = list(self.recent_cues)[-12:]
+                stage_roles = dict(self._stage_roles)
+                stage_state = dict(self._stage_state)
             return {
                 "shows": items,
                 "fxHooks": self.fx_hooks.to_dict(),
@@ -1578,6 +1989,8 @@ class ShowDirector:
                 "kokoroReady": kokoro_models_available(self.models_dir),
                 "voices": self.list_voices()["voices"],
                 "recentCues": cues,
+                "stageClients": stage_roles,
+                "stageState": stage_state,
             }
 
     def update_show(self, show_id: str, patch: dict[str, Any], *, rebuild: bool = True) -> dict[str, Any]:
@@ -1600,6 +2013,18 @@ class ShowDirector:
                             (self.sources_dir / old_src).unlink(missing_ok=True)
                         except Exception:
                             pass
+            if patch and patch.get("clearVideoSource"):
+                old_vid = cur.video_source_file
+                merged["videoSourceFile"] = ""
+                if old_vid:
+                    other_vrefs = any(
+                        s.id != sid and s.video_source_file == old_vid for s in self.shows.values()
+                    )
+                    if not other_vrefs:
+                        try:
+                            (self.sources_dir / old_vid).unlink(missing_ok=True)
+                        except Exception:
+                            pass
             if patch and isinstance(patch.get("triggersText"), str):
                 merged["triggers"] = [
                     line.strip()
@@ -1611,6 +2036,11 @@ class ShowDirector:
             self._save_locked()
 
         build_res = self.build_show_preview(sid, force=True) if rebuild else {"ok": True}
+        if rebuild and updated.three_screen_video and self.ffmpeg_bin:
+            try:
+                build_res["multimedia"] = self.build_show_multimedia(sid, force=True)
+            except Exception as exc:
+                build_res["multimedia"] = {"ok": False, "error": str(exc)}
         return {"ok": True, "show": self.get_show(sid).to_dict(), "build": build_res, "status": self.status_dict()}
 
     def save_uploaded_song(
@@ -1642,6 +2072,315 @@ class ShowDirector:
         if trim_leading_silence is not None:
             patch["trimLeadingSilence"] = bool(trim_leading_silence)
         return self.update_show(sid, patch, rebuild=True)
+
+    def save_uploaded_video(self, show_id: str, raw_filename: str, file_bytes: bytes) -> dict[str, Any]:
+        sid = _safe_show_id(show_id)
+        if not self.get_show(sid):
+            raise KeyError(f"Unknown show: {show_id}")
+        if not file_bytes or len(file_bytes) > MAX_VIDEO_UPLOAD_BYTES:
+            raise ValueError("Video upload must be non-empty and <= 250 MB")
+        safe_name = sanitize_video_upload_filename(raw_filename, sid)
+        dest = self.sources_dir / safe_name
+        tmp = dest.with_suffix(dest.suffix + ".tmp")
+        tmp.write_bytes(file_bytes)
+        tmp.replace(dest)
+        return self.update_show(sid, {"videoSourceFile": safe_name}, rebuild=True)
+
+    def fetch_youtube_video_source(self, show_id: str) -> dict[str, Any]:
+        """Download configured YouTube entrance video locally via yt-dlp (no anti-bot bypass)."""
+        sid = _safe_show_id(show_id)
+        spec = self.get_show(sid)
+        if not spec:
+            return {"ok": False, "error": f"Unknown show: {show_id}"}
+        if not spec.youtube_url:
+            return {"ok": False, "error": "No youtubeUrl configured on show"}
+        if not self.allow_network:
+            return {"ok": False, "error": "Network disabled"}
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError:
+            return {"ok": False, "error": "yt-dlp not installed on server (install with pip install --user yt-dlp)"}
+
+        target_name = f"{sid}_video.mp4"
+        out_tpl = str(self.sources_dir / f"{sid}_video.%(ext)s")
+        ydl_opts: dict[str, Any] = {
+            "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]",
+            "merge_output_format": "mp4",
+            "outtmpl": out_tpl,
+            "overwrites": True,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
+        if self.ffmpeg_bin:
+            ydl_opts["ffmpeg_location"] = str(Path(self.ffmpeg_bin).parent)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.extract_info(spec.youtube_url, download=True)
+        except Exception as exc:
+            return {"ok": False, "error": f"YouTube download blocked or failed: {exc}"}
+
+        dest = self.sources_dir / target_name
+        if not dest.is_file() or dest.stat().st_size < 1000:
+            return {"ok": False, "error": "Downloaded MP4 file missing or empty"}
+        res = self.update_show(sid, {"videoSourceFile": target_name}, rebuild=True)
+        return {**res, "videoSourceFile": target_name}
+
+    def build_show_multimedia(self, show_id: str, *, force: bool = False) -> dict[str, Any]:
+        """Assemble self-contained 1080p H.264+AAC MP4 combining intro pulses/voice + entrance video + 1:20 ducked overlay."""
+        sid = _safe_show_id(show_id)
+        spec = self.get_show(sid)
+        if spec is None:
+            return {"ok": False, "error": f"Unknown show: {show_id}"}
+        if not self.ffmpeg_bin:
+            return {"ok": False, "error": "FFmpeg binary not configured"}
+
+        with self._multimedia_build_lock:
+            p_res = self.build_show_preview(sid, force=force)
+            if not p_res.get("ok"):
+                return {"ok": False, "error": p_res.get("error") or "Preview build failed"}
+            if spec.overlay_text:
+                o_res = self.build_show_overlay(sid, force=force)
+                if not o_res.get("ok"):
+                    return {"ok": False, "error": o_res.get("error") or "Overlay build failed"}
+
+            p_wav = self.preview_wav_path(sid)
+            o_wav = self.overlay_wav_path(sid)
+            src_vid = (self.sources_dir / spec.video_source_file) if spec.video_source_file else None
+            has_src_vid = bool(src_vid and src_vid.is_file() and src_vid.stat().st_size > 1000)
+
+            sig_parts = [
+                f"v1",
+                f"p={p_wav.stat().st_size}:{int(p_wav.stat().st_mtime_ns)}" if p_wav.is_file() else "p=0",
+                f"o={o_wav.stat().st_size}:{int(o_wav.stat().st_mtime_ns)}" if o_wav.is_file() else "o=0",
+                f"vid={src_vid.name}:{src_vid.stat().st_size}:{int(src_vid.stat().st_mtime_ns)}" if has_src_vid else "vid=none",
+                f"l={spec.lightning_flash_sec:.2f}",
+                f"fc={spec.lights_flash_count}",
+                f"ov={spec.overlay_at_sec:.2f}:{spec.overlay_text}",
+            ]
+            sig = hashlib.sha1("|".join(sig_parts).encode("utf-8")).hexdigest()[:16]
+
+            out_mp4 = self.show_mp4_path(sid)
+            meta_path = self.show_meta_path(sid)
+            existing_meta = self._read_show_meta(sid)
+            if (
+                not force
+                and out_mp4.is_file()
+                and out_mp4.stat().st_size > 1000
+                and existing_meta.get("sig") == sig
+            ):
+                return {"ok": True, "cached": True, **existing_meta}
+
+            stamp = f"{threading.get_ident()}_{int(time.time() * 1000)}"
+            intro_mp4 = self.rendered_dir / f".intro_{sid}_{stamp}.mp4"
+            src_audio_wav = self.rendered_dir / f".srcaud_{sid}_{stamp}.wav"
+            master_wav = self.rendered_dir / f".master_{sid}_{stamp}.wav"
+            tmp_mp4 = out_mp4.with_name(f"{out_mp4.stem}.tmp{out_mp4.suffix}")
+
+            try:
+                intro_pcm_44k = read_wav_stereo_float(p_wav, target_sr=SHOW_SR)
+                intro_pcm_48k = resample_stereo_pcm(intro_pcm_44k, SHOW_SR, STAGE_VIDEO_SR)
+                raw_intro_dur = float(intro_pcm_48k.shape[0]) / float(STAGE_VIDEO_SR)
+
+                intro_video_dur = _generate_intro_pulse_video(
+                    intro_mp4,
+                    duration_sec=max(1.5, raw_intro_dur),
+                    lightning_sec=spec.lightning_flash_sec,
+                    flash_count=spec.lights_flash_count,
+                    ffmpeg_bin=self.ffmpeg_bin,
+                )
+                intro_target_samples = max(1, int(round(intro_video_dur * STAGE_VIDEO_SR)))
+                if intro_pcm_48k.shape[0] < intro_target_samples:
+                    pad_n = intro_target_samples - intro_pcm_48k.shape[0]
+                    intro_pcm_48k = np.concatenate(
+                        [intro_pcm_48k, np.zeros((pad_n, 2), dtype=np.float32)], axis=0
+                    )
+                else:
+                    intro_pcm_48k = intro_pcm_48k[:intro_target_samples]
+
+                src_dur = 0.0
+                overlay_dur = 0.0
+                if has_src_vid and src_vid is not None:
+                    # Decode entrance video's audio track cleanly to 48 kHz stereo PCM
+                    ext_proc = subprocess.run(
+                        [
+                            self.ffmpeg_bin,
+                            "-y",
+                            "-i",
+                            str(src_vid),
+                            "-vn",
+                            "-ar",
+                            str(STAGE_VIDEO_SR),
+                            "-ac",
+                            "2",
+                            "-c:a",
+                            "pcm_s16le",
+                            str(src_audio_wav),
+                        ],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=60,
+                        **_no_window_kwargs(),
+                    )
+                    src_vid_dur = _probe_media_duration_sec(src_vid, self.ffmpeg_bin)
+                    if ext_proc.returncode == 0 and src_audio_wav.is_file() and src_audio_wav.stat().st_size > 100:
+                        ent_pcm = read_wav_stereo_float(src_audio_wav, target_sr=STAGE_VIDEO_SR)
+                    else:
+                        ent_pcm = np.zeros((max(STAGE_VIDEO_SR, int(round(max(1.0, src_vid_dur) * STAGE_VIDEO_SR))), 2), dtype=np.float32)
+
+                    src_dur = src_vid_dur if src_vid_dur > 0.2 else (float(ent_pcm.shape[0]) / float(STAGE_VIDEO_SR))
+                    ent_target_samples = max(1, int(round(src_dur * STAGE_VIDEO_SR)))
+                    if ent_pcm.shape[0] < ent_target_samples:
+                        ent_pcm = np.concatenate(
+                            [ent_pcm, np.zeros((ent_target_samples - ent_pcm.shape[0], 2), dtype=np.float32)], axis=0
+                        )
+                    else:
+                        ent_pcm = ent_pcm[:ent_target_samples]
+
+                    # RMS match entrance soundtrack cleanly without clipping
+                    cur_rms = float(np.sqrt(np.mean(ent_pcm ** 2))) if ent_pcm.size else 0.0
+                    cur_peak = float(np.max(np.abs(ent_pcm))) if ent_pcm.size else 0.0
+                    if cur_rms > 1e-5 and cur_peak > 1e-5:
+                        scale = min(0.22 / cur_rms, 0.88 / cur_peak)
+                        ent_pcm = np.tanh(ent_pcm * scale * 1.05).astype(np.float32) * 0.92
+
+                    # Bake sample-accurate 1:20 duck + personal overlay voice directly into entrance track
+                    if spec.overlay_text and spec.overlay_at_sec > 0.0 and o_wav.is_file() and src_dur > (spec.overlay_at_sec + 0.5):
+                        ov_44k = read_wav_stereo_float(o_wav, target_sr=SHOW_SR)
+                        ov_48k = resample_stereo_pcm(ov_44k, SHOW_SR, STAGE_VIDEO_SR)
+                        overlay_dur = round(float(ov_48k.shape[0]) / float(STAGE_VIDEO_SR), 2)
+                        ent_pcm = apply_timed_duck_stereo(
+                            ent_pcm,
+                            sr=STAGE_VIDEO_SR,
+                            duck_start_sec=float(spec.overlay_at_sec),
+                            duck_hold_sec=max(0.4, overlay_dur),
+                            duck_gain=0.22,
+                            attack_sec=0.25,
+                            release_sec=0.45,
+                        )
+                        ov_off = int(round(float(spec.overlay_at_sec) * STAGE_VIDEO_SR))
+                        mix_into(ent_pcm, ov_48k, ov_off, gain=1.0)
+                        pk_ent = float(np.max(np.abs(ent_pcm)))
+                        if pk_ent > 0.94:
+                            ent_pcm = ent_pcm * (0.92 / pk_ent)
+
+                    master_pcm = np.concatenate([intro_pcm_48k, ent_pcm], axis=0)
+                    master_wav.write_bytes(encode_stereo_pcm16_wav(master_pcm, sr=STAGE_VIDEO_SR))
+
+                    cmd = [
+                        self.ffmpeg_bin,
+                        "-y",
+                        "-i",
+                        str(intro_mp4),
+                        "-i",
+                        str(src_vid),
+                        "-i",
+                        str(master_wav),
+                        "-filter_complex",
+                        (
+                            "[0:v]setsar=1,setpts=PTS-STARTPTS[v0];"
+                            "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                            "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1];"
+                            "[v0][v1]concat=n=2:v=1:a=0[v]"
+                        ),
+                        "-map",
+                        "[v]",
+                        "-map",
+                        "2:a",
+                        "-c:v",
+                        "libx264",
+                        "-profile:v",
+                        "main",
+                        "-level:v",
+                        "4.0",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-r",
+                        "30",
+                        "-g",
+                        "60",
+                        "-crf",
+                        "21",
+                        "-preset",
+                        "veryfast",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-ar",
+                        str(STAGE_VIDEO_SR),
+                        "-ac",
+                        "2",
+                        "-movflags",
+                        "+faststart",
+                        "-shortest",
+                        str(tmp_mp4),
+                    ]
+                else:
+                    master_wav.write_bytes(encode_stereo_pcm16_wav(intro_pcm_48k, sr=STAGE_VIDEO_SR))
+                    cmd = [
+                        self.ffmpeg_bin,
+                        "-y",
+                        "-i",
+                        str(intro_mp4),
+                        "-i",
+                        str(master_wav),
+                        "-map",
+                        "0:v",
+                        "-map",
+                        "1:a",
+                        "-c:v",
+                        "copy",
+                        "-c:a",
+                        "aac",
+                        "-b:a",
+                        "192k",
+                        "-ar",
+                        str(STAGE_VIDEO_SR),
+                        "-ac",
+                        "2",
+                        "-movflags",
+                        "+faststart",
+                        "-shortest",
+                        str(tmp_mp4),
+                    ]
+
+                mux_proc = subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    timeout=300,
+                    **_no_window_kwargs(),
+                )
+                if mux_proc.returncode != 0 or not tmp_mp4.is_file() or tmp_mp4.stat().st_size < 1000:
+                    err = (mux_proc.stderr or b"").decode("utf-8", errors="ignore")[-320:]
+                    raise RuntimeError(f"FFmpeg show MP4 build failed: {err}")
+
+                tmp_mp4.replace(out_mp4)
+                probed_total = _probe_media_duration_sec(out_mp4, self.ffmpeg_bin)
+                total_dur = round(probed_total if probed_total > 0.5 else (intro_video_dur + src_dur), 2)
+                meta = {
+                    "ok": True,
+                    "showId": sid,
+                    "sig": sig,
+                    "path": str(out_mp4),
+                    "introDurationSec": round(intro_video_dur, 2),
+                    "sourceDurationSec": round(src_dur, 2),
+                    "totalDurationSec": total_dur,
+                    "overlayDurationSec": overlay_dur,
+                    "hasSourceVideo": has_src_vid,
+                    "builtAt": _utc_iso_now(),
+                }
+                tmp_meta = meta_path.with_name(f"{meta_path.stem}.tmp{meta_path.suffix}")
+                tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+                tmp_meta.replace(meta_path)
+                return meta
+            finally:
+                for p in (intro_mp4, src_audio_wav, master_wav, tmp_mp4):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     def update_fx_hooks(self, raw: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -2149,9 +2888,449 @@ class ShowDirector:
         except Exception:
             pass
 
+    def _run_multimedia_show_sequence(
+        self,
+        spec: ShowSpec,
+        run_id: int,
+        cancel_ev: threading.Event,
+        mp4_path: Path,
+        meta: dict[str, Any],
+        fx: SmartFxConfig,
+    ) -> dict[str, Any]:
+        """Run unified local 1080p MP4 show across Cube + Hisense + SmartSpin + Wallboard with T=0 pre-staging."""
+        prev_db = -35.0
+        target_db = _clamp(float(spec.denon_vol) - 80.0, -50.0, -5.0)
+        current_db = prev_db
+        denon_raised = False
+        denon_restored = False
+        cube_ser = ""
+        cube_stage_launched = False
+        out_res: dict[str, Any] = {"ok": True, "showId": spec.id, "multimedia": True}
+
+        intro_dur = float(meta.get("introDurationSec") or 0.0)
+        if intro_dur <= 0.1:
+            p_wav = self.preview_wav_path(spec.id)
+            intro_dur = wav_duration_sec(p_wav) if p_wav.is_file() else 9.0
+        total_dur = float(meta.get("totalDurationSec") or 0.0)
+        if total_dur <= intro_dur:
+            total_dur = intro_dur + float(spec.video_hold_sec or 45.0)
+        overlay_dur = float(meta.get("overlayDurationSec") or 0.0)
+        if overlay_dur <= 0.1 and spec.overlay_text:
+            o_wav = self.overlay_wav_path(spec.id)
+            overlay_dur = wav_duration_sec(o_wav) if o_wav.is_file() else 4.0
+
+        try:
+            # 1. Snapshot Denon AVR baseline BEFORE raising volume or changing inputs
+            if self.house_audio is not None:
+                st = self.house_audio.denon.get_status()
+                if st.get("ok"):
+                    if st.get("volumeDb") is not None:
+                        prev_db = float(st["volumeDb"])
+            current_db = prev_db
+
+            with self._lock:
+                self._active_state["phase"] = "prestage_displays"
+            self._emit_cue(
+                "prestage",
+                "(PRE-STAGING ALL 3 TVS + DENON + FOG)",
+                show_id=spec.id,
+                duration_ms=3000,
+            )
+
+            # 2. Fire Lights Out + Fog Machine immediately so fog builds while TVs lock HDMI
+            if spec.lights_out:
+                out_res["lightsOff"] = self._fire_lights_state(
+                    False, tag="lights_off", label="(LIGHTS OFF)", show_id=spec.id, duration_ms=1500
+                )
+            if spec.trigger_fog:
+                burst_val = spec.fog_burst_sec if spec.fog_burst_sec > 0.0 else fx.fog_burst_sec
+                burst_str = f"{float(burst_val):.1f}".rstrip("0").rstrip(".")
+                self._emit_cue(
+                    "fog",
+                    f"(TRIGGER FOG · {burst_str}s)",
+                    show_id=spec.id,
+                    duration_ms=int(burst_val * 1000),
+                    fogSec=float(burst_val),
+                )
+                fog_url = fx.resolve_fog_url(burst_sec=burst_val)
+                if fog_url:
+                    out_res["fog"] = self._fire_http_hook(fog_url)
+
+            # 3. Broadcast stage_prepare immediately so already-open Wallboard blanks to #000 & buffers MP4
+            base_url = self._resolve_stage_base_url()
+            try:
+                ver_tag = int(mp4_path.stat().st_mtime)
+            except Exception:
+                ver_tag = int(time.time())
+            video_url = f"/api/shows/{spec.id}/show.mp4?v={ver_tag}"
+            self._broadcast_stage_event(
+                "stage_prepare",
+                runId=run_id,
+                showId=spec.id,
+                videoUrl=video_url,
+                introDurationSec=round(intro_dur, 2),
+                totalDurationSec=round(total_dur, 2),
+            )
+
+            # 4. Pre-stage all hardware targets IN PARALLEL (Denon + Hisense + SmartSpin + Cube + Wallboard)
+            wb_cfg = self._wallboard_cfg_fn() if self._wallboard_cfg_fn is not None else None
+            wb_host = str(getattr(wb_cfg, "fire_tv_host", "") or "").strip() if wb_cfg else ""
+            wb_port = int(getattr(wb_cfg, "adb_port", 5555) or 5555) if wb_cfg else 5555
+            wb_ser = f"{wb_host}:{wb_port}" if (wb_host and ":" not in wb_host) else wb_host
+
+            cube_host = ""
+            cube_port = 5555
+            if self.displays is not None:
+                dcfg = self.displays.get_config()
+                cube_host = dcfg.cube_host
+                cube_port = dcfg.cube_adb_port
+            elif self.house_audio is not None:
+                hcfg = self.house_audio.get_config()
+                cube_host = hcfg.cube_host
+                cube_port = hcfg.cube_adb_port
+            cube_ser = f"{cube_host}:{cube_port}" if (cube_host and ":" not in cube_host) else cube_host
+
+            def _prep_denon() -> dict[str, Any]:
+                res_d: dict[str, Any] = {}
+                if self.house_audio is not None:
+                    d_st = self.house_audio.denon.get_status()
+                    if d_st.get("ok") and d_st.get("power") != "ON":
+                        self.house_audio.denon.send_command("PWON")
+                        self._wait_cancelable(cancel_ev, 0.35)
+                        self.house_audio.denon.send_command("SIMPLAY")
+                    else:
+                        self.house_audio.denon.send_command("SIMPLAY")
+                if self.displays is not None:
+                    res_d["avrMode"] = self.displays._control_avr("mch_stereo")
+                    res_d["avrMonitor"] = self.displays.set_denon_monitor_out("AUTO")
+                return res_d
+
+            def _prep_hisense() -> dict[str, Any]:
+                if self.displays is None:
+                    return {"ok": False, "skipped": True}
+                if hasattr(self.displays, "ensure_primary_hdmi_ready"):
+                    return self.displays.ensure_primary_hdmi_ready("hdmi2")
+                return self.displays._control_primary("hdmi2")
+
+            def _prep_spin() -> dict[str, Any]:
+                if self.displays is None:
+                    return {"ok": False, "skipped": True}
+                if hasattr(self.displays, "ensure_spin_hdmi_ready"):
+                    return self.displays.ensure_spin_hdmi_ready()
+                if self.displays.get_config().spin.host:
+                    return self.displays._control_spin("on")
+                return {"ok": True, "skipped": True, "switched": False}
+
+            def _prep_cube() -> dict[str, Any]:
+                if not cube_ser or self.adb is None:
+                    return {"ok": False, "skipped": True}
+                st, detail = self.adb._connect_and_status(cube_ser)
+                if st != "device":
+                    return {"ok": False, "state": st, "error": detail}
+                try:
+                    self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+                    self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "127"], timeout=4.0)
+                    stage_url = f"{base_url}/stage?role=cube&audio=1"
+                    cmd = (
+                        f"am start -a android.intent.action.VIEW -d {shlex.quote(stage_url)} "
+                        "-n com.froriep.armorywallboard/.WallboardActivity"
+                    )
+                    rc, out, err = self.adb._run(["-s", cube_ser, "shell", cmd], timeout=6.0)
+                    return {"ok": rc == 0, "url": stage_url, "out": (out or err).strip()}
+                finally:
+                    if hasattr(self.adb, "disconnect_serial"):
+                        try:
+                            self.adb.disconnect_serial(cube_ser)
+                        except Exception:
+                            pass
+
+            def _prep_wallboard() -> dict[str, Any]:
+                if not wb_ser or self.adb is None:
+                    return {"ok": False, "skipped": True}
+                st, detail = self.adb._connect_and_status(wb_ser)
+                if st != "device" and self.displays is not None:
+                    wk = self.displays.execute("wallboard", "on")
+                    st, detail = self.adb._connect_and_status(wb_ser)
+                    if st != "device":
+                        return {"ok": False, "state": st, "wake": wk, "error": detail}
+                if st != "device":
+                    return {"ok": False, "state": st, "error": detail}
+                try:
+                    self.adb._run(["-s", wb_ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+                    self.adb._run(["-s", wb_ser, "shell", "media", "volume", "--stream", "3", "--set", "0"], timeout=4.0)
+                    rc_act, out_act, _ = self.adb._run(
+                        ["-s", wb_ser, "shell", "dumpsys", "activity", "activities"], timeout=4.5
+                    )
+                    on_top = (
+                        rc_act == 0
+                        and "com.froriep.armorywallboard" in (out_act or "")
+                        and self.has_stage_client("wallboard")
+                    )
+                    if on_top:
+                        return {"ok": True, "alreadyActive": True}
+                    wb_url = f"{base_url}/wallboard"
+                    cmd = (
+                        f"am start -a android.intent.action.VIEW -d {shlex.quote(wb_url)} "
+                        "-n com.froriep.armorywallboard/.WallboardActivity"
+                    )
+                    rc, out, err = self.adb._run(["-s", wb_ser, "shell", cmd], timeout=6.0)
+                    return {"ok": rc == 0, "url": wb_url, "launched": True, "out": (out or err).strip()}
+                finally:
+                    if hasattr(self.adb, "disconnect_serial"):
+                        try:
+                            self.adb.disconnect_serial(wb_ser)
+                        except Exception:
+                            pass
+
+            prestage: dict[str, Any] = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+                futs = {
+                    "denon": ex.submit(_prep_denon),
+                    "tv": ex.submit(_prep_hisense),
+                    "spin": ex.submit(_prep_spin),
+                    "cube": ex.submit(_prep_cube),
+                    "wallboard": ex.submit(_prep_wallboard),
+                }
+                for key, fut in futs.items():
+                    try:
+                        prestage[key] = fut.result(timeout=12.0)
+                    except Exception as exc:
+                        prestage[key] = {"ok": False, "error": str(exc)}
+
+            switch_done_mono = time.monotonic()
+            out_res["prestage"] = prestage
+            cube_stage_launched = bool(prestage.get("cube", {}).get("ok"))
+
+            if cancel_ev.is_set():
+                return {"ok": False, "canceled": True}
+
+            # 5. Wait for Cube & Wallboard stages to finish buffering + settle HDMI/HDCP switches cleanly
+            roles_to_wait: list[str] = []
+            if cube_stage_launched:
+                roles_to_wait.append("cube")
+            if prestage.get("wallboard", {}).get("ok") or self.has_stage_client("wallboard"):
+                roles_to_wait.append("wallboard")
+            ack_timeout = 0.05 if self._has_custom_sleep else 5.5
+            out_res["stageReady"] = self._wait_for_stage_acks(
+                run_id, roles_to_wait, target_states=("ready",), cancel_ev=cancel_ev, timeout_sec=ack_timeout
+            )
+            if cancel_ev.is_set():
+                return {"ok": False, "canceled": True}
+
+            any_hdmi_switched = bool(
+                prestage.get("tv", {}).get("switched") or prestage.get("spin", {}).get("switched")
+            )
+            if any_hdmi_switched and not self._has_custom_sleep:
+                rem_settle = max(0.0, 2.8 - (time.monotonic() - switch_done_mono))
+                if rem_settle > 0.0 and self._wait_cancelable(cancel_ev, rem_settle):
+                    return {"ok": False, "canceled": True}
+
+            # 6. Ramp Denon to MV70, then fire clock-synced `stage_play` across ALL 3 SCREENS!
+            if self.house_audio is not None:
+                self.house_audio.denon._ramp_volume(prev_db, target_db, steps=4, step_ms=35)
+                current_db = target_db
+                denon_raised = True
+
+            lead_sec = 0.0 if self._has_custom_sleep else 0.55
+            start_at_ms = int(time.time() * 1000) + int(round(lead_sec * 1000))
+            with self._lock:
+                self._active_state["phase"] = "playing"
+            self._broadcast_stage_event(
+                "stage_play",
+                runId=run_id,
+                showId=spec.id,
+                videoUrl=video_url,
+                startAtMs=start_at_ms,
+                introDurationSec=round(intro_dur, 2),
+                totalDurationSec=round(total_dur, 2),
+            )
+            self._emit_cue(
+                "intro",
+                f"(ALL 3 SCREENS BLACK → PULSES · DENON {spec.denon_vol})",
+                show_id=spec.id,
+                duration_ms=int(intro_dur * 1000),
+                denonVol=spec.denon_vol,
+                caption=spec.announcer_text,
+            )
+
+            if lead_sec > 0.0 and self._wait_cancelable(cancel_ev, lead_sec):
+                return {"ok": False, "canceled": True}
+
+            play_t0 = time.monotonic()
+            sim_clock = 0.0
+
+            def _wait_until_show_sec(target_sec: float) -> bool:
+                nonlocal sim_clock
+                tgt = max(0.0, float(target_sec))
+                if self._has_custom_sleep:
+                    delta = max(0.0, tgt - sim_clock)
+                    sim_clock = max(sim_clock, tgt)
+                    return self._wait_cancelable(cancel_ev, delta)
+                wait_s = max(0.0, (play_t0 + tgt) - time.monotonic())
+                return self._wait_cancelable(cancel_ev, wait_s)
+
+            # 7. Sync house-light choreography cleanly alongside pre-baked MP4 playback
+            if spec.lightning_flash_sec > 0.0 and spec.lightning_flash_sec < (intro_dur - 0.8):
+                if _wait_until_show_sec(spec.lightning_flash_sec):
+                    return {"ok": False, "canceled": True}
+                self._flash_lights(
+                    1,
+                    cancel_ev=cancel_ev,
+                    show_id=spec.id,
+                    end_on=False,
+                    on_sec=0.16,
+                    off_sec=0.05,
+                    tag_prefix="FLASH · LIGHTNING",
+                )
+                sim_clock += 0.21
+
+            if spec.lights_flash_count > 0:
+                strobe_at = max(0.5, intro_dur - 0.92)
+                if _wait_until_show_sec(strobe_at):
+                    return {"ok": False, "canceled": True}
+                self._flash_lights(
+                    spec.lights_flash_count,
+                    cancel_ev=cancel_ev,
+                    show_id=spec.id,
+                    end_on=True,
+                    tag_prefix="FLASH",
+                )
+
+            if _wait_until_show_sec(intro_dur):
+                return {"ok": False, "canceled": True}
+
+            with self._lock:
+                self._active_state["phase"] = "video_screens"
+            self._emit_cue(
+                "screens",
+                f"(ALL 3 SCREENS LIVE · DENON {spec.denon_vol})",
+                show_id=spec.id,
+                duration_ms=4000,
+                denonVol=spec.denon_vol,
+                youtubeUrl=spec.youtube_url,
+            )
+
+            if spec.lights_pulse_duration_sec > 0.0:
+                with self._lock:
+                    self._active_state["phase"] = "strobe_video"
+                if self._pulse_lights_loop(spec, cancel_ev):
+                    return {"ok": False, "canceled": True}
+                sim_clock += float(spec.lights_pulse_duration_sec)
+                self._fire_lights_state(
+                    True,
+                    tag="lights_on",
+                    label="(FULL HOUSE LIGHTS ON)",
+                    show_id=spec.id,
+                    duration_ms=2500,
+                )
+            elif spec.lights_out:
+                self._fire_lights_state(
+                    True,
+                    tag="lights_on",
+                    label="(FULL HOUSE LIGHTS ON)",
+                    show_id=spec.id,
+                    duration_ms=2500,
+                )
+
+            # 8. Mid-video 1:20 overlay HUD cue + Denon drop (audio overlay is pre-baked cleanly in MP4!)
+            if spec.overlay_text and spec.overlay_at_sec > 0.0 and total_dur > (intro_dur + spec.overlay_at_sec):
+                if _wait_until_show_sec(intro_dur + float(spec.overlay_at_sec)):
+                    return {"ok": False, "canceled": True}
+                with self._lock:
+                    self._active_state["phase"] = "overlay_duck"
+                self._emit_cue(
+                    "overlay",
+                    f"(DUCK + OVERLAY · \"{spec.overlay_text}\")",
+                    show_id=spec.id,
+                    duration_ms=int((overlay_dur + 1.0) * 1000),
+                    caption=spec.overlay_text,
+                )
+                if _wait_until_show_sec(intro_dur + float(spec.overlay_at_sec) + max(0.5, overlay_dur)):
+                    return {"ok": False, "canceled": True}
+                if spec.post_overlay_denon_vol > 0:
+                    post_db = _clamp(float(spec.post_overlay_denon_vol) - 80.0, -50.0, -5.0)
+                    self._restore_denon_down(current_db, post_db, fast=False)
+                    current_db = post_db
+                    self._emit_cue(
+                        "denon_drop",
+                        f"(RESTORE VIDEO · DENON {spec.denon_vol} → {spec.post_overlay_denon_vol} · FULL LIGHTS ON)",
+                        show_id=spec.id,
+                        duration_ms=3000,
+                        denonVol=spec.post_overlay_denon_vol,
+                    )
+
+            # 9. Hold until video ends (either Cube ACK `ended` or full MP4 duration)
+            with self._lock:
+                self._active_state["phase"] = "video_finish"
+            if self._has_custom_sleep:
+                rem = max(0.0, total_dur - sim_clock)
+                if rem > 0.0 and self._wait_cancelable(cancel_ev, rem):
+                    return {"ok": False, "canceled": True}
+            else:
+                end_deadline = play_t0 + total_dur + 0.6
+                while not cancel_ev.is_set():
+                    with self._stage_ack_cond:
+                        if self._stage_acks.get((run_id, "cube")) == "ended":
+                            break
+                        rem_wait = end_deadline - time.monotonic()
+                        if rem_wait <= 0.0:
+                            break
+                        self._stage_ack_cond.wait(timeout=min(0.20, rem_wait))
+                if cancel_ev.is_set():
+                    return {"ok": False, "canceled": True}
+
+            if spec.post_overlay_denon_vol <= 0 and denon_raised:
+                self._restore_denon_down(current_db, prev_db, fast=False)
+            denon_restored = True
+            self._emit_cue("ended", "(SHOW COMPLETE)", show_id=spec.id, duration_ms=1200)
+            return out_res
+
+        except Exception as exc:
+            out_res = {"ok": False, "showId": spec.id, "error": str(exc)}
+            return out_res
+        finally:
+            self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
+            if denon_raised and not denon_restored and self.house_audio is not None:
+                self._restore_denon_down(current_db, prev_db, fast=True)
+            if self.displays is not None:
+                try:
+                    self.displays.sync_denon_monitor_for_spin()
+                except Exception:
+                    pass
+            if cube_stage_launched and cube_ser and self.adb is not None:
+                try:
+                    st, _ = self.adb._connect_and_status(cube_ser)
+                    if st == "device":
+                        self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "4"], timeout=4.0)
+                except Exception:
+                    pass
+                finally:
+                    if hasattr(self.adb, "disconnect_serial"):
+                        try:
+                            self.adb.disconnect_serial(cube_ser)
+                        except Exception:
+                            pass
+            with self._lock:
+                if self._active_run_id == run_id:
+                    self._active_state = {
+                        "active": False,
+                        "showId": "",
+                        "showName": "",
+                        "phase": "idle",
+                        "startedAt": "",
+                        "lastError": "" if out_res.get("ok") else str(out_res.get("error") or ""),
+                    }
+                    self._last_result = {**out_res, "finishedAt": _utc_iso_now()}
+
     def _run_show_sequence(self, spec: ShowSpec, run_id: int, cancel_ev: threading.Event) -> dict[str, Any]:
         with self._lock:
             fx = SmartFxConfig.from_dict(self.fx_hooks.to_dict())
+
+        if spec.three_screen_video:
+            mp4_path = self.show_mp4_path(spec.id)
+            meta = self._read_show_meta(spec.id)
+            if mp4_path.is_file() and mp4_path.stat().st_size > 1000 and meta.get("hasSourceVideo"):
+                return self._run_multimedia_show_sequence(spec, run_id, cancel_ev, mp4_path, meta, fx)
 
         prev_db = -35.0
         target_db = _clamp(float(spec.denon_vol) - 80.0, -50.0, -5.0)
@@ -2471,6 +3650,8 @@ class ShowDirector:
             was_active = bool(self._active_state.get("active"))
         if ev is not None:
             ev.set()
+        with self._stage_ack_cond:
+            self._stage_ack_cond.notify_all()
         if t is not None and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=wait_timeout)
         if self.house_audio is not None:
