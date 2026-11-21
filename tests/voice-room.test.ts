@@ -78,7 +78,8 @@ vi.mock('../src/lifts/gymCam', async () => {
   };
 });
 
-import { voice } from '../src/lifts/voice';
+import { updateSettings } from '../src/store/settings';
+import { voice, type AbMicSample } from '../src/lifts/voice';
 
 function makeBenchSession(id: string): LiftSession {
   return {
@@ -176,6 +177,56 @@ describe('VoiceController room source relay', () => {
       expect(sess.exs[0].sets[0].done).toBe(true);
       expect(mockState.speakCalls).toEqual(['195 for 10, got it']);
     } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('logs set once during passive Dual-Mic A/B Benchmark while posting both samples and isolates Shootout capture', async () => {
+    const sess = makeBenchSession('sess_ab_1');
+    mockState.activeSess = sess;
+    const abPosts: Record<string, unknown>[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/voice/ab/sample') && init?.body) {
+        abPosts.push(JSON.parse(String(init.body)));
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      return { ok: true, json: async () => ({ ok: true, spoke: true }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    updateSettings({ voiceAbCompare: true });
+    try {
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 8',
+        isFinal: true,
+        source: 'mic',
+        state: 'listening',
+      });
+      voice.receiveExternalEvent({
+        transcript: 'Armory 225 for 8',
+        isFinal: true,
+        source: 'room',
+        state: 'room',
+      });
+      await new Promise((r) => setTimeout(r, 20));
+
+      // Only Set 1 is logged; Set 2 was NOT double-logged by the second mic!
+      expect(sess.exs[0].sets[0].done).toBe(true);
+      expect(sess.exs[0].sets[1].done).toBe(false);
+      expect(abPosts).toHaveLength(2);
+      expect(abPosts[0]).toMatchObject({ source: 'mic', matched: true, intentKey: 'log:225:8:_', executed: true });
+      expect(abPosts[1]).toMatchObject({ source: 'room', matched: true, intentKey: 'log:225:8:_', executed: false });
+
+      // Shootout mode captures both mics without modifying workout sets
+      const captured: AbMicSample[] = [];
+      await voice.startShootout((smp) => captured.push(smp));
+      voice.receiveExternalEvent({ transcript: 'Armory skip rest', isFinal: true, source: 'mic', state: 'listening' });
+      voice.receiveExternalEvent({ transcript: 'Armory skip rest', isFinal: true, source: 'room', state: 'room' });
+      expect(captured).toHaveLength(2);
+      expect(captured.map((c) => c.source)).toEqual(['mic', 'room']);
+      expect(sess.exs[0].sets[1].done).toBe(false);
+    } finally {
+      voice.stopShootout();
+      updateSettings({ voiceAbCompare: false });
       vi.unstubAllGlobals();
     }
   });

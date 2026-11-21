@@ -630,3 +630,70 @@ export function parseVoiceTranscript(
   }
   return null;
 }
+
+/** Deterministic canonical intent key used for dual-mic A/B comparison and cross-source dedup. */
+export function voiceIntentKey(intent: VoiceIntent | null): string {
+  if (!intent) return 'none';
+  switch (intent.kind) {
+    case 'arm_wake':
+      return 'arm_wake';
+    case 'log_current':
+      return `log:${intent.bodyweight ? 'bw' : (intent.weight ?? '_')}:${intent.seconds != null ? `s${intent.seconds}` : (intent.reps ?? '_')}:${intent.rpe ?? '_'}`;
+    case 'set_only':
+      return `set:${intent.weight ?? '_'}:${intent.reps ?? '_'}`;
+    case 'start_hold':
+      return `hold:${intent.seconds ?? '_'}`;
+    case 'jump_ex':
+      return `jump:${normalizeVoiceText(intent.target)}`;
+    case 'rest_add':
+      return `rest_add:${intent.deltaSec}`;
+    case 'cam_arm':
+    case 'cam_clip_last':
+    case 'cam_guest':
+      return `${intent.kind}:${(intent.camera ?? 'auto').toLowerCase()}`;
+    case 'buddy_mode':
+      return `buddy_mode:${intent.on == null ? 'tog' : intent.on ? '1' : '0'}`;
+    case 'wb_replay':
+      return `wb_replay:${intent.exQuery ? normalizeVoiceText(intent.exQuery) : '_'}:${intent.setNum ?? '_'}:${intent.slow ? 'slow' : '1x'}`;
+    default:
+      return intent.kind;
+  }
+}
+
+/** Normalized word-level F1 match percentage (0–100) between a transcript and target phrase. */
+export function voiceTokenMatchPct(heard: string, expected: string): number {
+  const a = normalizeVoiceText(heard).split(/\s+/).filter(Boolean);
+  const b = normalizeVoiceText(expected).split(/\s+/).filter(Boolean);
+  if (!a.length && !b.length) return 100;
+  if (!a.length || !b.length) return 0;
+  const counts = new Map<string, number>();
+  for (const tok of b) counts.set(tok, (counts.get(tok) ?? 0) + 1);
+  let overlap = 0;
+  for (const tok of a) {
+    const left = counts.get(tok) ?? 0;
+    if (left > 0) {
+      overlap += 1;
+      counts.set(tok, left - 1);
+    }
+  }
+  return Math.round(((2 * overlap) / (a.length + b.length)) * 1000) / 10;
+}
+
+export interface AbShootoutPhrase {
+  phrase: string;
+  expectedIntentKey: string;
+  expectedLabel: string;
+}
+
+export const AB_SHOOTOUT_PHRASES: readonly AbShootoutPhrase[] = [
+  { phrase: 'Armory 225 for 8', expectedIntentKey: 'log:225:8:_', expectedLabel: 'Log 225 × 8' },
+  { phrase: 'Armory check', expectedIntentKey: 'log:_:_:_', expectedLabel: 'Check set as-is' },
+  { phrase: 'Armory for 10', expectedIntentKey: 'log:_:10:_', expectedLabel: 'Log 10 reps' },
+  { phrase: 'Armory 50s for 12', expectedIntentKey: 'log:50:12:_', expectedLabel: 'Log 50s × 12' },
+  { phrase: 'Armory 185 for 10 rpe 8.5', expectedIntentKey: 'log:185:10:8.5', expectedLabel: 'Log 185 × 10 @ RPE 8.5' },
+  { phrase: 'Armory skip rest', expectedIntentKey: 'rest_skip', expectedLabel: 'Skip rest' },
+  { phrase: 'Armory next exercise', expectedIntentKey: 'next_ex', expectedLabel: 'Next exercise' },
+  { phrase: 'Armory record smith', expectedIntentKey: 'cam_arm:smith cam', expectedLabel: 'Record Smith Cam' },
+  { phrase: 'Armory clip that', expectedIntentKey: 'cam_clip_last:auto', expectedLabel: 'Clip last set' },
+  { phrase: 'Armory replay slow', expectedIntentKey: 'wb_replay:_:_:slow', expectedLabel: 'Replay slow on TV' },
+];

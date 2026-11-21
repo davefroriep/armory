@@ -9,13 +9,16 @@ stays unblocked.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+import hashlib
 import io
 import json
 import logging
 import math
+from pathlib import Path
 import queue
 import re
 import subprocess
@@ -39,6 +42,30 @@ HOST_API_PREFERENCE = (
     "MME",
     "Windows DirectSound",
     "Windows WDM-KS",
+)
+TTS_VOICES = (
+    "en-US-AndrewNeural",
+    "en-US-BrianNeural",
+    "en-US-GuyNeural",
+    "en-US-AriaNeural",
+    "sapi",
+)
+PREWARM_TTS_PHRASES = (
+    "Armory room mic ready",
+    "Checked, got it",
+    "Didn't catch that",
+    "Rest skipped",
+    "Set added",
+    "Undid last",
+    "Next exercise",
+    "Previous exercise",
+    "Recording Rack",
+    "Recording Smith",
+    "Clipping last set",
+    "Buddy mode on",
+    "Buddy mode off",
+    "Workout paused",
+    "Workout resumed",
 )
 
 HALLUCINATION_EXACT = frozenset({
@@ -193,6 +220,7 @@ class RoomVoiceConfig:
     model_size: str = "base.en"   # empirically benchmarked <= 1.2s on i7-4790
     wake_word: str = "armory"
     speaker_readback: bool = True
+    tts_voice: str = "en-US-AndrewNeural"
     vad_threshold: float = 0.45
     min_speech_ms: int = 280
     end_silence_ms: int = 620
@@ -208,6 +236,7 @@ class RoomVoiceConfig:
             "modelSize": self.model_size,
             "wakeWord": self.wake_word,
             "speakerReadback": bool(self.speaker_readback),
+            "ttsVoice": self.tts_voice,
             "vadThreshold": round(float(self.vad_threshold), 2),
             "minSpeechMs": int(self.min_speech_ms),
             "endSilenceMs": int(self.end_silence_ms),
@@ -224,6 +253,8 @@ class RoomVoiceConfig:
         model_raw = str(raw.get("modelSize", "base.en")).strip()
         model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en") else "base.en"
         wake = str(raw.get("wakeWord") or "armory").strip().lower() or "armory"
+        tts_raw = str(raw.get("ttsVoice") or "en-US-AndrewNeural").strip()
+        tts_voice = tts_raw if tts_raw in TTS_VOICES else "en-US-AndrewNeural"
         return cls(
             enabled=bool(raw.get("enabled", True)),
             device_match=str(raw.get("deviceMatch", "PowerConf S330") or "").strip(),
@@ -232,6 +263,7 @@ class RoomVoiceConfig:
             model_size=model_size,
             wake_word=wake,
             speaker_readback=bool(raw.get("speakerReadback", True)),
+            tts_voice=tts_voice,
             vad_threshold=_clamp(float(raw.get("vadThreshold", 0.45) or 0.45), 0.15, 0.90),
             min_speech_ms=max(160, min(1200, int(raw.get("minSpeechMs", 280) or 280))),
             end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 620) or 620))),
@@ -487,8 +519,50 @@ class UtteranceDetector:
         return completed
 
 
+def prepare_speaker_pcm(
+    mono_pcm: np.ndarray,
+    src_sr: int,
+    dst_sr: int,
+    dst_ch: int,
+    lead_ms: int = 420,
+    tail_ms: int = 300,
+    target_peak: float = 0.84,
+) -> np.ndarray:
+    """Resample, normalize, edge-fade, and pad audio with USB-amp wakeup lead-in + trailing tail."""
+    arr = resample_from_to(mono_pcm, src_sr, dst_sr).astype(np.float32)
+    if arr.size == 0:
+        return np.zeros((0, max(1, dst_ch)), dtype=np.float32) if dst_ch > 1 else np.zeros(0, dtype=np.float32)
+
+    peak = float(np.max(np.abs(arr)))
+    if peak > 0.05 and target_peak > 0.0:
+        gain = min(4.0, float(target_peak) / peak)
+        arr = arr * gain
+
+    fade_n = min(arr.size // 4, max(0, int(round(dst_sr * 0.008))))
+    if fade_n > 1:
+        arr = arr.copy()
+        ramp = np.linspace(0.0, 1.0, fade_n, dtype=np.float32)
+        arr[:fade_n] *= ramp
+        arr[-fade_n:] *= ramp[::-1]
+
+    arr = np.clip(arr, -0.95, 0.95).astype(np.float32)
+    lead_n = max(0, int(round(dst_sr * (lead_ms / 1000.0))))
+    tail_n = max(0, int(round(dst_sr * (tail_ms / 1000.0))))
+    parts: list[np.ndarray] = []
+    if lead_n > 0:
+        rng = np.random.default_rng(0)
+        parts.append((rng.standard_normal(lead_n) * 1.2e-4).astype(np.float32))
+    parts.append(arr)
+    if tail_n > 0:
+        parts.append(np.zeros(tail_n, dtype=np.float32))
+    padded = np.concatenate(parts).astype(np.float32)
+    if dst_ch > 1:
+        return np.repeat(padded[:, None], dst_ch, axis=1)
+    return padded
+
+
 class _SapiSynthesizer:
-    """Persistent hidden PowerShell `System.Speech` WAV synthesizer with small LRU phrase cache."""
+    """Persistent hidden PowerShell `System.Speech` WAV synthesizer (offline fallback at natural rate)."""
 
     def __init__(self, max_cache: int = 48) -> None:
         self._lock = threading.Lock()
@@ -515,7 +589,7 @@ class _SapiSynthesizer:
         ps_script = (
             "Add-Type -AssemblyName System.Speech\n"
             "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer\n"
-            "$s.Rate = 1\n"
+            "$s.Rate = 0\n"
             "while (($line = [Console]::In.ReadLine()) -ne $null) {\n"
             "  if ($line -eq '') { continue }\n"
             "  $ms = New-Object System.IO.MemoryStream\n"
@@ -576,6 +650,412 @@ class _SapiSynthesizer:
                 return None
 
 
+class _NeuralTtsSynthesizer:
+    """Microsoft Neural `edge-tts` synthesizer with persistent WAV cache + SAPI5 fallback."""
+
+    def __init__(
+        self,
+        cache_dir: Path | None = None,
+        sapi_fallback: _SapiSynthesizer | None = None,
+        max_cache: int = 64,
+    ) -> None:
+        self.cache_dir = cache_dir
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self._sapi = sapi_fallback or _SapiSynthesizer()
+        self._lock = threading.Lock()
+        self._cache: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
+        self._max_cache = max_cache
+
+    def close(self) -> None:
+        self._sapi.close()
+
+    @staticmethod
+    def _cache_key(text: str, voice: str) -> str:
+        clean = re.sub(r"\s+", " ", text or "").strip().lower()
+        return hashlib.sha1(f"{voice}|{clean}".encode("utf-8")).hexdigest()
+
+    def get_cached(self, text: str, voice: str) -> tuple[np.ndarray, int] | None:
+        clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
+        if not clean or voice == "sapi":
+            return None
+        key = self._cache_key(clean, voice)
+        with self._lock:
+            mem = self._cache.get(key)
+            if mem is not None:
+                self._cache.move_to_end(key)
+                return mem
+        if self.cache_dir is not None:
+            wav_p = self.cache_dir / f"{key}.wav"
+            if wav_p.is_file():
+                try:
+                    with wave.open(str(wav_p), "rb") as wf:
+                        sr = wf.getframerate()
+                        pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+                    with self._lock:
+                        self._cache[key] = (pcm, sr)
+                        while len(self._cache) > self._max_cache:
+                            self._cache.popitem(last=False)
+                    return pcm, sr
+                except Exception:
+                    pass
+        return None
+
+    def _put_cached(self, text: str, voice: str, pcm: np.ndarray, sr: int) -> None:
+        key = self._cache_key(text, voice)
+        with self._lock:
+            self._cache[key] = (pcm, sr)
+            while len(self._cache) > self._max_cache:
+                self._cache.popitem(last=False)
+        if self.cache_dir is not None:
+            try:
+                wav_p = self.cache_dir / f"{key}.wav"
+                tmp_p = self.cache_dir / f"{key}.wav.tmp"
+                int16_pcm = np.clip(np.round(pcm * 32767.0), -32768, 32767).astype(np.int16)
+                with wave.open(str(tmp_p), "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(int(sr))
+                    wf.writeframes(int16_pcm.tobytes())
+                tmp_p.replace(wav_p)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _synth_edge_pcm(text: str, voice: str) -> tuple[np.ndarray, int]:
+        import av
+        import edge_tts
+
+        async def _fetch() -> bytes:
+            comm = edge_tts.Communicate(text, voice=voice, rate="+0%")
+            chunks: list[bytes] = []
+            async for chunk in comm.stream():
+                if chunk.get("type") == "audio":
+                    chunks.append(chunk["data"])
+            return b"".join(chunks)
+
+        mp3_bytes = asyncio.run(_fetch())
+        if not mp3_bytes:
+            raise RuntimeError("Empty edge-tts audio")
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=24_000)
+        parts: list[np.ndarray] = []
+        with av.open(io.BytesIO(mp3_bytes), format="mp3") as container:
+            for frame in container.decode(audio=0):
+                for rf in resampler.resample(frame):
+                    parts.append(rf.to_ndarray().reshape(-1))
+            for rf in resampler.resample(None):
+                parts.append(rf.to_ndarray().reshape(-1))
+        if not parts:
+            raise RuntimeError("Decoded 0 audio frames")
+        return np.concatenate(parts).astype(np.float32), 24_000
+
+    def synthesize(self, text: str, voice: str = "en-US-AndrewNeural") -> tuple[np.ndarray, int] | None:
+        clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
+        if not clean:
+            return None
+        if voice == "sapi":
+            return self._sapi.synthesize(clean)
+        cached = self.get_cached(clean, voice)
+        if cached is not None:
+            return cached
+        try:
+            pcm, sr = self._synth_edge_pcm(clean, voice)
+            self._put_cached(clean, voice, pcm, sr)
+            return pcm, sr
+        except Exception:
+            return self._sapi.synthesize(clean)
+
+
+def _classify_ab_trial(trial: dict[str, Any]) -> str:
+    r = trial.get("room")
+    p = trial.get("phone")
+    rm = bool(r and r.get("matched"))
+    pm = bool(p and p.get("matched"))
+    if rm and pm:
+        return "both_match" if r.get("intentKey") == p.get("intentKey") else "disagree"
+    if rm:
+        return "room_only"
+    if pm:
+        return "phone_only"
+    return "both_missed"
+
+
+class VoiceAbTracker:
+    """Pairs simultaneous Room Mic + Pixel Phone Mic samples and persists A/B metrics & shootout runs."""
+
+    PAIR_WINDOW_MS = 4_500
+    MAX_TRIALS = 300
+    MAX_RUNS = 40
+
+    def __init__(self, root_dir: Path | None = None) -> None:
+        self.root_dir = root_dir
+        self.trials_path = (root_dir / "voice_ab.jsonl") if root_dir is not None else None
+        self.runs_path = (root_dir / "voice_ab_runs.json") if root_dir is not None else None
+        self.lock = threading.RLock()
+        self.trials: list[dict[str, Any]] = []
+        self.runs: list[dict[str, Any]] = []
+        self._seq = 0
+        self._load()
+
+    def _load(self) -> None:
+        if self.trials_path and self.trials_path.is_file():
+            loaded: list[dict[str, Any]] = []
+            try:
+                for line in self.trials_path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        loaded.append(json.loads(line))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.trials = loaded[-self.MAX_TRIALS :]
+            self._seq = len(self.trials)
+        if self.runs_path and self.runs_path.is_file():
+            try:
+                raw_runs = json.loads(self.runs_path.read_text(encoding="utf-8"))
+                if isinstance(raw_runs, list):
+                    self.runs = raw_runs[: self.MAX_RUNS]
+            except Exception:
+                pass
+
+    def _save_trials_locked(self) -> None:
+        if not self.trials_path:
+            return
+        self.trials_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.trials_path.with_suffix(".jsonl.tmp")
+        body = "\n".join(json.dumps(t, separators=(",", ":")) for t in self.trials[-self.MAX_TRIALS :])
+        tmp.write_text((body + "\n") if body else "", encoding="utf-8")
+        tmp.replace(self.trials_path)
+
+    def _save_runs_locked(self) -> None:
+        if not self.runs_path:
+            return
+        self.runs_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.runs_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self.runs[: self.MAX_RUNS], indent=2), encoding="utf-8")
+        tmp.replace(self.runs_path)
+
+    def record_sample(
+        self,
+        raw_sample: dict[str, Any],
+        raw_room_recent: Sequence[dict[str, Any]] = (),
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        src = str(raw_sample.get("source") or "mic").strip().lower()
+        slot = "room" if src == "room" else "phone"
+        ts_ms = int(raw_sample.get("tsMs") or int(time.time() * 1000))
+        station = str(raw_sample.get("station") or "").strip()
+        side_obj = {
+            "transcript": str(raw_sample.get("transcript") or "").strip(),
+            "matched": bool(raw_sample.get("matched", False)),
+            "intentKey": str(raw_sample.get("intentKey") or "none"),
+            "intentLabel": str(raw_sample.get("intentLabel") or ""),
+            "hasWake": bool(raw_sample.get("hasWake", False)),
+            "latencyMs": raw_sample.get("latencyMs"),
+            "executed": bool(raw_sample.get("executed", False)),
+            "tsMs": ts_ms,
+        }
+
+        with self.lock:
+            matched_trial: dict[str, Any] | None = None
+            best_diff = self.PAIR_WINDOW_MS + 1
+            for t in reversed(self.trials[-24:]):
+                if t.get(slot) is not None:
+                    continue
+                other_slot = "phone" if slot == "room" else "room"
+                other = t.get(other_slot)
+                ref_ts = int((other or {}).get("tsMs") or t["tsMs"])
+                diff = abs(ts_ms - ref_ts)
+                if diff <= self.PAIR_WINDOW_MS and diff < best_diff:
+                    best_diff = diff
+                    matched_trial = t
+
+            if matched_trial is not None:
+                matched_trial[slot] = side_obj
+                if not matched_trial.get("station") and station:
+                    matched_trial["station"] = station
+                matched_trial["outcome"] = _classify_ab_trial(matched_trial)
+                trial = matched_trial
+            else:
+                self._seq += 1
+                trial = {
+                    "id": f"ab_{self._seq}_{ts_ms}",
+                    "tsMs": ts_ms,
+                    "station": station,
+                    "room": side_obj if slot == "room" else None,
+                    "phone": side_obj if slot == "phone" else None,
+                    "outcome": "both_missed",
+                    "resolvedWinner": None,
+                }
+                if slot == "phone":
+                    used_room_ts = {
+                        int((t.get("room") or {}).get("tsMs") or -1)
+                        for t in self.trials[-24:]
+                        if t.get("room")
+                    }
+                    for raw_r in raw_room_recent:
+                        r_ts = int(raw_r.get("tsMs") or 0)
+                        if not raw_r.get("emitted") and abs(ts_ms - r_ts) <= self.PAIR_WINDOW_MS and r_ts not in used_room_ts:
+                            trial["room"] = {
+                                "transcript": str(raw_r.get("transcript") or "").strip(),
+                                "matched": False,
+                                "intentKey": "none",
+                                "intentLabel": "Missed wake",
+                                "hasWake": bool(raw_r.get("wakeMatched", False)),
+                                "latencyMs": raw_r.get("latencyMs"),
+                                "executed": False,
+                                "tsMs": r_ts,
+                            }
+                            break
+                trial["outcome"] = _classify_ab_trial(trial)
+                self.trials.append(trial)
+                if len(self.trials) > self.MAX_TRIALS:
+                    self.trials = self.trials[-self.MAX_TRIALS :]
+
+            self._save_trials_locked()
+            return dict(trial), self.summary_dict()
+
+    def resolve_trial(self, trial_id: str, winner: str | None) -> dict[str, Any] | None:
+        clean_w = winner if winner in ("room", "phone") else None
+        with self.lock:
+            for t in reversed(self.trials):
+                if t.get("id") == trial_id:
+                    t["resolvedWinner"] = clean_w
+                    self._save_trials_locked()
+                    return self.summary_dict()
+            return None
+
+    def save_run(self, raw_run: dict[str, Any]) -> dict[str, Any]:
+        ts_ms = int(raw_run.get("tsMs") or int(time.time() * 1000))
+        label = str(raw_run.get("label") or "Shootout Run").strip() or "Shootout Run"
+        items = raw_run.get("items") if isinstance(raw_run.get("items"), list) else []
+        count = max(1, int(raw_run.get("phrasesCount") or len(items) or 10))
+        room_pct = round(float(raw_run.get("roomIntentPct") or 0.0), 1)
+        phone_pct = round(float(raw_run.get("phoneIntentPct") or 0.0), 1)
+        room_word = round(float(raw_run.get("roomWordPct") or 0.0), 1)
+        phone_word = round(float(raw_run.get("phoneWordPct") or 0.0), 1)
+        run = {
+            "id": str(raw_run.get("id") or f"run_{ts_ms}"),
+            "tsMs": ts_ms,
+            "label": label,
+            "phrasesCount": count,
+            "roomIntentPct": room_pct,
+            "phoneIntentPct": phone_pct,
+            "deltaPts": round(room_pct - phone_pct, 1),
+            "roomWordPct": room_word,
+            "phoneWordPct": phone_word,
+            "items": items[:25],
+        }
+        with self.lock:
+            self.runs.insert(0, run)
+            self.runs = self.runs[: self.MAX_RUNS]
+            self._save_runs_locked()
+            return run
+
+    def reset(self, clear_runs: bool = False) -> dict[str, Any]:
+        with self.lock:
+            self.trials.clear()
+            self._save_trials_locked()
+            if clear_runs:
+                self.runs.clear()
+                self._save_runs_locked()
+            return self.summary_dict()
+
+    def summary_dict(self) -> dict[str, Any]:
+        with self.lock:
+            total = len(self.trials)
+            both_match = 0
+            room_only = 0
+            phone_only = 0
+            disagree = 0
+            both_missed = 0
+            disagree_room = 0
+            disagree_phone = 0
+            stations: dict[str, list[dict[str, Any]]] = {}
+
+            for t in self.trials:
+                out = t.get("outcome") or _classify_ab_trial(t)
+                if out == "both_match":
+                    both_match += 1
+                elif out == "room_only":
+                    room_only += 1
+                elif out == "phone_only":
+                    phone_only += 1
+                elif out == "disagree":
+                    disagree += 1
+                    w = t.get("resolvedWinner")
+                    if w == "room":
+                        disagree_room += 1
+                    elif w == "phone":
+                        disagree_phone += 1
+                else:
+                    both_missed += 1
+
+                st_name = str(t.get("station") or "General").strip() or "General"
+                stations.setdefault(st_name, []).append(t)
+
+            room_wins = both_match + room_only + disagree_room
+            phone_wins = both_match + phone_only + disagree_phone
+            room_pct = round((room_wins / total) * 100.0, 1) if total > 0 else 0.0
+            phone_pct = round((phone_wins / total) * 100.0, 1) if total > 0 else 0.0
+            delta_pts = round(room_pct - phone_pct, 1)
+            rel_gain = round(((room_pct - phone_pct) / phone_pct) * 100.0, 1) if phone_pct > 0 else None
+            both_parsed = both_match + disagree
+            agree_pct = round((both_match / both_parsed) * 100.0, 1) if both_parsed > 0 else None
+
+            by_station: list[dict[str, Any]] = []
+            for st_name, st_trials in stations.items():
+                n_st = len(st_trials)
+                rw = sum(
+                    1
+                    for x in st_trials
+                    if x.get("outcome") in ("both_match", "room_only")
+                    or (x.get("outcome") == "disagree" and x.get("resolvedWinner") == "room")
+                )
+                pw = sum(
+                    1
+                    for x in st_trials
+                    if x.get("outcome") in ("both_match", "phone_only")
+                    or (x.get("outcome") == "disagree" and x.get("resolvedWinner") == "phone")
+                )
+                r_p = round((rw / n_st) * 100.0, 1) if n_st else 0.0
+                p_p = round((pw / n_st) * 100.0, 1) if n_st else 0.0
+                by_station.append({
+                    "station": st_name,
+                    "trials": n_st,
+                    "roomCatchPct": r_p,
+                    "phoneCatchPct": p_p,
+                    "deltaPts": round(r_p - p_p, 1),
+                })
+
+            return {
+                "totalTrials": total,
+                "bothMatch": both_match,
+                "roomOnly": room_only,
+                "phoneOnly": phone_only,
+                "disagree": disagree,
+                "bothMissed": both_missed,
+                "roomWins": room_wins,
+                "phoneWins": phone_wins,
+                "roomCatchPct": room_pct,
+                "phoneCatchPct": phone_pct,
+                "deltaPts": delta_pts,
+                "relativeGainPct": rel_gain,
+                "agreementPct": agree_pct,
+                "byStation": by_station,
+            }
+
+    def snapshot_dict(self) -> dict[str, Any]:
+        with self.lock:
+            return {
+                "summary": self.summary_dict(),
+                "recentTrials": list(reversed(self.trials[-25:])),
+                "runs": list(self.runs),
+            }
+
+
 class RoomVoiceService:
     """Manages PowerConf S330 audio capture, Whisper ASR, SSE broadcast, and speaker feedback."""
 
@@ -586,8 +1066,10 @@ class RoomVoiceService:
         asr_transcribe_fn: Callable[[np.ndarray, str, str], str] | None = None,
         speak_fn: Callable[[str], bool] | None = None,
         allow_hardware_audio: bool = True,
+        root_dir: Path | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
+        self.root_dir = root_dir
         self.on_fallback_transcript = on_fallback_transcript
         self._asr_transcribe_fn = asr_transcribe_fn
         self._speak_fn = speak_fn
@@ -602,6 +1084,7 @@ class RoomVoiceService:
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
         self._utt_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=4)
+        self._speaker_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=16)
 
         self._model: Any = None
         self._model_size_loaded: str = ""
@@ -620,6 +1103,9 @@ class RoomVoiceService:
             rms_gate=self.cfg.rms_gate,
         )
         self._sapi = _SapiSynthesizer()
+        cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
+        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, sapi_fallback=self._sapi)
+        self.ab = VoiceAbTracker(root_dir=root_dir)
 
         self.listening = False
         self.last_error: str | None = None
@@ -651,17 +1137,26 @@ class RoomVoiceService:
                 self._ensure_model_loading_locked()
             t_cap = threading.Thread(target=self._capture_supervisor_loop, name="armory-voice-cap", daemon=True)
             t_asr = threading.Thread(target=self._asr_worker_loop, name="armory-voice-asr", daemon=True)
+            t_spk = threading.Thread(target=self._speaker_worker_loop, name="armory-voice-spk", daemon=True)
             t_cap.start()
             t_asr.start()
-            self._worker_threads = [t_cap, t_asr]
+            t_spk.start()
+            self._worker_threads = [t_cap, t_asr, t_spk]
+            if self._allow_hardware_audio and self.cfg.speaker_readback:
+                t_pre = threading.Thread(target=self._prewarm_tts_worker, name="armory-voice-ttswarm", daemon=True)
+                t_pre.start()
 
     def stop(self) -> None:
         self._stop_event.set()
         with self.lock:
             self._started = False
             self._cond.notify_all()
+        try:
+            self._speaker_queue.put_nowait(("stop", None))
+        except queue.Full:
+            pass
         self._close_stream()
-        self._sapi.close()
+        self._tts.close()
         for t in self._worker_threads:
             t.join(timeout=1.5)
         self._worker_threads.clear()
@@ -814,6 +1309,7 @@ class RoomVoiceService:
                 "hostApi": self._stream_host_api or (in_dev["hostApi"] if in_dev else ""),
                 "speaker": out_dev["name"] if out_dev else self.cfg.speaker_match,
                 "speakerReadback": bool(self.cfg.speaker_readback),
+                "ttsVoice": self.cfg.tts_voice,
                 "sseClients": self.sse_clients,
                 "contextActive": self.context_active,
                 "wallboardActive": self.wallboard_active,
@@ -823,6 +1319,7 @@ class RoomVoiceService:
                 "error": self._model_error or self.last_error,
                 "config": self.cfg.to_dict(),
                 "recent": list(self.recent_transcripts),
+                "abSummary": self.ab.summary_dict(),
             }
             if devs_snap is not None:
                 out["devices"] = devs_snap
@@ -960,36 +1457,94 @@ class RoomVoiceService:
 
     # ---------- speaker output ----------
 
-    def _play_pcm_to_speaker(self, mono_pcm: np.ndarray, src_sr: int, gain: float = 0.7) -> bool:
-        if not self._allow_hardware_audio or mono_pcm.size == 0:
-            return False
+    def _resolve_speaker(self) -> dict[str, Any] | None:
         with self._audio_lock:
             out_dev = resolve_audio_device("out", self.cfg.speaker_match)
-            if out_dev is None:
+            if out_dev is None and self._stream is None:
                 try:
                     sd._terminate()
                     sd._initialize()
                 except Exception:
                     pass
                 out_dev = resolve_audio_device("out", self.cfg.speaker_match)
-            if out_dev is None:
+            return out_dev
+
+    def _play_pcm_blocking(
+        self,
+        mono_pcm: np.ndarray,
+        src_sr: int,
+        lead_ms: int = 420,
+        tail_ms: int = 300,
+        target_peak: float = 0.84,
+    ) -> bool:
+        if not self._allow_hardware_audio or mono_pcm.size == 0:
+            return False
+        out_dev = self._resolve_speaker()
+        if out_dev is None:
+            return False
+        dst_sr = int(out_dev["sampleRate"] or 48_000)
+        dst_ch = max(1, int(out_dev["channels"] or 1))
+        try:
+            payload = prepare_speaker_pcm(
+                mono_pcm,
+                src_sr=src_sr,
+                dst_sr=dst_sr,
+                dst_ch=dst_ch,
+                lead_ms=lead_ms,
+                tail_ms=tail_ms,
+                target_peak=target_peak,
+            )
+            if payload.size == 0:
                 return False
-            dst_sr = int(out_dev["sampleRate"] or 48_000)
-            dst_ch = max(1, int(out_dev["channels"] or 1))
+            dur_sec = float(payload.shape[0]) / float(dst_sr)
+            self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur_sec + 0.35)
+            sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=True)
+            return True
+        except Exception as exc:
+            self.log.debug("Speaker playback failed on %s: %s", out_dev.get("name"), exc)
+            return False
+
+    def _speaker_worker_loop(self) -> None:
+        while not self._stop_event.is_set():
             try:
-                scaled = resample_from_to(mono_pcm, src_sr, dst_sr) * float(gain)
-                scaled = np.clip(scaled, -0.95, 0.95).astype(np.float32)
-                dur_sec = float(scaled.size) / float(dst_sr)
-                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur_sec + 0.38)
-                payload = np.repeat(scaled[:, None], dst_ch, axis=1) if dst_ch > 1 else scaled
-                sd.play(payload, samplerate=dst_sr, device=out_dev["index"], blocking=False)
-                return True
+                kind, data = self._speaker_queue.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            if self._stop_event.is_set() or kind == "stop":
+                break
+            try:
+                if kind == "pcm":
+                    pcm, sr, lead_ms, tail_ms, target_peak = data
+                    self._play_pcm_blocking(pcm, sr, lead_ms=lead_ms, tail_ms=tail_ms, target_peak=target_peak)
+                elif kind == "tts":
+                    text, voice = data
+                    rendered = self._tts.synthesize(text, voice=voice)
+                    if rendered:
+                        pcm, sr = rendered
+                        self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84)
             except Exception as exc:
-                self.log.debug("Speaker playback failed on %s: %s", out_dev.get("name"), exc)
-                return False
+                self.log.debug("Speaker worker error: %s", exc)
+
+    def _prewarm_tts_worker(self) -> None:
+        voice = self.cfg.tts_voice
+        if voice == "sapi":
+            return
+        for phrase in PREWARM_TTS_PHRASES:
+            if self._stop_event.is_set():
+                return
+            if self._tts.get_cached(phrase, voice) is not None:
+                continue
+            try:
+                self._tts.synthesize(phrase, voice=voice)
+            except Exception:
+                pass
+            if self._stop_event.wait(0.15):
+                return
 
     def play_ready_chime(self) -> bool:
         """Play a brief 120 ms two-tone ready chime on the PowerConf S330 speaker."""
+        if not self._allow_hardware_audio:
+            return False
         sr = 48_000
         n1 = int(sr * 0.055)
         n2 = int(sr * 0.065)
@@ -1001,19 +1556,39 @@ class RoomVoiceService:
             np.sin(2.0 * np.pi * 880.0 * t1) * env1,
             np.sin(2.0 * np.pi * 1174.66 * t2) * env2,
         ]).astype(np.float32)
-        return self._play_pcm_to_speaker(tone, sr, gain=0.22)
+        if self._started:
+            try:
+                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.85)
+                self._speaker_queue.put_nowait(("pcm", (tone, sr, 220, 150, 0.28)))
+                return True
+            except queue.Full:
+                return False
+        return self._play_pcm_blocking(tone, sr, lead_ms=220, tail_ms=150, target_peak=0.28)
 
     def speak_confirmation(self, text: str) -> bool:
-        """Synthesize concise confirmation speech and play it directly to PowerConf S330."""
+        """Synthesize natural neural confirmation speech and queue padded playback to PowerConf S330."""
+        clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
+        if not clean:
+            return False
         if self._speak_fn is not None:
-            return bool(self._speak_fn(text))
+            return bool(self._speak_fn(clean))
         if not self._allow_hardware_audio:
             return False
-        rendered = self._sapi.synthesize(text)
+        if self._resolve_speaker() is None:
+            return False
+        voice = self.cfg.tts_voice
+        if self._started:
+            try:
+                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 2.4)
+                self._speaker_queue.put_nowait(("tts", (clean, voice)))
+                return True
+            except queue.Full:
+                return False
+        rendered = self._tts.synthesize(clean, voice=voice)
         if not rendered:
             return False
         pcm, sr = rendered
-        return self._play_pcm_to_speaker(pcm, sr, gain=0.82)
+        return self._play_pcm_blocking(pcm, sr, lead_ms=420, tail_ms=300, target_peak=0.84)
 
     # ---------- capture & ASR loops ----------
 

@@ -27,6 +27,7 @@ import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
 import { castClipToWallboard, closeWallboardReplay, openSetVideoSheet, pickRecordCameraSheet, playVideo } from './video';
+import { openVoiceAbShootoutSheet } from './voiceAbSheet';
 
 const KIND_LABEL: Record<SetKind, string> = { n: 'Normal', w: 'Warm-up', d: 'Drop set', f: 'To failure' };
 const KIND_CHAR: Record<SetKind, string> = { n: '', w: 'W', d: 'D', f: 'F' };
@@ -252,29 +253,41 @@ function build(root: HTMLElement, id?: string): () => void {
     if (!btn) return;
     const lbl = btn.querySelector<HTMLElement>('#smicLbl');
     const st = getSettings();
-    const roomLive = st.voiceRoomEnabled && voice.roomListening;
-    const phoneLive = st.voiceEnabled && voice.listening;
+    const roomLive = (st.voiceRoomEnabled || st.voiceAbCompare) && voice.roomListening;
+    const phoneLive = (st.voiceEnabled || st.voiceAbCompare) && voice.listening;
     const anyLive = roomLive || phoneLive;
-    const waiting = st.voiceEnabled && !voice.listening && !roomLive;
+    const waiting = (st.voiceEnabled || st.voiceAbCompare) && !voice.listening && !roomLive;
     const armed = voice.isArmed();
     btn.classList.toggle('on', anyLive && !armed);
-    btn.classList.toggle('armed', (anyLive || st.voiceEnabled || st.voiceRoomEnabled) && armed);
+    btn.classList.toggle('armed', (anyLive || st.voiceEnabled || st.voiceRoomEnabled || st.voiceAbCompare) && armed);
     btn.classList.toggle('warn', waiting);
     if (lbl) {
-      lbl.textContent = !anyLive && !waiting ? '' : armed ? 'ARMED' : phoneLive ? 'MIC' : roomLive ? 'ROOM' : 'MIC …';
+      lbl.textContent = !anyLive && !waiting
+        ? ''
+        : armed
+          ? 'ARMED'
+          : st.voiceAbCompare
+            ? 'A/B'
+            : phoneLive
+              ? 'MIC'
+              : roomLive
+                ? 'ROOM'
+                : 'MIC …';
     }
-    btn.setAttribute('aria-pressed', String(st.voiceRoomEnabled || st.voiceEnabled));
+    btn.setAttribute('aria-pressed', String(st.voiceRoomEnabled || st.voiceEnabled || st.voiceAbCompare));
     btn.title = armed
       ? 'Listening for command…'
-      : roomLive && !phoneLive
-        ? `Room Mic live (${voice.roomDevice || 'PowerConf S330'}) — say "${st.voiceWakeWord || 'armory'} …"`
-        : phoneLive
-          ? `Mic live — say "${st.voiceWakeWord || 'armory'} …"`
-          : waiting
-            ? 'Phone mic recovering — tap for Voice Input'
-            : st.voiceRoomEnabled
-              ? 'Room Mic standby / offline — tap for Voice Input'
-              : 'Enable hands-free voice logging';
+      : st.voiceAbCompare
+        ? 'Dual-Mic A/B Benchmark active — Room + Phone mics comparing'
+        : roomLive && !phoneLive
+          ? `Room Mic live (${voice.roomDevice || 'PowerConf S330'}) — say "${st.voiceWakeWord || 'armory'} …"`
+          : phoneLive
+            ? `Mic live — say "${st.voiceWakeWord || 'armory'} …"`
+            : waiting
+              ? 'Phone mic recovering — tap for Voice Input'
+              : st.voiceRoomEnabled
+                ? 'Room Mic standby / offline — tap for Voice Input'
+                : 'Enable hands-free voice logging';
   };
 
   const paint = (): void => {
@@ -1170,6 +1183,10 @@ function build(root: HTMLElement, id?: string): () => void {
             : voice.lastHeard
               ? `Heard “${esc(voice.lastHeard)}”`
               : `Say “${esc(st.voiceWakeWord || 'armory')} 225 for 8” or “check”`;
+          const abSum = voice.abSummary;
+          const abSub = abSum && abSum.totalTrials > 0
+            ? `Room ${abSum.roomCatchPct}% vs Phone ${abSum.phoneCatchPct}% (${abSum.deltaPts > 0 ? '+' : ''}${abSum.deltaPts} pts · ${abSum.totalTrials} trials)`
+            : 'Logs both mics silently during sets with 4.5s dedup (zero double-logging)';
           sh.body.querySelector('#vxSheetBody')!.innerHTML = `
             <h3 class="sh-title">Voice Input</h3>
             <p class="sh-text">${lastTxt}</p>
@@ -1185,9 +1202,14 @@ function build(root: HTMLElement, id?: string): () => void {
               <b>Spoken Readback: ${st.voiceReadback ? 'ON' : 'OFF'}</b>
               <small>Plays confirmations on PowerConf S330 speaker (or Pixel when away)</small>
             </button>
+            <button class="aitem${st.voiceAbCompare ? ' on' : ''}" type="button" data-vxact="ab" style="margin:6px 0">
+              <b>Dual-Mic A/B Benchmark: ${st.voiceAbCompare ? 'ON' : 'OFF'}</b>
+              <small>${esc(abSub)}</small>
+            </button>
             <div class="vp-foot-row" style="margin-top:8px">
-              ${st.voiceRoomEnabled ? '<button class="btn sm" type="button" data-vxact="reconnect">Reconnect Room Mic</button>' : ''}
-              ${st.voiceEnabled ? '<button class="btn sm" type="button" data-vxact="restartPhone">Restart Phone Mic</button>' : ''}
+              <button class="btn sm primary" type="button" data-vxact="shootout">Run 10-Phrase Shootout</button>
+              ${st.voiceRoomEnabled || st.voiceAbCompare ? '<button class="btn sm" type="button" data-vxact="reconnect">Reconnect Room Mic</button>' : ''}
+              ${st.voiceEnabled || st.voiceAbCompare ? '<button class="btn sm" type="button" data-vxact="restartPhone">Restart Phone Mic</button>' : ''}
             </div>
             <button class="btn big" type="button" data-vxact="close" style="margin-top:8px">Close</button>`;
         };
@@ -1195,6 +1217,7 @@ function build(root: HTMLElement, id?: string): () => void {
         offSheetSet = settingsChanged.on(renderVoiceSheet);
         renderVoiceSheet();
         if (getSettings().voiceRoomEnabled && !voice.roomOnline) void voice.refreshRoomStatus();
+        void voice.fetchAbSummary();
         sh.body.addEventListener('click', (ev) => {
           const actEl = (ev.target as HTMLElement).closest<HTMLElement>('[data-vxact]');
           if (!actEl) return;
@@ -1214,6 +1237,15 @@ function build(root: HTMLElement, id?: string): () => void {
           } else if (kind === 'readback') {
             updateSettings({ voiceReadback: !getSettings().voiceReadback });
             voice.refreshBiasPhrases();
+          } else if (kind === 'ab') {
+            const next = !getSettings().voiceAbCompare;
+            void voice.setAbCompare(next).then((ok) => {
+              paintMic();
+              if (ok) toast(next ? 'Dual-Mic A/B Benchmark ON' : 'Dual-Mic A/B Benchmark OFF');
+            });
+          } else if (kind === 'shootout') {
+            sh.close();
+            void openVoiceAbShootoutSheet();
           } else if (kind === 'reconnect') {
             voice.reconnectRoom();
             toast('Reconnecting Room Mic…');

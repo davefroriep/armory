@@ -60,6 +60,8 @@ export interface Settings {
   voiceEnabled: boolean;
   /** OptiPlex Room Mic (Anker PowerConf S330 via :8766 SSE) during active Strength workouts on home Wi-Fi. */
   voiceRoomEnabled: boolean;
+  /** Passive dual-mic A/B benchmark mode (runs Room + Phone mics simultaneously during workouts with 4.5s execution dedup). */
+  voiceAbCompare: boolean;
   voiceWakeWord: string;
   /** Speak short confirmation readbacks ("For 10, got it" / "Didn't catch that") after voice commands. */
   voiceReadback: boolean;
@@ -118,6 +120,7 @@ export const DEFAULTS: Settings = {
   wallboardRelayEnabled: true,
   voiceEnabled: false,
   voiceRoomEnabled: true,
+  voiceAbCompare: false,
   voiceWakeWord: 'armory',
   voiceReadback: true,
   voiceCustomAliases: {},
@@ -171,6 +174,7 @@ function load(): Settings {
       ...parsed,
       apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : DEFAULTS.apiKey,
       voiceRoomEnabled: typeof parsed.voiceRoomEnabled === 'boolean' ? parsed.voiceRoomEnabled : DEFAULTS.voiceRoomEnabled,
+      voiceAbCompare: typeof parsed.voiceAbCompare === 'boolean' ? parsed.voiceAbCompare : DEFAULTS.voiceAbCompare,
       voiceReadback: typeof parsed.voiceReadback === 'boolean' ? parsed.voiceReadback : DEFAULTS.voiceReadback,
       gymCamBuddyMode: typeof parsed.gymCamBuddyMode === 'boolean' ? parsed.gymCamBuddyMode : DEFAULTS.gymCamBuddyMode,
       gymCamPreviewUrl: typeof parsed.gymCamPreviewUrl === 'string' && parsed.gymCamPreviewUrl.trim() ? parsed.gymCamPreviewUrl.trim() : DEFAULTS.gymCamPreviewUrl,

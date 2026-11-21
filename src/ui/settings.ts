@@ -18,6 +18,7 @@ import { backupCardHtml, wireBackupCard } from './backupUi';
 import { revFooter, topbar, wireChips } from './chrome';
 import { $, esc } from './dom';
 import { toast } from './lifts/kit';
+import { openVoiceAbShootoutSheet } from './lifts/voiceAbSheet';
 
 export function settingsScreen(root: HTMLElement): () => void {
   const s = getSettings();
@@ -80,6 +81,12 @@ export function settingsScreen(root: HTMLElement): () => void {
       <div class="line"><span>Room Mic (OptiPlex PowerConf S330)<small>Default on Armory Wi-Fi · listens on OptiPlex during active Strength workouts</small></span>${tog('voiceRoomEnabled', s.voiceRoomEnabled)}</div>
       <div class="line"><span>Phone Mic (Pixel On-Device)<small>Off by default · optional fallback when away from home Wi-Fi</small></span><button class="switch ${s.voiceEnabled ? 'on' : ''}" id="vxTog" role="switch" aria-checked="${s.voiceEnabled}"><i></i></button></div>
       <div class="line"><span>Spoken Voice Readback<small>Plays confirmations on PowerConf S330 speaker (or Pixel when away)</small></span>${tog('voiceReadback', s.voiceReadback)}</div>
+      <div class="line"><span>Dual-Mic A/B Benchmark (Workout)<small>Silently scores Room vs. Phone mic catch rate during lifts with 4.5s dedup</small></span><button class="switch ${s.voiceAbCompare ? 'on' : ''}" id="vxAbTog" role="switch" aria-checked="${s.voiceAbCompare}"><i></i></button></div>
+      <div class="hint" id="vxAbStatus"></div>
+      <div class="row" style="margin-top:4px">
+        <button class="btn sm primary" id="vxShootoutBtn" type="button">Run 10-Phrase Mic Shootout</button>
+        <button class="btn sm" id="vxAbReset" type="button">Reset A/B</button>
+      </div>
       <label class="field">Wake word<input id="vxWake" value="${esc(s.voiceWakeWord || 'armory')}" placeholder="armory" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
       <div class="hint" id="vxStatus"></div>
       <div class="row" style="margin-top:4px">
@@ -207,6 +214,28 @@ export function settingsScreen(root: HTMLElement): () => void {
       vxRb.classList.toggle('on', cur.voiceReadback);
       vxRb.setAttribute('aria-checked', String(cur.voiceReadback));
     }
+    const vxAbTog = root.querySelector<HTMLElement>('#vxAbTog');
+    if (vxAbTog) {
+      vxAbTog.classList.toggle('on', cur.voiceAbCompare);
+      vxAbTog.setAttribute('aria-checked', String(cur.voiceAbCompare));
+    }
+    const vxAbEl = root.querySelector<HTMLElement>('#vxAbStatus');
+    if (vxAbEl) {
+      const ab = voice.abSummary;
+      const latestRun = voice.abRuns[0];
+      const parts: string[] = [];
+      if (ab && ab.totalTrials > 0) {
+        const sign = ab.deltaPts > 0 ? '+' : '';
+        parts.push(`Workout A/B (${ab.totalTrials}): Room <b>${ab.roomCatchPct}%</b> vs Phone <b>${ab.phoneCatchPct}%</b> (<b>${sign}${ab.deltaPts} pts</b>)`);
+      } else {
+        parts.push('No workout A/B trials yet');
+      }
+      if (latestRun) {
+        const rSign = latestRun.deltaPts > 0 ? '+' : '';
+        parts.push(`Last Shootout (${esc(latestRun.label)}): Room <b>${latestRun.roomIntentPct}%</b> vs Phone <b>${latestRun.phoneIntentPct}%</b> (${rSign}${latestRun.deltaPts} pts)`);
+      }
+      vxAbEl.innerHTML = parts.join(' · ');
+    }
     const vxEl = $('#vxStatus', root);
     const roomPart = !cur.voiceRoomEnabled
       ? 'Room Mic off'
@@ -312,6 +341,7 @@ export function settingsScreen(root: HTMLElement): () => void {
   const offCam = gymCam.changed.on(paintFtpBox);
   void wallboard.refreshStatus();
   void voice.refreshRoomStatus();
+  void voice.fetchAbSummary();
   if (hasKey()) void syncAthleteFtp(false).catch(() => {});
 
   const onClick = (e: Event) => {
@@ -362,6 +392,15 @@ export function settingsScreen(root: HTMLElement): () => void {
       void navigator.clipboard?.writeText(u).then(() => toast(`Copied ${u}`)).catch(() => toast(u));
     }
     if (t.closest('#vxTog')) void voice.setEnabled(!getSettings().voiceEnabled).then(paintFtpBox);
+    if (t.closest('#vxAbTog')) void voice.setAbCompare(!getSettings().voiceAbCompare).then(paintFtpBox);
+    if (t.closest('#vxShootoutBtn')) void openVoiceAbShootoutSheet(paintFtpBox);
+    if (t.closest('#vxAbReset')) {
+      void voice.resetAbStats(false).then((res) => {
+        if (res) toast('Cleared workout A/B stats');
+        else toast('OptiPlex offline');
+        paintFtpBox();
+      });
+    }
     if (t.closest('#vxRun')) {
       const phrase = $<HTMLInputElement>('#vxTest', root).value.trim();
       if (phrase) {

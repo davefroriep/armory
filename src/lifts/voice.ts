@@ -16,7 +16,7 @@ import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
 import {
   defaultReadbackForIntent, describeVoiceIntent, hasCommandTailAfterWake, hasWakeWord,
-  parseVoiceTranscript, type VoiceIntent,
+  parseVoiceTranscript, voiceIntentKey, type VoiceIntent,
 } from './voiceParser';
 
 export interface VoiceActionNotice {
@@ -24,6 +24,48 @@ export interface VoiceActionNotice {
   kind: 'ok' | 'info' | 'warn';
   atMs: number;
   speech?: string | null;
+}
+
+export interface AbMicSample {
+  source: NativeVoiceEvent['source'];
+  tsMs: number;
+  transcript: string;
+  matched: boolean;
+  intentKey: string;
+  intentLabel: string;
+  hasWake: boolean;
+  station?: string;
+  executed?: boolean;
+}
+
+export interface AbSummary {
+  totalTrials: number;
+  bothMatch: number;
+  roomOnly: number;
+  phoneOnly: number;
+  disagree: number;
+  bothMissed: number;
+  roomWins: number;
+  phoneWins: number;
+  roomCatchPct: number;
+  phoneCatchPct: number;
+  deltaPts: number;
+  relativeGainPct: number | null;
+  agreementPct: number | null;
+  byStation: { station: string; trials: number; roomCatchPct: number; phoneCatchPct: number; deltaPts: number }[];
+}
+
+export interface AbShootoutRun {
+  id: string;
+  tsMs: number;
+  label: string;
+  phrasesCount: number;
+  roomIntentPct: number;
+  phoneIntentPct: number;
+  deltaPts: number;
+  roomWordPct: number;
+  phoneWordPct: number;
+  items?: unknown[];
 }
 
 type UndoEntry =
@@ -79,6 +121,9 @@ class VoiceController {
   roomReady = false;
   roomDevice = '';
   roomError: string | null = null;
+  abSummary: AbSummary | null = null;
+  abRuns: AbShootoutRun[] = [];
+  shootoutActive = false;
   lastSource: NativeVoiceEvent['source'] | null = null;
   lastHeard = '';
   lastError: string | null = null;
@@ -107,6 +152,9 @@ class VoiceController {
   private roomRetryMs = 2000;
   private lastRoomEventId = 0;
   private lastRoomCfgSig = '';
+  private shootoutListener: ((sample: AbMicSample) => void) | null = null;
+  private abExecAtMs = 0;
+  private abExecSource: NativeVoiceEvent['source'] | null = null;
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
@@ -126,7 +174,7 @@ class VoiceController {
     });
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && this.liftScreenMounted) this.ensureRoomConnected();
+        if (!document.hidden && (this.liftScreenMounted || this.shootoutActive)) this.ensureRoomConnected();
       });
     }
     this.syncSessionFromSettings();
@@ -182,9 +230,91 @@ class VoiceController {
     updateSettings({ voiceRoomEnabled: on });
   }
 
+  async setAbCompare(on: boolean): Promise<boolean> {
+    if (on && isNative()) {
+      const ok = await ensureNativeVoicePermission();
+      if (!ok) {
+        this.toasted.emit({ msg: 'Microphone permission needed for Dual-Mic A/B benchmark' });
+        return false;
+      }
+    }
+    updateSettings({ voiceAbCompare: on });
+    if (on) void this.fetchAbSummary();
+    return true;
+  }
+
+  async startShootout(cb: (sample: AbMicSample) => void): Promise<boolean> {
+    if (isNative()) {
+      const ok = await ensureNativeVoicePermission();
+      if (!ok) {
+        this.toasted.emit({ msg: 'Microphone permission denied' });
+        return false;
+      }
+    }
+    this.shootoutListener = cb;
+    this.shootoutActive = true;
+    this.syncSessionFromSettings();
+    this.changed.emit();
+    return true;
+  }
+
+  stopShootout(): void {
+    if (!this.shootoutActive && !this.shootoutListener) return;
+    this.shootoutActive = false;
+    this.shootoutListener = null;
+    this.syncSessionFromSettings();
+    this.changed.emit();
+  }
+
+  async fetchAbSummary(): Promise<AbSummary | null> {
+    const s = getSettings();
+    if (!s.gymCamEnabled || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1800);
+    try {
+      const res = await fetch(`${this.roomBaseUrl()}/api/voice/ab`, { signal: ctrl.signal, cache: 'no-store' });
+      if (!res.ok) return null;
+      const d = (await res.json()) as { summary?: AbSummary; runs?: AbShootoutRun[] };
+      if (d.summary) this.abSummary = d.summary;
+      if (Array.isArray(d.runs)) this.abRuns = d.runs;
+      this.changed.emit();
+      return this.abSummary;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async saveShootoutRun(run: Omit<AbShootoutRun, 'id' | 'deltaPts'>): Promise<AbShootoutRun | null> {
+    const res = await this.postRoomJson<{ ok?: boolean; run?: AbShootoutRun; runs?: AbShootoutRun[] }>('/api/voice/ab/run', run, 2500);
+    if (Array.isArray(res?.runs)) this.abRuns = res!.runs;
+    this.changed.emit();
+    return res?.run ?? null;
+  }
+
+  async resetAbStats(clearRuns = false): Promise<AbSummary | null> {
+    const res = await this.postRoomJson<{ ok?: boolean; summary?: AbSummary }>('/api/voice/ab/reset', { clearRuns }, 2000);
+    if (res?.summary) this.abSummary = res.summary;
+    if (clearRuns) this.abRuns = [];
+    this.changed.emit();
+    return this.abSummary;
+  }
+
+  private recordAbSample(sample: AbMicSample): void {
+    void this.postRoomJson<{ ok?: boolean; summary?: AbSummary }>('/api/voice/ab/sample', sample, 1500).then((res) => {
+      if (res?.summary) {
+        this.abSummary = res.summary;
+        this.changed.emit();
+      }
+    });
+  }
+
   ensureRoomConnected(): void {
     const s = getSettings();
-    const want = this.liftScreenMounted && s.voiceRoomEnabled && s.gymCamEnabled && typeof EventSource !== 'undefined';
+    const want = (this.shootoutActive || ((s.voiceRoomEnabled || s.voiceAbCompare) && this.liftScreenMounted))
+      && s.gymCamEnabled
+      && typeof EventSource !== 'undefined';
     if (!want) return;
     if (!this.roomEs || this.roomEs.readyState === 2) {
       if (this.roomRetryTimer) { clearTimeout(this.roomRetryTimer); this.roomRetryTimer = null; }
@@ -331,7 +461,8 @@ class VoiceController {
   }
 
   private syncSessionFromSettings(): void {
-    const want = getSettings().voiceEnabled && this.liftScreenMounted;
+    const s = getSettings();
+    const want = this.shootoutActive || ((s.voiceEnabled || s.voiceAbCompare) && this.liftScreenMounted);
     if (want && (!this.listening || (isNative() && !this.nativeDesired)) && (isNative() || typeof window !== 'undefined')) {
       void this.applyListening(true);
     } else if (!want && (this.listening || this.webRec || (isNative() && this.nativeDesired))) {
@@ -346,7 +477,9 @@ class VoiceController {
 
   private syncRoomStream(): void {
     const s = getSettings();
-    const want = this.liftScreenMounted && s.voiceRoomEnabled && s.gymCamEnabled && typeof EventSource !== 'undefined';
+    const want = (this.shootoutActive || ((s.voiceRoomEnabled || s.voiceAbCompare) && this.liftScreenMounted))
+      && s.gymCamEnabled
+      && typeof EventSource !== 'undefined';
     const cfgSig = `${this.roomBaseUrl()}|${s.voiceWakeWord}|${s.voiceReadback}`;
     if (!want) {
       if (this.roomEs || this.roomRetryTimer || this.roomOnline || this.roomListening) {
@@ -623,10 +756,11 @@ class VoiceController {
       return;
     }
 
-    const wakeWord = getSettings().voiceWakeWord;
+    const s = getSettings();
+    const wakeWord = s.voiceWakeWord;
     if (!ev.isFinal && ev.source !== 'lan' && ev.source !== 'room') {
       this.lastHeard = pool[0];
-      if (!this.isArmed() && pool.some((c) => hasWakeWord(c, wakeWord))) {
+      if (!this.shootoutActive && !this.isArmed() && pool.some((c) => hasWakeWord(c, wakeWord))) {
         this.armNow();
         buzz(20);
       }
@@ -636,14 +770,47 @@ class VoiceController {
 
     const now = Date.now();
     const sig = pool[0].toLowerCase();
-    const dedupMs = ev.source !== this.lastSource ? 2200 : 450;
-    if (sig === this.lastFinalSig && now - this.lastFinalAt < dedupMs) return;
+    const abActive = !this.shootoutActive && s.voiceAbCompare;
+    const sameSource = ev.source === this.lastSource;
+    if (this.shootoutActive || abActive) {
+      if (sameSource && sig === this.lastFinalSig && now - this.lastFinalAt < 450) return;
+    } else {
+      const dedupMs = !sameSource ? 2200 : 450;
+      if (sig === this.lastFinalSig && now - this.lastFinalAt < dedupMs) return;
+    }
     this.lastFinalSig = sig;
     this.lastFinalAt = now;
     this.lastSource = ev.source;
 
+    const customAliases = s.voiceCustomAliases;
+    if (this.shootoutActive && this.shootoutListener) {
+      let matchedCand: string | null = null;
+      let intent: VoiceIntent | null = null;
+      for (const cand of pool) {
+        const hit = parseVoiceTranscript(cand, { wakeWord, armed: false, customAliases });
+        if (hit) {
+          matchedCand = cand;
+          intent = hit;
+          break;
+        }
+      }
+      const heard = matchedCand ?? pool[0];
+      this.lastHeard = heard;
+      const sample: AbMicSample = {
+        source: ev.source,
+        tsMs: now,
+        transcript: heard,
+        matched: !!intent && intent.kind !== 'arm_wake',
+        intentKey: voiceIntentKey(intent),
+        intentLabel: intent ? describeVoiceIntent(intent) : 'Unmatched',
+        hasWake: pool.some((c) => hasWakeWord(c, wakeWord)),
+      };
+      this.shootoutListener(sample);
+      this.changed.emit();
+      return;
+    }
+
     const armed = this.isArmed();
-    const customAliases = getSettings().voiceCustomAliases;
     let matchedCand: string | null = null;
     let intent: VoiceIntent | null = null;
     for (const cand of pool) {
@@ -654,7 +821,40 @@ class VoiceController {
         break;
       }
     }
-    this.lastHeard = matchedCand ?? pool[0];
+    const heard = matchedCand ?? pool[0];
+    this.lastHeard = heard;
+
+    if (abActive) {
+      const matchedCmd = !!intent && intent.kind !== 'arm_wake';
+      const hasWake = pool.some((c) => hasWakeWord(c, wakeWord));
+      const hasTail = hasCommandTailAfterWake(pool[0], wakeWord, armed);
+      const suppressed = this.abExecSource != null && ev.source !== this.abExecSource && (now - this.abExecAtMs) < 4500;
+      const sess = lifts.active;
+      const curPtr = sess ? resolveTargetSet(sess.exs, this.cursor) : null;
+      const station = curPtr && sess ? lifts.exOrStub(sess.exs[curPtr.exIdx].exId).name : '';
+      if (matchedCmd || hasTail || hasWake) {
+        this.recordAbSample({
+          source: ev.source,
+          tsMs: now,
+          transcript: heard,
+          matched: matchedCmd,
+          intentKey: voiceIntentKey(intent),
+          intentLabel: intent ? describeVoiceIntent(intent) : (hasTail ? 'Unmatched' : 'Wake only'),
+          hasWake,
+          station,
+          executed: !suppressed && matchedCmd,
+        });
+      }
+      if (suppressed) {
+        this.changed.emit();
+        return;
+      }
+      if (matchedCmd) {
+        this.abExecAtMs = now;
+        this.abExecSource = ev.source;
+      }
+    }
+
     if (!intent) {
       if (hasCommandTailAfterWake(pool[0], wakeWord, armed)) {
         this.armedUntilMs = 0;

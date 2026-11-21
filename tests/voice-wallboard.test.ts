@@ -11,7 +11,8 @@ import {
 } from '../src/lifts/cursor';
 import { buildExercise, driveUrlFor, secondsSinceLastSet } from '../src/lifts/logic';
 import {
-  defaultReadbackForIntent, hasCommandTailAfterWake, hasWakeWord, parseVoiceTranscript,
+  AB_SHOOTOUT_PHRASES, defaultReadbackForIntent, hasCommandTailAfterWake, hasWakeWord,
+  parseVoiceTranscript, voiceIntentKey, voiceTokenMatchPct,
 } from '../src/lifts/voiceParser';
 import { prescriptionFor, resolvePrescription } from '../src/lifts/prescriptions';
 import { TV_H, TV_W, WALLBOARD_HTML, computeTvPreviewFit } from '../src/wallboard/page';
@@ -897,5 +898,16 @@ describe('wallboard snapshot & routing', () => {
     expect(wbRoom.voice.enabled).toBe(true);
     expect(wbRoom.voice.listening).toBe(true);
     expect(wbRoom.lift!.stage!.stations[0].voiceHint!.micState).toBe('ready');
+    expect(DEFAULTS.voiceAbCompare).toBe(false);
+
+    // Every guided shootout phrase parses cleanly to its canonical expectedIntentKey
+    expect(AB_SHOOTOUT_PHRASES).toHaveLength(10);
+    for (const item of AB_SHOOTOUT_PHRASES) {
+      const parsed = parseVoiceTranscript(item.phrase);
+      expect(voiceIntentKey(parsed)).toBe(item.expectedIntentKey);
+      expect(voiceTokenMatchPct(item.phrase, item.phrase)).toBe(100);
+    }
+    expect(voiceTokenMatchPct('armory two twenty five for eight', 'Armory 225 for 8')).toBe(100);
+    expect(voiceTokenMatchPct('armory skip rest', 'Armory next exercise')).toBeLessThan(60);
   });
 });

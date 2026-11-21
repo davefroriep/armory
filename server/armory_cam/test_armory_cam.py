@@ -1535,6 +1535,8 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIn("vxTestBtn", dash)
             self.assertIn("vxSpeakBtn", dash)
             self.assertIn("vxSaveBtn", dash)
+            self.assertIn("vxTtsVoice", dash)
+            self.assertIn("vxAbBox", dash)
 
             ping = client.get("/api/ping").get_json()
             self.assertIn("voice", ping)
@@ -1544,14 +1546,16 @@ class ArmoryCamTests(unittest.TestCase):
             # Config update persists across service reload
             cfg_res = client.post(
                 "/api/voice/config",
-                json={"listenMode": "always", "modelSize": "tiny.en", "vadThreshold": 0.55},
+                json={"listenMode": "always", "modelSize": "tiny.en", "vadThreshold": 0.55, "ttsVoice": "en-US-BrianNeural"},
             )
             self.assertEqual(cfg_res.status_code, 200)
             self.assertEqual(cfg_res.get_json()["config"]["listenMode"], "always")
+            self.assertEqual(cfg_res.get_json()["config"]["ttsVoice"], "en-US-BrianNeural")
 
             svc_reload = ac.ArmoryCamService(root_dir=tmp)
             self.assertEqual(svc_reload.voice_cfg.listen_mode, "always")
             self.assertEqual(svc_reload.voice_cfg.model_size, "tiny.en")
+            self.assertEqual(svc_reload.voice_cfg.tts_voice, "en-US-BrianNeural")
             self.assertAlmostEqual(svc_reload.voice_cfg.vad_threshold, 0.55)
 
             # Context update + SSE stream + inject + ack
@@ -1586,6 +1590,106 @@ class ArmoryCamTests(unittest.TestCase):
 
             st = client.get("/api/voice/status").get_json()
             self.assertEqual(st["recent"][0]["ackText"], "✓ 1 Low Bar Squat · 225 lb × 8")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_speaker_padding_and_dual_mic_ab_tracker_endpoints(self) -> None:
+        # 1. Speaker PCM padding & peak normalization prevents clipping
+        tone = 0.25 * np.sin(2.0 * np.pi * 440.0 * np.linspace(0, 0.5, 12_000, endpoint=False, dtype=np.float32))
+        padded = rv.prepare_speaker_pcm(tone, src_sr=24_000, dst_sr=48_000, dst_ch=2, lead_ms=420, tail_ms=300, target_peak=0.84)
+        self.assertEqual(padded.ndim, 2)
+        self.assertEqual(padded.shape[1], 2)
+        expected_min = int(round(48_000 * (0.42 + 0.50 + 0.30)))
+        self.assertGreaterEqual(padded.shape[0], expected_min - 8)
+        self.assertLessEqual(float(np.max(np.abs(padded))), 0.85)
+        self.assertLess(float(np.max(np.abs(padded[:10_000]))), 0.01)
+        self.assertAlmostEqual(float(np.max(np.abs(padded[-10_000:]))), 0.0, places=5)
+
+        # 2. A/B Tracker pairing, missed-wake raw attachment, metrics, adjudication, shootout runs, and persistence
+        tmp = Path(tempfile.mkdtemp(prefix="armory_ab_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            t0 = 1_763_600_000_000
+
+            # Trial 1: Both match within 4.5s
+            client.post("/api/voice/ab/sample", json={
+                "source": "mic", "tsMs": t0, "transcript": "Armory 225 for 8",
+                "matched": True, "intentKey": "log:225:8", "intentLabel": "225 × 8", "hasWake": True, "station": "Barbell Bench Press", "executed": True,
+            })
+            res1 = client.post("/api/voice/ab/sample", json={
+                "source": "room", "tsMs": t0 + 900, "transcript": "Armory 225 for 8",
+                "matched": True, "intentKey": "log:225:8", "intentLabel": "225 × 8", "hasWake": True, "station": "Barbell Bench Press", "executed": False,
+            }).get_json()
+            self.assertEqual(res1["trial"]["outcome"], "both_match")
+
+            # Trial 2: Room catches command while Phone misses
+            client.post("/api/voice/ab/sample", json={
+                "source": "room", "tsMs": t0 + 20_000, "transcript": "Armory skip rest",
+                "matched": True, "intentKey": "rest_skip", "intentLabel": "Skip rest", "hasWake": True, "station": "Barbell Bench Press", "executed": True,
+            })
+            res2 = client.post("/api/voice/ab/sample", json={
+                "source": "mic", "tsMs": t0 + 20_400, "transcript": "armory ...",
+                "matched": False, "intentKey": "none", "intentLabel": "Unmatched", "hasWake": True, "station": "Barbell Bench Press", "executed": False,
+            }).get_json()
+            self.assertEqual(res2["trial"]["outcome"], "room_only")
+
+            # Trial 3: Phone catches, Room missed wake (raw transcript attached from recent_transcripts)
+            svc.voice.recent_transcripts.appendleft({
+                "id": 99, "tsMs": t0 + 40_200, "transcript": "225 for 8", "wakeMatched": False, "emitted": False, "latencyMs": 950, "ackText": "",
+            })
+            res3 = client.post("/api/voice/ab/sample", json={
+                "source": "mic", "tsMs": t0 + 40_000, "transcript": "Armory 225 for 8",
+                "matched": True, "intentKey": "log:225:8", "intentLabel": "225 × 8", "hasWake": True, "station": "Smith Machine Row", "executed": True,
+            }).get_json()
+            self.assertEqual(res3["trial"]["outcome"], "phone_only")
+            self.assertEqual(res3["trial"]["room"]["transcript"], "225 for 8")
+
+            # Trial 4: Disagreement adjudicated in Room's favor
+            client.post("/api/voice/ab/sample", json={
+                "source": "mic", "tsMs": t0 + 60_000, "transcript": "Armory for 6",
+                "matched": True, "intentKey": "log:r:6", "intentLabel": "For 6", "hasWake": True, "station": "Smith Machine Row", "executed": True,
+            })
+            t4 = client.post("/api/voice/ab/sample", json={
+                "source": "room", "tsMs": t0 + 61_000, "transcript": "Armory for 8",
+                "matched": True, "intentKey": "log:r:8", "intentLabel": "For 8", "hasWake": True, "station": "Smith Machine Row", "executed": False,
+            }).get_json()["trial"]
+            self.assertEqual(t4["outcome"], "disagree")
+
+            resolved = client.post("/api/voice/ab/resolve", json={"trialId": t4["id"], "winner": "room"}).get_json()
+            s = resolved["summary"]
+            self.assertEqual(s["totalTrials"], 4)
+            self.assertEqual(s["roomWins"], 3)
+            self.assertEqual(s["phoneWins"], 2)
+            self.assertAlmostEqual(s["roomCatchPct"], 75.0)
+            self.assertAlmostEqual(s["phoneCatchPct"], 50.0)
+            self.assertAlmostEqual(s["deltaPts"], 25.0)
+            self.assertAlmostEqual(s["relativeGainPct"], 50.0)
+            self.assertAlmostEqual(s["agreementPct"], 50.0)
+
+            # Save a Guided 10-Phrase Shootout run and verify persistence across service reload
+            run_res = client.post("/api/voice/ab/run", json={
+                "label": "S330 Walking Desk",
+                "phrasesCount": 10,
+                "roomIntentPct": 90.0,
+                "phoneIntentPct": 60.0,
+                "roomWordPct": 93.4,
+                "phoneWordPct": 71.2,
+                "items": [{"phrase": "Armory 225 for 8", "roomMatch": True, "phoneMatch": False}],
+            }).get_json()
+            self.assertTrue(run_res["ok"])
+            self.assertAlmostEqual(run_res["run"]["deltaPts"], 30.0)
+
+            svc_reload = ac.ArmoryCamService(root_dir=tmp)
+            snap = svc_reload.voice.ab.snapshot_dict()
+            self.assertEqual(snap["summary"]["totalTrials"], 4)
+            self.assertEqual(snap["runs"][0]["label"], "S330 Walking Desk")
+
+            # Reset passive trials while keeping saved shootout runs
+            rst = client.post("/api/voice/ab/reset", json={"clearRuns": False}).get_json()
+            self.assertEqual(rst["summary"]["totalTrials"], 0)
+            self.assertEqual(len(client.get("/api/voice/ab").get_json()["runs"]), 1)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

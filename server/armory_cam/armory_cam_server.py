@@ -1709,6 +1709,7 @@ class ArmoryCamService:
             config=self.voice_cfg,
             on_fallback_transcript=self._forward_voice_to_wallboard_source,
             allow_hardware_audio=self._voice_autostart,
+            root_dir=self.root,
         )
 
         self.lock = threading.RLock()
@@ -4445,6 +4446,16 @@ DASHBOARD_HTML = """<!doctype html>
         <select id="vxReadback"><option value="1">Yes (Speak on S330)</option><option value="0">No (Pixel Only)</option></select>
       </div>
       <div>
+        <label>Speaker Voice</label>
+        <select id="vxTtsVoice">
+          <option value="en-US-AndrewNeural">Andrew (Neural Natural)</option>
+          <option value="en-US-BrianNeural">Brian (Neural Warm)</option>
+          <option value="en-US-GuyNeural">Guy (Neural Crisp)</option>
+          <option value="en-US-AriaNeural">Aria (Neural Female)</option>
+          <option value="sapi">Windows Offline SAPI</option>
+        </select>
+      </div>
+      <div>
         <label>Whisper Model (CPU int8)</label>
         <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (most accurate)</option></select>
       </div>
@@ -4461,6 +4472,15 @@ DASHBOARD_HTML = """<!doctype html>
       <span id="vxOut" style="color:var(--mut);font-size:12px"></span>
     </div>
     <div id="vxRecent" style="margin-top:10px;color:var(--mut);font-size:12px">No voice utterances captured yet.</div>
+    <div id="vxAbBox" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);color:var(--mut);font-size:12px">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+        <b style="color:var(--fg)">Dual-Mic A/B Metrics (PowerConf S330 vs. Pixel Phone Mic)</b>
+        <button class="btn sec sm" id="vxAbResetBtn" type="button">Reset Passive A/B</button>
+      </div>
+      <div id="vxAbSummary">Enable Dual-Mic A/B Benchmark or run the 10-Phrase Shootout in Armory Fit to compare catch % and improvement.</div>
+      <div id="vxAbRuns" style="margin-top:8px"></div>
+      <div id="vxAbTrials" style="margin-top:8px"></div>
+    </div>
   </div>
 
   <div class="card" style="margin-top:14px">
@@ -6605,6 +6625,7 @@ async function saveVoiceConfig(triggerBtn) {
     listenMode: $('vxMode').value || 'workout',
     deviceMatch: $('vxDevice').value || 'PowerConf S330',
     speakerReadback: $('vxReadback').value === '1',
+    ttsVoice: $('vxTtsVoice').value || 'en-US-AndrewNeural',
     modelSize: $('vxModel').value || 'base.en',
     vadThreshold: Number($('vxVad').value) || 0.45,
   };
@@ -6619,6 +6640,70 @@ async function saveVoiceConfig(triggerBtn) {
     $('vxOut').textContent = 'Save failed';
     if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Failed', 2500);
   }
+}
+
+async function resolveAbTrial(trialId, winner) {
+  try {
+    await fetch('/api/voice/ab/resolve', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ trialId, winner }) });
+    await pollVoiceAb();
+  } catch {}
+}
+
+async function pollVoiceAb() {
+  try {
+    const ab = await fetch('/api/voice/ab').then(r => r.json());
+    const sum = ab.summary || {};
+    const sumEl = $('vxAbSummary');
+    if (sumEl) {
+      if (!sum.totalTrials) {
+        sumEl.textContent = 'No paired workout A/B trials recorded yet. Toggle Dual-Mic A/B Benchmark in Armory Fit Settings or during a lift.';
+      } else {
+        const sign = sum.deltaPts > 0 ? '+' : '';
+        const relTxt = sum.relativeGainPct != null ? ` (${sum.relativeGainPct > 0 ? '+' : ''}${sum.relativeGainPct}% relative)` : '';
+        const agreeTxt = sum.agreementPct != null ? ` · Agreement <b>${sum.agreementPct}%</b>` : '';
+        sumEl.innerHTML =
+          `Trials: <b>${sum.totalTrials}</b> · Room Catch: <b>${sum.roomCatchPct}%</b> (${sum.roomWins}/${sum.totalTrials}) · ` +
+          `Phone Catch: <b>${sum.phoneCatchPct}%</b> (${sum.phoneWins}/${sum.totalTrials}) · ` +
+          `Net: <span class="pill ${sum.deltaPts >= 0 ? 'ok' : ''}">${sign}${sum.deltaPts} pts${relTxt}</span>${agreeTxt} · ` +
+          `Room-Only Saves: <b>${sum.roomOnly}</b> · Phone-Only: <b>${sum.phoneOnly}</b>`;
+      }
+    }
+    const runsEl = $('vxAbRuns');
+    if (runsEl) {
+      const runs = Array.isArray(ab.runs) ? ab.runs : [];
+      if (!runs.length) {
+        runsEl.innerHTML = '';
+      } else {
+        runsEl.innerHTML = `<div style="margin:6px 0 4px;font-weight:700;color:var(--fg)">Saved 10-Phrase Shootout Runs</div>` +
+          `<table><thead><tr><th>Placement</th><th>Phrases</th><th>Room Intent</th><th>Phone Intent</th><th>Improvement</th><th>Room Word %</th><th>Phone Word %</th></tr></thead><tbody>` +
+          runs.map(r => {
+            const dSign = r.deltaPts > 0 ? '+' : '';
+            const ts = new Date(r.tsMs).toLocaleDateString([], { month: 'short', day: 'numeric' });
+            return `<tr><td><b>${r.label}</b> <small>(${ts})</small></td><td>${r.phrasesCount}</td><td>${r.roomIntentPct}%</td><td>${r.phoneIntentPct}%</td><td><span class="pill ${r.deltaPts >= 0 ? 'ok' : ''}">${dSign}${r.deltaPts} pts</span></td><td>${r.roomWordPct}%</td><td>${r.phoneWordPct}%</td></tr>`;
+          }).join('') +
+          `</tbody></table>`;
+      }
+    }
+    const trEl = $('vxAbTrials');
+    if (trEl) {
+      const trials = Array.isArray(ab.recentTrials) ? ab.recentTrials.slice(0, 12) : [];
+      if (!trials.length) {
+        trEl.innerHTML = '';
+      } else {
+        trEl.innerHTML = `<div style="margin:6px 0 4px;font-weight:700;color:var(--fg)">Recent Workout A/B Trials</div>` +
+          `<table><thead><tr><th>Station</th><th>Room Mic (S330)</th><th>Phone Mic (Pixel)</th><th>Outcome</th></tr></thead><tbody>` +
+          trials.map(t => {
+            const rTxt = t.room ? `${t.room.transcript || '—'} <small>(${t.room.intentLabel || t.room.intentKey})</small>` : '—';
+            const pTxt = t.phone ? `${t.phone.transcript || '—'} <small>(${t.phone.intentLabel || t.phone.intentKey})</small>` : '—';
+            const resolveBtns = t.outcome === 'disagree' && !t.resolvedWinner
+              ? ` <button class="btn sec sm" type="button" onclick="resolveAbTrial('${t.id}','room')">Room ✓</button> <button class="btn sec sm" type="button" onclick="resolveAbTrial('${t.id}','phone')">Phone ✓</button>`
+              : (t.resolvedWinner ? ` (${t.resolvedWinner} ✓)` : '');
+            return `<tr><td>${t.station || '—'}</td><td>${rTxt}</td><td>${pTxt}</td><td>${t.outcome}${resolveBtns}</td></tr>`;
+          }).join('') +
+          `</tbody></table>`;
+      }
+    }
+  } catch {}
 }
 
 async function pollStatus() {
@@ -6723,15 +6808,17 @@ async function init() {
   $('vxEnabled').value = vx.enabled === false ? '0' : '1';
   $('vxMode').value = vx.listenMode === 'always' ? 'always' : 'workout';
   $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
+  $('vxTtsVoice').value = vx.ttsVoice || 'en-US-AndrewNeural';
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
   renderCameras();
   syncAlignmentUI();
   wireMaskModal();
   setInterval(drawAllCanvases, 100);
-  await Promise.all([pollStatus(), pollVoiceStatus(), pollClips()]);
+  await Promise.all([pollStatus(), pollVoiceStatus(), pollVoiceAb(), pollClips()]);
   setInterval(pollStatus, 1000);
   setInterval(pollVoiceStatus, 3000);
+  setInterval(pollVoiceAb, 4000);
   setInterval(pollClips, 6000);
 }
 
@@ -6788,6 +6875,11 @@ $('vxInjectBtn').onclick = async () => {
   const r = await fetch('/api/voice/inject', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ transcript: 'Armory check' }) }).then(x => x.json());
   $('vxOut').textContent = r.ok ? 'Sent "Armory check" to Pixel SSE stream' : 'Failed';
   await pollVoiceStatus();
+};
+$('vxAbResetBtn').onclick = async () => {
+  await fetch('/api/voice/ab/reset', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ clearRuns: false }) });
+  $('vxOut').textContent = 'Cleared passive workout A/B trials';
+  await pollVoiceAb();
 };
 init();
 </script>
@@ -7199,6 +7291,47 @@ def create_app(service: ArmoryCamService) -> Flask:
             return jsonify({"ok": False, "error": "Empty transcript"}), 400
         entry = service.voice.inject_transcript(transcript)
         return jsonify({"ok": True, "entry": entry})
+
+    @app.get("/api/voice/ab")
+    def api_voice_ab() -> Response:
+        resp = jsonify(service.voice.ab.snapshot_dict())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/voice/ab/sample")
+    def api_voice_ab_sample() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid sample"}), 400
+        with service.voice.lock:
+            raw_recent = list(service.voice.recent_transcripts)
+        trial, summary = service.voice.ab.record_sample(body, raw_room_recent=raw_recent)
+        return jsonify({"ok": True, "trial": trial, "summary": summary})
+
+    @app.post("/api/voice/ab/resolve")
+    def api_voice_ab_resolve() -> Response:
+        body = request.get_json(silent=True) or {}
+        tid = str(body.get("trialId") or "").strip()
+        winner = body.get("winner")
+        summary = service.voice.ab.resolve_trial(tid, str(winner) if winner else None)
+        if summary is None:
+            return jsonify({"ok": False, "error": "Trial not found"}), 404
+        return jsonify({"ok": True, "summary": summary})
+
+    @app.post("/api/voice/ab/run")
+    def api_voice_ab_run() -> Response:
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid run payload"}), 400
+        run = service.voice.ab.save_run(body)
+        return jsonify({"ok": True, "run": run, "runs": service.voice.ab.snapshot_dict()["runs"]})
+
+    @app.post("/api/voice/ab/reset")
+    def api_voice_ab_reset() -> Response:
+        body = request.get_json(silent=True) or {}
+        clear_runs = bool(body.get("clearRuns", False))
+        summary = service.voice.ab.reset(clear_runs=clear_runs)
+        return jsonify({"ok": True, "summary": summary})
 
     @app.get("/api/clips")
     def api_clips() -> Response:
