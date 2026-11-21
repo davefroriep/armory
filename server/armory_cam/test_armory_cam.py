@@ -56,22 +56,19 @@ class ArmoryCamTests(unittest.TestCase):
         overridden = ac.select_camera_for_window(samples, base + 10_000, base + 16_000, preferred_camera="Smith Cam")
         self.assertEqual(overridden, "Smith Cam")
 
-        # Secondary (primary=False) 3rd angle camera does not steal Auto selection even with stronger motion
+        # All enabled views compete equally on motion energy; explicit selection always wins
         extra_samples = samples + [
-            {"camera": "Low Knee Cam", "startMs": base + 10_000, "endMs": base + 14_000, "energy": 25.0},
+            {"camera": "Fly Machine Cam", "startMs": base + 10_000, "endMs": base + 14_000, "energy": 25.0},
         ]
-        prim_picked = ac.select_camera_for_window(
-            extra_samples, base + 10_000, base + 16_000, primary_cameras={"Rack Cam", "Smith Cam"}
-        )
-        self.assertEqual(prim_picked, "Rack Cam")
-        explicit_third = ac.select_camera_for_window(
+        auto_picked = ac.select_camera_for_window(extra_samples, base + 10_000, base + 16_000)
+        self.assertEqual(auto_picked, "Fly Machine Cam")
+        explicit_pick = ac.select_camera_for_window(
             extra_samples,
             base + 10_000,
             base + 16_000,
-            preferred_camera="Low Knee Cam",
-            primary_cameras={"Rack Cam", "Smith Cam"},
+            preferred_camera="Rack Cam",
         )
-        self.assertEqual(explicit_third, "Low Knee Cam")
+        self.assertEqual(explicit_pick, "Rack Cam")
 
     def test_select_pr_window_respects_prev_set_and_batch_boundary(self) -> None:
         base = 1_763_500_000_000
@@ -135,6 +132,7 @@ class ArmoryCamTests(unittest.TestCase):
                             "exclusions": [[0.55, 0.1, 0.9, 0.6]],
                             "crop": [0.25, 0.25, 0.75, 0.75],
                             "rotate": 0,
+                            "defish": False,
                         },
                         {"name": "Smith Cam", "slug": "smith_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.0},
                     ],
@@ -968,16 +966,15 @@ class ArmoryCamTests(unittest.TestCase):
                             "slug": "rack_cam",
                             "rtspUrl": "",
                             "enabled": True,
-                            "primary": True,
                             "motionThreshold": 2.0,
                             "crop": [0.0, 0.0, 1.0, 1.0],
+                            "defish": False,
                         },
                         {
                             "name": "Smith Cam",
                             "slug": "smith_cam",
                             "rtspUrl": "",
                             "enabled": True,
-                            "primary": True,
                             "motionThreshold": 2.0,
                         },
                         {
@@ -986,18 +983,18 @@ class ArmoryCamTests(unittest.TestCase):
                             "sourceSlug": "rack_cam",
                             "rtspUrl": "rtsp://should-be-cleared",
                             "enabled": True,
-                            "primary": False,
                             "motionThreshold": 2.0,
                             "crop": [0.0, 0.0, 0.45, 1.0],
+                            "defish": False,
                         },
                         {
                             "name": "Smith Wide",
                             "slug": "smith_wide",
                             "sourceSlug": "rack_cam",
                             "enabled": True,
-                            "primary": False,
                             "motionThreshold": 2.0,
                             "crop": [0.55, 0.0, 1.0, 1.0],
+                            "defish": False,
                         },
                     ]
                 },
@@ -1007,7 +1004,7 @@ class ArmoryCamTests(unittest.TestCase):
             fly_cfg = next(c for c in saved_cfg["cameras"] if c["slug"] == "fly_machine_cam")
             self.assertEqual(fly_cfg["sourceSlug"], "rack_cam")
             self.assertEqual(fly_cfg["rtspUrl"], "")
-            self.assertFalse(fly_cfg["primary"])
+            self.assertNotIn("primary", fly_cfg)
 
             self.assertEqual(
                 [c.slug for c in svc._physical_cameras()],
@@ -1052,10 +1049,10 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertFalse((svc.tapes_root / "sess-virt" / "fly_machine_cam").exists())
             self.assertFalse((svc.tapes_root / "sess-virt" / "smith_wide").exists())
 
-            # Auto bursts ignore primary=False virtual views; explicit camera="Fly Machine Cam" returns its burst
+            # All enabled cameras participate equally (no primary/secondary suppression)
             auto_bursts = client.get("/api/bursts?sessionId=sess-virt").get_json()["bursts"]
             self.assertTrue(auto_bursts)
-            self.assertTrue(all(b["camera"] == "Rack Cam" for b in auto_bursts))
+            self.assertIn(auto_bursts[0]["camera"], ("Rack Cam", "Fly Machine Cam"))
             fly_bursts = client.get("/api/bursts?sessionId=sess-virt&camera=Fly%20Machine%20Cam").get_json()["bursts"]
             self.assertEqual(len(fly_bursts), 1)
             self.assertEqual(fly_bursts[0]["camera"], "Fly Machine Cam")
@@ -1193,11 +1190,11 @@ class ArmoryCamTests(unittest.TestCase):
                             "slug": "rack_cam",
                             "rtspUrl": "rtsp://127.0.0.1:554/rack",
                             "enabled": True,
-                            "primary": True,
                             "motionThreshold": 2.2,
                             "crop": [0.0, 0.0, 1.0, 1.0],
                             "rotate": 0,
                             "tilt": -2.5,
+                            "defish": False,
                         },
                         {
                             "name": "Fly Machine Cam",
@@ -1205,11 +1202,11 @@ class ArmoryCamTests(unittest.TestCase):
                             "sourceSlug": "rack_cam",
                             "rtspUrl": "",
                             "enabled": True,
-                            "primary": False,
                             "motionThreshold": 2.2,
                             "crop": [0.0, 0.1, 0.45, 0.9],
                             "rotate": 0,
                             "tilt": 6.0,
+                            "defish": False,
                         },
                     ]
                 },
@@ -1220,10 +1217,12 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertAlmostEqual(by_slug["rack_cam"]["tilt"], -2.5, places=1)
             self.assertAlmostEqual(by_slug["fly_machine_cam"]["tilt"], 6.0, places=1)
 
-            cam_zero = ac.CameraConfig(name="Z", slug="z", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=0.0)
-            cam_tilted = ac.CameraConfig(name="T", slug="t", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=6.0)
+            cam_zero = ac.CameraConfig(name="Z", slug="z", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=0.0, defish=False)
+            cam_tilted = ac.CameraConfig(name="T", slug="t", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=6.0, defish=False)
+            cam_defish = ac.CameraConfig(name="D", slug="d", crop=(0.0, 0.0, 1.0, 1.0), rotate=0, tilt=0.0, defish=True)
             self.assertEqual(svc._crop_cache_key(cam_zero), "r0_0_0_1000_1000")
             self.assertEqual(svc._crop_cache_key(cam_tilted), "r0_0_0_1000_1000_t60")
+            self.assertEqual(svc._crop_cache_key(cam_defish), "r0_0_0_1000_1000_d1")
 
             self.assertEqual(client.post("/api/session/start", json={"sessionId": "sess-tilt", "name": "Tilt Lift"}).status_code, 200)
             t0_dt = datetime(2026, 11, 19, 15, 0, 0)
@@ -1299,8 +1298,8 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_auto_level_reference_realign_and_drift_ntfy(self) -> None:
-        # 1. Verify OpenCV LSD auto-level estimation on +6.0 deg CW tilted structural rack bars -> -6.0 deg correction
+    def test_bump_ntfy_only_and_no_autolevel_realign_primary_artifacts(self) -> None:
+        # 1. Lightweight phase-correlation bump detector: shift detected, lighting shift ignored
         w, h = 640, 360
         base = np.full((h, w, 3), 24, dtype=np.uint8)
         for x in range(80, 580, 60):
@@ -1311,53 +1310,56 @@ class ArmoryCamTests(unittest.TestCase):
             cv2.putText(base, f"R{k}", (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (90, 210, 255), 2)
             cv2.circle(base, (cx + 18, cy + 16), 14, (240, 140, 70), 2)
 
-        m_tilt = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -6.0, 1.0)  # +6.0 deg CW
-        tilted_src = cv2.warpAffine(base, m_tilt, (w, h), flags=cv2.INTER_LINEAR, borderValue=(24, 24, 24))
-        lvl_res = ac.estimate_auto_level_tilt(tilted_src, crop=(0.1, 0.1, 0.9, 0.9), rotate=0)
-        self.assertTrue(lvl_res["ok"], lvl_res)
-        self.assertAlmostEqual(lvl_res["tilt"], -6.0, delta=0.6)
+        ref_gray_small = cv2.resize(cv2.cvtColor(base, cv2.COLOR_BGR2GRAY), ac.BUMP_REF_SIZE, interpolation=cv2.INTER_AREA)
 
-        # Verify vertical vs horizontal vs balanced both axis estimation under perspective skew
-        v_only = np.full((h, w, 3), 24, dtype=np.uint8)
-        for x in range(110, 540, 70):
-            cv2.line(v_only, (x, 30), (x, 330), (225, 225, 225), 4)
-        h_only = np.full((h, w, 3), 24, dtype=np.uint8)
-        for y in range(60, 310, 60):
-            cv2.line(h_only, (80, y), (560, y), (205, 205, 205), 4)
-        v_skew = cv2.warpAffine(v_only, cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -6.0, 1.0), (w, h), borderValue=(24, 24, 24))
-        h_skew = cv2.warpAffine(h_only, cv2.getRotationMatrix2D((w / 2.0, h / 2.0), 4.0, 1.0), (w, h), borderValue=(24, 24, 24))
-        skew_img = np.maximum(v_skew, h_skew)
-        self.assertAlmostEqual(ac.estimate_auto_level_tilt(skew_img, crop=(0.1, 0.1, 0.9, 0.9), axis="vertical")["tilt"], -6.0, delta=0.6)
-        self.assertAlmostEqual(ac.estimate_auto_level_tilt(skew_img, crop=(0.1, 0.1, 0.9, 0.9), axis="horizontal")["tilt"], 4.0, delta=0.6)
-        self.assertAlmostEqual(ac.estimate_auto_level_tilt(skew_img, crop=(0.1, 0.1, 0.9, 0.9), axis="both")["tilt"], -1.0, delta=0.6)
+        bright = np.clip(base.astype(np.int16) + 35, 0, 255).astype(np.uint8)
+        res_bright = ac.detect_camera_bump(ref_gray_small, bright)
+        self.assertTrue(res_bright["ok"], res_bright)
+        self.assertFalse(res_bright["bumped"], res_bright)
 
-        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_align_"))
+        m_shift = np.float32([[1, 0, 28.0], [0, 1, -12.0]])
+        shifted = cv2.warpAffine(base, m_shift, (w, h), borderValue=(24, 24, 24))
+        res_shift = ac.detect_camera_bump(ref_gray_small, shifted)
+        self.assertTrue(res_shift["ok"], res_shift)
+        self.assertTrue(res_shift["bumped"], res_shift)
+        self.assertGreater(res_shift["shiftPx"], ac.BUMP_PX_THRESHOLD)
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_bump_"))
         try:
-            svc = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestDriftTopic")
+            svc = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestBumpTopic")
             app = ac.create_app(svc)
             client = app.test_client()
 
             dash_html = client.get("/").get_data(as_text=True)
-            for marker in (
+            self.assertIn("bumpAlertNtfy", dash_html)
+            self.assertIn("defish-", dash_html)
+            for removed in (
+                "alignBar",
+                "pinRefBtn",
+                "realignModeBtn",
+                "realignNowBtn",
+                "driftNtfyBtn",
                 "autoLvl-",
                 "autoAxis-",
                 "mmAutoLvlBtn",
                 "mmAutoAxisSel",
-                "realignModeBtn",
-                "realignNowBtn",
-                "driftNtfyBtn",
-                "pinRefBtn",
                 "mmRealignModeBtn",
                 "mmRealignNowBtn",
                 "mmDriftNtfyBtn",
+                "Secondary / Pinned",
             ):
-                self.assertIn(marker, dash_html)
+                self.assertNotIn(removed, dash_html)
 
-            # Configure Rack Cam (manual tilt) + Fly Machine Cam (virtual view with autoLevel=True)
+            # Removed alignment endpoints must be gone (404/405 due to OPTIONS catch-all)
+            for dead_url in ("/api/camera/auto-level", "/api/camera/reference", "/api/camera/realign"):
+                self.assertIn(client.post(dead_url, json={}).status_code, (404, 405))
+
+            # Legacy primary/autoLevel/realignMode/driftAlertNtfy keys are ignored & stripped from config
             cfg_res = client.post(
                 "/api/config",
                 json={
-                    "realignMode": "manual",
+                    "bumpAlertNtfy": True,
+                    "realignMode": "auto",
                     "driftAlertNtfy": True,
                     "cameras": [
                         {
@@ -1366,42 +1368,39 @@ class ArmoryCamTests(unittest.TestCase):
                             "rtspUrl": "rtsp://127.0.0.1:554/rack",
                             "enabled": True,
                             "primary": True,
+                            "autoLevel": True,
+                            "autoLevelAxis": "vertical",
                             "crop": [0.25, 0.15, 0.75, 0.85],
-                            "exclusions": [[[0.6, 0.2], [0.7, 0.2], [0.7, 0.6], [0.6, 0.6]]],
-                            "rotate": 0,
-                            "tilt": 0.0,
-                            "autoLevel": False,
-                            "autoLevelAxis": "horizontal",
+                            "defish": True,
                         },
                         {
                             "name": "Fly Machine Cam",
                             "slug": "fly_machine_cam",
                             "sourceSlug": "rack_cam",
-                            "rtspUrl": "",
                             "enabled": True,
                             "primary": False,
-                            "crop": [0.08, 0.2, 0.38, 0.85],
-                            "rotate": 0,
-                            "tilt": 0.0,
-                            "autoLevel": True,
-                            "autoLevelAxis": "vertical",
+                            "crop": [0.02, 0.25, 0.25, 0.88],
+                            "defish": True,
                         },
                     ],
                 },
             )
             self.assertEqual(cfg_res.status_code, 200)
             got_cfg = client.get("/api/config").get_json()
-            self.assertEqual(got_cfg["realignMode"], "manual")
-            self.assertTrue(got_cfg["driftAlertNtfy"])
-            self.assertEqual(got_cfg["cameras"][0]["autoLevelAxis"], "horizontal")
-            self.assertTrue(got_cfg["cameras"][1]["autoLevel"])
-            self.assertEqual(got_cfg["cameras"][1]["autoLevelAxis"], "vertical")
+            self.assertTrue(got_cfg["bumpAlertNtfy"])
+            self.assertNotIn("realignMode", got_cfg)
+            self.assertNotIn("driftAlertNtfy", got_cfg)
+            self.assertNotIn("alignment", got_cfg)
+            for c_obj in got_cfg["cameras"]:
+                self.assertNotIn("primary", c_obj)
+                self.assertNotIn("autoLevel", c_obj)
+                self.assertNotIn("autoLevelAxis", c_obj)
+                self.assertTrue(c_obj["defish"])
 
-            # Write clean baseline TS segment and pin reference
+            # Seed baseline in bump_refs/<slug>.png from unshifted frame
             ring_rack = svc.ring_root / "rack_cam"
             ring_rack.mkdir(parents=True, exist_ok=True)
-            t0_dt = datetime(2026, 11, 19, 16, 0, 0)
-            t0_ms = int(t0_dt.timestamp() * 1000)
+            t0_ms = int(datetime(2026, 11, 19, 16, 0, 0).timestamp() * 1000)
 
             def _write_img_ts(img_bgr: np.ndarray, ts_ms: int) -> Path:
                 png_p = tmp / f"frame_{ts_ms}.png"
@@ -1422,70 +1421,169 @@ class ArmoryCamTests(unittest.TestCase):
             ref_seg = _write_img_ts(base, t0_ms)
             svc.cam_connected["rack_cam"] = True
             svc.ring_segments["rack_cam"] = [ac.SegmentInfo(path=ref_seg, start_ms=t0_ms, end_ms=t0_ms + 1200, energy=0.0, camera="Rack Cam")]
+            svc.latest_energy = {"rack_cam": 0.1, "fly_machine_cam": 0.1}
 
-            # Test /api/camera/auto-level endpoint directly on current Rack Cam frame with axis overrides
-            al_res = client.post("/api/camera/auto-level", json={"camera": "Rack Cam", "axis": "vertical"})
-            self.assertEqual(al_res.status_code, 200)
-            al_json = al_res.get_json()
-            self.assertTrue(al_json["ok"])
-            self.assertEqual(al_json["axis"], "vertical")
+            # First quiet tick lazily saves baseline PNG in bump_refs without firing ntfy
+            self.assertEqual(svc.check_camera_bump_background(900.0), [])
+            self.assertTrue((svc.bump_refs_root / "rack_cam.png").is_file())
+            self.assertFalse((svc.root / "refs").exists())
 
-            # Pin reference baseline
-            pin_res = client.post("/api/camera/reference", json={"camera": "Rack Cam"})
-            self.assertEqual(pin_res.status_code, 200)
-            self.assertTrue((svc.refs_root / "rack_cam.jpg").is_file())
-            ref_json_before = (svc.refs_root / "rack_cam.json").read_text(encoding="utf-8")
-
-            # Simulate physical bump: +28px X, -18px Y, +3.5 deg CW roll on live stream
-            m_bump = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -3.5, 1.0)
-            m_bump[0, 2] += 28.0
-            m_bump[1, 2] += -18.0
-            bumped = cv2.warpAffine(base, m_bump, (w, h), flags=cv2.INTER_LINEAR, borderValue=(24, 24, 24))
-            bumped_seg = _write_img_ts(bumped, t0_ms + 4000)
+            # Bumped segment: requires 2 consecutive quiet strikes + respects 6h cooldown
+            bumped_seg = _write_img_ts(shifted, t0_ms + 4000)
             svc.ring_segments["rack_cam"].append(
                 ac.SegmentInfo(path=bumped_seg, start_ms=t0_ms + 4000, end_ms=t0_ms + 5200, energy=0.0, camera="Rack Cam")
             )
-
-            # Realign Now updates both Rack Cam & Fly Machine Cam while preserving refs/rack_cam.json
-            ra_res = client.post("/api/camera/realign", json={"camera": "Rack Cam", "apply": True})
-            self.assertEqual(ra_res.status_code, 200)
-            ra_data = ra_res.get_json()
-            self.assertTrue(ra_data["ok"])
-            self.assertTrue(ra_data["results"][0]["drifted"])
-            self.assertAlmostEqual(ra_data["results"][0]["dx"], 28.0, delta=3.0)
-            self.assertAlmostEqual(ra_data["results"][0]["dy"], -18.0, delta=3.0)
-            self.assertAlmostEqual(ra_data["results"][0]["dAngle"], 3.5, delta=0.5)
-            self.assertEqual((svc.refs_root / "rack_cam.json").read_text(encoding="utf-8"), ref_json_before)
-
-            by_slug = {c["slug"]: c for c in client.get("/api/config").get_json()["cameras"]}
-            self.assertAlmostEqual(by_slug["rack_cam"]["tilt"], -3.5, delta=0.6)
-            self.assertAlmostEqual(by_slug["fly_machine_cam"]["tilt"], -3.5, delta=0.7)
-            # Rack Cam crop shifted right & up to follow the +28px, -18px camera motion
-            rack_crop = by_slug["rack_cam"]["crop"]
-            self.assertGreater((rack_crop[0] + rack_crop[2]) / 2.0, 0.50)
-            self.assertLess((rack_crop[1] + rack_crop[3]) / 2.0, 0.50)
-            self.assertNotEqual(by_slug["rack_cam"]["exclusions"], [[[0.6, 0.2], [0.7, 0.2], [0.7, 0.6], [0.6, 0.6]]])
-
-            # Background drift watchdog: requires 2 consecutive quiet strikes and respects 6h ntfy cooldown
-            svc.realign_mode = "manual"
-            svc.drift_alert_ntfy = True
-            svc.latest_energy = {"rack_cam": 0.1, "fly_machine_cam": 0.1}
             with mock.patch.object(ac, "send_ntfy_alert", return_value=True) as m_ntfy:
-                ev1 = svc.check_camera_drift_background(1000.0)
-                self.assertEqual(ev1, [])  # Strike 1 only
+                self.assertEqual(svc.check_camera_bump_background(1000.0), [])
                 self.assertEqual(m_ntfy.call_count, 0)
 
-                ev2 = svc.check_camera_drift_background(1035.0)
-                self.assertEqual(len(ev2), 1)  # Strike 2 confirmed -> alert
+                ev2 = svc.check_camera_bump_background(1035.0)
+                self.assertEqual(len(ev2), 1)
                 self.assertTrue(ev2[0]["notified"])
                 time.sleep(0.15)
                 self.assertEqual(m_ntfy.call_count, 1)
 
-                # Within 6h cooldown -> no second ntfy even after 2 more strikes
-                svc._drift_strikes["rack_cam"] = 1
-                svc.check_camera_drift_background(1070.0)
+                # Within 6h cooldown -> no second alert
+                svc._bump_strikes["rack_cam"] = 1
+                svc.check_camera_bump_background(1070.0)
                 time.sleep(0.1)
                 self.assertEqual(m_ntfy.call_count, 1)
+
+                # When bumpAlertNtfy is disabled -> zero bump image processing occurs
+                svc.bump_alert_ntfy = False
+                with mock.patch.object(ac, "detect_camera_bump") as m_det:
+                    self.assertEqual(svc.check_camera_bump_background(50_000.0), [])
+                    m_det.assert_not_called()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_v360_defish_parity_cache_and_clip_encode(self) -> None:
+        w, h = 640, 360
+        src = np.full((h, w, 3), 24, dtype=np.uint8)
+        for x in range(40, w, 60):
+            cv2.line(src, (x, 10), (x, h - 10), (220, 220, 220), 3)
+        for y in range(40, h, 50):
+            cv2.line(src, (10, y), (w - 10, y), (140, 190, 240), 2)
+        cv2.circle(src, (160, 180), 42, (80, 220, 120), 3)
+
+        crop = (0.04, 0.20, 0.42, 0.88)
+        tilt = 1.7
+        vf = ac.build_ffmpeg_vf(crop=crop, rotate=0, tilt=tilt, defish=True, src_size=(w, h))
+        self.assertIsNotNone(vf)
+        self.assertIn("v360=input=fisheye", vf)
+
+        cv_out = ac.apply_frame_transform(src, crop=crop, rotate=0, apply_crop=True, tilt=tilt, defish=True)
+        _, png_bytes = cv2.imencode(".png", src)
+        ff = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        proc = subprocess.run(
+            [ff, "-hide_banner", "-loglevel", "error", "-f", "image2pipe", "-vcodec", "png", "-i", "-", "-vf", vf, "-f", "image2pipe", "-vcodec", "png", "-"],
+            input=png_bytes.tobytes(),
+            capture_output=True,
+            check=True,
+        )
+        ff_out = cv2.imdecode(np.frombuffer(proc.stdout, np.uint8), cv2.IMREAD_COLOR)
+        self.assertEqual(cv_out.shape, ff_out.shape)
+        mad = float(np.mean(np.abs(cv_out.astype(np.float32) - ff_out.astype(np.float32))))
+        self.assertLess(mad, 5.0)
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_v360_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            client.post("/api/config", json={
+                "cameras": [{
+                    "name": "Rack Cam",
+                    "slug": "rack_cam",
+                    "enabled": True,
+                    "crop": [0.20, 0.15, 0.80, 0.90],
+                    "tilt": 1.5,
+                    "defish": True,
+                }]
+            })
+            t0_ms = int(datetime(2026, 11, 20, 9, 0, 0).timestamp() * 1000)
+            seg_dir = svc.tapes_root / "sess-v360" / "rack_cam"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            seg_p = seg_dir / f"seg_{datetime.fromtimestamp(t0_ms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts"
+            png_p = tmp / "in.png"
+            cv2.imwrite(str(png_p), src)
+            subprocess.run(
+                [svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-loop", "1", "-t", "2.0", "-i", str(png_p),
+                 "-r", "15", "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_p)],
+                check=True,
+            )
+            res = client.post("/api/clip", json={
+                "sessionId": "sess-v360",
+                "exName": "Squat",
+                "startMs": t0_ms,
+                "endMs": t0_ms + 2000,
+                "camera": "Rack Cam",
+            })
+            self.assertEqual(res.status_code, 200)
+            mp4 = svc.clips_root / res.get_json()["lanUrl"].removeprefix("/clips/")
+            self.assertTrue(mp4.is_file())
+            self.assertGreater(mp4.stat().st_size, 1000)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_multi_camera_clip_and_auto_pr(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_multi_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            client.post("/api/config", json={
+                "cameras": [
+                    {"name": "Rack Cam", "slug": "rack_cam", "enabled": True, "crop": [0.25, 0.1, 0.75, 0.9], "defish": False},
+                    {"name": "Smith Cam", "slug": "smith_cam", "enabled": True, "crop": [0.25, 0.0, 0.75, 1.0], "defish": False},
+                    {"name": "Smith Wide", "slug": "smith_wide", "sourceSlug": "rack_cam", "enabled": True, "crop": [0.45, 0.0, 0.95, 1.0], "defish": False},
+                ]
+            })
+            t0_ms = int(datetime(2026, 11, 20, 10, 0, 0).timestamp() * 1000)
+            rack_dir = svc.tapes_root / "sess-multi" / "rack_cam"
+            rack_dir.mkdir(parents=True, exist_ok=True)
+            motion_lines = []
+            for i in range(3):
+                seg_dt = datetime.fromtimestamp((t0_ms + i * 2000) / 1000.0)
+                seg_p = rack_dir / f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                subprocess.run(
+                    [svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                     "-i", f"color=c={'white' if i == 1 else 'black'}:s=320x240:r=15:d=2",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_p)],
+                    check=True,
+                )
+                motion_lines.append(json.dumps({
+                    "camera": "Rack Cam", "slug": "rack_cam", "file": seg_p.name,
+                    "startMs": t0_ms + i * 2000, "endMs": t0_ms + (i + 1) * 2000,
+                    "energy": 9.0 if i == 1 else 0.2,
+                }))
+            (svc.tapes_root / "sess-multi" / "motion.jsonl").write_text("\n".join(motion_lines) + "\n", encoding="utf-8")
+
+            res = client.post("/api/clip", json={
+                "sessionId": "sess-multi",
+                "exName": "Standing Calf Raise",
+                "startMs": t0_ms + 1000,
+                "endMs": t0_ms + 5000,
+                "cameras": ["Rack Cam", "Smith Wide"],
+            })
+            self.assertEqual(res.status_code, 200)
+            data = res.get_json()
+            self.assertEqual(len(data["clips"]), 2)
+            self.assertEqual([c["camera"] for c in data["clips"]], ["Rack Cam", "Smith Wide"])
+            for item in data["clips"]:
+                self.assertTrue((svc.clips_root / item["lanUrl"].removeprefix("/clips/")).is_file())
+
+            pr_res = client.post("/api/clip/auto-pr", json={
+                "sessionId": "sess-multi",
+                "exName": "Pull-up",
+                "setAtMs": t0_ms + 5000,
+                "cameras": ["Rack Cam", "Smith Wide"],
+            })
+            self.assertEqual(pr_res.status_code, 200)
+            pr_data = pr_res.get_json()
+            self.assertEqual(len(pr_data["clips"]), 2)
+            self.assertEqual(pr_data["clips"][0]["startMs"], pr_data["clips"][1]["startMs"])
+            self.assertEqual(pr_data["clips"][0]["endMs"], pr_data["clips"][1]["endMs"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -1511,7 +1609,6 @@ class ArmoryCamTests(unittest.TestCase):
                             "slug": "rack_cam",
                             "rtspUrl": "rtsp://127.0.0.1:554/rack",
                             "enabled": True,
-                            "primary": True,
                             "motionThreshold": 2.2,
                             "crop": [0.0, 0.0, 1.0, 1.0],
                             "rotate": 0,
@@ -1523,7 +1620,6 @@ class ArmoryCamTests(unittest.TestCase):
                             "sourceSlug": "rack_cam",
                             "rtspUrl": "",
                             "enabled": True,
-                            "primary": False,
                             "motionThreshold": 2.2,
                             "crop": [0.0, 0.05, 0.45, 0.95],
                             "rotate": 0,
@@ -2284,7 +2380,7 @@ class ArmoryCamTests(unittest.TestCase):
             svc = ac.ArmoryCamService(root_dir=tmp, voice_autostart=False)
             svc.update_config({
                 "retentionDays": 14,
-                "cameras": [{"name": "Rack Cam", "rtspUrl": "rtsp://127.0.0.1/none", "enabled": True, "primary": True}],
+                "cameras": [{"name": "Rack Cam", "rtspUrl": "rtsp://127.0.0.1/none", "enabled": True}],
             })
             app = ac.create_app(svc)
             client = app.test_client()

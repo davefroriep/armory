@@ -73,7 +73,7 @@ vi.mock('../src/lifts/gymCam', async () => {
       changed: new Emitter<void>(),
       online: false,
       isArmed: () => false,
-      stopAndSaveArmed: vi.fn(),
+      stopAndSaveArmed: vi.fn(async () => []),
     },
   };
 });

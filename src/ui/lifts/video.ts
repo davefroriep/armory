@@ -2,7 +2,9 @@ import { active } from '../../lifts/active';
 import {
   gymCam, type GymCamBurst, type GymCamPreviewResult, type GymCamTapeFrame, type GymCamTimeline,
 } from '../../lifts/gymCam';
-import { driveUrlFor } from '../../lifts/logic';
+import {
+  camsForExercise, DEFAULT_CAM_OPTIONS, DEFAULT_FALLBACK_CAM, driveUrlFor, normalizeCamList,
+} from '../../lifts/logic';
 import {
   extractMp4CreationMs, formatPixelFilename, inferPixelVideoLink, sortDeviceVideosNewestFirst,
 } from '../../lifts/mp4';
@@ -545,38 +547,53 @@ export async function linkDcimVideo(t: VideoTarget): Promise<VideoMeta | null> {
 /** Legacy alias for callers. */
 export const attachVideo = (t: VideoTarget): Promise<VideoMeta | null> => linkDcimVideo(t);
 
-/** Quick 1-tap chooser asking which station camera to arm, highlighting any default camera first. */
+/** Quick 1-tap chooser asking which station camera(s) to arm, highlighting assigned angles and offering Record All when 2+ are assigned. */
 export function pickRecordCameraSheet(
   exName: string,
   setLabel: string,
-  preferredCam?: string,
+  preferredCams?: string | string[],
   buddyMode = false,
-): Promise<{ kind: 'cam'; camera?: string; explicitAuto?: boolean } | { kind: 'link' } | { kind: 'cancel' }> {
-  const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-  const effectiveDef = preferredCam || (buddyMode ? cams[0] : undefined);
+): Promise<{ kind: 'cam'; cameras: string[] } | { kind: 'link' } | { kind: 'cancel' }> {
+  const prefNorm = normalizeCamList(preferredCams);
+  const prefList = prefNorm.length ? prefNorm : [DEFAULT_FALLBACK_CAM];
+  const baseCams = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
+  const cams = [...new Set([...baseCams, ...prefList])];
   return new Promise((resolve) => {
-    let out: { kind: 'cam'; camera?: string; explicitAuto?: boolean } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
+    let out: { kind: 'cam'; cameras: string[] } | { kind: 'link' } | { kind: 'cancel' } = { kind: 'cancel' };
     const sh = openSheet(
       `<h3 class="sh-title">${esc(exName)} · ${esc(setLabel)}</h3>
-       <div class="fl">${buddyMode ? 'WHICH CAMERA TO RECORD? · 👥 BUDDY MODE' : 'WHICH CAMERA TO RECORD?'}</div>
+       <div class="fl">${buddyMode ? 'WHICH CAMERA(S) TO RECORD? · 👥 BUDDY MODE' : 'WHICH CAMERA(S) TO RECORD?'}</div>
+       ${prefList.length > 1
+         ? `<button class="btn primary big" type="button" data-rcamall style="margin-bottom:8px">Record All Assigned (${esc(prefList.map(shortCamLabel).join(' + '))})</button>`
+         : ''}
        <div class="vcam-pick${cams.length > 2 ? ' many' : ''}">
-         ${cams.map((c) => `
-           <button class="vcam-btn${c === effectiveDef ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
+         ${cams.map((c) => {
+           const assigned = prefList.includes(c);
+           const sub = assigned
+             ? (buddyMode ? '★ Assigned · Buddy lock · stops on ✓' : '★ Assigned · stops on ✓')
+             : 'Record this angle · stops on ✓';
+           return `
+           <button class="vcam-btn${assigned ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
              <b>${esc(shortCamLabel(c))}</b>
-             <small>${c === preferredCam ? '★ Default · stops on ✓' : (buddyMode && c === effectiveDef ? '★ Buddy lock · stops on ✓' : 'Auto-stops when you tap ✓')}</small>
-           </button>`).join('')}
+             <small>${sub}</small>
+           </button>`;
+         }).join('')}
        </div>
-       ${buddyMode ? '' : '<button class="btn big" type="button" data-rcam="">Auto (Strongest Motion Zone)</button>'}
        <button class="btn big" type="button" data-rlink>Link Existing Tape / Phone Video…</button>
        <button class="btn big" type="button" data-rcancel>Cancel</button>`,
       { onClose: () => resolve(out) },
     );
     sh.body.addEventListener('click', (e) => {
       const el = e.target as HTMLElement;
+      if (el.closest('[data-rcamall]')) {
+        out = { kind: 'cam', cameras: [...prefList] };
+        sh.close();
+        return;
+      }
       const camBtn = el.closest<HTMLElement>('[data-rcam]');
       if (camBtn) {
-        const picked = camBtn.dataset.rcam?.trim();
-        out = picked ? { kind: 'cam', camera: picked } : { kind: 'cam', explicitAuto: true };
+        const picked = camBtn.dataset.rcam?.trim() || DEFAULT_FALLBACK_CAM;
+        out = { kind: 'cam', cameras: [picked] };
         sh.close();
         return;
       }
@@ -621,13 +638,22 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       </div>`).join('')}`;
   };
 
-  const camList = (): string[] => (gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam']);
+  const camList = (): string[] => {
+    const base = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
+    const assigned = camsForExercise(ex, lifts.row(t.se.exId), t.se, base);
+    return [...new Set([...base, ...assigned])];
+  };
 
   const gymArmHtml = () => {
     if (!camAvail || t.session.status !== 'active' || t.set.done) return '';
-    return camList().map((c) =>
-      `<button class="aitem on" type="button" data-varmcam="${esc(c)}"><b>Record on ${esc(shortCamLabel(c))}</b><small>Arms this set and auto-stops when you tap ✓</small></button>`
-    ).join('');
+    const assigned = camsForExercise(ex, lifts.row(t.se.exId), t.se, gymCam.cameras);
+    const multi = assigned.length > 1
+      ? `<button class="aitem on" type="button" data-varmall><b>Record All Assigned (${esc(assigned.map(shortCamLabel).join(' + '))})</b><small>Arms all assigned stations and auto-stops on ✓</small></button>`
+      : '';
+    return multi + camList().map((c) => {
+      const isAssigned = assigned.includes(c);
+      return `<button class="aitem${isAssigned ? ' on' : ''}" type="button" data-varmcam="${esc(c)}"><b>Record on ${esc(shortCamLabel(c))}${isAssigned ? ' ★' : ''}</b><small>Arms this set and auto-stops when you tap ✓</small></button>`;
+    }).join('');
   };
 
   const actionsHtml = () => native
@@ -1440,7 +1466,8 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     const pickCam = el.closest<HTMLElement>('[data-pickcam]');
     if (pickCam) {
       const picked = pickCam.dataset.pickcam!;
-      t.se.camPref = picked;
+      t.se.cams = [picked];
+      delete t.se.camPref;
       lifts.saveSession(t.session, true);
       void selectCamera(picked);
       return;
@@ -1605,12 +1632,25 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       return;
     }
 
+    if (el.closest('[data-varmall]')) {
+      const assigned = camsForExercise(ex, lifts.row(t.se.exId), t.se, gymCam.cameras);
+      startTimerForVideo(t.session);
+      t.se.cams = [...assigned];
+      delete t.se.camPref;
+      lifts.saveSession(t.session, true);
+      gymCam.armSet(t.session, t.se, t.set, assigned);
+      sh.close();
+      toast(`Recording ${assigned.map(shortCamLabel).join(' + ')} · ${setLabel} — tap ✓ or red camera to stop`);
+      return;
+    }
+
     const warmCam = el.closest<HTMLElement>('[data-varmcam]')?.dataset.varmcam;
     if (warmCam) {
       startTimerForVideo(t.session);
-      t.se.camPref = warmCam;
+      t.se.cams = [warmCam];
+      delete t.se.camPref;
       lifts.saveSession(t.session, true);
-      gymCam.armSet(t.session, t.se, t.set, warmCam);
+      gymCam.armSet(t.session, t.se, t.set, [warmCam]);
       sh.close();
       toast(`Recording ${shortCamLabel(warmCam)} · ${setLabel} — tap ✓ or red camera to stop`);
       return;
@@ -1618,10 +1658,11 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
 
     const act = el.closest<HTMLElement>('[data-vact]')?.dataset.vact;
     if (act === 'gymarm') {
+      const assigned = camsForExercise(ex, lifts.row(t.se.exId), t.se, gymCam.cameras);
       startTimerForVideo(t.session);
-      gymCam.armSet(t.session, t.se, t.set);
+      gymCam.armSet(t.session, t.se, t.set, assigned);
       sh.close();
-      toast(`Recording ${setLabel} — tap ✓ or camera to stop`);
+      toast(`Recording ${assigned.map(shortCamLabel).join(' + ')} · ${setLabel} — tap ✓ or camera to stop`);
       return;
     }
     if (act === 'cam') {
@@ -3134,21 +3175,27 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       toast('Video link updated');
       void playVideo(meta!.id, ctx);
     } else if (t.closest('[data-del]')) {
-      const isGym = meta!.source === 'gymcam';
-      const title = isGym ? (meta!.guest ? 'Delete Guest Clip?' : 'Delete Gym Cam clip?') : (meta!.linkOnly ? 'Unlink this video?' : 'Delete this video?');
+      const targetMeta = activeClipMeta();
+      const isGym = targetMeta.source === 'gymcam';
+      const angleLbl = targetMeta.camera ? `${shortCamLabel(targetMeta.camera)} ` : '';
+      const title = isGym
+        ? (targetMeta.guest ? 'Delete Guest Clip?' : `Delete ${angleLbl}clip?`)
+        : (targetMeta.linkOnly ? 'Unlink this video?' : 'Delete this video?');
       const msg = isGym
-        ? (meta!.guest
+        ? (targetMeta.guest
           ? 'Removes this guest clip from this session, OptiPlex, and Google Drive (your 14-day raw tape stays intact).'
-          : 'Removes this clip from the set, OptiPlex, and Google Drive (your 14-day raw tape stays intact).')
-        : (meta!.linkOnly ? 'Removes this link from the set (keeps the file on your phone & Drive).' : 'It is removed from this phone.');
-      const okLbl = (meta!.linkOnly && !isGym) ? 'Unlink' : 'Delete';
+          : `Removes this ${angleLbl}clip from the set, OptiPlex, and Google Drive (any other saved angles & your 14-day raw tape stay intact).`)
+        : (targetMeta.linkOnly ? 'Removes this link from the set (keeps the file on your phone & Drive).' : 'It is removed from this phone.');
+      const okLbl = (targetMeta.linkOnly && !isGym) ? 'Unlink' : 'Delete';
       if (await confirmSheet(title, msg, okLbl, true)) {
-        sessionFiles.delete(id);
-        if (isGym) void gymCam.deleteClip(meta!);
-        await lifts.deleteVideo(id);
-        await resetTimerIfIdle(lifts.sessions.get(meta!.sessionId));
+        sessionFiles.delete(targetMeta.id);
+        if (isGym) void gymCam.deleteClip(targetMeta);
+        await lifts.deleteVideo(targetMeta.id);
+        await resetTimerIfIdle(lifts.sessions.get(targetMeta.sessionId));
+        const nextVidId = (set?.vids ?? []).find((vidId) => vidId !== targetMeta.id && lifts.videos.has(vidId));
         sh.close();
-        toast(isGym ? (meta!.guest ? 'Guest clip deleted from session, OptiPlex & Drive' : 'Clip deleted from set, OptiPlex & Drive') : (meta!.linkOnly ? 'Video unlinked' : 'Video deleted'));
+        toast(isGym ? (targetMeta.guest ? 'Guest clip deleted from session, OptiPlex & Drive' : `${angleLbl}clip deleted from set, OptiPlex & Drive`) : (targetMeta.linkOnly ? 'Video unlinked' : 'Video deleted'));
+        if (nextVidId) void playVideo(nextVidId, ctx);
       }
     }
   });

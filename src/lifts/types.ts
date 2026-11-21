@@ -30,7 +30,9 @@ export interface ExRow extends Partial<Exercise> {
   restSec?: number;
   /** Per-exercise auto-rest override (when checking a set). */
   restAuto?: boolean;
-  /** Permanent preferred Gym Cam ("Rack Cam" | "Smith Cam" | ... | "auto"). */
+  /** Assigned Gym Cam view(s) for this exercise (at least 1 required; default Rack Cam). */
+  cams?: string[];
+  /** @deprecated Legacy single-camera preference migrated to `cams`. */
   camPref?: string;
 }
 
@@ -86,7 +88,9 @@ export interface SessionEx {
   restAuto?: boolean;
   /** Original 0-based index inside the routine this session was started from. */
   slot?: number;
-  /** Last explicitly chosen Gym-Cam station ("Rack Cam" | "Smith Cam") for this exercise in this session. */
+  /** Assigned Gym Cam view(s) for this exercise in this session (at least 1 required). */
+  cams?: string[];
+  /** @deprecated Legacy single-camera override. */
   camPref?: string;
 }
 

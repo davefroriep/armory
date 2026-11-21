@@ -8,8 +8,9 @@ import {
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import { buildBoostcampSessions } from '../src/lifts/boostcampSeed';
 import {
-  addSet, buildExercise, canLog, collectUnfinishedItems, driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec,
-  hasSessionActivity, inferredCamForExercise, isSessionPaused, isSessionStarted, labels, midSuperset, newSet, pauseSessionClock,
+  addSet, buildExercise, canLog, collectUnfinishedItems, camsForExercise, defaultCamsForExercise, DEFAULT_FALLBACK_CAM,
+  driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec, hasSessionActivity, inferredCamForExercise,
+  isSessionPaused, isSessionStarted, labels, midSuperset, newSet, normalizeCamList, pauseSessionClock,
   preferredCamForExercise, prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
   startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
@@ -21,10 +22,11 @@ import {
   MIN_TRIM_SPAN_SEC, resolvePlayStart, stepTrimFrames,
 } from '../src/lifts/trimmer';
 import { EQUIPS, GROUPS } from '../src/lifts/muscles';
-import { PHASE1_ROUTINES, matchRoutineByTitle } from '../src/lifts/seed';
+import { PHASE1_EXERCISE_CAMS, PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from '../src/lifts/seed';
+import { applyCamsAndSmithRdlMigration } from '../src/lifts/store';
 import { KG_PER_LB, fmtNum, fromDisplay, stepsFor, toDisplay } from '../src/lifts/settings';
 import { condenseSets, intervalsDescription, shortLine } from '../src/lifts/summary';
-import { MUSCLES, type Exercise, type LiftSession, type LiftSet, type SessionEx } from '../src/lifts/types';
+import { MUSCLES, type ExRow, type Exercise, type LiftSession, type LiftSet, type Routine, type SessionEx } from '../src/lifts/types';
 
 const lb = (v: number): number => v * KG_PER_LB;
 const ex = (id: string, type: Exercise['type'] = 'weight', primary: Exercise['primary'] = ['ch'], secondary: Exercise['secondary'] = []): Exercise => ({ id, name: id, type, equip: 'bb', primary, secondary });
@@ -730,9 +732,12 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
 
     for (const r of PHASE1_ROUTINES) {
       for (const it of r.items) {
+        expect(LIBRARY_BY_ID.has(it.exId), `missing library slug ${it.exId}`).toBe(true);
+        if (it.exId === 'smith-machine-romanian-deadlift') continue;
         expect(previousPerformance(sessions, it.exId), `missing PREVIOUS for ${it.exId}`).not.toBeNull();
       }
     }
+    expect(previousPerformance(sessions, 'romanian-deadlift'), 'missing PREVIOUS for historical romanian-deadlift').not.toBeNull();
 
     // Low Bar Squat merges barbell + low-bar history: latest 185x8 PREVIOUS and full 415 1RM..275x20 records
     const sqPrev = previousPerformance(sessions, 'low-bar-squat')!;
@@ -788,56 +793,96 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
     ]);
   });
 
-  it('infers Smith, Rack, Fly Machine & Leg Machine defaults and respects persistent ExRow camPref overrides', () => {
+  it('resolves mandatory multi-cam defaults, never maps rear-delt-fly to Fly Machine Cam, and falls back to Rack Cam', () => {
+    expect(defaultCamsForExercise({ id: 'smith-machine-row', name: 'Smith Machine Row', equip: 'smith' })).toEqual(['Smith Cam', 'Smith Wide']);
+    expect(defaultCamsForExercise({ id: 'smith-machine-romanian-deadlift', name: 'Smith Machine Romanian Deadlift', equip: 'smith' })).toEqual(['Smith Cam', 'Smith Wide']);
+    expect(defaultCamsForExercise({ id: 'pull-up', name: 'Pull-Up', equip: 'bw' })).toEqual(['Smith Wide', 'Smith Cam']);
+    expect(defaultCamsForExercise({ id: 'low-bar-squat', name: 'Low Bar Squat', equip: 'bb' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'barbell-bench-press', name: 'Barbell Bench Press', equip: 'bb' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'deadlift', name: 'Deadlift', equip: 'bb' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'lat-pulldown', name: 'Lat Pulldown', equip: 'cable' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'cable-triceps-pushdown', name: 'Cable Triceps Pushdown', equip: 'cable' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'dumbbell-curl', name: 'Dumbbell Curl', equip: 'db' })).toEqual(['Rack Cam', 'Smith Cam', 'Smith Wide']);
+    expect(defaultCamsForExercise({ id: 'chest-fly-machine', name: 'Chest Fly Machine', equip: 'machine' })).toEqual(['Fly Machine Cam']);
+    expect(defaultCamsForExercise({ id: 'rear-delt-fly', name: 'Rear Delt Fly', equip: 'db' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'reverse-pec-deck', name: 'Reverse Pec Deck', equip: 'machine' })).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise({ id: 'leg-extension', name: 'Leg Extension', equip: 'machine' })).toEqual(['Leg Machine Cam']);
+    expect(defaultCamsForExercise({ id: 'lying-leg-curl', name: 'Lying Leg Curl', equip: 'machine' })).toEqual(['Leg Machine Cam']);
+    expect(defaultCamsForExercise({ id: 'custom-stretch', name: 'Custom Stretch', equip: 'other' })).toEqual([DEFAULT_FALLBACK_CAM]);
+
     expect(inferredCamForExercise({ name: 'Smith Machine Row', equip: 'smith' })).toBe('Smith Cam');
-    expect(inferredCamForExercise({ name: 'Smith Calf Raise', equip: 'other' })).toBe('Smith Cam');
-    expect(inferredCamForExercise({ name: 'Low Bar Squat', equip: 'bb' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Barbell Bench Press', equip: 'bb' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Deadlift', equip: 'bb' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Lat Pulldown', equip: 'cable' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Seated Cable Row', equip: 'cable' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Cable Triceps Pushdown', equip: 'cable' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Tricep Extension', equip: 'other' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Dumbbell Curl', equip: 'db' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Dumbbell Bench Press', equip: 'db' })).toBeUndefined();
+    expect(inferredCamForExercise({ name: 'Dumbbell Curl', equip: 'db' })).toBe('Rack Cam');
+    expect(inferredCamForExercise({ name: 'Reverse Pec Deck', equip: 'machine' })).toBe('Rack Cam');
 
-    // Machine flys -> Fly Machine Cam; DB flys -> Auto; Cable flys -> Rack Cam
-    expect(inferredCamForExercise({ name: 'Chest Fly Machine', equip: 'machine' })).toBe('Fly Machine Cam');
-    expect(inferredCamForExercise({ name: 'Reverse Pec Deck', equip: 'machine' })).toBe('Fly Machine Cam');
-    expect(inferredCamForExercise({ name: 'Dumbbell Fly', equip: 'db' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Incline Dumbbell Fly', equip: 'db' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Rear Delt Fly', equip: 'db' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Cable Crossover', equip: 'cable' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Low-to-High Cable Fly', equip: 'cable' })).toBe('Rack Cam');
-    expect(inferredCamForExercise({ name: 'Cable Rear Delt Fly', equip: 'cable' })).toBe('Rack Cam');
+    // Available camera matching falls back to Rack Cam when assigned station is absent
+    const chestFly = { id: 'chest-fly-machine', name: 'Chest Fly Machine', equip: 'machine' as const };
+    const legExt = { id: 'leg-extension', name: 'Leg Extension', equip: 'machine' as const };
+    expect(defaultCamsForExercise(chestFly, ['Rack Cam', 'Smith Cam'])).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise(legExt, ['Rack Cam', 'Smith Cam'])).toEqual(['Rack Cam']);
+    expect(defaultCamsForExercise(chestFly, ['Rack Cam', 'Smith Cam', 'Fly Machine Cam'])).toEqual(['Fly Machine Cam']);
+    expect(defaultCamsForExercise(legExt, ['Rack Cam', 'Smith Cam', 'Leg Machine Cam'])).toEqual(['Leg Machine Cam']);
 
-    // Leg Extension / Leg Curl only -> Leg Machine Cam; other leg/calf exercises untouched
-    expect(inferredCamForExercise({ name: 'Leg Extension', equip: 'machine' })).toBe('Leg Machine Cam');
-    expect(inferredCamForExercise({ name: 'Lying Leg Curl', equip: 'machine' })).toBe('Leg Machine Cam');
-    expect(inferredCamForExercise({ name: 'Seated Leg Curl', equip: 'machine' })).toBe('Leg Machine Cam');
-    expect(inferredCamForExercise({ name: 'Leg Press', equip: 'machine' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Seated Calf Raise', equip: 'machine' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Leg Press Calf Raise', equip: 'machine' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Nordic Hamstring Curl', equip: 'bw' })).toBeUndefined();
-    expect(inferredCamForExercise({ name: 'Hanging Leg Raise', equip: 'bw' })).toBe('Rack Cam');
-
-    // availableCameras filter hides unconfigured virtual views gracefully
-    const chestFly = { name: 'Chest Fly Machine', equip: 'machine' as const };
-    const legExt = { name: 'Leg Extension', equip: 'machine' as const };
-    expect(inferredCamForExercise(chestFly, ['Rack Cam', 'Smith Cam'])).toBeUndefined();
-    expect(inferredCamForExercise(legExt, ['Rack Cam', 'Smith Cam'])).toBeUndefined();
-    expect(inferredCamForExercise(chestFly, ['Rack Cam', 'Smith Cam', 'Fly Machine Cam'])).toBe('Fly Machine Cam');
-    expect(inferredCamForExercise(legExt, ['Rack Cam', 'Smith Cam', 'Leg Machine Cam'])).toBe('Leg Machine Cam');
-
-    // Persistent ExRow.camPref & explicit 'auto' opt-out + session precedence
-    const curl = { name: 'Dumbbell Curl', equip: 'db' as const };
-    expect(preferredCamForExercise(curl, null)).toBeUndefined();
-    expect(preferredCamForExercise(curl, { camPref: 'Rack Cam' })).toBe('Rack Cam');
-    expect(preferredCamForExercise(curl, { camPref: 'Rack Cam' }, 'Smith Cam')).toBe('Smith Cam');
-
-    const bench = { name: 'Barbell Bench Press', equip: 'bb' as const };
-    expect(preferredCamForExercise(bench, null)).toBe('Rack Cam');
-    expect(preferredCamForExercise(bench, { camPref: 'auto' })).toBeUndefined();
+    // Mandatory camsForExercise precedence + legacy 'auto' stripping -> never empty
+    const curl = { id: 'dumbbell-curl', name: 'Dumbbell Curl', equip: 'db' as const };
+    const bench = { id: 'barbell-bench-press', name: 'Barbell Bench Press', equip: 'bb' as const };
+    expect(normalizeCamList(['auto', 'Smith Cam', 'smith cam', ''])).toEqual(['Smith Cam']);
+    expect(camsForExercise(curl, null)).toEqual(['Rack Cam', 'Smith Cam', 'Smith Wide']);
+    expect(camsForExercise(curl, { cams: ['Rack Cam'] })).toEqual(['Rack Cam']);
+    expect(camsForExercise(curl, { cams: ['Rack Cam'] }, { cams: ['Smith Cam', 'Smith Wide'] })).toEqual(['Smith Cam', 'Smith Wide']);
+    expect(camsForExercise(bench, { camPref: 'auto' })).toEqual(['Rack Cam']);
+    expect(preferredCamForExercise(bench, { camPref: 'auto' })).toBe('Rack Cam');
     expect(preferredCamForExercise(bench, { camPref: 'Low Knee Cam' })).toBe('Low Knee Cam');
+  });
+
+  it('seeds all 19 Phase 1 exercise camera mappings, swaps Lower 1 to Smith RDL, and migrates legacy ExRow/Routine data', () => {
+    const phase1Ids = Object.keys(PHASE1_EXERCISE_CAMS);
+    expect(phase1Ids).toHaveLength(19);
+    const seedById = new Map(SEED_EX_ROWS.map((r) => [r.id, r]));
+    for (const id of phase1Ids) {
+      expect(PHASE1_EXERCISE_CAMS[id].length).toBeGreaterThanOrEqual(1);
+      expect(seedById.get(id)?.cams).toEqual(PHASE1_EXERCISE_CAMS[id]);
+    }
+    expect(seedById.get('rear-delt-fly')?.cams).toEqual(['Rack Cam']);
+    expect(seedById.get('chest-fly-machine')?.cams).toEqual(['Fly Machine Cam']);
+    expect(seedById.get('smith-machine-romanian-deadlift')?.cams).toEqual(['Smith Cam']);
+    expect(seedById.get('triceps-isometric-hold')?.restSec).toBe(45);
+
+    const lower1Seed = PHASE1_ROUTINES.find((r) => r.id === 'day-lower-1')!;
+    expect(lower1Seed.items.map((it) => it.exId)).toContain('smith-machine-romanian-deadlift');
+    expect(lower1Seed.items.map((it) => it.exId)).not.toContain('romanian-deadlift');
+    expect(lower1Seed.items[1].rx).toBeTruthy();
+
+    const routines = new Map<string, Routine>([
+      ['day-lower-1', {
+        id: 'day-lower-1',
+        name: 'Lower 1 · Squat & RDL',
+        createdMs: 1,
+        order: 0,
+        items: [
+          { exId: 'low-bar-squat', sets: 3 },
+          { exId: 'romanian-deadlift', sets: 3 },
+          { exId: 'standing-calf-raise', sets: 3, ss: true },
+          { exId: 'cable-crunch', sets: 3 },
+        ],
+      }],
+    ]);
+    const rows = new Map<string, ExRow>([
+      ['barbell-bench-press', { id: 'barbell-bench-press', camPref: 'auto' }],
+      ['custom-move', { id: 'custom-move', custom: true, name: 'Custom Move', type: 'weight', equip: 'other', primary: ['ch'], secondary: [], camPref: 'Smith Wide' }],
+    ]);
+    const mig = applyCamsAndSmithRdlMigration({
+      routines,
+      rows,
+      resolveEx: (id) => LIBRARY_BY_ID.get(id),
+      prevFor: () => null,
+      bestE1For: () => 225 * KG_PER_LB,
+      unit: 'lb',
+    });
+    expect(mig.changedRoutines).toHaveLength(1);
+    expect(routines.get('day-lower-1')!.items[1].exId).toBe('smith-machine-romanian-deadlift');
+    expect(rows.get('barbell-bench-press')!.cams).toEqual(['Rack Cam']);
+    expect(rows.get('barbell-bench-press')!.camPref).toBeUndefined();
+    expect(rows.get('custom-move')!.cams).toEqual(['Smith Wide']);
+    expect(rows.get('rear-delt-fly')!.cams).toEqual(['Rack Cam']);
   });
 });

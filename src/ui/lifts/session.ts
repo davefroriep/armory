@@ -3,8 +3,9 @@ import { active } from '../../lifts/active';
 import { computePRs } from '../../lifts/calc';
 import { advanceCursorAfterLog, jumpToExerciseCursor, resolveTargetSet } from '../../lifts/cursor';
 import {
-  addSet, buildExercise, canLog, collectUnfinishedItems, deleteSet, editReps, editWeight, hasLogged, inferredCamForExercise, isSessionPaused, isSessionStarted, labels, midSuperset,
-  preferredCamForExercise, prevSetFor, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
+  addSet, buildExercise, camsForExercise, canLog, collectUnfinishedItems, DEFAULT_CAM_OPTIONS, DEFAULT_FALLBACK_CAM,
+  deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
+  prevSetFor, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
@@ -234,7 +235,9 @@ function build(root: HTMLElement, id?: string): () => void {
         : guestArmed
           ? (guestArmed.camera ? `● GUEST ${shortCamLabel(guestArmed.camera)}` : '● GUEST REC')
           : armed
-            ? (armed.camera ? `● REC ${shortCamLabel(armed.camera)}` : '● REC Auto')
+            ? (armed.cameras.length > 1
+              ? `● REC ${armed.cameras.length} CAMS`
+              : `● REC ${shortCamLabel(armed.camera || DEFAULT_FALLBACK_CAM)}`)
             : gymCam.recording && !gymCam.paused
               ? `${buddyPrefix}● CAM`
               : `${buddyPrefix}○ CAM`;
@@ -551,14 +554,21 @@ function build(root: HTMLElement, id?: string): () => void {
         buzz(25);
       }
     };
-    const maybeCamOnLog = (hadPr: boolean, wasArmed: boolean, armedCam?: string): void => {
+    const maybeCamOnLog = (hadPr: boolean, wasArmed: boolean, armedCams?: string[]): void => {
       if (edit) return;
       if (wasArmed) {
-        const camLbl = armedCam ? shortCamLabel(armedCam) : 'Gym Cam';
+        const list = armedCams?.length ? armedCams : [DEFAULT_FALLBACK_CAM];
+        const camLbl = list.length > 1 ? `${list.length} cams` : shortCamLabel(list[0]);
         toast(`Saving ${camLbl} clip…`);
-        void gymCam.stopAndSaveArmed(s, se, set).then((meta) => {
+        void gymCam.stopAndSaveArmed(s, se, set).then((clips) => {
           if (dead) return;
-          toast(meta ? `${camLbl} clip saved · ${ex.name}` : 'Could not save clip from Gym Cam');
+          toast(
+            clips.length > 1
+              ? `${clips.length} angles saved · ${ex.name}`
+              : clips.length === 1
+                ? `${shortCamLabel(clips[0].camera || list[0])} clip saved · ${ex.name}`
+                : 'Could not save clip from Gym Cam',
+          );
           save();
           syncVisibleCards();
         });
@@ -566,10 +576,13 @@ function build(root: HTMLElement, id?: string): () => void {
       }
       if (!gymCam.online) return;
       if (!hadPr && hits.has(set.id) && getSettings().gymCamAutoPr && !set.vids?.length) {
-        const resolved = preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref, gymCam.cameras);
-        const prefCam = resolved || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
-        void gymCam.autoClipPr(s, se, set, prefCam).then((meta) => {
-          if (!dead && meta) { toast('★ PR auto-clipped from Gym Cam'); save(); syncVisibleCards(); }
+        const cams = camsForEx(se);
+        void gymCam.autoClipPr(s, se, set, cams).then((clips) => {
+          if (!dead && clips.length > 0) {
+            toast(clips.length > 1 ? `★ PR auto-clipped (${clips.length} angles)` : '★ PR auto-clipped from Gym Cam');
+            save();
+            syncVisibleCards();
+          }
         });
       }
     };
@@ -577,10 +590,10 @@ function build(root: HTMLElement, id?: string): () => void {
       if (!canLog(set, ex)) return shakeIncomplete();
       const hadPr = hits.has(set.id);
       const wasArmed = !edit && gymCam.isArmed(set.id);
-      const armedCam = wasArmed ? gymCam.armed?.camera : undefined;
+      const armedCams = wasArmed ? (gymCam.armed?.cameras ?? (gymCam.armed?.camera ? [gymCam.armed.camera] : [])) : undefined;
       recomputePRs();
       commitBuzz(hadPr);
-      maybeCamOnLog(hadPr, wasArmed, armedCam);
+      maybeCamOnLog(hadPr, wasArmed, armedCams);
       syncCard(card);
       save();
       focused?.blur();
@@ -588,7 +601,7 @@ function build(root: HTMLElement, id?: string): () => void {
       return;
     }
     const wasArmed = !edit && gymCam.isArmed(set.id);
-    const armedCam = wasArmed ? gymCam.armed?.camera : undefined;
+    const armedCams = wasArmed ? (gymCam.armed?.cameras ?? (gymCam.armed?.camera ? [gymCam.armed.camera] : [])) : undefined;
     const r = toggleDone(se, i, ex);
     if (r === null) return shakeIncomplete();
     if (r && !was) {
@@ -603,7 +616,7 @@ function build(root: HTMLElement, id?: string): () => void {
         paintClock();
       }
       commitBuzz(false);
-      maybeCamOnLog(false, wasArmed, armedCam);
+      maybeCamOnLog(false, wasArmed, armedCams);
     } else {
       recomputePRs();
       if (!r && was && !edit) {
@@ -632,14 +645,14 @@ function build(root: HTMLElement, id?: string): () => void {
   const restore = (snap: string): void => { s.exs = JSON.parse(snap); save(); paint(); };
   const defaultSets = (ex: Exercise): number => (ex.type === 'time' ? 2 : 3);
 
-  const camForEx = (se: SessionEx): string | undefined =>
-    preferredCamForExercise(exOf(se.exId), lifts.row(se.exId), se.camPref, gymCam.cameras);
+  const camsForEx = (se: SessionEx): string[] =>
+    camsForExercise(exOf(se.exId), lifts.row(se.exId), se, gymCam.cameras);
 
   const exMenu = async (se: SessionEx): Promise<void> => {
     const ex = exOf(se.exId);
     const idx = s.exs.indexOf(se);
-    const resolvedCam = camForEx(se);
-    const camSub = resolvedCam ? shortCamLabel(resolvedCam) : 'Auto Cam';
+    const resolvedCams = camsForEx(se);
+    const camSub = resolvedCams.map(shortCamLabel).join(' + ');
     const k = await actionSheet(ex.name, [
       { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
       ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
@@ -683,7 +696,7 @@ function build(root: HTMLElement, id?: string): () => void {
        <div class="line"><span>Show auto-timer<small>Show Auto toggle pill on exercise cards</small></span><button class="switch" type="button" data-tcfg="showAutoTimer" role="switch"><i></i></button></div>
        <div class="fl">REST DURATION <small>THIS EXERCISE</small></div>
        <div class="chips-row wrap" id="tdur"></div>
-       <div class="fl">PREFERRED CAMERA <small>SAVED FOR THIS EXERCISE</small></div>
+       <div class="fl">ASSIGNED CAMERAS <small>REQUIRED · 1+ STATIONS</small></div>
        <div class="chips-row wrap" id="tcam"></div>
        <div class="fl">THIS CARD</div>
        <div class="line"><span>Auto-timer on check<small>Starts countdown automatically when logging a set here</small></span><button class="switch" type="button" data-tcfg="cardAuto" role="switch"><i></i></button></div>
@@ -707,17 +720,11 @@ function build(root: HTMLElement, id?: string): () => void {
       sh.body.querySelector('#tdur')!.innerHTML = opts
         .map((o) => `<button class="fchip${o === cur ? ' on' : ''}" type="button" data-d="${o}">${clock(o)}</button>`)
         .join('');
-      const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
-      const inferred = inferredCamForExercise(ex, gymCam.cameras);
-      const savedPref = lifts.row(se.exId)?.camPref ?? '';
-      const defLabel = inferred ? `Default (${shortCamLabel(inferred)})` : 'Default (Auto)';
-      const camChoices: [string, string][] = [
-        ['', defLabel],
-        ...cams.map((c): [string, string] => [c, shortCamLabel(c)]),
-        ...(inferred ? [['auto', 'Auto (Motion)'] as [string, string]] : []),
-      ];
+      const baseCams = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
+      const assigned = camsForExercise(ex, lifts.row(se.exId), se);
+      const camChoices = [...new Set([...DEFAULT_CAM_OPTIONS, ...baseCams, ...assigned])];
       sh.body.querySelector('#tcam')!.innerHTML = camChoices
-        .map(([val, lbl]) => `<button class="fchip${savedPref === val ? ' on' : ''}" type="button" data-xcam="${esc(val)}">${esc(lbl)}</button>`)
+        .map((c) => `<button class="fchip${assigned.includes(c) ? ' on' : ''}" type="button" data-xcam="${esc(c)}">${esc(shortCamLabel(c))}</button>`)
         .join('');
       syncTog('[data-tcfg="showTimer"]', ls.showTimer);
       syncTog('[data-tcfg="showAutoTimer"]', ls.showAutoTimer);
@@ -740,11 +747,26 @@ function build(root: HTMLElement, id?: string): () => void {
       }
       const xc = t.closest<HTMLElement>('[data-xcam]');
       if (xc) {
+        const clicked = xc.dataset.xcam!;
+        const cur = camsForExercise(ex, lifts.row(se.exId), se);
+        const known = [...new Set([...DEFAULT_CAM_OPTIONS, ...gymCam.cameras, ...cur])];
+        let nextCams: string[];
+        if (cur.includes(clicked)) {
+          if (cur.length <= 1) {
+            toast('Keep at least 1 camera assigned');
+            return;
+          }
+          nextCams = cur.filter((c) => c !== clicked);
+        } else {
+          nextCams = known.filter((c) => c === clicked || cur.includes(c));
+        }
+        delete se.cams;
         delete se.camPref;
-        const val = xc.dataset.xcam!;
         const nextRow = { ...(lifts.row(se.exId) ?? { id: se.exId }) };
-        if (val) nextRow.camPref = val; else delete nextRow.camPref;
+        nextRow.cams = nextCams;
+        delete nextRow.camPref;
         await lifts.saveRow(nextRow);
+        save();
         draw();
         return;
       }
@@ -1039,7 +1061,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'camstatus') {
       const sh = openSheet('<div id="camStatusBody"></div>');
       const renderCamSheet = (): void => {
-        const cams = gymCam.cameras.length ? gymCam.cameras : ['Rack Cam', 'Smith Cam'];
+        const cams = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
         const guestVids = [...lifts.videos.values()]
           .filter((v) => v.sessionId === s.id && v.guest)
           .sort((a, b) => b.ms - a.ms);
@@ -1052,7 +1074,6 @@ function build(root: HTMLElement, id?: string): () => void {
             ? `<div class="fl">RECORD GUEST / BUDDY CLIP (NO LOG ENTRY)</div>
                <div class="vp-foot-row" style="margin:6px 0 10px">
                  ${cams.map((c) => `<button class="btn sm" type="button" data-gstart="${esc(c)}">● ${esc(shortCamLabel(c))}</button>`).join('')}
-                 ${s.buddyMode ? '' : '<button class="btn sm" type="button" data-gstart="">● Auto</button>'}
                </div>`
             : '';
         const guestList = guestVids.length
@@ -1089,11 +1110,11 @@ function build(root: HTMLElement, id?: string): () => void {
         const gStart = el.closest<HTMLElement>('[data-gstart]');
         if (gStart) {
           active.ensureStarted(s, true);
-          const effCam = gStart.dataset.gstart || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+          const effCam = gStart.dataset.gstart || gymCam.cameras[0] || DEFAULT_FALLBACK_CAM;
           gymCam.armGuest(s, effCam);
           paintCamPill();
           sh.close();
-          toast('Guest clip recording — tap ● GUEST REC or say “Armory guest record” to save');
+          toast(`Guest clip recording on ${shortCamLabel(effCam)} — tap ● GUEST REC or say “Armory guest record” to save`);
           return;
         }
         if (el.closest('[data-gcancel]')) {
@@ -1312,33 +1333,37 @@ function build(root: HTMLElement, id?: string): () => void {
           return;
         }
         if (gymCam.isArmed(set.id)) {
-          const camLbl = gymCam.armed?.camera ? shortCamLabel(gymCam.armed.camera) : 'Gym Cam';
+          const armedCams = gymCam.armed?.cameras ?? (gymCam.armed?.camera ? [gymCam.armed.camera] : [DEFAULT_FALLBACK_CAM]);
+          const camLbl = armedCams.length > 1 ? `${armedCams.length} cams` : shortCamLabel(armedCams[0]);
           toast(`Saving ${camLbl} clip…`);
-          const meta = await gymCam.stopAndSaveArmed(s, se, set);
+          const clips = await gymCam.stopAndSaveArmed(s, se, set);
           if (!dead) {
-            toast(meta ? `${camLbl} clip saved & linked` : 'Could not save clip from Gym Cam');
+            toast(
+              clips.length > 1
+                ? `${clips.length} angles saved & linked`
+                : clips.length === 1
+                  ? `${shortCamLabel(clips[0].camera || armedCams[0])} clip saved & linked`
+                  : 'Could not save clip from Gym Cam',
+            );
             save();
             syncVisibleCards();
           }
           return;
         }
         if (gymCam.online && !set.done) {
-          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel, camForEx(se), !!s.buddyMode);
+          const choice = await pickRecordCameraSheet(exOf(se.exId).name, setLabel, camsForEx(se), !!s.buddyMode);
           if (dead || choice.kind === 'cancel') return;
           if (choice.kind === 'cam') {
             active.ensureStarted(s, true);
             paintClock();
-            if (choice.camera) {
-              se.camPref = choice.camera;
-              save();
-            }
-            const effCam = choice.explicitAuto && !s.buddyMode
-              ? undefined
-              : (choice.camera || camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined));
-            gymCam.armSet(s, se, set, effCam);
+            const effCams = choice.cameras.length ? choice.cameras : camsForEx(se);
+            se.cams = [...effCams];
+            delete se.camPref;
+            save();
+            gymCam.armSet(s, se, set, effCams);
             buzz(25);
             syncVisibleCards();
-            const camLbl = effCam ? shortCamLabel(effCam) : 'Auto';
+            const camLbl = effCams.map(shortCamLabel).join(' + ');
             toast(`Recording ${camLbl} · ${setLabel} — tap ✓ or red camera to stop`);
             return;
           }
@@ -1394,11 +1419,10 @@ function build(root: HTMLElement, id?: string): () => void {
         }
         if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
         active.ensureStarted(s, true);
-        const effCam = camera || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
+        const effCam = camera || gymCam.cameras[0] || DEFAULT_FALLBACK_CAM;
         gymCam.armGuest(s, effCam);
         if (!dead) paintCamPill();
-        const camLbl = effCam ? shortCamLabel(effCam) : 'Auto';
-        return `Guest recording ${camLbl}`;
+        return `Guest recording ${shortCamLabel(effCam)}`;
       }
       if (mode === 'arm') {
         const ptr = resolveTargetSet(s.exs, voice.cursor);
@@ -1406,20 +1430,25 @@ function build(root: HTMLElement, id?: string): () => void {
         const se = s.exs[ptr.exIdx];
         const set = se.sets[ptr.setIdx];
         if (gymCam.isArmed(set.id)) {
-          const meta = await gymCam.stopAndSaveArmed(s, se, set);
+          const clips = await gymCam.stopAndSaveArmed(s, se, set);
           if (!dead) { save(); syncVisibleCards(); }
-          return meta ? `Clip saved · ${exOf(se.exId).name}` : 'Could not save clip from Gym Cam';
+          return clips.length > 1
+            ? `${clips.length} clips saved · ${exOf(se.exId).name}`
+            : clips.length === 1
+              ? `Clip saved · ${exOf(se.exId).name}`
+              : 'Could not save clip from Gym Cam';
         }
         if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
         active.ensureStarted(s, true);
         if (camera) {
-          se.camPref = camera;
+          se.cams = [camera];
+          delete se.camPref;
           save();
         }
-        const effCam = camera || camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
-        gymCam.armSet(s, se, set, effCam);
+        const effCams = camera ? [camera] : camsForEx(se);
+        gymCam.armSet(s, se, set, effCams);
         if (!dead) syncVisibleCards();
-        const camLbl = effCam ? shortCamLabel(effCam) : 'Auto';
+        const camLbl = effCams.map(shortCamLabel).join(' + ');
         return `Recording ${camLbl} · ${exOf(se.exId).name} Set ${ptr.setNumber}`;
       }
       if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
@@ -1431,13 +1460,18 @@ function build(root: HTMLElement, id?: string): () => void {
       }
       if (!latest) return 'Log a set first to clip it';
       if (camera) {
-        latest.se.camPref = camera;
+        latest.se.cams = [camera];
+        delete latest.se.camPref;
         save();
       }
-      const effCam = camera || camForEx(latest.se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
-      const meta = await gymCam.autoClipPr(s, latest.se, latest.set, effCam, true);
-      if (!dead && meta) { save(); syncVisibleCards(); }
-      return meta ? `Clipped ${exOf(latest.se.exId).name}` : 'No motion burst found yet';
+      const effCams = camera ? [camera] : camsForEx(latest.se);
+      const clips = await gymCam.autoClipPr(s, latest.se, latest.set, effCams, true);
+      if (!dead && clips.length > 0) { save(); syncVisibleCards(); }
+      return clips.length > 1
+        ? `Clipped ${clips.length} angles · ${exOf(latest.se.exId).name}`
+        : clips.length === 1
+          ? `Clipped ${exOf(latest.se.exId).name}`
+          : 'No motion burst found yet';
     };
     voice.replayHandler = async (req) => {
       if (req.close) {
@@ -1487,8 +1521,9 @@ function build(root: HTMLElement, id?: string): () => void {
       let meta = set.vids?.length ? lifts.videos.get(set.vids[set.vids.length - 1]) : undefined;
       if ((!meta || !meta.lanUrl) && gymCam.online && set.done) {
         toast(`Pulling ${exOf(se.exId).name} ${setLabel} for TV…`);
-        const effCam = camForEx(se) || (s.buddyMode ? (gymCam.cameras[0] || 'Rack Cam') : undefined);
-        meta = (await gymCam.autoClipPr(s, se, set, effCam, true)) ?? undefined;
+        const effCams = camsForEx(se);
+        const clips = await gymCam.autoClipPr(s, se, set, effCams, true);
+        meta = clips[0] ?? meta;
         if (meta && !dead) { save(); syncVisibleCards(); }
       }
       if (!meta?.lanUrl) return `No Gym Cam clip found for ${exOf(se.exId).name} ${setLabel}`;

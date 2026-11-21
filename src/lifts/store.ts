@@ -2,8 +2,8 @@ import { Emitter } from '../emitter';
 import { idbAll, idbDelete, idbGet, idbPut, idbPutMany } from '../store/db';
 import { computePRs, doneSessions, e1rm, exerciseSessions, previousPerformance, type PRHit } from './calc';
 import { LIBRARY, LIBRARY_BY_ID } from './library';
-import { buildExercise, isSessionStarted } from './logic';
-import { PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from './seed';
+import { DEFAULT_FALLBACK_CAM, buildExercise, defaultCamsForExercise, isSessionStarted, normalizeCamList } from './logic';
+import { PHASE1_EXERCISE_CAMS, PHASE1_ROUTINES, SEED_EX_ROWS, matchRoutineByTitle } from './seed';
 import { liftSettings, updateLiftSettings } from './settings';
 import type { ExRow, Exercise, ExerciseRx, LiftSession, Routine, SessionEx, VideoMeta } from './types';
 
@@ -42,10 +42,12 @@ class LiftStore {
   private deletedSessionIds = new Set<string>();
 
   constructor() {
-    this.ready = this.load();
-    const flush = (): void => void this.flush();
-    window.addEventListener('pagehide', flush);
-    document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
+    this.ready = typeof indexedDB !== 'undefined' ? this.load() : Promise.resolve();
+    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+      const flush = (): void => void this.flush();
+      window.addEventListener('pagehide', flush);
+      document.addEventListener('visibilitychange', () => { if (document.hidden) flush(); });
+    }
   }
 
   private async load(): Promise<void> {
@@ -169,6 +171,23 @@ class LiftStore {
       localStorage.setItem(BOOSTCAMP_SEED_KEY, '1');
     }
 
+    const MIG_CAMS_KEY = 'armory.lifts.mig_cams_smith_rdl.v1';
+    if (typeof localStorage !== 'undefined' && !localStorage.getItem(MIG_CAMS_KEY)) {
+      const mig = applyCamsAndSmithRdlMigration({
+        routines: this.routines,
+        rows: this.rows,
+        activeSession: this.active,
+        resolveEx: (id) => this.exercise(id),
+        prevFor: (id) => this.previous(id),
+        bestE1For: (id) => this.bestE1rm(id),
+        unit: liftSettings().unit,
+      });
+      if (mig.changedRoutines.length) await idbPutMany('lift_routines', mig.changedRoutines);
+      if (mig.changedRows.length) await idbPutMany('lift_ex', mig.changedRows);
+      if (mig.activeChanged && this.active) await idbPut('lift_sessions', this.active);
+      localStorage.setItem(MIG_CAMS_KEY, '1');
+    }
+
     // Discard any leftover unstarted preview session on cold start so scratch numbers never linger.
     const stale = this.active;
     if (stale && !isSessionStarted(stale)) {
@@ -268,9 +287,11 @@ class LiftStore {
     this.touch();
   }
 
-  async createCustom(def: Omit<Exercise, 'id' | 'custom'>): Promise<Exercise> {
+  async createCustom(def: Omit<Exercise, 'id' | 'custom'> & { cams?: string[] }): Promise<Exercise> {
     const id = `c-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
-    const row: ExRow = { id, custom: true, ...def };
+    const cams = normalizeCamList(def.cams);
+    const effCams = cams.length ? cams : defaultCamsForExercise({ id, name: def.name, equip: def.equip });
+    const row: ExRow = { id, custom: true, ...def, cams: effCams };
     await this.saveRow(row);
     return this.exercise(id)!;
   }
@@ -462,6 +483,85 @@ class LiftStore {
     if (videos.length) await idbPutMany('lift_videos', videos);
     return { sessions: sessions.length, routines: routines.length, exercises: exercises.length };
   }
+}
+
+export function applyCamsAndSmithRdlMigration(args: {
+  routines: Map<string, Routine>;
+  rows: Map<string, ExRow>;
+  activeSession?: LiftSession | null;
+  resolveEx: (id: string) => Exercise | undefined;
+  prevFor: (id: string) => SessionEx | null;
+  bestE1For: (id: string) => number | null;
+  unit: 'lb' | 'kg';
+}): { changedRoutines: Routine[]; changedRows: ExRow[]; activeChanged: boolean } {
+  const changedRoutines: Routine[] = [];
+  const changedRows: ExRow[] = [];
+  const dirtyRowIds = new Set<string>();
+  let activeChanged = false;
+
+  for (const rt of args.routines.values()) {
+    let dirty = false;
+    for (const it of rt.items) {
+      if (it.exId === 'romanian-deadlift') {
+        it.exId = 'smith-machine-romanian-deadlift';
+        dirty = true;
+      }
+    }
+    if (dirty) changedRoutines.push(rt);
+  }
+
+  const act = args.activeSession;
+  if (act && act.status === 'active') {
+    for (let i = 0; i < act.exs.length; i++) {
+      const se = act.exs[i];
+      if (se.exId === 'romanian-deadlift' && !se.sets.some((st) => st.done)) {
+        const nextEx = args.resolveEx('smith-machine-romanian-deadlift');
+        const workCount = Math.max(1, se.sets.filter((st) => st.kind !== 'w').length);
+        if (nextEx) {
+          const rebuilt = buildExercise(
+            'smith-machine-romanian-deadlift',
+            workCount,
+            args.prevFor('smith-machine-romanian-deadlift'),
+            !!se.ss,
+            se.slot ?? i,
+            { rx: se.rx, ex: nextEx, base1RmKg: args.bestE1For('smith-machine-romanian-deadlift'), unit: args.unit },
+          );
+          rebuilt.uid = se.uid;
+          act.exs[i] = rebuilt;
+        } else {
+          se.exId = 'smith-machine-romanian-deadlift';
+        }
+        activeChanged = true;
+      }
+    }
+  }
+
+  for (const [exId, cams] of Object.entries(PHASE1_EXERCISE_CAMS)) {
+    const prev = args.rows.get(exId);
+    const next: ExRow = { ...(prev ?? { id: exId }), cams: [...cams] };
+    delete next.camPref;
+    args.rows.set(exId, next);
+    dirtyRowIds.add(exId);
+  }
+
+  for (const row of args.rows.values()) {
+    if (dirtyRowIds.has(row.id)) continue;
+    if (row.camPref !== undefined) {
+      const migrated = normalizeCamList(row.camPref);
+      const ex = args.resolveEx(row.id);
+      const effCams = migrated.length ? migrated : (ex ? defaultCamsForExercise(ex) : [DEFAULT_FALLBACK_CAM]);
+      const next: ExRow = { ...row, cams: effCams };
+      delete next.camPref;
+      args.rows.set(row.id, next);
+      dirtyRowIds.add(row.id);
+    }
+  }
+
+  for (const id of dirtyRowIds) {
+    const row = args.rows.get(id);
+    if (row) changedRows.push(row);
+  }
+  return { changedRoutines, changedRows, activeChanged };
 }
 
 function pickDef(r: ExRow): Partial<Exercise> {

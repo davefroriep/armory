@@ -20,6 +20,7 @@ interface Phase1Spec {
 
 const PHASE1_RX: Record<string, Phase1Spec> = {
   'low-bar-squat': { repTarget: '6–8 reps', tier: 'compound', sampleRep: 8 },
+  'smith-machine-romanian-deadlift': { repTarget: '8–10 reps', tier: 'compound', sampleRep: 10 },
   'romanian-deadlift': { repTarget: '8–10 reps', tier: 'compound', sampleRep: 10 },
   'standing-calf-raise': { repTarget: '12–15 reps', tier: 'isolation', sampleRep: 15 },
   'cable-crunch': { repTarget: '12–15 reps', tier: 'isolation', sampleRep: 15 },

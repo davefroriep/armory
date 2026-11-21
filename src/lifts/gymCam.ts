@@ -1,5 +1,6 @@
 import { Emitter } from '../emitter';
 import { getSettings, updateSettings } from '../store/settings';
+import { DEFAULT_FALLBACK_CAM, normalizeCamList } from './logic';
 import { lifts } from './store';
 import { uid, type LiftSession, type LiftSet, type SessionEx, type VideoMeta } from './types';
 
@@ -138,6 +139,7 @@ interface ClipApiResponse {
   audioSource?: string;
   driveFileId?: string;
   driveUrl?: string;
+  clips?: ClipApiResponse[];
 }
 
 class GymCamController {
@@ -147,7 +149,7 @@ class GymCamController {
   retentionDays = 14;
   cameras: string[] = [];
   clockOffsetMs = 0;
-  armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera?: string } | null = null;
+  armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera: string; cameras: string[] } | null = null;
   savingSetId: string | null = null;
   guestArmed: { sessionId: string; startEpochMs: number; camera?: string } | null = null;
   savingGuest = false;
@@ -371,10 +373,11 @@ class GymCamController {
     this.changed.emit();
   }
 
-  armSet(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string): boolean {
+  armSet(s: LiftSession, se: SessionEx, set: LiftSet, cameras?: string | string[]): boolean {
     if (!this.online) return false;
-    const cam = camera?.trim() || undefined;
-    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs(), ...(cam ? { camera: cam } : {}) };
+    const raw = normalizeCamList(cameras);
+    const list = raw.length ? raw : [DEFAULT_FALLBACK_CAM];
+    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs(), camera: list[0], cameras: list };
     this.changed.emit();
     return true;
   }
@@ -527,9 +530,11 @@ class GymCamController {
     return meta;
   }
 
-  async stopAndSaveArmed(s: LiftSession, se: SessionEx, set: LiftSet): Promise<VideoMeta | null> {
-    if (!this.armed || this.armed.setId !== set.id || this.savingSetId === set.id) return null;
-    const { startEpochMs: startMs, camera } = this.armed;
+  async stopAndSaveArmed(s: LiftSession, se: SessionEx, set: LiftSet): Promise<VideoMeta[]> {
+    if (!this.armed || this.armed.setId !== set.id || this.savingSetId === set.id) return [];
+    const { startEpochMs: startMs, camera, cameras } = this.armed;
+    const camList = normalizeCamList(cameras?.length ? cameras : camera);
+    const effCams = camList.length ? camList : [DEFAULT_FALLBACK_CAM];
     const endMs = Math.max(startMs + 3000, this.serverNowMs() + 2000);
     this.armed = null;
     this.savingSetId = set.id;
@@ -543,19 +548,24 @@ class GymCamController {
         setId: set.id,
         startMs,
         endMs,
-        ...(camera ? { camera } : {}),
+        camera: effCams[0],
+        cameras: effCams,
       };
       let res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
       if (!res) {
         await new Promise((r) => setTimeout(r, 1200));
         res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
       }
-      if (res?.lanUrl) {
-        this.online = true;
-        this.probeMisses = 0;
-        return await this.persistClipFromServer({ session: s, se, set }, res);
+      const rawClips = res?.clips?.length ? res.clips : (res?.lanUrl ? [res] : []);
+      if (!rawClips.length) return [];
+      this.online = true;
+      this.probeMisses = 0;
+      const saved: VideoMeta[] = [];
+      for (const item of rawClips) {
+        const meta = await this.persistClipFromServer({ session: s, se, set }, item);
+        if (meta) saved.push(meta);
       }
-      return null;
+      return saved;
     } finally {
       if (this.savingSetId === set.id) this.savingSetId = null;
       this.changed.emit();
@@ -563,11 +573,17 @@ class GymCamController {
   }
 
   /**
-   * Auto-clips a PR set using server motion-burst alignment while filtering out
-   * rapid batch check-check-check timestamps (<20s apart).
+   * Auto-clips a PR set across all assigned cameras using server motion-burst alignment while
+   * filtering out rapid batch check-check-check timestamps (<20s apart).
    */
-  async autoClipPr(s: LiftSession, se: SessionEx, set: LiftSet, camera?: string, force = false): Promise<VideoMeta | null> {
-    if (!this.online || (!force && !getSettings().gymCamAutoPr)) return null;
+  async autoClipPr(
+    s: LiftSession,
+    se: SessionEx,
+    set: LiftSet,
+    cameras?: string | string[],
+    force = false,
+  ): Promise<VideoMeta[]> {
+    if (!this.online || (!force && !getSettings().gymCamAutoPr)) return [];
     const atMs = set.at ?? Date.now();
     let prevLocalAt = 0;
     for (const ex of s.exs) {
@@ -577,7 +593,8 @@ class GymCamController {
         }
       }
     }
-    const cam = camera?.trim();
+    const raw = normalizeCamList(cameras);
+    const effCams = raw.length ? raw : [DEFAULT_FALLBACK_CAM];
     const res = await this.postJson<ClipApiResponse>('/api/clip/auto-pr', {
       sessionId: s.camSessionId ?? s.id,
       exId: se.exId,
@@ -585,9 +602,16 @@ class GymCamController {
       setId: set.id,
       setAtMs: atMs + this.clockOffsetMs,
       ...(prevLocalAt > 0 ? { prevSetAtMs: prevLocalAt + this.clockOffsetMs } : {}),
-      ...(cam ? { camera: cam } : {}),
+      camera: effCams[0],
+      cameras: effCams,
     }, 45_000);
-    return res?.lanUrl ? this.persistClipFromServer({ session: s, se, set }, res) : null;
+    const rawClips = res?.clips?.length ? res.clips : (res?.lanUrl ? [res] : []);
+    const saved: VideoMeta[] = [];
+    for (const item of rawClips) {
+      const meta = await this.persistClipFromServer({ session: s, se, set }, item);
+      if (meta) saved.push(meta);
+    }
+    return saved;
   }
 
   async listBursts(

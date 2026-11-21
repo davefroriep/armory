@@ -13,7 +13,7 @@ export const PHASE1_ROUTINES: Routine[] = [
     order: 0,
     items: [
       { exId: 'low-bar-squat', sets: 3, rx: { reps: '6–8', rpe: 7.5 } },
-      { exId: 'romanian-deadlift', sets: 3, rx: { reps: '8–10', rpe: 7.5 } },
+      { exId: 'smith-machine-romanian-deadlift', sets: 3, rx: { reps: '8–10', rpe: 7.5 } },
       { exId: 'standing-calf-raise', sets: 3, ss: true, rx: { reps: '12–15', rpe: 8 } },
       { exId: 'cable-crunch', sets: 3, rx: { reps: '12–15', rpe: 8 } },
     ],
@@ -62,9 +62,34 @@ export const PHASE1_ROUTINES: Routine[] = [
   },
 ];
 
-export const SEED_EX_ROWS: ExRow[] = [
-  { id: 'triceps-isometric-hold', restSec: 45 },
-];
+/** Dave's verified camera assignments across all 19 Phase 1 exercises (equal views, Rack Cam fallback). */
+export const PHASE1_EXERCISE_CAMS: Record<string, string[]> = {
+  'low-bar-squat': ['Rack Cam'],
+  'smith-machine-romanian-deadlift': ['Smith Cam'],
+  'standing-calf-raise': ['Smith Cam', 'Smith Wide'],
+  'cable-crunch': ['Rack Cam'],
+  'triceps-isometric-hold': ['Rack Cam'],
+  'barbell-bench-press': ['Rack Cam'],
+  'smith-machine-row': ['Smith Cam', 'Smith Wide'],
+  'seated-dumbbell-shoulder-press': ['Rack Cam', 'Smith Cam', 'Smith Wide'],
+  'pull-up': ['Smith Wide', 'Smith Cam'],
+  'dumbbell-lateral-raise': ['Smith Wide', 'Smith Cam'],
+  'cable-triceps-pushdown': ['Rack Cam'],
+  deadlift: ['Rack Cam'],
+  'bulgarian-split-squat': ['Smith Cam', 'Smith Wide'],
+  'smith-machine-overhead-press': ['Smith Cam', 'Smith Wide'],
+  'lat-pulldown': ['Rack Cam'],
+  'chest-fly-machine': ['Fly Machine Cam'],
+  'dumbbell-row': ['Rack Cam', 'Smith Cam', 'Smith Wide'],
+  'rear-delt-fly': ['Rack Cam'],
+  'dumbbell-curl': ['Rack Cam', 'Smith Cam', 'Smith Wide'],
+};
+
+export const SEED_EX_ROWS: ExRow[] = Object.entries(PHASE1_EXERCISE_CAMS).map(([id, cams]) => ({
+  id,
+  ...(id === 'triceps-isometric-hold' ? { restSec: 45 } : {}),
+  cams: [...cams],
+}));
 
 /** Planned-event title -> matching day (e.g. "Strength Train — Wk 1 · Day 2 Upper 1" -> "Upper 1"). */
 export function matchRoutineByTitle(title: string, routines: Routine[]): Routine | undefined {

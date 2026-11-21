@@ -305,8 +305,8 @@ function buildPhase1Steps(): PlanStep[] {
       index: steps.length,
       week: w,
       day: 1,
-      title: `Wk ${w} · Day 1 — Lower 1 (Squat + RDL)`,
-      slots: [strengthSlot(w, 1, 'Lower 1', `Low Bar Squat · RDL · Calf Raise / Cable Crunch (${cfg.pct} ramp).`, 55)],
+      title: `Wk ${w} · Day 1 — Lower 1 (Squat + Smith RDL)`,
+      slots: [strengthSlot(w, 1, 'Lower 1', `Low Bar Squat · Smith RDL · Calf Raise / Cable Crunch (${cfg.pct} ramp).`, 55)],
     });
     steps.push({
       index: steps.length,
