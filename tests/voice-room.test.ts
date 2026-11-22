@@ -383,4 +383,78 @@ describe('VoiceController room source relay', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('goes back to previous edited set on "Armory, back" / "Armory, undo" and resets it to blanks while restoring forward suggestions', () => {
+    const sess = makeBenchSession('sess_back_undo');
+    mockState.activeSess = sess;
+    voice.cursor = null;
+
+    // 1. Log Set 1 with RPE -> forward-fills Set 2 and advances cursor to Set 2
+    voice.receiveExternalEvent({
+      transcript: 'Armory 225 for 8 rpe 8.5',
+      isFinal: true,
+      source: 'mic',
+      state: 'listening',
+    });
+    expect(sess.exs[0].sets[0].done).toBe(true);
+    expect(Math.round((sess.exs[0].sets[0].w ?? 0) / KG_PER_LB)).toBe(225);
+    expect(sess.exs[0].sets[0].r).toBe(8);
+    expect(sess.exs[0].sets[0].rpe).toBe(8.5);
+    expect(Math.round((sess.exs[0].sets[1].w ?? 0) / KG_PER_LB)).toBe(225);
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's2' });
+
+    // 2. "Armory, back" returns cursor to s1, blanks s1, restores s2 auto suggestion, and clears rest timer
+    voice.receiveExternalEvent({
+      transcript: 'Armory, back',
+      isFinal: true,
+      source: 'mic',
+      state: 'listening',
+    });
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's1' });
+    expect(sess.exs[0].sets[0]).toMatchObject({ id: 's1', w: null, r: null, done: false });
+    expect(sess.exs[0].sets[0].wAuto).toBeUndefined();
+    expect(sess.exs[0].sets[0].rAuto).toBeUndefined();
+    expect(sess.exs[0].sets[0].rpe).toBeUndefined();
+    expect(sess.exs[0].sets[0].at).toBeUndefined();
+    expect(Math.round((sess.exs[0].sets[1].w ?? 0) / KG_PER_LB)).toBe(185);
+    expect(sess.exs[0].sets[1].wAuto).toBe(true);
+    expect(sess.exs[0].sets[1].r).toBe(8);
+    expect(sess.exs[0].sets[1].rAuto).toBe(true);
+
+    // 3. Re-speaking the corrected numbers logs directly onto s1
+    voice.receiveExternalEvent({
+      transcript: 'Armory 205 for 10',
+      isFinal: true,
+      source: 'mic',
+      state: 'listening',
+    });
+    expect(sess.exs[0].sets[0].done).toBe(true);
+    expect(Math.round((sess.exs[0].sets[0].w ?? 0) / KG_PER_LB)).toBe(205);
+    expect(sess.exs[0].sets[0].r).toBe(10);
+
+    // 4. Manual touch edit tracked via recordEditedSet + "Armory, undo" blanks s2 and moves cursor to s2
+    voice.recordEditedSet(sess.id, 'u1', 's2', sess.exs[0].sets);
+    sess.exs[0].sets[1].w = 215 * KG_PER_LB;
+    sess.exs[0].sets[1].r = 9;
+    sess.exs[0].sets[1].done = true;
+    sess.exs[0].sets[1].at = Date.now();
+    voice.receiveExternalEvent({
+      transcript: 'Armory, undo',
+      isFinal: true,
+      source: 'mic',
+      state: 'listening',
+    });
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's2' });
+    expect(sess.exs[0].sets[1]).toMatchObject({ id: 's2', w: null, r: null, done: false });
+
+    // 5. Fallback when undoStack is empty still clears the latest completed set (s1) to blanks
+    voice.receiveExternalEvent({
+      transcript: 'Armory go back',
+      isFinal: true,
+      source: 'mic',
+      state: 'listening',
+    });
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's1' });
+    expect(sess.exs[0].sets[0]).toMatchObject({ id: 's1', w: null, r: null, done: false });
+  });
 });

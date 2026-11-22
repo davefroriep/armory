@@ -338,10 +338,19 @@ function build(root: HTMLElement, id?: string): () => void {
       svid?.classList.toggle('on', !!set.vids?.length);
       svid?.classList.toggle('rec', !edit && gymCam.isArmed(set.id));
       svid?.classList.toggle('saving', !edit && gymCam.isSaving(set.id));
-      const star = row.querySelector('.prstar');
+      const snum = row.querySelector('.snum')!;
+      snum.classList.toggle('has-rpe', set.rpe != null);
+      const star = snum.querySelector('.prstar');
       const pr = set.done && hits.has(set.id);
-      if (pr && !star) row.querySelector('.snum')!.insertAdjacentHTML('beforeend', '<i class="prstar">★</i>');
+      if (pr && !star) snum.insertAdjacentHTML('beforeend', '<i class="prstar">★</i>');
       if (!pr && star) star.remove();
+      const srpe = snum.querySelector('.srpe');
+      if (set.rpe != null) {
+        if (srpe) srpe.textContent = `@${set.rpe}`;
+        else snum.insertAdjacentHTML('beforeend', `<u class="srpe">@${set.rpe}</u>`);
+      } else if (srpe) {
+        srpe.remove();
+      }
     });
     void ex;
   };
@@ -514,6 +523,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const t = e.target as HTMLInputElement;
     if (!t.closest?.('.srow')) return;
     const { card, se, i } = rowOf(t);
+    if (!edit && se.sets[i]) voice.recordEditedSet(s.id, se.uid, se.sets[i].id, se.sets);
     const v = num(t.value);
     if (t.classList.contains('sw')) editWeight(se, i, v == null ? null : fromDisplay(v));
     else editReps(se, i, v == null ? null : Math.round(v));
@@ -603,6 +613,7 @@ function build(root: HTMLElement, id?: string): () => void {
     }
     const wasArmed = !edit && gymCam.isArmed(set.id);
     const armedCams = wasArmed ? (gymCam.armed?.cameras ?? (gymCam.armed?.camera ? [gymCam.armed.camera] : [])) : undefined;
+    if (!edit && !was && canLog(set, ex)) voice.recordEditedSet(s.id, se.uid, set.id, se.sets);
     const r = toggleDone(se, i, ex);
     if (r === null) return shakeIncomplete();
     if (r && !was) {
@@ -1406,6 +1417,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'usePrev') {
       const p = prevSetFor(prevOf(se), se, i);
       if (!p) return;
+      if (!edit) voice.recordEditedSet(s.id, se.uid, se.sets[i].id, se.sets);
       se.sets[i].w = p.w; se.sets[i].r = p.r;
       se.sets[i].wAuto = false; se.sets[i].rAuto = false;
       syncCard(card); save();

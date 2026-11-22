@@ -213,6 +213,14 @@ describe('voice transcript parser', () => {
     expect(parseVoiceTranscript('armory clip smith')).toEqual({ kind: 'cam_clip_last', camera: 'Smith Cam' });
     expect(parseVoiceTranscript('armory clip leg machine')).toEqual({ kind: 'cam_clip_last', camera: 'Leg Machine Cam' });
     expect(parseVoiceTranscript('armory undo')).toEqual({ kind: 'undo' });
+    expect(parseVoiceTranscript('Armory, back')).toEqual({ kind: 'undo' });
+    expect(parseVoiceTranscript('Armory go back')).toEqual({ kind: 'undo' });
+    expect(parseVoiceTranscript('Armory back one')).toEqual({ kind: 'undo' });
+    expect(parseVoiceTranscript('Armory undo that')).toEqual({ kind: 'undo' });
+    expect(parseVoiceTranscript('Armory undo last set')).toEqual({ kind: 'undo' });
+    expect(parseVoiceTranscript('Armory back exercise')).toEqual({ kind: 'prev_ex' });
+    expect(parseVoiceTranscript('Armory go to back extension')).toEqual({ kind: 'jump_ex', target: 'back extension' });
+    expect(parseVoiceTranscript('Armory back squat')).toBeNull();
 
     // Two-beat wake flow & natural dumbbell/same shortcuts
     expect(parseVoiceTranscript('Armory')).toEqual({ kind: 'arm_wake' });

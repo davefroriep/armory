@@ -2271,7 +2271,7 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIsNone(dc.parse_display_voice_command(phrase), msg=phrase)
 
         self.assertEqual(dc.parse_display_voice_command("Armory, open the gym"), {"target": "open_gym", "targets": ["open_gym"], "action": "run", "speech": "Opening the gym"})
-        self.assertEqual(dc.parse_display_voice_command("Armory, close the gym"), {"target": "close_gym", "targets": ["close_gym"], "action": "run", "speech": "Closing the gym"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, close the gym"), {"target": "close_gym", "targets": ["close_gym"], "action": "run", "speech": "", "silent": True})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV"), {"target": "tv", "targets": ["tv"], "action": "on", "speech": "TV on"})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on SmartSpin TV"), {"target": "spin", "targets": ["spin"], "action": "on", "speech": "SmartSpin TV on"})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV and SmartSpin TV"), {"target": "multi", "targets": ["tv", "spin"], "action": "on", "speech": "TV and SmartSpin TV on"})
@@ -2446,12 +2446,15 @@ class ArmoryCamTests(unittest.TestCase):
 
         adb_cmds.clear()
         denon_cmds.clear()
+        roku_posts.clear()
         wb_calls.clear()
         cg = ctrl.execute("close_gym", "run")
         self.assertTrue(cg["ok"])
         self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "127"] for c in adb_cmds))
         self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "223"] for c in adb_cmds))
         self.assertIn("PWSTANDBY", denon_cmds)
+        self.assertNotIn("VSMONI1", denon_cmds)
+        self.assertIn("http://192.168.1.88:8060/keypress/PowerOff", roku_posts)
         self.assertEqual(wb_calls, ["sleep"])
 
         adb_cmds.clear()
@@ -2471,7 +2474,8 @@ class ArmoryCamTests(unittest.TestCase):
         try:
             svc = ac.ArmoryCamService(root_dir=tmp, adb_controller=fake_adb)
             svc.displays = ctrl
-            svc.voice._speak_fn = lambda _txt: True
+            spoken_msgs: list[str] = []
+            svc.voice._speak_fn = lambda txt: (spoken_msgs.append(txt), True)[1]
             app = ac.create_app(svc)
             client = app.test_client()
 
@@ -2493,6 +2497,14 @@ class ArmoryCamTests(unittest.TestCase):
             disp_evt = svc.voice.inject_transcript("Armory, turn on SmartSpin TV")
             self.assertTrue(disp_evt["localHandled"])
             self.assertIn("SmartSpin TV on", disp_evt["ackText"])
+
+            # Close gym handled locally, silently (zero TTS confirmation)
+            spoken_msgs.clear()
+            svc.voice.set_context(active=True, readback=True)
+            close_evt = svc.voice.inject_transcript("Armory, close the gym")
+            self.assertTrue(close_evt["localHandled"])
+            self.assertEqual(close_evt["ackText"], "✓ Gym closed")
+            self.assertEqual(spoken_msgs, [])
 
             # Compound voice command handled locally
             wb_calls.clear()

@@ -68,6 +68,14 @@ export interface AbShootoutRun {
   items?: unknown[];
 }
 
+type UndoSetFieldSnap = {
+  id: string;
+  w: number | null;
+  r: number | null;
+  wAuto?: boolean;
+  rAuto?: boolean;
+};
+
 type UndoEntry =
   | {
       type: 'set';
@@ -80,6 +88,7 @@ type UndoEntry =
       rAuto?: boolean;
       rpe?: number;
       prevLastLoggedExUid: string | null;
+      forwardSnap?: UndoSetFieldSnap[];
     }
   | {
       type: 'exs';
@@ -103,7 +112,7 @@ interface WebSpeechRec {
 
 const ARM_WINDOW_MS = 6500;
 const BASE_BIAS = [
-  'armory', 'check', 'done', 'log', 'undo', 'next exercise', 'previous exercise',
+  'armory', 'check', 'done', 'log', 'undo', 'back', 'go back', 'next exercise', 'previous exercise',
   'add set', 'add set to last exercise', 'delete empty sets',
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
   'camera', 'record set', 'record rack', 'record smith', 'rack camera', 'smith camera', 'clip that', 'save clip', 'clip rack', 'clip smith',
@@ -195,6 +204,53 @@ class VoiceController {
   recordLoggedExercise(exUid: string): void {
     this.syncCursorToSession();
     this.lastLoggedExUid = exUid;
+  }
+
+  private snapshotForward(
+    sets: { id: string; w: number | null; r: number | null; done: boolean; wAuto?: boolean; rAuto?: boolean }[],
+    setId: string,
+  ): UndoSetFieldSnap[] {
+    const idx = sets.findIndex((x) => x.id === setId);
+    if (idx < 0) return [];
+    return sets
+      .slice(idx + 1)
+      .filter((x) => !x.done)
+      .map((x) => ({
+        id: x.id,
+        w: x.w,
+        r: x.r,
+        ...(x.wAuto ? { wAuto: true } : {}),
+        ...(x.rAuto ? { rAuto: true } : {}),
+      }));
+  }
+
+  recordEditedSet(
+    sessionId: string,
+    exUid: string,
+    setId: string,
+    sets: { id: string; w: number | null; r: number | null; done: boolean; wAuto?: boolean; rAuto?: boolean; rpe?: number }[],
+  ): void {
+    this.syncCursorToSession();
+    const top = this.undoStack[this.undoStack.length - 1];
+    if (top?.type === 'set' && top.sessionId === sessionId && top.exUid === exUid && top.setId === setId) {
+      return;
+    }
+    const target = sets.find((x) => x.id === setId);
+    if (!target) return;
+    this.undoStack.push({
+      type: 'set',
+      sessionId,
+      exUid,
+      setId,
+      w: target.w,
+      r: target.r,
+      wAuto: target.wAuto,
+      rAuto: target.rAuto,
+      rpe: target.rpe,
+      prevLastLoggedExUid: this.lastLoggedExUid,
+      forwardSnap: this.snapshotForward(sets, setId),
+    });
+    if (this.undoStack.length > 20) this.undoStack.shift();
   }
 
   setCursor(ref: CursorRef | null): void {
@@ -1225,9 +1281,11 @@ class VoiceController {
     }
 
     if (intent.kind === 'undo') {
+      while (this.undoStack.length && this.undoStack[this.undoStack.length - 1].sessionId !== s.id) {
+        this.undoStack.pop();
+      }
       const last = this.undoStack.pop();
-      if (!last || last.sessionId !== s.id) return this.notice('Nothing to undo', 'warn', true, 'Nothing to undo');
-      if (last.type === 'exs') {
+      if (last?.type === 'exs') {
         s.exs = JSON.parse(last.exsJson);
         this.cursor = last.prevCursor;
         this.lastLoggedExUid = last.prevLastLoggedExUid;
@@ -1236,21 +1294,79 @@ class VoiceController {
         buzz(25);
         return this.notice(`↶ Undid ${last.label}`, 'warn', true, `Undid ${last.label}`);
       }
-      const se = s.exs.find((e) => e.uid === last.exUid);
-      const set = se?.sets.find((x) => x.id === last.setId);
-      if (!se || !set) return this.notice('Set no longer exists', 'warn', true, 'Set no longer exists');
-      set.done = false;
-      set.w = last.w;
-      set.r = last.r;
-      if (last.wAuto) set.wAuto = true; else delete set.wAuto;
-      if (last.rAuto) set.rAuto = true; else delete set.rAuto;
-      if (last.rpe != null) set.rpe = last.rpe; else delete set.rpe;
-      this.cursor = { exUid: se.uid, setId: set.id };
-      this.lastLoggedExUid = last.prevLastLoggedExUid;
+
+      let targetSe: typeof s.exs[number] | undefined;
+      let targetSet: typeof s.exs[number]['sets'][number] | undefined;
+      if (last?.type === 'set') {
+        targetSe = s.exs.find((e) => e.uid === last.exUid);
+        targetSet = targetSe?.sets.find((x) => x.id === last.setId);
+      }
+      if (!targetSe || !targetSet) {
+        let bestAt = -1;
+        for (const candSe of s.exs) {
+          for (const candSet of candSe.sets) {
+            if (!candSet.done) continue;
+            const at = candSet.at ?? 0;
+            if (at >= bestAt) {
+              bestAt = at;
+              targetSe = candSe;
+              targetSet = candSet;
+            }
+          }
+        }
+      }
+      if (!targetSe || !targetSet) {
+        return this.notice('Nothing to undo', 'warn', true, 'Nothing to undo');
+      }
+
+      targetSet.done = false;
+      delete targetSet.at;
+      targetSet.w = null;
+      targetSet.r = null;
+      delete targetSet.wAuto;
+      delete targetSet.rAuto;
+      delete targetSet.rpe;
+
+      if (last?.type === 'set' && last.forwardSnap?.length) {
+        for (const snap of last.forwardSnap) {
+          const other = targetSe.sets.find((x) => x.id === snap.id);
+          if (!other || other.done || !(other.wAuto || other.rAuto)) continue;
+          if (other.wAuto || snap.wAuto) {
+            other.w = snap.w;
+            if (snap.wAuto) other.wAuto = true;
+            else delete other.wAuto;
+          }
+          if (other.rAuto || snap.rAuto) {
+            other.r = snap.r;
+            if (snap.rAuto) other.rAuto = true;
+            else delete other.rAuto;
+          }
+        }
+      }
+
+      active.clearRest();
+      this.cursor = { exUid: targetSe.uid, setId: targetSet.id };
+      if (last?.type === 'set') {
+        this.lastLoggedExUid = last.prevLastLoggedExUid;
+      } else {
+        let latestExUid: string | null = null;
+        let latestAt = -1;
+        for (const candSe of s.exs) {
+          for (const candSet of candSe.sets) {
+            if (!candSet.done) continue;
+            const at = candSet.at ?? 0;
+            if (at >= latestAt) {
+              latestAt = at;
+              latestExUid = candSe.uid;
+            }
+          }
+        }
+        this.lastLoggedExUid = latestExUid;
+      }
       void active.resetIfNoneLogged(s);
       lifts.saveSession(s, true);
       buzz(25);
-      return this.notice(`↶ Undid ${lifts.exOrStub(se.exId).name}`, 'warn', true, 'Undid last set');
+      return this.notice(`↶ Cleared ${lifts.exOrStub(targetSe.exId).name}`, 'warn', true, 'Cleared last set');
     }
 
     if (!cur) return this.notice('All sets in this workout are complete!', 'ok', true, 'Workout complete');
@@ -1273,6 +1389,7 @@ class VoiceController {
     }
 
     if (intent.kind === 'set_only') {
+      this.recordEditedSet(s.id, se.uid, set.id, se.sets);
       if (intent.weight != null) editWeight(se, cur.setIdx, fromDisplay(intent.weight, u));
       if (intent.reps != null) editReps(se, cur.setIdx, intent.reps);
       this.cursor = { exUid: se.uid, setId: set.id };
@@ -1281,18 +1398,23 @@ class VoiceController {
     }
 
     // intent.kind === 'log_current'
-    const undoSnap: UndoEntry = {
-      type: 'set',
-      sessionId: s.id,
-      exUid: se.uid,
-      setId: set.id,
-      w: set.w,
-      r: set.r,
-      wAuto: set.wAuto,
-      rAuto: set.rAuto,
-      rpe: set.rpe,
-      prevLastLoggedExUid: this.lastLoggedExUid,
-    };
+    const topUndo = this.undoStack[this.undoStack.length - 1];
+    const reuseTopUndo = topUndo?.type === 'set' && topUndo.sessionId === s.id && topUndo.exUid === se.uid && topUndo.setId === set.id;
+    const undoSnap: UndoEntry | null = reuseTopUndo
+      ? null
+      : {
+          type: 'set',
+          sessionId: s.id,
+          exUid: se.uid,
+          setId: set.id,
+          w: set.w,
+          r: set.r,
+          wAuto: set.wAuto,
+          rAuto: set.rAuto,
+          rpe: set.rpe,
+          prevLastLoggedExUid: this.lastLoggedExUid,
+          forwardSnap: this.snapshotForward(se.sets, set.id),
+        };
     if (intent.bodyweight) {
       editWeight(se, cur.setIdx, 0);
     } else if (intent.weight != null) {
@@ -1314,8 +1436,10 @@ class VoiceController {
     if (!logged) {
       return this.notice(`Could not log ${ex.name}`, 'warn', true, 'Could not log set');
     }
-    this.undoStack.push(undoSnap);
-    if (this.undoStack.length > 20) this.undoStack.shift();
+    if (undoSnap) {
+      this.undoStack.push(undoSnap);
+      if (this.undoStack.length > 20) this.undoStack.shift();
+    }
 
     this.lastLoggedExUid = se.uid;
     active.ensureStarted(s);

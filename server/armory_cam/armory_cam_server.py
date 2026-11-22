@@ -5371,15 +5371,20 @@ class ArmoryCamService:
             res = self.displays.execute_many(targets, parsed["action"])
         else:
             res = self.displays.execute(parsed["target"], parsed["action"])
-        speech = parsed["speech"] if res.get("ok") else (res.get("error") or "Display command failed")
+        silent = bool(parsed.get("silent"))
+        ok = bool(res.get("ok"))
+        raw_speech = str(parsed.get("speech") or "").strip()
+        err_msg = str(res.get("error") or "Display command failed").strip()
+        speech = "" if silent else (raw_speech if ok else err_msg)
+        ack_label = raw_speech or str(res.get("message") or "Done").strip()
         return {
             "handled": True,
-            "ok": bool(res.get("ok")),
+            "ok": ok,
             "target": parsed["target"],
             "targets": targets,
             "action": parsed["action"],
             "speech": speech,
-            "ackText": f"✓ {parsed['speech']}" if res.get("ok") else f"✗ {speech}",
+            "ackText": f"✓ {ack_label}" if ok else f"✗ {err_msg}",
             "result": res,
         }
 

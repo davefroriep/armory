@@ -101,7 +101,7 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
   {
     title: 'Workout & Undo',
     slot: 'undo',
-    examples: ['undo', 'pause workout', 'resume workout', 'finish workout'],
+    examples: ['undo', 'back', 'go back', 'pause workout', 'resume workout', 'finish workout'],
   },
 ];
 
@@ -386,7 +386,7 @@ function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
   if (/^close\s+(?:the\s+)?(?:replay|video|clip|tv)\b/.test(tail)) return { kind: 'wb_close_replay' };
   if (/^replay\s+slow\b/.test(tail)) return { kind: 'wb_replay', slow: true };
   if (/^(?:instant\s+)?replay\b/.test(tail)) return { kind: 'wb_replay' };
-  if (/^undo\b/.test(tail)) return { kind: 'undo' };
+  if (/^(?:undo|go\s+back)\b/.test(tail)) return { kind: 'undo' };
   if (/^(?:check|done|logged)\s+\S/.test(tail)) return { kind: 'log_current', ...(rpe != null ? { rpe } : {}) };
   return null;
 }
@@ -415,7 +415,9 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): Voi
   const customHit = matchCustomVoiceAlias(tailNoRpe, customAliases, rpe);
   if (customHit) return customHit;
 
-  if (/^(?:undo|uncheck|undo\s+last|cancel(?:\s+last)?)$/.test(tail)) return { kind: 'undo' };
+  if (/^(?:undo(?:\s+(?:that|last(?:\s+set)?|set))?|uncheck(?:\s+(?:that|last(?:\s+set)?|set))?|cancel(?:\s+last)?|(?:go\s+|step\s+)?back(?:\s+(?:1|one|a\s+set|(?:1|one)\s+set|to\s+last(?:\s+set)?))?)$/.test(tail)) {
+    return { kind: 'undo' };
+  }
   if (/^(?:check|check\s+it|check\s+set|log|log\s+it|log\s+set|done|same|same\s+reps|same\s+weight|repeat|mark\s+done|complete(?:\s+set)?|yep|got\s+it|crushed\s+it|nailed\s+it|good(?:\s+set)?|easy|boom|locked\s+in)$/.test(tailNoRpe)) {
     return { kind: 'log_current', ...(rpe != null ? { rpe } : {}) };
   }

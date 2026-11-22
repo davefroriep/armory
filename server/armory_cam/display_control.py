@@ -383,7 +383,8 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
             "target": "close_gym",
             "targets": ["close_gym"],
             "action": "run",
-            "speech": "Closing the gym",
+            "speech": "",
+            "silent": True,
         }
 
     # 1b. Music playback commands on Fire TV Cube / Denon AVR (skip if user said clip/video/replay)
@@ -1074,7 +1075,7 @@ class GymDisplayController:
                     found.append(item)
         return found
 
-    def _control_spin(self, action: str) -> dict[str, Any]:
+    def _control_spin(self, action: str, *, sync_denon: bool = True) -> dict[str, Any]:
         cfg = self.get_config().spin
         if not cfg.enabled:
             return {"ok": False, "target": "spin", "action": action, "error": "SmartSpin TV disabled"}
@@ -1097,7 +1098,11 @@ class GymDisplayController:
                 if cfg.hdmi_input:
                     self._sleep(0.5)
                     self._do_post(f"{base}/keypress/{urllib.parse.quote(cfg.hdmi_input, safe='')}", b"", {}, 2.0)
-                denon_res = self.sync_denon_monitor_for_spin(spin_expected_on=True)
+                denon_res = (
+                    self.sync_denon_monitor_for_spin(spin_expected_on=True)
+                    if sync_denon
+                    else {"ok": True, "skipped": True, "reason": "Skipped Denon monitor sync"}
+                )
                 return {
                     "ok": True,
                     "target": "spin",
@@ -1113,7 +1118,11 @@ class GymDisplayController:
                 code, _ = self._do_post(f"{base}/keypress/PowerOff", b"", {}, 2.0)
                 if code >= 400:
                     return {"ok": False, "target": "spin", "action": "off", "error": f"HTTP {code}"}
-                denon_res = self.sync_denon_monitor_for_spin(spin_expected_on=False)
+                denon_res = (
+                    self.sync_denon_monitor_for_spin(spin_expected_on=False)
+                    if sync_denon
+                    else {"ok": True, "skipped": True, "reason": "Skipped during gym shutdown"}
+                )
                 return {
                     "ok": True,
                     "target": "spin",
@@ -1270,35 +1279,62 @@ class GymDisplayController:
         if tgt == "open_gym":
             cfg = self.get_config()
             results: dict[str, Any] = {}
-            results["tv"] = self.ensure_primary_hdmi_ready("hdmi2")
+
+            def _open_avr_chain() -> dict[str, Any]:
+                out: dict[str, Any] = {"avr": self._control_avr("on")}
+                if self.denon is not None:
+                    out["avr_mode"] = self.denon.send_command("MSMCH STEREO")
+                    if cfg.spin.enabled and cfg.spin.host:
+                        out["avr_monitor"] = self.set_denon_monitor_out("AUTO")
+                    else:
+                        out["avr_monitor"] = self.sync_denon_monitor_for_spin()
+                return out
+
+            open_tasks: dict[str, Callable[[], dict[str, Any]]] = {
+                "tv": lambda: {"tv": self.ensure_primary_hdmi_ready("hdmi2")},
+                "avr_chain": _open_avr_chain,
+            }
             if cfg.spin.enabled and cfg.spin.host:
-                results["spin"] = self.ensure_spin_hdmi_ready()
-            results["avr"] = self._control_avr("on")
-            if self.denon is not None:
-                results["avr_mode"] = self.denon.send_command("MSMCH STEREO")
-                if cfg.spin.enabled and cfg.spin.host:
-                    results["avr_monitor"] = self.set_denon_monitor_out("AUTO")
-                else:
-                    results["avr_monitor"] = self.sync_denon_monitor_for_spin()
+                open_tasks["spin"] = lambda: {"spin": self.ensure_spin_hdmi_ready()}
             if self._wake_wallboard_fn is not None:
-                results["wallboard"] = self._wake_wallboard_fn(True)
+                wake_fn = self._wake_wallboard_fn
+                open_tasks["wallboard"] = lambda: {"wallboard": wake_fn(True)}
             if cfg.open_gym_play_music:
-                results["music"] = self._launch_cube_youtube_music()
+                open_tasks["music"] = lambda: {"music": self._launch_cube_youtube_music()}
             elif cfg.cube_host:
-                results["cube"] = self._control_cube("on")
+                open_tasks["cube"] = lambda: {"cube": self._control_cube("on")}
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(open_tasks)) as pool:
+                futs = {key: pool.submit(fn) for key, fn in open_tasks.items()}
+                for key, fut in futs.items():
+                    try:
+                        results.update(fut.result())
+                    except Exception as exc:
+                        err_key = "avr" if key == "avr_chain" else key
+                        results[err_key] = {"ok": False, "target": err_key, "error": str(exc)}
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
             return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (All 3 TVs, Denon, YouTube Music)"}
         if tgt == "close_gym":
             results = {}
-            cube_off = self._control_cube("off")
-            results["cube"] = cube_off
-            results["media_pause"] = cube_off
-            results["tv"] = self._control_primary("off")
-            results["avr"] = self._control_avr("off")
+            close_tasks: dict[str, Callable[[], dict[str, Any]]] = {
+                "cube": lambda: self._control_cube("off"),
+                "tv": lambda: self._control_primary("off"),
+                "avr": lambda: self._control_avr("off"),
+            }
             if self._sleep_wallboard_fn is not None:
-                results["wallboard"] = self._sleep_wallboard_fn()
+                sleep_fn = self._sleep_wallboard_fn
+                close_tasks["wallboard"] = sleep_fn
             if self.get_config().spin.host:
-                results["spin"] = self._control_spin("off")
+                close_tasks["spin"] = lambda: self._control_spin("off", sync_denon=False)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(close_tasks)) as pool:
+                futs = {key: pool.submit(fn) for key, fn in close_tasks.items()}
+                for key, fut in futs.items():
+                    try:
+                        results[key] = fut.result()
+                    except Exception as exc:
+                        results[key] = {"ok": False, "target": key, "error": str(exc)}
+            results["media_pause"] = results["cube"]
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict) and not r.get("skipped"))
             return {"ok": ok, "target": "close_gym", "action": "run", "results": results, "message": "Gym closed"}
         if tgt == "gym":
