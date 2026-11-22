@@ -1618,10 +1618,13 @@ def parse_speech_markup(
     merged: list[dict[str, Any]] = []
     for tok in tokens:
         if tok["kind"] == "pause":
-            cleaned = {"kind": "pause", "sec": tok["sec"]}
+            cleaned: dict[str, Any] = {"kind": "pause", "sec": tok["sec"]}
+            if tok.get("implicit"):
+                cleaned["implicit"] = True
             if merged and merged[-1]["kind"] == "pause":
                 if not tok.get("implicit"):
                     merged[-1]["sec"] = round(_clamp(float(cleaned["sec"]), 0.02, 10.0), 3)
+                    merged[-1].pop("implicit", None)
             elif merged:  # Drop leading pause before any words
                 merged.append(cleaned)
         else:
@@ -1858,6 +1861,50 @@ def _trim_mono_edges(seg: np.ndarray, sr: int = 24_000) -> np.ndarray:
     return seg.astype(np.float32)
 
 
+def _format_tts_error(engine: str, exc: Exception) -> str:
+    """Format cloud TTS exceptions into concise, actionable messages (esp. Gemini 429 daily quota)."""
+    raw = str(exc or "").strip()
+    if engine == "gemini" and ("429" in raw or "RESOURCE_EXHAUSTED" in raw.upper()):
+        wait_str = ""
+        m_sec = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+)(?:\.\d+)?s", raw)
+        if m_sec:
+            secs = max(1, int(m_sec.group(1)))
+            h, rem = divmod(secs, 3600)
+            m = rem // 60
+            wait_str = f"~{h}h {m}m" if h else (f"~{m}m" if m else f"~{secs}s")
+        else:
+            m_txt = re.search(r"retry in\s+([0-9hms\.]+)", raw, re.I)
+            if m_txt:
+                wait_str = f"~{m_txt.group(1).strip('.')}"
+        wait_part = f", {wait_str}" if wait_str else ""
+        return (
+            f"Gemini Free Tier daily quota reached (10 requests/day; resets at midnight PT{wait_part}). "
+            "Switch to ElevenLabs (10k chars/mo) or Kokoro Local meanwhile, or enable pay-as-you-go billing in Google AI Studio. "
+            "Cached lines reuse 0 quota."
+        )
+    return re.sub(r"\s+", " ", raw)[:260] or f"{engine} TTS synthesis failed"
+
+
+def _coalesce_gemini_tokens(tokens: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge implicit `...` pauses between equal-style speech runs to cut Gemini TTS API requests per show."""
+    out: list[dict[str, Any]] = []
+    for tok in tokens:
+        if (
+            tok.get("kind") == "speech"
+            and len(out) >= 2
+            and out[-1].get("kind") == "pause"
+            and out[-1].get("implicit")
+            and out[-2].get("kind") == "speech"
+            and abs(float(out[-2].get("speed", 1.0)) - float(tok.get("speed", 1.0))) < 1e-4
+            and abs(float(out[-2].get("gainDb", 0.0)) - float(tok.get("gainDb", 0.0))) < 0.05
+        ):
+            out.pop()
+            out[-1]["text"] = f"{out[-1]['text']} ... {tok['text']}"
+        else:
+            out.append(dict(tok))
+    return out
+
+
 def synthesize_announcer_wav(
     text: str,
     *,
@@ -1868,6 +1915,7 @@ def synthesize_announcer_wav(
     ffmpeg_bin: str = "",
     allow_network: bool = True,
     models_dir: Path | None = None,
+    tts_cache_dir: Path | None = None,
     reverb_wet: float = 0.06,
     boost_db: float = 2.0,
     voice_style: str = "",
@@ -1883,6 +1931,46 @@ def synthesize_announcer_wav(
     engine = str(preset.get("engine") or "kokoro")
     sec_cfg = dict(tts_secrets or {})
     el_model = str(sec_cfg.get("elevenlabsModel") or DEFAULT_ELEVENLABS_MODEL).strip() or DEFAULT_ELEVENLABS_MODEL
+
+    def _seg_cache_path(key_parts: tuple[str, ...]) -> Path | None:
+        if tts_cache_dir is None:
+            return None
+        tts_cache_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1("|".join(key_parts).encode("utf-8")).hexdigest()[:24]
+        return tts_cache_dir / f"show_seg_{digest}.wav"
+
+    def _load_cached_mono(p: Path | None, target_sr: int) -> np.ndarray | None:
+        if p is None or not p.is_file() or p.stat().st_size < 100:
+            return None
+        try:
+            with wave.open(str(p), "rb") as wf:
+                sr = wf.getframerate()
+                ch = wf.getnchannels()
+                raw_pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2").astype(np.float32) / 32768.0
+            if ch > 1:
+                n = (raw_pcm.size // ch) * ch
+                raw_pcm = np.mean(raw_pcm[:n].reshape(-1, ch), axis=1).astype(np.float32)
+            if int(sr) != int(target_sr) and raw_pcm.size > 16:
+                g = math.gcd(int(sr), int(target_sr))
+                raw_pcm = resample_poly(raw_pcm, int(target_sr) // g, int(sr) // g).astype(np.float32)
+            return raw_pcm.astype(np.float32) if raw_pcm.size else None
+        except Exception:
+            return None
+
+    def _save_cached_mono(p: Path | None, mono: np.ndarray, sr: int) -> None:
+        if p is None or mono.size == 0:
+            return
+        try:
+            pcm16 = (np.clip(mono, -1.0, 1.0) * 32767.0).astype("<i2")
+            tmp_c = p.with_suffix(".wav.tmp")
+            with wave.open(str(tmp_c), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(int(sr))
+                wf.writeframes(pcm16.tobytes())
+            tmp_c.replace(p)
+        except Exception:
+            pass
 
     tokens, inline_style = parse_speech_markup(
         text,
@@ -1976,16 +2064,20 @@ def synthesize_announcer_wav(
             if tok["kind"] == "pause":
                 mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
                 continue
-            vset: dict[str, Any] = {"stability": 0.45, "similarity_boost": 0.78}
-            if el_model != "eleven_v3":
-                vset["style"] = 0.45
-            mp3_bytes = _do_post_json(
-                url,
-                hdrs,
-                {"text": tok["text"], "model_id": el_model, "voice_settings": vset},
-            )
-            seg = _decode_mp3_bytes_mono(mp3_bytes, target_sr=k_sr)
-            seg = _trim_mono_edges(seg, k_sr)
+            c_path = _seg_cache_path(("elevenlabs", el_vid, el_model, tok["text"]))
+            seg = _load_cached_mono(c_path, k_sr)
+            if seg is None:
+                vset: dict[str, Any] = {"stability": 0.45, "similarity_boost": 0.78}
+                if el_model != "eleven_v3":
+                    vset["style"] = 0.45
+                mp3_bytes = _do_post_json(
+                    url,
+                    hdrs,
+                    {"text": tok["text"], "model_id": el_model, "voice_settings": vset},
+                )
+                seg = _decode_mp3_bytes_mono(mp3_bytes, target_sr=k_sr)
+                seg = _trim_mono_edges(seg, k_sr)
+                _save_cached_mono(c_path, seg, k_sr)
             seg = time_stretch_mono_pcm(seg, k_sr, float(tok.get("speed", 1.0)), ffmpeg_bin)
             gdb = float(tok.get("gainDb", 0.0))
             if abs(gdb) > 0.05:
@@ -2006,52 +2098,60 @@ def synthesize_announcer_wav(
         v_name = str(preset.get("voiceName") or "Fenrir").strip()
         gem_client = None
         types_mod = None
-        if gemini_synth_fn is None:
-            if not allow_network:
-                raise RuntimeError("Network disabled for Gemini TTS")
-            from google import genai
-            from google.genai import types as g_types
-
-            gem_client = genai.Client(api_key=gem_key)
-            types_mod = g_types
+        gem_tokens = _coalesce_gemini_tokens(tokens)
 
         mono_parts = []
-        for tok in tokens:
+        for tok in gem_tokens:
             if tok["kind"] == "pause":
                 mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
                 continue
-            prompt_txt = (
-                f"Audio direction ({effective_style}). Speak only the exact script below naturally with that energy:\n\n{tok['text']}"
-                if effective_style
-                else tok["text"]
-            )
-            if gemini_synth_fn is not None:
-                raw_pcm = gemini_synth_fn(prompt_txt, v_name, effective_style)
-            else:
-                assert gem_client is not None and types_mod is not None
-                resp = gem_client.models.generate_content(
-                    model="gemini-2.5-flash-preview-tts",
-                    contents=prompt_txt,
-                    config=types_mod.GenerateContentConfig(
-                        response_modalities=["AUDIO"],
-                        speech_config=types_mod.SpeechConfig(
-                            voice_config=types_mod.VoiceConfig(
-                                prebuilt_voice_config=types_mod.PrebuiltVoiceConfig(voice_name=v_name)
-                            )
-                        ),
-                    ),
+            c_path = _seg_cache_path(("gemini", v_name, effective_style, tok["text"]))
+            seg = _load_cached_mono(c_path, k_sr)
+            if seg is None:
+                prompt_txt = (
+                    f"Audio direction ({effective_style}). Speak only the exact script below naturally with that energy:\n\n{tok['text']}"
+                    if effective_style
+                    else tok["text"]
                 )
-                try:
-                    raw_pcm = resp.candidates[0].content.parts[0].inline_data.data
-                except (IndexError, AttributeError) as exc:
-                    raise RuntimeError("Gemini TTS returned empty audio response") from exc
-            if isinstance(raw_pcm, str):
-                import base64
+                if gemini_synth_fn is not None:
+                    raw_pcm = gemini_synth_fn(prompt_txt, v_name, effective_style)
+                else:
+                    if gem_client is None:
+                        if not allow_network:
+                            raise RuntimeError("Network disabled for Gemini TTS")
+                        from google import genai
+                        from google.genai import types as g_types
 
-                raw_pcm = base64.b64decode(raw_pcm)
-            usable = (len(raw_pcm) // 2) * 2
-            seg = (np.frombuffer(raw_pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0) if usable else np.zeros(0, dtype=np.float32)
-            seg = _trim_mono_edges(seg, k_sr)
+                        gem_client = genai.Client(api_key=gem_key)
+                        types_mod = g_types
+                    assert gem_client is not None and types_mod is not None
+                    try:
+                        resp = gem_client.models.generate_content(
+                            model="gemini-2.5-flash-preview-tts",
+                            contents=prompt_txt,
+                            config=types_mod.GenerateContentConfig(
+                                response_modalities=["AUDIO"],
+                                speech_config=types_mod.SpeechConfig(
+                                    voice_config=types_mod.VoiceConfig(
+                                        prebuilt_voice_config=types_mod.PrebuiltVoiceConfig(voice_name=v_name)
+                                    )
+                                ),
+                            ),
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(_format_tts_error("gemini", exc)) from exc
+                    try:
+                        raw_pcm = resp.candidates[0].content.parts[0].inline_data.data
+                    except (IndexError, AttributeError) as exc:
+                        raise RuntimeError("Gemini TTS returned empty audio response") from exc
+                if isinstance(raw_pcm, str):
+                    import base64
+
+                    raw_pcm = base64.b64decode(raw_pcm)
+                usable = (len(raw_pcm) // 2) * 2
+                seg = (np.frombuffer(raw_pcm[:usable], dtype="<i2").astype(np.float32) / 32768.0) if usable else np.zeros(0, dtype=np.float32)
+                seg = _trim_mono_edges(seg, k_sr)
+                _save_cached_mono(c_path, seg, k_sr)
             seg = time_stretch_mono_pcm(seg, k_sr, float(tok.get("speed", 1.0)), ffmpeg_bin)
             gdb = float(tok.get("gainDb", 0.0))
             if abs(gdb) > 0.05:
@@ -2078,19 +2178,23 @@ def synthesize_announcer_wav(
             if tok["kind"] == "pause":
                 mono_parts.append(np.zeros(int(round(float(tok["sec"]) * k_sr)), dtype=np.float32))
                 continue
-            wav_bytes = _do_post_json(
-                url,
-                hdrs,
-                {
-                    "model": "gpt-4o-mini-tts",
-                    "voice": oai_voice,
-                    "input": tok["text"],
-                    "instructions": inst,
-                    "response_format": "wav",
-                },
-            )
-            seg = _decode_wav_bytes_mono(wav_bytes, target_sr=k_sr)
-            seg = _trim_mono_edges(seg, k_sr)
+            c_path = _seg_cache_path(("openai", oai_voice, inst, tok["text"]))
+            seg = _load_cached_mono(c_path, k_sr)
+            if seg is None:
+                wav_bytes = _do_post_json(
+                    url,
+                    hdrs,
+                    {
+                        "model": "gpt-4o-mini-tts",
+                        "voice": oai_voice,
+                        "input": tok["text"],
+                        "instructions": inst,
+                        "response_format": "wav",
+                    },
+                )
+                seg = _decode_wav_bytes_mono(wav_bytes, target_sr=k_sr)
+                seg = _trim_mono_edges(seg, k_sr)
+                _save_cached_mono(c_path, seg, k_sr)
             seg = time_stretch_mono_pcm(seg, k_sr, float(tok.get("speed", 1.0)), ffmpeg_bin)
             gdb = float(tok.get("gainDb", 0.0))
             if abs(gdb) > 0.05:
@@ -3675,6 +3779,7 @@ class ShowDirector:
                 ffmpeg_bin=self.ffmpeg_bin,
                 allow_network=self.allow_network,
                 models_dir=self.models_dir,
+                tts_cache_dir=self.root_dir / "tts_cache",
                 reverb_wet=reverb,
                 boost_db=spec.voice_boost_db,
                 voice_style=spec.voice_style,
@@ -3839,6 +3944,7 @@ class ShowDirector:
                 ffmpeg_bin=self.ffmpeg_bin,
                 allow_network=self.allow_network,
                 models_dir=self.models_dir,
+                tts_cache_dir=self.root_dir / "tts_cache",
                 reverb_wet=reverb,
                 boost_db=boost,
                 voice_style=str(voice_style or "").strip(),

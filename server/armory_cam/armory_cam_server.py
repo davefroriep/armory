@@ -3409,6 +3409,9 @@ class ArmoryCamService:
         by_name: dict[str, SegmentInfo] = {}
         inferred_names: set[str] = set()
 
+        with self.lock:
+            active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
+
         if clean_id:
             tape_dirs = [self.tapes_root / clean_id / media_slug]
             if slug != media_slug:
@@ -3433,27 +3436,30 @@ class ArmoryCamService:
                         )
                         inferred_names.add(p.name)
 
-        with self.lock:
-            for info in self.ring_segments.get(slug, []):
-                if info.path.exists() and info.path.name not in by_name:
-                    by_name[info.path.name] = info
-            if media_slug != slug:
-                for info in self.ring_segments.get(media_slug, []):
+        include_ring = (not clean_id) or (clean_id == active_slug) or (not by_name)
+        if include_ring:
+            with self.lock:
+                for info in self.ring_segments.get(slug, []):
                     if info.path.exists() and info.path.name not in by_name:
-                        by_name[info.path.name] = SegmentInfo(
-                            path=info.path,
-                            start_ms=info.start_ms,
-                            end_ms=info.end_ms,
-                            energy=0.0,
-                            camera=canon_name,
-                        )
+                        by_name[info.path.name] = info
+                if media_slug != slug:
+                    for info in self.ring_segments.get(media_slug, []):
+                        if info.path.exists() and info.path.name not in by_name:
+                            by_name[info.path.name] = SegmentInfo(
+                                path=info.path,
+                                start_ms=info.start_ms,
+                                end_ms=info.end_ms,
+                                energy=0.0,
+                                camera=canon_name,
+                            )
 
-        inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_name))
+            inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_name))
         return self._reconcile_inferred_segments(sorted(by_name.values(), key=lambda s: s.start_ms), inferred_names)
 
     def tape_timeline(self, camera_name: str, session_id: str, buckets: int = 80) -> dict[str, Any]:
         cam = self._find_camera(camera_name)
         canon = cam.name if cam else (camera_name or "Rack Cam")
+        thresh = float(cam.motion_threshold if cam else DEFAULT_MOTION_THRESHOLD)
         segs = self._list_camera_segments(canon, session_id)
         if not segs:
             return {
@@ -3462,15 +3468,24 @@ class ArmoryCamService:
                 "minMs": 0,
                 "maxMs": 0,
                 "segmentCount": 0,
+                "threshold": round(thresh, 2),
                 "activity": [],
+                "bursts": [],
                 "bursts30": [],
             }
 
         min_ms = int(segs[0].start_ms)
         max_ms = max(min_ms + 2000, max(int(s.end_ms) for s in segs))
         span = max(1, max_ms - min_ms)
-        n_buckets = max(10, min(200, int(buckets)))
+        n_buckets = max(10, min(400, int(buckets)))
         bucket_max = [0.0] * n_buckets
+        bucket_has_video = [False] * n_buckets
+
+        for s in segs:
+            bi0 = min(n_buckets - 1, max(0, int(((int(s.start_ms) - min_ms) / span) * n_buckets)))
+            bi1 = min(n_buckets - 1, max(0, int(((max(int(s.start_ms), int(s.end_ms) - 1) - min_ms) / span) * n_buckets)))
+            for bi in range(bi0, bi1 + 1):
+                bucket_has_video[bi] = True
 
         cam_samples: list[dict[str, Any]] = []
         cam_l = canon.lower()
@@ -3487,11 +3502,46 @@ class ArmoryCamService:
             if e > bucket_max[bi]:
                 bucket_max[bi] = e
 
+        if not cam_samples:
+            for s in segs:
+                e = float(s.energy)
+                cam_samples.append(
+                    {
+                        "camera": canon,
+                        "slug": slug_l,
+                        "startMs": int(s.start_ms),
+                        "endMs": int(s.end_ms),
+                        "energy": e,
+                    }
+                )
+                mid = (int(s.start_ms) + int(s.end_ms)) // 2
+                bi = min(n_buckets - 1, max(0, int(((mid - min_ms) / span) * n_buckets)))
+                if e > bucket_max[bi]:
+                    bucket_max[bi] = e
+
         activity = [
-            {"tMs": int(min_ms + ((i + 0.5) / n_buckets) * span), "e": round(bucket_max[i], 2)}
+            {
+                "tMs": int(min_ms + ((i + 0.5) / n_buckets) * span),
+                "e": round(bucket_max[i], 2),
+                "v": 1 if bucket_has_video[i] else 0,
+            }
             for i in range(n_buckets)
         ]
-        thresh = cam.motion_threshold if cam else DEFAULT_MOTION_THRESHOLD
+        bursts = [
+            {
+                "startMs": b["startMs"],
+                "endMs": b["endMs"],
+                "durationSec": b["durationSec"],
+                "peakEnergy": b.get("peakEnergy", 0.0),
+            }
+            for b in cluster_motion_bursts(
+                cam_samples,
+                threshold=thresh,
+                min_dur_ms=8_000,
+                camera=canon,
+                resolve_overlap=False,
+            )
+        ]
         bursts30 = [
             {"startMs": b["startMs"], "endMs": b["endMs"], "durationSec": b["durationSec"]}
             for b in cluster_motion_bursts(
@@ -3508,8 +3558,195 @@ class ArmoryCamService:
             "minMs": min_ms,
             "maxMs": max_ms,
             "segmentCount": len(segs),
+            "threshold": round(thresh, 2),
             "activity": activity,
+            "bursts": bursts,
             "bursts30": bursts30,
+        }
+
+    def list_tapes(self) -> dict[str, Any]:
+        """List rolling workout tapes grouped by local calendar day + the live pre-roll ring buffer."""
+        with self.lock:
+            cams = list(self.cameras)
+            active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
+            ret_days = int(self.retention_days)
+            ring_snapshot = {k: list(v) for k, v in self.ring_segments.items()}
+
+        def _views_for_sources(phys_slugs: set[str]) -> list[str]:
+            views = [c.name for c in cams if c.enabled and self._source_slug_for(c) in phys_slugs]
+            return views or [c.name for c in cams if c.enabled]
+
+        tapes: list[dict[str, Any]] = []
+        if self.tapes_root.exists():
+            try:
+                sess_entries = sorted(os.scandir(self.tapes_root), key=lambda e: e.name)
+            except OSError:
+                sess_entries = []
+            for s_ent in sess_entries:
+                if not s_ent.is_dir():
+                    continue
+                sid = s_ent.name
+                min_ms: int | None = None
+                max_ms: int | None = None
+                seg_count = 0
+                total_bytes = 0
+                phys_slugs: set[str] = set()
+                try:
+                    sub_entries = list(os.scandir(s_ent.path))
+                except OSError:
+                    sub_entries = []
+                for cam_ent in sub_entries:
+                    if not cam_ent.is_dir():
+                        continue
+                    cam_segs = 0
+                    try:
+                        with os.scandir(cam_ent.path) as it:
+                            for f_ent in it:
+                                nm = f_ent.name
+                                if not (nm.startswith("seg_") and nm.endswith(".ts") and f_ent.is_file()):
+                                    continue
+                                s_ms = parse_segment_start_ms(nm)
+                                try:
+                                    st = f_ent.stat()
+                                    sz = int(st.st_size)
+                                    if s_ms is None:
+                                        s_ms = int(st.st_mtime * 1000) - 2000
+                                except OSError:
+                                    sz = 0
+                                if s_ms is None:
+                                    continue
+                                e_ms = s_ms + 2500
+                                min_ms = s_ms if (min_ms is None or s_ms < min_ms) else min_ms
+                                max_ms = e_ms if (max_ms is None or e_ms > max_ms) else max_ms
+                                total_bytes += sz
+                                seg_count += 1
+                                cam_segs += 1
+                    except OSError:
+                        continue
+                    if cam_segs > 0:
+                        phys_slugs.add(cam_ent.name)
+
+                if seg_count == 0 or min_ms is None or max_ms is None:
+                    continue
+                dt = datetime.fromtimestamp(min_ms / 1000.0)
+                tapes.append(
+                    {
+                        "sessionId": sid,
+                        "isLive": False,
+                        "isActive": sid == active_slug,
+                        "date": dt.strftime("%Y-%m-%d"),
+                        "startMs": min_ms,
+                        "endMs": max_ms,
+                        "durationSec": max(2, int(round((max_ms - min_ms) / 1000.0))),
+                        "segmentCount": seg_count,
+                        "sizeMb": round(total_bytes / (1024.0 * 1024.0), 1),
+                        "cameras": _views_for_sources(phys_slugs),
+                        "hasAudio": self.room_audio.has_audio(min_ms, max_ms),
+                    }
+                )
+
+        tapes.sort(key=lambda t: t["startMs"], reverse=True)
+
+        # Build days summary (newest date first)
+        days_map: dict[str, dict[str, Any]] = {}
+        for t in tapes:
+            dkey = t["date"]
+            bucket = days_map.get(dkey)
+            if bucket is None:
+                dt = datetime.strptime(dkey, "%Y-%m-%d")
+                bucket = {
+                    "date": dkey,
+                    "label": f"{dt.strftime('%a %b')} {dt.day}",
+                    "tapeCount": 0,
+                    "totalDurationSec": 0,
+                    "totalMb": 0.0,
+                    "tapes": [],
+                }
+                days_map[dkey] = bucket
+            bucket["tapes"].append(t)
+            bucket["tapeCount"] += 1
+            bucket["totalDurationSec"] += int(t["durationSec"])
+            bucket["totalMb"] = round(float(bucket["totalMb"]) + float(t["sizeMb"]), 1)
+        days = sorted(days_map.values(), key=lambda d: d["date"], reverse=True)
+
+        # Live rolling ring entry (always present when physical ring has segments)
+        live_min: int | None = None
+        live_max: int | None = None
+        live_segs = 0
+        live_bytes = 0
+        live_phys: set[str] = set()
+        seen_paths: set[str] = set()
+        if self.ring_root.exists():
+            for cam in self._physical_cameras():
+                cdir = self.ring_root / cam.slug
+                if not cdir.is_dir():
+                    continue
+                cnt = 0
+                try:
+                    with os.scandir(cdir) as it:
+                        for f_ent in it:
+                            nm = f_ent.name
+                            if not (nm.startswith("seg_") and nm.endswith(".ts") and f_ent.is_file()):
+                                continue
+                            s_ms = parse_segment_start_ms(nm)
+                            try:
+                                st = f_ent.stat()
+                                sz = int(st.st_size)
+                                if s_ms is None:
+                                    s_ms = int(st.st_mtime * 1000) - 2000
+                            except OSError:
+                                sz = 0
+                            if s_ms is None:
+                                continue
+                            seen_paths.add(f_ent.path)
+                            e_ms = s_ms + 2500
+                            live_min = s_ms if (live_min is None or s_ms < live_min) else live_min
+                            live_max = e_ms if (live_max is None or e_ms > live_max) else live_max
+                            live_bytes += sz
+                            live_segs += 1
+                            cnt += 1
+                except OSError:
+                    continue
+                if cnt > 0:
+                    live_phys.add(cam.slug)
+        for slug_k, infos in ring_snapshot.items():
+            for info in infos:
+                p_str = str(info.path)
+                if p_str in seen_paths or not info.path.exists():
+                    continue
+                seen_paths.add(p_str)
+                try:
+                    live_bytes += int(info.path.stat().st_size)
+                except OSError:
+                    pass
+                live_min = info.start_ms if (live_min is None or info.start_ms < live_min) else live_min
+                live_max = info.end_ms if (live_max is None or info.end_ms > live_max) else live_max
+                live_segs += 1
+                live_phys.add(slug_k)
+
+        live_entry: dict[str, Any] | None = None
+        if live_segs > 0 and live_min is not None and live_max is not None:
+            dt_l = datetime.fromtimestamp(live_min / 1000.0)
+            live_entry = {
+                "sessionId": "",
+                "isLive": True,
+                "label": "Live Buffer",
+                "date": dt_l.strftime("%Y-%m-%d"),
+                "startMs": live_min,
+                "endMs": live_max,
+                "durationSec": max(2, int(round((live_max - live_min) / 1000.0))),
+                "segmentCount": live_segs,
+                "sizeMb": round(live_bytes / (1024.0 * 1024.0), 1),
+                "cameras": _views_for_sources(live_phys),
+                "hasAudio": self.room_audio.has_audio(live_min, live_max),
+            }
+
+        return {
+            "ok": True,
+            "retentionDays": ret_days,
+            "live": live_entry,
+            "days": days,
+            "tapes": tapes,
         }
 
     @staticmethod
@@ -5172,21 +5409,87 @@ DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Armory Cam · OptiPlex DVR</title>
+<title>Armory Console · OptiPlex DVR &amp; Gym Command</title>
 <style>
-  :root{--bg:#0b0f14;--card:#131a22;--line:#233040;--fg:#edf2f7;--mut:#8b9bb0;--blue:#1e9bff;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  :root{--bg:#090c11;--side:#0d1219;--card:#131a24;--inset:#0b1017;--line:#202d3e;--fg:#eef3f9;--mut:#8b9cb3;--blue:#2ea0ff;--green:#22c55e;--amber:#f59e0b;--red:#ef4444;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;overflow-x:hidden}
   [hidden]{display:none!important}
-  .wrap{max-width:1120px;margin:0 auto;padding:18px}
-  h1{margin:0 0 6px;font-size:22px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .app-shell{display:flex;min-height:100vh}
+  .sidebar{width:232px;flex-shrink:0;background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;padding:16px 12px;gap:14px;z-index:40}
+  .brand{display:flex;align-items:center;gap:10px;padding:4px 8px 10px;border-bottom:1px solid var(--line)}
+  .brand-mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#1d4ed8,#0ea5e9);display:flex;align-items:center;justify-content:center;font-weight:950;font-size:15px;color:#fff;letter-spacing:-.02em;box-shadow:0 4px 14px rgba(14,165,233,.28)}
+  .brand-title{font-weight:900;font-size:15px;letter-spacing:.04em;line-height:1.15}
+  .brand-sub{font-size:11px;color:var(--mut);font-weight:600}
+  .nav-list{display:flex;flex-direction:column;gap:4px;flex:1}
+  .nav-btn{width:100%;display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:10px;border:1px solid transparent;background:transparent;color:var(--mut);font:700 13px/1.25 inherit;cursor:pointer;text-align:left;transition:background-color .14s ease,color .14s ease,border-color .14s ease}
+  .nav-btn svg{width:16px;height:16px;flex-shrink:0;opacity:.82}
+  .nav-btn:hover{background:#151e2a;color:var(--fg)}
+  .nav-btn.on{background:rgba(46,160,255,.14);border-color:rgba(46,160,255,.36);color:#eaf4ff}
+  .nav-btn.on svg{opacity:1;color:var(--blue)}
+  .nav-end{margin-left:auto;display:inline-flex;align-items:center;gap:5px}
+  .dot{width:8px;height:8px;border-radius:50%;background:#334155}
+  .dot.ok{background:var(--green);box-shadow:0 0 8px rgba(34,197,94,.65)}
+  .dot.live{background:var(--blue);box-shadow:0 0 8px rgba(46,160,255,.65)}
+  .dot.warn{background:var(--amber);box-shadow:0 0 8px rgba(245,158,11,.7)}
+  .dot.err{background:var(--red)}
+  .nav-mini{font-size:10px;font-weight:800;padding:1px 6px;border-radius:999px;background:#1a2433;color:var(--mut)}
+  .side-foot{border-top:1px solid var(--line);padding-top:10px;display:flex;flex-direction:column;gap:6px;font-size:12px}
+  .side-link{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;border-radius:8px;background:#121923;border:1px solid var(--line);color:#9cc7f5;font-weight:700}
+  .side-link:hover{border-color:var(--blue);color:#fff}
+  .app-main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .topbar{position:sticky;top:0;z-index:35;background:rgba(9,12,17,.90);backdrop-filter:blur(10px);border-bottom:1px solid var(--line);padding:10px 22px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .topbar-title{font-size:17px;font-weight:900;letter-spacing:.01em;margin:0}
+  .topbar-meta{font-size:12px;color:var(--mut);margin-left:4px;font-variant-numeric:tabular-nums}
+  .topbar-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .page-wrap{width:100%;max-width:1240px;margin:0 auto;padding:18px 22px 36px}
+  .page{display:none}
+  .page.active{display:block}
+  .page-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .page-head h1{margin:0;font-size:20px;font-weight:900;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .page-sub{font-size:12px;color:var(--mut);margin-top:2px}
+  .eyebrow{font-size:10px;font-weight:900;letter-spacing:.09em;text-transform:uppercase;color:#7cc4ff;margin-bottom:4px}
+  .kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:12px;margin-bottom:16px}
+  .kpi-card{background:var(--card);border:1px solid var(--line);border-radius:13px;padding:13px 14px;cursor:pointer;transition:border-color .14s ease,transform .12s ease}
+  .kpi-card:hover{border-color:rgba(46,160,255,.55);transform:translateY(-1px)}
+  .kpi-lbl{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;color:var(--mut);display:flex;align-items:center;justify-content:space-between;gap:6px}
+  .kpi-val{font-size:18px;font-weight:900;margin:5px 0 3px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .kpi-sub{font-size:11px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ov-split{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(260px,1fr);gap:14px;margin-top:14px}
+  .deck-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:8px}
+  .deck-group{background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:10px 12px}
+  .deck-group .ctrl-row{margin-top:6px}
+  .dp-groups{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-bottom:12px}
+  .dp-group{background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:10px 12px}
+  .dp-group .ctrl-row{margin-top:6px}
   .pill{font-size:11px;padding:3px 10px;border-radius:999px;background:#1d2836;color:var(--mut);font-weight:800;letter-spacing:.04em}
   .pill.ok{background:rgba(34,197,94,.18);color:#86efac}
   .pill.live{background:rgba(30,155,255,.18);color:#7cc4ff}
   .pill.warn{background:rgba(245,158,11,.20);color:#fcd34d}
   .pill.err{background:rgba(239,68,68,.20);color:#fca5a5}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;margin-top:14px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px}
-  .card h2{margin:0 0 10px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px;margin-top:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
+  .card + .card{margin-top:14px}
+  .card h2{margin:0 0 10px;font-size:16px;font-weight:900;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+  .ts-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 8px}
+  .ts-pill{border:1px solid var(--line);background:var(--inset);color:var(--mut);border-radius:9px;padding:5px 10px;font:700 12px/1.2 inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:border-color .12s ease,background-color .12s ease,color .12s ease}
+  .ts-pill:hover{border-color:#3a5270;color:var(--fg)}
+  .ts-pill.on{background:rgba(46,160,255,.18);border-color:var(--blue);color:#fff}
+  .ts-stage{position:relative;width:100%;aspect-ratio:16/9;max-height:480px;background:#04070b;border-radius:12px;border:1px solid var(--line);overflow:hidden;display:flex;align-items:center;justify-content:center;margin-top:8px}
+  .ts-stage img,.ts-stage video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+  .ts-hud{position:absolute;left:10px;top:10px;z-index:4;background:rgba(7,10,15,.84);border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:4px 10px;font:700 12px/1.3 ui-monospace,Consolas,monospace;color:#e2e8f0;font-variant-numeric:tabular-nums;pointer-events:none}
+  .ts-stage-tools{position:absolute;right:10px;top:10px;z-index:5;display:flex;align-items:center;gap:6px}
+  .ts-stage-tools select{width:auto;padding:4px 8px;font-size:12px;font-weight:700;background:rgba(9,13,19,.88)}
+  .ts-rail-wrap{position:relative;margin-top:10px;background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:8px 10px 6px}
+  #tsTimelineCanvas{width:100%;height:78px;display:block;cursor:crosshair;touch-action:none;border-radius:6px}
+  .ts-hover-tip{position:absolute;top:-26px;transform:translateX(-50%);background:#0f172a;border:1px solid var(--blue);color:#f8fafc;border-radius:6px;padding:2px 7px;font:700 11px/1.3 ui-monospace,Consolas,monospace;pointer-events:none;white-space:nowrap;z-index:6}
+  .ts-rail-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:6px;font:600 11px/1.3 ui-monospace,Consolas,monospace;color:var(--mut);flex-wrap:wrap}
+  .ts-legend{display:inline-flex;gap:12px;align-items:center;flex-wrap:wrap;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .ts-sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
+  .ts-bursts{display:flex;flex-wrap:wrap;gap:6px;max-height:116px;overflow:auto;margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+  .ts-burst-btn{background:#121b27;border:1px solid #25364c;color:#cbd5e1;border-radius:8px;padding:4px 9px;font:700 11px/1.2 ui-monospace,Consolas,monospace;cursor:pointer}
+  .ts-burst-btn:hover{border-color:var(--green);color:#fff}
+  .ts-burst-btn.on{background:rgba(34,197,94,.20);border-color:var(--green);color:#86efac}
   .cam-head-l{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}
   .cam-head-r{display:flex;align-items:center;gap:6px;flex-shrink:0}
   .cam-name-inp{width:170px;max-width:100%;padding:4px 8px!important;font-weight:800!important;font-size:14px!important;border-radius:8px!important}
@@ -5235,13 +5538,13 @@ DASHBOARD_HTML = """<!doctype html>
   .mbar-fill.hot{background:var(--green)}
   .mbar-th{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
   label{display:block;font-size:12px;color:var(--mut);margin:8px 0 4px}
-  input[type=text],input[type=number],select,textarea{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:#0d1218;color:var(--fg);font:inherit}
+  input[type=text],input[type=password],input[type=number],select,textarea{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:#0c1118;color:var(--fg);font:inherit}
   .show-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin-top:10px}
-  .show-item{background:#0d1218;border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}
+  .show-item{background:#0c1118;border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}
   .show-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap}
   .show-trigs{font-size:11px;color:var(--mut);line-height:1.5}
   .show-audio{width:100%;height:34px;border-radius:8px;background:#131a22}
-  .dev-drop-box{background:#090d12;border:1px solid #2b4566;border-radius:12px;padding:12px;margin-bottom:12px}
+  .dev-drop-box{background:#0b1018;border:1px solid #284160;border-radius:14px;padding:14px;margin-bottom:14px}
   .dev-stage{position:relative;border-radius:12px;border:2px solid #233040;background:#0a0e14;min-height:240px;padding:12px;display:flex;flex-direction:column;justify-content:space-between;gap:10px;overflow:hidden;transition:background-color .12s ease,box-shadow .12s ease,border-color .12s ease}
   .dev-stage.lights-off{background:#020305;border-color:#1e293b}
   .dev-stage.lights-on{background:#231f16;border-color:#facc15;box-shadow:inset 0 0 60px rgba(250,204,21,.22)}
@@ -5314,571 +5617,909 @@ DASHBOARD_HTML = """<!doctype html>
   th,td{text-align:left;padding:7px 6px;border-top:1px solid var(--line)}
   a{color:#7cc4ff;text-decoration:none}
   code{background:#0d1218;padding:2px 6px;border-radius:6px;font-size:12px}
+  @media (max-width:920px){
+    .app-shell{flex-direction:column}
+    .sidebar{width:100%;height:auto;position:sticky;top:0;border-right:0;border-bottom:1px solid var(--line);padding:10px 12px;gap:8px;flex-direction:row;align-items:center;overflow-x:auto}
+    .brand{border-bottom:0;padding:0 10px 0 0;border-right:1px solid var(--line);flex-shrink:0}
+    .brand-sub,.side-foot{display:none}
+    .nav-list{flex-direction:row;gap:4px;overflow-x:auto}
+    .nav-btn{width:auto;padding:7px 10px;white-space:nowrap}
+    .topbar{position:static;padding:10px 14px}
+    .page-wrap{padding:14px 14px 32px}
+    .ov-split{grid-template-columns:1fr}
+  }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>
-    <span>ARMORY CAM</span>
-    <span id="svcBadge" class="pill">Checking…</span>
-    <button class="btn sec" id="openEditorTop" type="button" style="margin-left:auto">⤢ Full-Screen Editor</button>
-    <button class="btn" id="saveAllTop" type="button">Save Camera Settings</button>
-  </h1>
-  <div id="subInfo" style="color:var(--mut)">Loading OptiPlex status…</div>
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">A</div>
+      <div>
+        <div class="brand-title">ARMORY</div>
+        <div class="brand-sub">Gym Command Console</div>
+      </div>
+    </div>
+    <nav class="nav-list" aria-label="Console sections">
+      <button class="nav-btn on" type="button" data-nav="overview">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+        <span>Overview</span>
+        <span class="nav-end"><span id="navDotOverview" class="dot ok"></span></span>
+      </button>
+      <button class="nav-btn" type="button" data-nav="cameras">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>
+        <span>Cameras</span>
+        <span class="nav-end"><span id="navDotCams" class="dot live"></span></span>
+      </button>
+      <button class="nav-btn" type="button" data-nav="footage">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+        <span>Footage</span>
+        <span class="nav-end"><span id="navBadgeRet" class="nav-mini">14d</span></span>
+      </button>
+      <button class="nav-btn" type="button" data-nav="shows">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+        <span>Show Lab</span>
+        <span class="nav-end"><span id="navDotShow" class="dot"></span></span>
+      </button>
+      <button class="nav-btn" type="button" data-nav="gym">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+        <span>Gym &amp; Displays</span>
+        <span class="nav-end"><span id="navDotGym" class="dot"></span></span>
+      </button>
+      <button class="nav-btn" type="button" data-nav="audio">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4M8 22h8"/></svg>
+        <span>Audio &amp; Voice</span>
+        <span class="nav-end"><span id="navDotAudio" class="dot"></span></span>
+      </button>
+    </nav>
+    <div class="side-foot">
+      <a class="side-link" href="/wallboard" target="_blank"><span>Wallboard View</span><span>↗</span></a>
+      <a class="side-link" href="/stage" target="_blank"><span>TV Stage Screen</span><span>↗</span></a>
+      <div style="color:var(--mut);font-size:11px;padding:2px 4px">Shortcuts: keys <code>1</code>–<code>6</code></div>
+    </div>
+  </aside>
 
-  <div id="camGrid" class="grid"></div>
+  <div class="app-main">
+    <header class="topbar">
+      <h1 id="pageTitle" class="topbar-title">Overview</h1>
+      <span id="svcBadge" class="pill">Checking…</span>
+      <span id="subInfo" class="topbar-meta">Loading OptiPlex status…</span>
+      <div class="topbar-actions">
+        <button class="btn red sm" id="topStopShowBtn" type="button" hidden>⏹ Stop Show</button>
+      </div>
+    </header>
 
-  <div class="card" style="margin-top:14px">
-    <h2>Retention, Buffer &amp; Google Drive Sync</h2>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-      <div><label>Full Tape Retention (days)</label><input id="retDays" type="number" min="1" max="90"></div>
-      <div><label>Pre-Roll Buffer (seconds)</label><input id="preRoll" type="number" min="30" max="600"></div>
-    </div>
-    <label>Google Drive Clip Backup Folder (auto-copied on save)</label>
-    <input id="driveDir" type="text" placeholder="J:\\My Drive\\Backups\\ArmoryFit Backup\\Clips">
-    <label style="display:flex;align-items:center;gap:8px;margin-top:10px;text-transform:none;font-size:13px;color:var(--fg)">
-      <input id="bumpAlertNtfy" type="checkbox" style="width:auto;margin:0">
-      <span>Camera Bump Alert (ntfy push if a camera gets bumped)</span>
-    </label>
-    <div class="ctrl-row" style="margin-top:10px">
-      <button class="btn" id="saveBtn" type="button">Save Camera Config &amp; Apply</button>
-      <span id="saveMsg" style="color:var(--mut);font-size:12px"></span>
-    </div>
-  </div>
+    <div class="page-wrap">
 
-  <div class="card" style="margin-top:14px">
-    <h2>
-      <span>32&quot; Fire TV Wallboard &amp; ADB Auto-Wake</span>
-      <span style="display:flex;align-items:center;gap:8px">
-        <a href="/wallboard" target="_blank" style="font-size:12px;font-weight:700">Open Wallboard ↗</a>
-        <span id="wbBadge" class="pill">UNCONFIGURED</span>
-      </span>
-    </h2>
-    <div id="wbMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Permanent URL: <code>/wallboard</code></div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
-      <div><label>Fire TV IP / Hostname</label><input id="wbHost" type="text" placeholder="192.168.1.xxx"></div>
-      <div><label>Fire TV MAC (Wake-on-LAN)</label><input id="wbMac" type="text" placeholder="08:97:98:xx:xx:xx"></div>
-      <div><label>ADB Port</label><input id="wbPort" type="number" min="1" max="65535" value="5555"></div>
-      <div>
-        <label>Display Client</label>
-        <select id="wbClient">
-          <option value="armory">Armory Wallboard App (Kiosk APK)</option>
-          <option value="silk">Amazon Silk</option>
-          <option value="fully">Fully Kiosk Browser</option>
-          <option value="custom">Custom App / URL Intent</option>
-        </select>
-      </div>
-      <div><label>Idle Auto-Sleep (minutes)</label><input id="wbIdleMin" type="number" min="1" max="120" value="10"></div>
-      <div>
-        <label>Wake on Workout Start</label>
-        <select id="wbWake"><option value="1">Yes (Auto-Wake)</option><option value="0">No</option></select>
-      </div>
-      <div>
-        <label>Sleep When Workout Ends</label>
-        <select id="wbSleep"><option value="1">Yes (30s delay)</option><option value="0">No</option></select>
-      </div>
-    </div>
-    <div class="ctrl-row" style="margin-top:10px">
-      <button class="btn" id="wbSaveBtn" type="button">Save Wallboard</button>
-      <button class="btn sec" id="wbPairBtn" type="button">Connect / Pair ADB</button>
-      <button class="btn ok" id="wbWakeBtn" type="button">Test Wake &amp; Launch</button>
-      <button class="btn sec" id="wbSleepBtn" type="button">Sleep TV Now</button>
-      <span id="wbOut" style="color:var(--mut);font-size:12px"></span>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top:14px">
-    <h2>
-      <span>Room Voice Mic (PowerConf S330)</span>
-      <span id="vxBadge" class="pill">CHECKING</span>
-    </h2>
-    <div id="vxMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">WASAPI Shared Mode opens automatically only during active Strength workouts so Windows Voice Typing (<code>Win + H</code>) works anytime.</div>
-    <div class="mbar-wrap" style="margin-bottom:8px"><div id="vxMeter" class="mbar-fill"></div></div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
-      <div>
-        <label>Room Mic Relay</label>
-        <select id="vxEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select>
-      </div>
-      <div>
-        <label>Listen Mode</label>
-        <select id="vxMode"><option value="workout">Active Lift Workout</option><option value="always">Always Listening</option></select>
-      </div>
-      <div>
-        <label>Input Microphone</label>
-        <select id="vxDevice"><option value="PowerConf S330">PowerConf S330 (Auto)</option></select>
-      </div>
-      <div>
-        <label>Spoken Readback (S330 Speaker)</label>
-        <select id="vxReadback"><option value="1">Yes (Speak on S330)</option><option value="0">No (Pixel Only)</option></select>
-      </div>
-      <div>
-        <label>Set Confirmation</label>
-        <select id="vxSetCommitMode">
-          <option value="voice">Voice (+10% Speed — Default)</option>
-          <option value="chime">Commit Chime Only (Fast Bing)</option>
-        </select>
-      </div>
-      <div>
-        <label>Speaker Voice</label>
-        <select id="vxTtsVoice">
-          <option value="kokoro:am_michael">Michael (Local GPU — Fastest)</option>
-          <option value="kokoro:am_onyx">Onyx (Local GPU Deep Male)</option>
-          <option value="kokoro:am_fenrir">Fenrir (Local GPU Bold Male)</option>
-          <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural — Legacy Default)</option>
-          <option value="en-US-AvaMultilingualNeural">Ava (Cloud Neural Female)</option>
-          <option value="sapi">Windows Offline SAPI</option>
-        </select>
-      </div>
-      <div>
-        <label>Whisper Model (CPU int8)</label>
-        <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (most accurate)</option></select>
-      </div>
-      <div>
-        <label>VAD Threshold (0.15–0.90)</label>
-        <input id="vxVad" type="number" min="0.15" max="0.90" step="0.05" value="0.45">
-      </div>
-    </div>
-    <div class="ctrl-row" style="margin-top:10px">
-      <button class="btn" id="vxSaveBtn" type="button">Save Voice</button>
-      <button class="btn ok" id="vxTestBtn" type="button">Test Mic (60s)</button>
-      <button class="btn sec" id="vxSpeakBtn" type="button">Test Speaker</button>
-      <button class="btn sec" id="vxInjectBtn" type="button">Send &ldquo;Armory check&rdquo;</button>
-      <span id="vxOut" style="color:var(--mut);font-size:12px"></span>
-    </div>
-    <div id="vxRecent" style="margin-top:10px;color:var(--mut);font-size:12px">No voice utterances captured yet.</div>
-    <div id="vxAbBox" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);color:var(--mut);font-size:12px">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-        <b style="color:var(--fg)">Dual-Mic A/B Metrics (PowerConf S330 vs. Pixel Phone Mic)</b>
-        <button class="btn sec sm" id="vxAbResetBtn" type="button">Reset Passive A/B</button>
-      </div>
-      <div id="vxAbSummary">Enable Dual-Mic A/B Benchmark or run the 10-Phrase Shootout in Armory Fit to compare catch % and improvement.</div>
-      <div id="vxAbRuns" style="margin-top:8px"></div>
-      <div id="vxAbTrials" style="margin-top:8px"></div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top:14px">
-    <h2>
-      <span>House Audio (Denon AVR-3313CI + Fire TV Cube Mixer)</span>
-      <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-        <span id="haDenonPill" class="pill">DENON…</span>
-        <span id="haCubePill" class="pill">CUBE…</span>
-      </span>
-    </h2>
-    <div id="haMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Checking Denon AVR (<code>192.168.1.15</code>) &amp; Fire TV Cube mixer…</div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px">
-      <div>
-        <label>Output Route</label>
-        <select id="haRoute">
-          <option value="s330">PowerConf S330 Only</option>
-          <option value="auto">Auto: Cube (when MPLAY) -&gt; S330</option>
-          <option value="cube">Fire TV Cube Only</option>
-        </select>
-      </div>
-      <div><label>Denon AVR IP</label><input id="haDenonHost" type="text" value="192.168.1.15" placeholder="192.168.1.15"></div>
-      <div>
-        <label>Loud-Only Denon Duck</label>
-        <select id="haDuckEnabled">
-          <option value="0">Off (Never drop music)</option>
-          <option value="1">Loud-Only (Above threshold)</option>
-        </select>
-      </div>
-      <div><label>Loud Threshold (dB)</label><input id="haDuckThresh" type="number" min="-65" max="10" step="0.5" value="-20.0"></div>
-      <div><label>Gentle Dip (dB)</label><input id="haDuckDrop" type="number" min="0.5" max="30" step="0.5" value="5.0"></div>
-      <div><label>Fire TV Cube IP</label><input id="haCubeHost" type="text" placeholder="192.168.1.xxx"></div>
-      <div>
-        <label>Cube Mixer APK</label>
-        <select id="haCubeEnabled">
-          <option value="0">Disabled</option>
-          <option value="1">Enabled (:8767)</option>
-        </select>
-      </div>
-      <div>
-        <label>Readback Mode</label>
-        <select id="haReadMode">
-          <option value="overlay">Overlay (No Pause/Duck)</option>
-          <option value="duck">Duck (MAY_DUCK)</option>
-          <option value="takeover">Takeover (Pause &amp; Resume)</option>
-        </select>
-      </div>
-      <div>
-        <label>Chime Mode</label>
-        <select id="haChimeMode">
-          <option value="overlay">Overlay (No Pause/Duck)</option>
-          <option value="duck">Duck (MAY_DUCK)</option>
-          <option value="takeover">Takeover (Pause &amp; Resume)</option>
-        </select>
-      </div>
-      <div>
-        <label>1RM / Hype Mode</label>
-        <select id="haHypeMode">
-          <option value="takeover">Takeover (Pause &amp; Resume)</option>
-          <option value="duck">Duck (MAY_DUCK)</option>
-          <option value="overlay">Overlay (No Pause/Duck)</option>
-        </select>
-      </div>
-      <div>
-        <label>Cube Audio Usage</label>
-        <select id="haUsage">
-          <option value="media">media (STREAM_MUSIC)</option>
-          <option value="assist">assist (Guidance/TTS)</option>
-          <option value="sonification">sonification (Chimes)</option>
-          <option value="alarm">alarm (High Priority)</option>
-        </select>
-      </div>
-      <div><label>Readback Gain (0.05–1.0)</label><input id="haReadGain" type="number" min="0.05" max="1.0" step="0.05" value="0.85"></div>
-      <div><label>SFX Gain (0.05–1.0)</label><input id="haSfxGain" type="number" min="0.05" max="1.0" step="0.05" value="0.90"></div>
-    </div>
-    <div class="ctrl-row" style="margin-top:10px">
-      <button class="btn" id="haSaveBtn" type="button">Save Audio</button>
-      <button class="btn sec" id="haDenonDipBtn" type="button">Test Denon Dip</button>
-      <button class="btn sec" id="haCubeProbeBtn" type="button">Probe Cube ADB</button>
-      <button class="btn ok" id="haCubeReviveBtn" type="button">Revive Cube Service</button>
-      <span id="haOut" style="color:var(--mut);font-size:12px"></span>
-    </div>
-    <div id="haAdbDetails" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
-
-    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
-      <div style="font-weight:700;margin-bottom:6px">One-Click Mode Test Bench</div>
-      <div style="display:grid;grid-template-columns:minmax(180px,2fr) repeat(3,minmax(120px,1fr));gap:8px;align-items:end">
-        <div><label>Test TTS Phrase</label><input id="haTestText" type="text" value="225 for 8, got it"></div>
-        <div>
-          <label>Target</label>
-          <select id="haTestTarget">
-            <option value="auto">Auto Route</option>
-            <option value="cube">Fire TV Cube</option>
-            <option value="s330">PowerConf S330</option>
-          </select>
+      <!-- PAGE 1: OVERVIEW -->
+      <section class="page active" data-page="overview">
+        <div class="page-head">
+          <div>
+            <h1>Mission Control</h1>
+            <div class="page-sub">Live status across OptiPlex DVR, displays, audio, voice mic &amp; entrance shows</div>
+          </div>
+          <div class="ctrl-row" style="margin-top:0">
+            <button class="btn sec sm" type="button" onclick="navigatePage('footage')">⏱ Open 14-Day Scrubber</button>
+            <button class="btn sm" type="button" onclick="navigatePage('shows')">⚡ Open Show Lab</button>
+          </div>
         </div>
-        <div>
-          <label>Custom SFX (S:\\ArmoryCam\\sfx)</label>
-          <select id="haSfxSel"><option value="">(None placed yet)</option></select>
+
+        <div class="kpi-grid">
+          <div class="kpi-card" onclick="navigatePage('cameras')">
+            <div class="kpi-lbl"><span>Cameras</span><span class="pill live" id="ovKpiCamsPill">LIVE</span></div>
+            <div class="kpi-val" id="ovKpiCamsVal">—</div>
+            <div class="kpi-sub" id="ovKpiCamsSub">Checking feeds…</div>
+          </div>
+          <div class="kpi-card" onclick="navigatePage('footage')">
+            <div class="kpi-lbl"><span>14-Day Storage</span><span class="pill" id="ovKpiDiskPill">DVR</span></div>
+            <div class="kpi-val" id="ovKpiDiskVal">—</div>
+            <div class="kpi-sub" id="ovKpiDiskSub">Checking tapes…</div>
+          </div>
+          <div class="kpi-card" onclick="navigatePage('audio')">
+            <div class="kpi-lbl"><span>Room Voice Mic</span><span class="pill" id="ovKpiVoicePill">…</span></div>
+            <div class="kpi-val" id="ovKpiVoiceVal">—</div>
+            <div class="kpi-sub" id="ovKpiVoiceSub">PowerConf S330</div>
+          </div>
+          <div class="kpi-card" onclick="navigatePage('audio')">
+            <div class="kpi-lbl"><span>House Audio</span><span class="pill" id="ovKpiAudioPill">…</span></div>
+            <div class="kpi-val" id="ovKpiAudioVal">—</div>
+            <div class="kpi-sub" id="ovKpiAudioSub">Denon + Fire TV Cube</div>
+          </div>
+          <div class="kpi-card" onclick="navigatePage('gym')">
+            <div class="kpi-lbl"><span>Gym Displays</span><span class="pill" id="ovKpiDispPill">…</span></div>
+            <div class="kpi-val" id="ovKpiDispVal">—</div>
+            <div class="kpi-sub" id="ovKpiDispSub">TV · Wallboard · Spin</div>
+          </div>
+          <div class="kpi-card" onclick="navigatePage('shows')">
+            <div class="kpi-lbl"><span>Show Director</span><span class="pill" id="ovKpiShowPill">IDLE</span></div>
+            <div class="kpi-val" id="ovKpiShowVal">Ready</div>
+            <div class="kpi-sub" id="ovKpiShowSub">6 shows configured</div>
+          </div>
         </div>
-        <div>
-          <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer">
-            <input id="haTestDenonDuck" type="checkbox" style="width:auto">
-            <span>Pair w/ Denon Dip</span>
+
+        <div class="card">
+          <h2>
+            <span>Quick Gym Control Deck</span>
+            <span id="ovDeckOut" style="font-size:12px;color:var(--mut);font-weight:600">Discrete one-tap controls</span>
+          </h2>
+          <div class="deck-grid">
+            <div class="deck-group">
+              <div class="eyebrow">Gym Power Macros</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="open_gym:run">Open Gym</button>
+                <button class="btn red sm" type="button" data-dpact="close_gym:run">Close Gym</button>
+                <button class="btn sec sm" type="button" data-dpact="all_tvs:on">All TVs ON</button>
+                <button class="btn sec sm" type="button" data-dpact="all_tvs:off">All TVs OFF</button>
+              </div>
+            </div>
+            <div class="deck-group">
+              <div class="eyebrow">Main TV &amp; Cube</div>
+              <div class="ctrl-row">
+                <button class="btn sec sm" type="button" data-dpact="tv:hdmi1">TV PC</button>
+                <button class="btn sec sm" type="button" data-dpact="tv:hdmi2">TV Fire TV</button>
+                <button class="btn ok sm" type="button" data-dpact="cube:on">Cube ON</button>
+                <button class="btn sec sm" type="button" data-dpact="cube:off">Cube OFF</button>
+                <button class="btn sec sm" type="button" data-dpact="cube:home">Home</button>
+              </div>
+            </div>
+            <div class="deck-group">
+              <div class="eyebrow">Receiver &amp; Lights</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="avr:on">Denon ON</button>
+                <button class="btn sec sm" type="button" data-dpact="avr:off">Denon OFF</button>
+                <button class="btn sec sm" type="button" id="ovLightsOnBtn">Lights ON</button>
+                <button class="btn sec sm" type="button" id="ovLightsOffBtn">Lights OFF</button>
+              </div>
+            </div>
+            <div class="deck-group">
+              <div class="eyebrow">PR &amp; Show Triggers</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" onclick="fireShow('matt_pr')">🔥 Global PR Drop</button>
+                <button class="btn red sm" type="button" onclick="stopShow()">⏹ Stop Show</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ov-split">
+          <div class="card">
+            <h2>
+              <span>Latest Footage &amp; Saved Clips</span>
+              <button class="btn sec sm" type="button" onclick="navigatePage('footage')">Browse All 14 Days →</button>
+            </h2>
+            <div id="ovFootageSummary" style="font-size:12px;color:var(--mut);margin-bottom:8px">Loading tape index…</div>
+            <div id="ovRecentClips" style="font-size:12px;color:var(--mut)">Loading clips…</div>
+          </div>
+          <div class="card" style="margin-top:0">
+            <h2><span>Shortcuts &amp; Tools</span></h2>
+            <div class="ctrl-row" style="margin-top:0">
+              <button class="btn sec" type="button" onclick="navigatePage('cameras'); $('openEditorTop') && $('openEditorTop').click()">⤢ Full-Screen Crop &amp; Mask</button>
+              <button class="btn sec" type="button" onclick="navigatePage('shows')">🎬 Ryder Intro Simulator</button>
+              <button class="btn sec" type="button" onclick="navigatePage('gym')">📺 Configure Displays / IP</button>
+              <button class="btn sec" type="button" onclick="navigatePage('audio')">🎙️ Test S330 Mic / Denon</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- PAGE 2: CAMERAS -->
+      <section class="page" data-page="cameras">
+        <div class="page-head">
+          <div>
+            <h1>Camera Views, Crop &amp; Mirror Masks</h1>
+            <div class="page-sub">Drag blue crop corners, <b>4-dot Mirror Masks</b>, or click <b>+ Add View</b> to crop extra stations from a camera.</div>
+          </div>
+          <div class="ctrl-row" style="margin-top:0">
+            <button class="btn sec" id="openEditorTop" type="button">⤢ Full-Screen Editor</button>
+            <button class="btn" id="saveAllTop" type="button">Save Camera Settings</button>
+          </div>
+        </div>
+
+        <div id="camGrid" class="grid"></div>
+
+        <div class="card" style="margin-top:14px">
+          <h2>Retention, Buffer &amp; Google Drive Sync</h2>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div><label>Full Tape Retention (days)</label><input id="retDays" type="number" min="1" max="90"></div>
+            <div><label>Pre-Roll Buffer (seconds)</label><input id="preRoll" type="number" min="30" max="600"></div>
+          </div>
+          <label>Google Drive Clip Backup Folder (auto-copied on save)</label>
+          <input id="driveDir" type="text" placeholder="J:\\My Drive\\Backups\\ArmoryFit Backup\\Clips">
+          <label style="display:flex;align-items:center;gap:8px;margin-top:10px;text-transform:none;font-size:13px;color:var(--fg)">
+            <input id="bumpAlertNtfy" type="checkbox" style="width:auto;margin:0">
+            <span>Camera Bump Alert (ntfy push if a camera gets bumped)</span>
           </label>
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn" id="saveBtn" type="button">Save Camera Config &amp; Apply</button>
+            <span id="saveMsg" style="color:var(--mut);font-size:12px"></span>
+          </div>
         </div>
-      </div>
-      <div class="ctrl-row" style="margin-top:8px">
-        <button class="btn sec sm" type="button" data-hatest="tts:overlay">TTS Overlay</button>
-        <button class="btn sec sm" type="button" data-hatest="tts:duck">TTS Duck</button>
-        <button class="btn sec sm" type="button" data-hatest="tts:takeover">TTS Takeover</button>
-        <button class="btn sec sm" type="button" data-hatest="chime:overlay">Chime Overlay</button>
-        <button class="btn sec sm" type="button" data-hatest="rest_done:overlay">Rest Done</button>
-        <button class="btn ok sm" type="button" data-hatest="pr_fanfare:takeover">PR Bell + Crowd (Takeover)</button>
-        <button class="btn sec sm" type="button" data-hatest="pr_fanfare:duck">PR Bell + Crowd (Duck)</button>
-        <button class="btn sec sm" type="button" id="haSfxPlayBtn">Play Custom SFX</button>
-        <button class="btn red sm" type="button" id="haStopBtn">Stop</button>
-        <span id="haTestOut" style="color:var(--mut);font-size:12px"></span>
-      </div>
-    </div>
+      </section>
 
-    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
-      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px">
-        <b>Gym App Compatibility Matrix</b>
-        <button class="btn sec sm" id="haMatrixResetBtn" type="button">Reset Matrix</button>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;align-items:end;margin-bottom:8px">
-        <div>
-          <label>App</label>
-          <select id="haMxApp">
-            <option>Spotify</option>
-            <option>YouTube</option>
-            <option>Netflix</option>
-            <option>Prime Video</option>
-            <option>Amazon / Apple Music</option>
-            <option>Live TV / Sports</option>
-          </select>
+      <!-- PAGE 3: FOOTAGE (14-DAY SCRUBBER & CLIPS) -->
+      <section class="page" data-page="footage">
+        <div class="page-head">
+          <div>
+            <h1>14-Day Footage &amp; Saved Clips</h1>
+            <div class="page-sub">Scrub any recorded workout session or the live pre-roll buffer with green activity spikes and instant clip export.</div>
+          </div>
+          <div class="ctrl-row" style="margin-top:0">
+            <button class="btn sec sm" id="tsRefreshBtn" type="button">↻ Refresh Tapes</button>
+          </div>
         </div>
-        <div>
-          <label>Mode</label>
-          <select id="haMxMode">
-            <option value="overlay">overlay</option>
-            <option value="duck">duck</option>
-            <option value="takeover">takeover</option>
-          </select>
-        </div>
-        <div>
-          <label>Result</label>
-          <select id="haMxStatus">
-            <option value="pass">pass</option>
-            <option value="warn">warn</option>
-            <option value="fail">fail</option>
-            <option value="untested">untested</option>
-          </select>
-        </div>
-        <div><label>Observed Behavior</label><input id="haMxBehavior" type="text" placeholder="e.g. Clean mix, no pause"></div>
-        <div><button class="btn sm" id="haMxSaveBtn" type="button">Log Result</button></div>
-      </div>
-      <div id="haMatrixTable" style="color:var(--mut);font-size:12px">Loading compatibility matrix…</div>
-    </div>
-  </div>
 
-  <div class="card" style="margin-top:14px">
-    <h2>
-      <span>Gym Displays &amp; Discrete Power Control</span>
-      <span id="dpBadge" class="pill">READY</span>
-    </h2>
-    <div id="dpMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
-      Discrete IP power &amp; input commands (never toggles). Devices: <strong>TV</strong> (Hisense), <strong>Wallboard</strong>, <strong>SmartSpin TV</strong>, <strong>Fire TV Cube</strong>, and <strong>Denon</strong>. Voice: <code>&ldquo;Armory, open the gym&rdquo;</code>, <code>&ldquo;Armory, close the gym&rdquo;</code>, <code>&ldquo;Armory, turn on Fire TV Cube&rdquo;</code>, <code>&ldquo;Armory, sleep Fire TV Cube&rdquo;</code>, <code>&ldquo;Armory, turn on all TVs&rdquo;</code>, <code>&ldquo;Armory, switch TV to PC&rdquo;</code>.
-    </div>
-    <div class="ctrl-row" style="margin-top:0;margin-bottom:10px">
-      <button class="btn ok sm" type="button" data-dpact="open_gym:run">Open Gym</button>
-      <button class="btn red sm" type="button" data-dpact="close_gym:run">Close Gym</button>
-      <button class="btn ok sm" type="button" data-dpact="tv:on">TV ON</button>
-      <button class="btn sec sm" type="button" data-dpact="tv:off">TV OFF</button>
-      <button class="btn sec sm" type="button" data-dpact="tv:hdmi1">TV PC (HDMI 1)</button>
-      <button class="btn sec sm" type="button" data-dpact="tv:hdmi2">TV Fire TV (HDMI 2)</button>
-      <button class="btn ok sm" type="button" data-dpact="spin:on">SmartSpin ON</button>
-      <button class="btn sec sm" type="button" data-dpact="spin:off">SmartSpin OFF</button>
-      <button class="btn ok sm" type="button" data-dpact="wallboard:on">Wallboard ON</button>
-      <button class="btn sec sm" type="button" data-dpact="wallboard:off">Wallboard OFF</button>
-      <button class="btn ok sm" type="button" data-dpact="all_tvs:on">All TVs ON</button>
-      <button class="btn sec sm" type="button" data-dpact="all_tvs:off">All TVs OFF</button>
-      <button class="btn ok sm" type="button" data-dpact="avr:on">Denon ON</button>
-      <button class="btn sec sm" type="button" data-dpact="avr:off">Denon OFF</button>
-      <button class="btn sec sm" type="button" data-dpact="avr:mch_stereo">Denon Multi-Ch</button>
-      <button class="btn sec sm" type="button" data-dpact="avr:monitor1">Denon Monitor 1</button>
-      <button class="btn sec sm" type="button" data-dpact="avr:monitor_auto">Denon Dual</button>
-      <button class="btn ok sm" type="button" data-dpact="cube:on">Cube ON</button>
-      <button class="btn sec sm" type="button" data-dpact="cube:off">Cube OFF</button>
-      <button class="btn sec sm" type="button" data-dpact="cube:home">Cube Home</button>
-    </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
-      <div><label>TV IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
-      <div><label>TV Wi-Fi MAC</label><input id="dpPrimMac" type="text" value="bc:09:b9:e7:35:26"></div>
-      <div><label>TV PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="KEYCODE_TV_INPUT_HDMI_1"></div>
-      <div><label>TV Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="KEYCODE_TV_INPUT_HDMI_2"></div>
-      <div><label>SmartSpin TV IP (TCL)</label><input id="dpSpinHost" type="text" placeholder="192.168.1.xxx"></div>
-      <div><label>SmartSpin MAC</label><input id="dpSpinMac" type="text" placeholder="xx:xx:xx:xx:xx:xx"></div>
-      <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
-      <div>
-        <label>Auto Denon Monitor 1 / Dual</label>
-        <select id="dpSpinDual"><option value="1">Yes (Single Sink when Spin OFF)</option><option value="0">No (Keep Denon on Auto Dual)</option></select>
-      </div>
-      <div>
-        <label>Primary Denon Monitor</label>
-        <select id="dpPrimDenonMon"><option value="1">Monitor 1 (Hisense)</option><option value="2">Monitor 2</option></select>
-      </div>
-      <div>
-        <label>Open Gym Music (Cube)</label>
-        <select id="dpOpenMusic"><option value="1">Yes (Launch YouTube Music)</option><option value="0">No</option></select>
-      </div>
-      <div><label>Fire TV Cube IP</label><input id="dpCubeHost" type="text" value="192.168.1.151"></div>
-      <div><label>YouTube Music Playlist/Mix URL</label><input id="dpMusicUrl" type="text" placeholder="https://music.youtube.com/playlist?list=..."></div>
-      <div><label>YouTube Music Search Fallback</label><input id="dpMusicQuery" type="text" value="workout music mix"></div>
-    </div>
-    <div class="ctrl-row" style="margin-top:10px">
-      <button class="btn" id="dpSaveBtn" type="button">Save Displays</button>
-      <button class="btn sec" id="dpProbePrimBtn" type="button">Probe TV ADB</button>
-      <button class="btn sec" id="dpProbeCubeBtn" type="button">Probe Cube ADB</button>
-      <button class="btn sec" id="dpFindRokuBtn" type="button">Find Roku TVs</button>
-      <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
-    </div>
-    <div id="dpRokuList" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
-  </div>
+        <div class="card" id="tapeScrubCard">
+          <h2>
+            <span>14-Day Activity Tape Scrubber</span>
+            <span id="tsStatusPill" class="pill live">READY</span>
+          </h2>
+          <div class="eyebrow">Day</div>
+          <div id="tsDayStrip" class="ts-strip"></div>
+          <div id="tsSessionRow" hidden>
+            <div class="eyebrow" style="margin-top:4px">Workout Session</div>
+            <div id="tsSessionStrip" class="ts-strip"></div>
+          </div>
+          <div class="eyebrow" style="margin-top:4px">Camera Angle</div>
+          <div id="tsCamStrip" class="ts-strip"></div>
 
-  <div class="card" style="margin-top:14px">
-    <h2>
-      <span>Walk-Ins &amp; PR Drop-Ins (Show Lab)</span>
-      <span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-        <button class="btn red sm" id="shStopAllBtn" type="button">⏹ Stop Active Show</button>
-        <span id="shBadge" class="pill">IDLE</span>
-      </span>
-    </h2>
-    <div id="shMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
-      Iterating on the <b>Ryder Dev Drop</b> below leaves your other 5 shows untouched. Studio voice uses local <b>Kokoro-82M FP32</b> neural synthesis + clean stadium hall mastering (zero robotic/clipped voices).
-    </div>
-    <div id="devRyderBox" class="dev-drop-box">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-        <div>
-          <span class="pill live" style="margin-right:6px">DEV DROP</span>
-          <strong style="font-size:15px">Ryder Curry Armory Debut — Full FX &amp; 3-Screen Simulator</strong>
-          <span id="devKokoroPill" class="pill ok" style="margin-left:6px">Checking Voices…</span>
-          <span id="devStagePill" class="pill" style="margin-left:6px">Checking MP4 &amp; Screens…</span>
-        </div>
-        <div class="ctrl-row" style="margin-top:0">
-          <button class="btn sm ok" id="devSimFullBtn" type="button">🎬 Simulate Full Show (Local)</button>
-          <button class="btn sm sec" id="devSimJumpBtn" type="button">⏩ Jump to 1:16 (Test 1:20 Overlay)</button>
-          <button class="btn sm red" id="devSimStopBtn" type="button">⏹ Stop Sim / Live</button>
-          <button class="btn sm sec" id="devSimFsBtn" type="button">⤢ Fullscreen</button>
-          <button class="btn sm" id="devFireLiveBtn" type="button">🔥 Fire Ryder LIVE (Screens + Denon 70)</button>
-          <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:700;margin:0;cursor:pointer">
-            <input id="devRyExcludeMainTv" type="checkbox" style="width:auto;margin:0"> Exclude Main TV (Coding)
-          </label>
-        </div>
-      </div>
+          <div class="ts-stage">
+            <div id="tsTimeHud" class="ts-hud">Select a session to scrub</div>
+            <div class="ts-stage-tools">
+              <button class="btn sm sec" id="tsBackToScrubBtn" type="button" hidden>← Scrub Frame</button>
+              <select id="tsSpeedSel" aria-label="Playback speed">
+                <option value="0.25">0.25× Slow</option>
+                <option value="0.5">0.5× Half</option>
+                <option value="1" selected>1× Normal</option>
+                <option value="2">2× Fast</option>
+              </select>
+            </div>
+            <img id="tsFrameImg" alt="Scrub frame">
+            <video id="tsVideo" controls playsinline hidden></video>
+          </div>
 
-      <div id="devStage" class="dev-stage">
-        <div class="fx-hud">
-          <span id="devLightsHud" class="fx-tag">LIGHTS: STANDBY</span>
-          <span id="devFogHud" class="fx-tag">FOG: OFF</span>
-          <span id="devFlashHud" class="fx-tag">FLASH: READY</span>
-          <span id="devDenonHud" class="fx-tag">DENON: STANDBY</span>
-          <span id="devSimClock" class="fx-tag">0:00</span>
-        </div>
-        <div class="dev-yt-wrap" id="devYtWrap">
-          <video id="devRyVideo" controls playsinline preload="metadata" style="width:100%;height:100%;background:#000;border-radius:8px"></video>
-          <div id="devVidFlash" style="pointer-events:none;position:absolute;inset:0;background:#fff;opacity:0;border-radius:8px;transition:opacity 0.05s linear;z-index:4"></div>
-        </div>
-        <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;z-index:2">
-          <span id="devScrubClock" class="pill" style="font-family:ui-monospace,Consolas,monospace;font-size:12px">MP4 0:00.0 · Intro 0:00.0</span>
-          <button class="btn sm sec" type="button" data-scrub="-5">-5s</button>
-          <button class="btn sm sec" type="button" data-scrub="-1">-1s</button>
-          <button class="btn sm sec" type="button" data-scrub="-0.1">-0.1s</button>
-          <button class="btn sm ok" id="devScrubPlayBtn" type="button">▶/⏸</button>
-          <button class="btn sm sec" type="button" data-scrub="0.1">+0.1s</button>
-          <button class="btn sm sec" type="button" data-scrub="1">+1s</button>
-          <button class="btn sm sec" type="button" data-scrub="5">+5s</button>
-        </div>
-        <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch the pre-baked 1080p MP4 + synchronized TV stage cues.</div>
-        <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
-      </div>
+          <div class="ts-rail-wrap">
+            <div id="tsHoverTip" class="ts-hover-tip" hidden></div>
+            <canvas id="tsTimelineCanvas" width="1000" height="78"></canvas>
+            <div class="ts-rail-foot">
+              <span id="tsStartLbl">--:--</span>
+              <span class="ts-legend">
+                <span><span class="ts-sw" style="background:#22c55e"></span>Activity (Motion)</span>
+                <span><span class="ts-sw" style="background:#263649"></span>Quiet / Rest</span>
+                <span><span class="ts-sw" style="background:#f59e0b"></span>In–Out Range</span>
+              </span>
+              <span id="tsCurLbl" style="color:#eaf4ff">--:--:--</span>
+              <span id="tsEndLbl">--:--</span>
+            </div>
+          </div>
 
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px">
-        <div>
-          <label>Audition Intro (Thunder + Announcer + Crowd)</label>
-          <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
-          <div class="ctrl-row" style="margin-top:4px">
-            <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice</button>
-            <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-              <input id="devRyTestFxChk" type="checkbox" style="width:auto;margin:0"> + Thunder &amp; Crowd
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn sec sm" id="tsPrevBurstBtn" type="button">⏮ Prev Activity</button>
+            <button class="btn sec sm" type="button" data-tsstep="-30">-30s</button>
+            <button class="btn sec sm" type="button" data-tsstep="-10">-10s</button>
+            <button class="btn sec sm" type="button" data-tsstep="-2">-2s</button>
+            <button class="btn ok sm" id="tsPlayBtn" type="button">▶ Play Window</button>
+            <button class="btn sec sm" type="button" data-tsstep="2">+2s</button>
+            <button class="btn sec sm" type="button" data-tsstep="10">+10s</button>
+            <button class="btn sec sm" type="button" data-tsstep="30">+30s</button>
+            <button class="btn sec sm" id="tsNextBurstBtn" type="button">Next Activity ⏭</button>
+            <select id="tsWinSec" style="width:auto;padding:4px 8px;font-size:12px">
+              <option value="15">15s window</option>
+              <option value="30" selected>30s window</option>
+              <option value="60">60s window</option>
+              <option value="120">120s window</option>
+            </select>
+          </div>
+
+          <div class="ctrl-row" style="margin-top:8px">
+            <button class="btn sec sm" id="tsSetInBtn" type="button">Set In [</button>
+            <button class="btn sec sm" id="tsSetOutBtn" type="button">Set Out ]</button>
+            <button class="btn sec sm" id="tsClearRangeBtn" type="button">Clear Range</button>
+            <input id="tsClipLabel" type="text" placeholder="Clip name (e.g. Squat 315x3)" style="width:210px;padding:5px 9px;font-size:12px">
+            <label style="margin:0;font-size:12px;display:inline-flex;align-items:center;gap:5px;cursor:pointer">
+              <input id="tsIncludeAudio" type="checkbox" style="width:auto;margin:0"> Include S330 Audio
             </label>
+            <button class="btn sm" id="tsSaveClipBtn" type="button">💾 Save Clip to Drive</button>
+            <span id="tsOut" style="font-size:12px;color:var(--mut)"></span>
           </div>
-        </div>
-        <div>
-          <label>Audition Speech Box (Dry / Fast Test)</label>
-          <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
-          <div class="ctrl-row" style="margin-top:4px">
-            <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1st Speech Box</button>
-          </div>
-        </div>
-      </div>
 
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-top:8px">
-        <div><label>Studio Voice Engine</label><select id="devRyVoice"></select></div>
-        <div><label>Intro Voice Start (s)</label><input id="devRyIntroStart" type="number" min="0" max="15" step="0.1" value="2.3"></div>
-        <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.06"></div>
-        <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
-        <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
-        <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
-      </div>
-      <div style="margin-top:6px">
-        <label>Voice Acting Style / Direction (used by Gemini 2.5 Flash TTS &amp; OpenAI gpt-4o-mini-tts)</label>
-        <input id="devRyStyle" type="text" placeholder="Electric HBO championship boxing ring announcer in a packed arena...">
-      </div>
-      <div style="margin-top:6px">
-        <label>Main HBO Intro Script (starts at Intro Voice Start; supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label>
-        <textarea id="devRyIntroTxt" rows="3"></textarea>
-      </div>
-      <div class="tag-bar" id="devRyTagBar">
-        <span style="font-size:11px;color:var(--mut);font-weight:700">Insert Inline Tag:</span>
-        <button class="tag-chip" type="button" data-tag=" [pause:100ms] ">+[pause:100ms]</button>
-        <button class="tag-chip" type="button" data-tag=" [pause:350ms] ">+[pause:350ms]</button>
-        <button class="tag-chip" type="button" data-tag=" [pause:750ms] ">+[pause:750ms]</button>
-        <button class="tag-chip" type="button" data-wrap="speed:+10%">+[speed:+10%]</button>
-        <button class="tag-chip" type="button" data-wrap="speed:-10%">+[speed:-10%]</button>
-        <button class="tag-chip" type="button" data-wrap="vol:+3dB">+[vol:+3dB]</button>
-        <button class="tag-chip" type="button" data-tag=" [shouting] ">+[shouting] (EL v3)</button>
-        <button class="tag-chip" type="button" data-tag=" [excited] ">+[excited] (EL v3)</button>
-      </div>
-      <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-          <span style="font-weight:800;font-size:12px;color:#7cc4ff">Timed Speech Boxes (Intro or Entrance Video · 📍 Stamp from Scrubber)</span>
-          <button class="btn sm sec" id="devRyAddSpeechBtn" type="button">+ Add Speech Box</button>
-        </div>
-        <div id="devRySpeechList" class="cue-list"></div>
-      </div>
-      <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-          <span style="font-weight:800;font-size:12px;color:#fde047">Timed FX / Screen Flash Cues (Zero MP4 Rebuild Required)</span>
-          <button class="btn sm sec" id="devRyAddFxBtn" type="button">+ Add FX Cue</button>
-        </div>
-        <div id="devRyFxCueList" class="cue-list"></div>
-      </div>
-      <div class="ctrl-row" style="margin-top:10px">
-        <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Bake Into Show MP4</button>
-        <button class="btn sm ok" id="devRySaveQuickBtn" type="button">Save Timings / FX Only (No MP4 Rebuild)</button>
-        <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
-        <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
-        <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
-      </div>
-      <details style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
-        <summary style="cursor:pointer;font-weight:800;font-size:12px;color:#7cc4ff">Studio Voice API Keys (ElevenLabs Free 10k/mo · Gemini Free · OpenAI) &amp; Custom Voice Upload</summary>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:8px">
-          <div><label>ElevenLabs API Key <span id="ttsElHint" style="color:#86efac"></span></label><input id="ttsElKey" type="password" autocomplete="off" placeholder="sk_... (elevenlabs.io free tier 10k/mo)"></div>
-          <div><label>ElevenLabs Model</label><select id="ttsElModel"><option value="eleven_v3">eleven_v3 (Most Expressive + [shouting])</option><option value="eleven_multilingual_v2">eleven_multilingual_v2 (Ultra-Stable)</option></select></div>
-          <div><label>Google Gemini AI Studio Key <span id="ttsGemHint" style="color:#86efac"></span></label><input id="ttsGemKey" type="password" autocomplete="off" placeholder="AIza... (aistudio.google.com free)"></div>
-          <div><label>OpenAI API Key <span id="ttsOaiHint" style="color:#86efac"></span></label><input id="ttsOaiKey" type="password" autocomplete="off" placeholder="sk-... (gpt-4o-mini-tts)"></div>
-        </div>
-        <div class="ctrl-row" style="margin-top:8px">
-          <button class="btn sm" id="ttsSaveKeysBtn" type="button">Save API Keys &amp; Refresh Voices</button>
-          <span id="ttsKeysOut" style="color:var(--mut);font-size:12px"></span>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;margin-top:8px;border-top:1px dashed rgba(255,255,255,.08);padding-top:8px">
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-            <label style="margin:0;font-size:12px">Custom Intro Voice (.mp3/.wav): <input id="devRyIntroVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
-            <button class="btn sm sec" id="devRyIntroVoiceClr" type="button" hidden>Revert to TTS</button>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-            <label style="margin:0;font-size:12px">Custom 1:20 Overlay (.mp3/.wav): <input id="devRyOvVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
-            <button class="btn sm sec" id="devRyOvVoiceClr" type="button" hidden>Revert to TTS</button>
+          <div id="tsBurstList" class="ts-bursts">
+            <span style="font-size:12px;color:var(--mut)">Select a day/session above to see detected activity windows.</span>
           </div>
         </div>
-      </details>
+
+        <div class="card" style="margin-top:14px">
+          <h2>
+            <span>Recent Saved Clips</span>
+            <span id="calBadge" class="pill">0 / 5 clips for pose calibration</span>
+          </h2>
+          <div id="clipList" style="color:var(--mut)">No clips saved yet.</div>
+        </div>
+      </section>
+
+      <!-- PAGE 4: SHOW LAB -->
+      <section class="page" data-page="shows">
+        <div class="page-head">
+          <div>
+            <h1>Walk-Ins &amp; PR Drop-Ins (Show Lab)</h1>
+            <div id="shMsg" class="page-sub">
+              Iterating on the <b>Ryder Dev Drop</b> below leaves your other 5 shows untouched. Studio voices auto-cache by segment so timing/FX tweaks use zero cloud quota.
+            </div>
+          </div>
+          <div class="ctrl-row" style="margin-top:0">
+            <button class="btn red sm" id="shStopAllBtn" type="button">⏹ Stop Active Show</button>
+            <span id="shBadge" class="pill">IDLE</span>
+          </div>
+        </div>
+
+        <div id="devRyderBox" class="dev-drop-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <div>
+              <span class="pill live" style="margin-right:6px">DEV DROP</span>
+              <strong style="font-size:15px">Ryder Curry Armory Debut — Full FX &amp; 3-Screen Simulator</strong>
+              <span id="devKokoroPill" class="pill ok" style="margin-left:6px">Checking Voices…</span>
+              <span id="devStagePill" class="pill" style="margin-left:6px">Checking MP4 &amp; Screens…</span>
+            </div>
+            <div class="ctrl-row" style="margin-top:0">
+              <button class="btn sm ok" id="devSimFullBtn" type="button">🎬 Simulate Full Show (Local)</button>
+              <button class="btn sm sec" id="devSimJumpBtn" type="button">⏩ Jump to 1:16 (Test 1:20 Overlay)</button>
+              <button class="btn sm red" id="devSimStopBtn" type="button">⏹ Stop Sim / Live</button>
+              <button class="btn sm sec" id="devSimFsBtn" type="button">⤢ Fullscreen</button>
+              <button class="btn sm" id="devFireLiveBtn" type="button">🔥 Fire Ryder LIVE (Screens + Denon 70)</button>
+              <label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:700;margin:0;cursor:pointer">
+                <input id="devRyExcludeMainTv" type="checkbox" style="width:auto;margin:0"> Exclude Main TV (Coding)
+              </label>
+            </div>
+          </div>
+
+          <div id="devStage" class="dev-stage">
+            <div class="fx-hud">
+              <span id="devLightsHud" class="fx-tag">LIGHTS: STANDBY</span>
+              <span id="devFogHud" class="fx-tag">FOG: OFF</span>
+              <span id="devFlashHud" class="fx-tag">FLASH: READY</span>
+              <span id="devDenonHud" class="fx-tag">DENON: STANDBY</span>
+              <span id="devSimClock" class="fx-tag">0:00</span>
+            </div>
+            <div class="dev-yt-wrap" id="devYtWrap">
+              <video id="devRyVideo" controls playsinline preload="metadata" style="width:100%;height:100%;background:#000;border-radius:8px"></video>
+              <div id="devVidFlash" style="pointer-events:none;position:absolute;inset:0;background:#fff;opacity:0;border-radius:8px;transition:opacity 0.05s linear;z-index:4"></div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;z-index:2">
+              <span id="devScrubClock" class="pill" style="font-family:ui-monospace,Consolas,monospace;font-size:12px">MP4 0:00.0 · Intro 0:00.0</span>
+              <button class="btn sm sec" type="button" data-scrub="-5">-5s</button>
+              <button class="btn sm sec" type="button" data-scrub="-1">-1s</button>
+              <button class="btn sm sec" type="button" data-scrub="-0.1">-0.1s</button>
+              <button class="btn sm ok" id="devScrubPlayBtn" type="button">▶/⏸</button>
+              <button class="btn sm sec" type="button" data-scrub="0.1">+0.1s</button>
+              <button class="btn sm sec" type="button" data-scrub="1">+1s</button>
+              <button class="btn sm sec" type="button" data-scrub="5">+5s</button>
+            </div>
+            <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch the pre-baked 1080p MP4 + synchronized TV stage cues.</div>
+            <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px">
+            <div>
+              <label>Audition Intro (Thunder + Announcer + Crowd)</label>
+              <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
+              <div class="ctrl-row" style="margin-top:4px">
+                <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice</button>
+                <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+                  <input id="devRyTestFxChk" type="checkbox" style="width:auto;margin:0"> + Thunder &amp; Crowd
+                </label>
+              </div>
+            </div>
+            <div>
+              <label>Audition Speech Box (Dry / Fast Test)</label>
+              <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
+              <div class="ctrl-row" style="margin-top:4px">
+                <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1st Speech Box</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-top:8px">
+            <div><label>Studio Voice Engine</label><select id="devRyVoice"></select></div>
+            <div><label>Intro Voice Start (s)</label><input id="devRyIntroStart" type="number" min="0" max="15" step="0.1" value="2.3"></div>
+            <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.06"></div>
+            <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
+            <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
+            <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
+          </div>
+          <div style="margin-top:6px">
+            <label>Voice Acting Style / Direction (used by Gemini 2.5 Flash TTS &amp; OpenAI gpt-4o-mini-tts)</label>
+            <input id="devRyStyle" type="text" placeholder="Electric HBO championship boxing ring announcer in a packed arena...">
+          </div>
+          <div style="margin-top:6px">
+            <label>Main HBO Intro Script (starts at Intro Voice Start; supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label>
+            <textarea id="devRyIntroTxt" rows="3"></textarea>
+          </div>
+          <div class="tag-bar" id="devRyTagBar">
+            <span style="font-size:11px;color:var(--mut);font-weight:700">Insert Inline Tag:</span>
+            <button class="tag-chip" type="button" data-tag=" [pause:100ms] ">+[pause:100ms]</button>
+            <button class="tag-chip" type="button" data-tag=" [pause:350ms] ">+[pause:350ms]</button>
+            <button class="tag-chip" type="button" data-tag=" [pause:750ms] ">+[pause:750ms]</button>
+            <button class="tag-chip" type="button" data-wrap="speed:+10%">+[speed:+10%]</button>
+            <button class="tag-chip" type="button" data-wrap="speed:-10%">+[speed:-10%]</button>
+            <button class="tag-chip" type="button" data-wrap="vol:+3dB">+[vol:+3dB]</button>
+            <button class="tag-chip" type="button" data-tag=" [shouting] ">+[shouting] (EL v3)</button>
+            <button class="tag-chip" type="button" data-tag=" [excited] ">+[excited] (EL v3)</button>
+          </div>
+          <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+              <span style="font-weight:800;font-size:12px;color:#7cc4ff">Timed Speech Boxes (Intro or Entrance Video · 📍 Stamp from Scrubber)</span>
+              <button class="btn sm sec" id="devRyAddSpeechBtn" type="button">+ Add Speech Box</button>
+            </div>
+            <div id="devRySpeechList" class="cue-list"></div>
+          </div>
+          <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+              <span style="font-weight:800;font-size:12px;color:#fde047">Timed FX / Screen Flash Cues (Zero MP4 Rebuild Required)</span>
+              <button class="btn sm sec" id="devRyAddFxBtn" type="button">+ Add FX Cue</button>
+            </div>
+            <div id="devRyFxCueList" class="cue-list"></div>
+          </div>
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Bake Into Show MP4</button>
+            <button class="btn sm ok" id="devRySaveQuickBtn" type="button">Save Timings / FX Only (No MP4 Rebuild)</button>
+            <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
+            <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
+            <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
+          </div>
+          <details style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+            <summary style="cursor:pointer;font-weight:800;font-size:12px;color:#7cc4ff">Studio Voice API Keys (ElevenLabs · Gemini 2.5 Flash · OpenAI) &amp; Custom Voice Upload</summary>
+            <div style="font-size:11px;color:var(--mut);margin-top:6px">
+              Gemini Free Tier allows <code>10</code> requests/day (<code>...</code> pauses coalesce to 1 call &amp; segments auto-cache on disk); ElevenLabs Free gives <code>10,000</code> chars/mo; Kokoro Local is unlimited offline.
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:6px">
+              <div><label>ElevenLabs API Key <span id="ttsElHint" style="color:#86efac"></span></label><input id="ttsElKey" type="password" autocomplete="off" placeholder="sk_... (elevenlabs.io free tier 10k/mo)"></div>
+              <div><label>ElevenLabs Model</label><select id="ttsElModel"><option value="eleven_v3">eleven_v3 (Most Expressive + [shouting])</option><option value="eleven_multilingual_v2">eleven_multilingual_v2 (Ultra-Stable)</option></select></div>
+              <div><label>Google Gemini AI Studio Key <span id="ttsGemHint" style="color:#86efac"></span></label><input id="ttsGemKey" type="password" autocomplete="off" placeholder="AIza... (aistudio.google.com free)"></div>
+              <div><label>OpenAI API Key <span id="ttsOaiHint" style="color:#86efac"></span></label><input id="ttsOaiKey" type="password" autocomplete="off" placeholder="sk-... (gpt-4o-mini-tts)"></div>
+            </div>
+            <div class="ctrl-row" style="margin-top:8px">
+              <button class="btn sm" id="ttsSaveKeysBtn" type="button">Save API Keys &amp; Refresh Voices</button>
+              <span id="ttsKeysOut" style="color:var(--mut);font-size:12px"></span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;margin-top:8px;border-top:1px dashed rgba(255,255,255,.08);padding-top:8px">
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                <label style="margin:0;font-size:12px">Custom Intro Voice (.mp3/.wav): <input id="devRyIntroVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
+                <button class="btn sm sec" id="devRyIntroVoiceClr" type="button" hidden>Revert to TTS</button>
+              </div>
+              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                <label style="margin:0;font-size:12px">Custom 1:20 Overlay (.mp3/.wav): <input id="devRyOvVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
+                <button class="btn sm sec" id="devRyOvVoiceClr" type="button" hidden>Revert to TTS</button>
+              </div>
+            </div>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2><span>Global PR Drop-In &amp; Walk-In Shows</span></h2>
+          <div id="shGrid" class="show-grid">
+            <div style="color:var(--mut);font-size:12px">Loading shows…</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2><span>Smart FX Hooks (House Lights Rack &amp; Smith + Fog Machine)</span></h2>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">
+            <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+            <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+            <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+            <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+            <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
+            <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
+          </div>
+          <details style="margin-top:8px">
+            <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Single-Relay Legacy Fallback (optional)</summary>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-top:6px">
+              <div><label>Legacy House Lights IP</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
+              <div><label>Legacy Lights OFF URL</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+              <div><label>Legacy Lights ON URL</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+            </div>
+          </details>
+          <div class="ctrl-row" style="margin-top:10px;flex-wrap:wrap;gap:6px">
+            <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
+            <button class="btn sm ok" id="fxRackOnBtn" type="button">Rack ON</button>
+            <button class="btn sm sec" id="fxRackOffBtn" type="button">Rack OFF</button>
+            <button class="btn sm ok" id="fxSmithOnBtn" type="button">Smith ON</button>
+            <button class="btn sm sec" id="fxSmithOffBtn" type="button">Smith OFF</button>
+            <button class="btn sm ok" id="fxAllOnBtn" type="button">All Lights ON</button>
+            <button class="btn sm sec" id="fxAllOffBtn" type="button">All Lights OFF</button>
+            <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Both Flash</button>
+            <button class="btn sec sm" id="fxTestAltFlashBtn" type="button">Test 4x Alternate Rack ↔ Smith</button>
+            <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
+            <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- PAGE 5: GYM & DISPLAYS -->
+      <section class="page" data-page="gym">
+        <div class="page-head">
+          <div>
+            <h1>Gym &amp; Displays</h1>
+            <div class="page-sub">Discrete power, HDMI inputs, Open/Close Gym macros, Denon monitor routing &amp; 32&quot; Wallboard kiosk control.</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>
+            <span>Gym Displays &amp; Discrete Power Control</span>
+            <span id="dpBadge" class="pill">READY</span>
+          </h2>
+          <div id="dpMsg" style="color:var(--mut);font-size:12px;margin-bottom:10px">
+            Discrete IP power &amp; input commands (never toggles). Devices: <strong>TV</strong> (Hisense), <strong>Wallboard</strong>, <strong>SmartSpin TV</strong>, <strong>Fire TV Cube</strong>, and <strong>Denon</strong>. Voice: <code>&ldquo;Armory, open the gym&rdquo;</code>, <code>&ldquo;Armory, close the gym&rdquo;</code>, <code>&ldquo;Armory, turn on Fire TV Cube&rdquo;</code>, <code>&ldquo;Armory, sleep Fire TV Cube&rdquo;</code>, <code>&ldquo;Armory, turn on all TVs&rdquo;</code>, <code>&ldquo;Armory, switch TV to PC&rdquo;</code>.
+          </div>
+
+          <div class="dp-groups">
+            <div class="dp-group">
+              <div class="eyebrow">Gym Macros &amp; All TVs</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="open_gym:run">Open Gym</button>
+                <button class="btn red sm" type="button" data-dpact="close_gym:run">Close Gym</button>
+                <button class="btn ok sm" type="button" data-dpact="all_tvs:on">All TVs ON</button>
+                <button class="btn sec sm" type="button" data-dpact="all_tvs:off">All TVs OFF</button>
+              </div>
+            </div>
+            <div class="dp-group">
+              <div class="eyebrow">Main TV (Hisense)</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="tv:on">TV ON</button>
+                <button class="btn sec sm" type="button" data-dpact="tv:off">TV OFF</button>
+                <button class="btn sec sm" type="button" data-dpact="tv:hdmi1">TV PC (HDMI 1)</button>
+                <button class="btn sec sm" type="button" data-dpact="tv:hdmi2">TV Fire TV (HDMI 2)</button>
+              </div>
+            </div>
+            <div class="dp-group">
+              <div class="eyebrow">SmartSpin (TCL) &amp; Wallboard</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="spin:on">SmartSpin ON</button>
+                <button class="btn sec sm" type="button" data-dpact="spin:off">SmartSpin OFF</button>
+                <button class="btn ok sm" type="button" data-dpact="wallboard:on">Wallboard ON</button>
+                <button class="btn sec sm" type="button" data-dpact="wallboard:off">Wallboard OFF</button>
+              </div>
+            </div>
+            <div class="dp-group">
+              <div class="eyebrow">Fire TV Cube</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="cube:on">Cube ON</button>
+                <button class="btn sec sm" type="button" data-dpact="cube:off">Cube OFF</button>
+                <button class="btn sec sm" type="button" data-dpact="cube:home">Cube Home</button>
+              </div>
+            </div>
+            <div class="dp-group" style="grid-column:1 / -1">
+              <div class="eyebrow">Denon AVR-3313CI</div>
+              <div class="ctrl-row">
+                <button class="btn ok sm" type="button" data-dpact="avr:on">Denon ON</button>
+                <button class="btn sec sm" type="button" data-dpact="avr:off">Denon OFF</button>
+                <button class="btn sec sm" type="button" data-dpact="avr:mch_stereo">Denon Multi-Ch</button>
+                <button class="btn sec sm" type="button" data-dpact="avr:monitor1">Denon Monitor 1</button>
+                <button class="btn sec sm" type="button" data-dpact="avr:monitor_auto">Denon Dual</button>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+            <div><label>TV IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
+            <div><label>TV Wi-Fi MAC</label><input id="dpPrimMac" type="text" value="bc:09:b9:e7:35:26"></div>
+            <div><label>TV PC Input (HDMI 1)</label><input id="dpPrimHdmi1" type="text" value="KEYCODE_TV_INPUT_HDMI_1"></div>
+            <div><label>TV Denon Input (HDMI 2)</label><input id="dpPrimHdmi2" type="text" value="KEYCODE_TV_INPUT_HDMI_2"></div>
+            <div><label>SmartSpin TV IP (TCL)</label><input id="dpSpinHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div><label>SmartSpin MAC</label><input id="dpSpinMac" type="text" placeholder="xx:xx:xx:xx:xx:xx"></div>
+            <div><label>SmartSpin HDMI Input</label><input id="dpSpinHdmi" type="text" value="InputHDMI1"></div>
+            <div>
+              <label>Auto Denon Monitor 1 / Dual</label>
+              <select id="dpSpinDual"><option value="1">Yes (Single Sink when Spin OFF)</option><option value="0">No (Keep Denon on Auto Dual)</option></select>
+            </div>
+            <div>
+              <label>Primary Denon Monitor</label>
+              <select id="dpPrimDenonMon"><option value="1">Monitor 1 (Hisense)</option><option value="2">Monitor 2</option></select>
+            </div>
+            <div>
+              <label>Open Gym Music (Cube)</label>
+              <select id="dpOpenMusic"><option value="1">Yes (Launch YouTube Music)</option><option value="0">No</option></select>
+            </div>
+            <div><label>Fire TV Cube IP</label><input id="dpCubeHost" type="text" value="192.168.1.151"></div>
+            <div><label>YouTube Music Playlist/Mix URL</label><input id="dpMusicUrl" type="text" placeholder="https://music.youtube.com/playlist?list=..."></div>
+            <div><label>YouTube Music Search Fallback</label><input id="dpMusicQuery" type="text" value="workout music mix"></div>
+          </div>
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn" id="dpSaveBtn" type="button">Save Displays</button>
+            <button class="btn sec" id="dpProbePrimBtn" type="button">Probe TV ADB</button>
+            <button class="btn sec" id="dpProbeCubeBtn" type="button">Probe Cube ADB</button>
+            <button class="btn sec" id="dpFindRokuBtn" type="button">Find Roku TVs</button>
+            <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
+          </div>
+          <div id="dpRokuList" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>
+            <span>32&quot; Fire TV Wallboard &amp; ADB Auto-Wake</span>
+            <span style="display:flex;align-items:center;gap:8px">
+              <a href="/wallboard" target="_blank" style="font-size:12px;font-weight:700">Open Wallboard ↗</a>
+              <span id="wbBadge" class="pill">UNCONFIGURED</span>
+            </span>
+          </h2>
+          <div id="wbMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Permanent URL: <code>/wallboard</code></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+            <div><label>Fire TV IP / Hostname</label><input id="wbHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div><label>Fire TV MAC (Wake-on-LAN)</label><input id="wbMac" type="text" placeholder="08:97:98:xx:xx:xx"></div>
+            <div><label>ADB Port</label><input id="wbPort" type="number" min="1" max="65535" value="5555"></div>
+            <div>
+              <label>Display Client</label>
+              <select id="wbClient">
+                <option value="armory">Armory Wallboard App (Kiosk APK)</option>
+                <option value="silk">Amazon Silk</option>
+                <option value="fully">Fully Kiosk Browser</option>
+                <option value="custom">Custom App / URL Intent</option>
+              </select>
+            </div>
+            <div><label>Idle Auto-Sleep (minutes)</label><input id="wbIdleMin" type="number" min="1" max="120" value="10"></div>
+            <div>
+              <label>Wake on Workout Start</label>
+              <select id="wbWake"><option value="1">Yes (Auto-Wake)</option><option value="0">No</option></select>
+            </div>
+            <div>
+              <label>Sleep When Workout Ends</label>
+              <select id="wbSleep"><option value="1">Yes (30s delay)</option><option value="0">No</option></select>
+            </div>
+          </div>
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn" id="wbSaveBtn" type="button">Save Wallboard</button>
+            <button class="btn sec" id="wbPairBtn" type="button">Connect / Pair ADB</button>
+            <button class="btn ok" id="wbWakeBtn" type="button">Test Wake &amp; Launch</button>
+            <button class="btn sec" id="wbSleepBtn" type="button">Sleep TV Now</button>
+            <span id="wbOut" style="color:var(--mut);font-size:12px"></span>
+          </div>
+        </div>
+      </section>
+
+      <!-- PAGE 6: AUDIO & VOICE -->
+      <section class="page" data-page="audio">
+        <div class="page-head">
+          <div>
+            <h1>Audio &amp; Voice</h1>
+            <div class="page-sub">Denon AVR-3313CI + Fire TV Cube audio mixer routing, and PowerConf S330 room mic Whisper relay.</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>
+            <span>House Audio (Denon AVR-3313CI + Fire TV Cube Mixer)</span>
+            <span style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+              <span id="haDenonPill" class="pill">DENON…</span>
+              <span id="haCubePill" class="pill">CUBE…</span>
+            </span>
+          </h2>
+          <div id="haMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">Checking Denon AVR (<code>192.168.1.15</code>) &amp; Fire TV Cube mixer…</div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:10px">
+            <div>
+              <label>Output Route</label>
+              <select id="haRoute">
+                <option value="s330">PowerConf S330 Only</option>
+                <option value="auto">Auto: Cube (when MPLAY) -&gt; S330</option>
+                <option value="cube">Fire TV Cube Only</option>
+              </select>
+            </div>
+            <div><label>Denon AVR IP</label><input id="haDenonHost" type="text" value="192.168.1.15" placeholder="192.168.1.15"></div>
+            <div>
+              <label>Loud-Only Denon Duck</label>
+              <select id="haDuckEnabled">
+                <option value="0">Off (Never drop music)</option>
+                <option value="1">Loud-Only (Above threshold)</option>
+              </select>
+            </div>
+            <div><label>Loud Threshold (dB)</label><input id="haDuckThresh" type="number" min="-65" max="10" step="0.5" value="-20.0"></div>
+            <div><label>Gentle Dip (dB)</label><input id="haDuckDrop" type="number" min="0.5" max="30" step="0.5" value="5.0"></div>
+            <div><label>Fire TV Cube IP</label><input id="haCubeHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div>
+              <label>Cube Mixer APK</label>
+              <select id="haCubeEnabled">
+                <option value="0">Disabled</option>
+                <option value="1">Enabled (:8767)</option>
+              </select>
+            </div>
+            <div>
+              <label>Readback Mode</label>
+              <select id="haReadMode">
+                <option value="overlay">Overlay (No Pause/Duck)</option>
+                <option value="duck">Duck (MAY_DUCK)</option>
+                <option value="takeover">Takeover (Pause &amp; Resume)</option>
+              </select>
+            </div>
+            <div>
+              <label>Chime Mode</label>
+              <select id="haChimeMode">
+                <option value="overlay">Overlay (No Pause/Duck)</option>
+                <option value="duck">Duck (MAY_DUCK)</option>
+                <option value="takeover">Takeover (Pause &amp; Resume)</option>
+              </select>
+            </div>
+            <div>
+              <label>1RM / Hype Mode</label>
+              <select id="haHypeMode">
+                <option value="takeover">Takeover (Pause &amp; Resume)</option>
+                <option value="duck">Duck (MAY_DUCK)</option>
+                <option value="overlay">Overlay (No Pause/Duck)</option>
+              </select>
+            </div>
+            <div>
+              <label>Cube Audio Usage</label>
+              <select id="haUsage">
+                <option value="media">media (STREAM_MUSIC)</option>
+                <option value="assist">assist (Guidance/TTS)</option>
+                <option value="sonification">sonification (Chimes)</option>
+                <option value="alarm">alarm (High Priority)</option>
+              </select>
+            </div>
+            <div><label>Readback Gain (0.05–1.0)</label><input id="haReadGain" type="number" min="0.05" max="1.0" step="0.05" value="0.85"></div>
+            <div><label>SFX Gain (0.05–1.0)</label><input id="haSfxGain" type="number" min="0.05" max="1.0" step="0.05" value="0.90"></div>
+          </div>
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn" id="haSaveBtn" type="button">Save Audio</button>
+            <button class="btn sec" id="haDenonDipBtn" type="button">Test Denon Dip</button>
+            <button class="btn sec" id="haCubeProbeBtn" type="button">Probe Cube ADB</button>
+            <button class="btn ok" id="haCubeReviveBtn" type="button">Revive Cube Service</button>
+            <span id="haOut" style="color:var(--mut);font-size:12px"></span>
+          </div>
+          <div id="haAdbDetails" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
+
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+            <div style="font-weight:700;margin-bottom:6px">One-Click Mode Test Bench</div>
+            <div style="display:grid;grid-template-columns:minmax(180px,2fr) repeat(3,minmax(120px,1fr));gap:8px;align-items:end">
+              <div><label>Test TTS Phrase</label><input id="haTestText" type="text" value="225 for 8, got it"></div>
+              <div>
+                <label>Target</label>
+                <select id="haTestTarget">
+                  <option value="auto">Auto Route</option>
+                  <option value="cube">Fire TV Cube</option>
+                  <option value="s330">PowerConf S330</option>
+                </select>
+              </div>
+              <div>
+                <label>Custom SFX (S:\\ArmoryCam\\sfx)</label>
+                <select id="haSfxSel"><option value="">(None placed yet)</option></select>
+              </div>
+              <div>
+                <label style="display:flex;align-items:center;gap:6px;margin-top:0;cursor:pointer">
+                  <input id="haTestDenonDuck" type="checkbox" style="width:auto">
+                  <span>Pair w/ Denon Dip</span>
+                </label>
+              </div>
+            </div>
+            <div class="ctrl-row" style="margin-top:8px">
+              <button class="btn sec sm" type="button" data-hatest="tts:overlay">TTS Overlay</button>
+              <button class="btn sec sm" type="button" data-hatest="tts:duck">TTS Duck</button>
+              <button class="btn sec sm" type="button" data-hatest="tts:takeover">TTS Takeover</button>
+              <button class="btn sec sm" type="button" data-hatest="chime:overlay">Chime Overlay</button>
+              <button class="btn sec sm" type="button" data-hatest="rest_done:overlay">Rest Done</button>
+              <button class="btn ok sm" type="button" data-hatest="pr_fanfare:takeover">PR Bell + Crowd (Takeover)</button>
+              <button class="btn sec sm" type="button" data-hatest="pr_fanfare:duck">PR Bell + Crowd (Duck)</button>
+              <button class="btn sec sm" type="button" id="haSfxPlayBtn">Play Custom SFX</button>
+              <button class="btn red sm" type="button" id="haStopBtn">Stop</button>
+              <span id="haTestOut" style="color:var(--mut);font-size:12px"></span>
+            </div>
+          </div>
+
+          <details style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+            <summary style="cursor:pointer;font-weight:800;font-size:13px;color:#7cc4ff">Gym App Compatibility Matrix</summary>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:8px 0 6px">
+              <b>Compatibility Log</b>
+              <button class="btn sec sm" id="haMatrixResetBtn" type="button">Reset Matrix</button>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;align-items:end;margin-bottom:8px">
+              <div>
+                <label>App</label>
+                <select id="haMxApp">
+                  <option>Spotify</option>
+                  <option>YouTube</option>
+                  <option>Netflix</option>
+                  <option>Prime Video</option>
+                  <option>Amazon / Apple Music</option>
+                  <option>Live TV / Sports</option>
+                </select>
+              </div>
+              <div>
+                <label>Mode</label>
+                <select id="haMxMode">
+                  <option value="overlay">overlay</option>
+                  <option value="duck">duck</option>
+                  <option value="takeover">takeover</option>
+                </select>
+              </div>
+              <div>
+                <label>Result</label>
+                <select id="haMxStatus">
+                  <option value="pass">pass</option>
+                  <option value="warn">warn</option>
+                  <option value="fail">fail</option>
+                  <option value="untested">untested</option>
+                </select>
+              </div>
+              <div><label>Observed Behavior</label><input id="haMxBehavior" type="text" placeholder="e.g. Clean mix, no pause"></div>
+              <div><button class="btn sm" id="haMxSaveBtn" type="button">Log Result</button></div>
+            </div>
+            <div id="haMatrixTable" style="color:var(--mut);font-size:12px">Loading compatibility matrix…</div>
+          </details>
+        </div>
+
+        <div class="card">
+          <h2>
+            <span>Room Voice Mic (PowerConf S330)</span>
+            <span id="vxBadge" class="pill">CHECKING</span>
+          </h2>
+          <div id="vxMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">WASAPI Shared Mode opens automatically only during active Strength workouts so Windows Voice Typing (<code>Win + H</code>) works anytime.</div>
+          <div class="mbar-wrap" style="margin-bottom:8px"><div id="vxMeter" class="mbar-fill"></div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+            <div>
+              <label>Room Mic Relay</label>
+              <select id="vxEnabled"><option value="1">Enabled</option><option value="0">Disabled</option></select>
+            </div>
+            <div>
+              <label>Listen Mode</label>
+              <select id="vxMode"><option value="workout">Active Lift Workout</option><option value="always">Always Listening</option></select>
+            </div>
+            <div>
+              <label>Input Microphone</label>
+              <select id="vxDevice"><option value="PowerConf S330">PowerConf S330 (Auto)</option></select>
+            </div>
+            <div>
+              <label>Spoken Readback (S330 Speaker)</label>
+              <select id="vxReadback"><option value="1">Yes (Speak on S330)</option><option value="0">No (Pixel Only)</option></select>
+            </div>
+            <div>
+              <label>Set Confirmation</label>
+              <select id="vxSetCommitMode">
+                <option value="voice">Voice (+10% Speed — Default)</option>
+                <option value="chime">Commit Chime Only (Fast Bing)</option>
+              </select>
+            </div>
+            <div>
+              <label>Speaker Voice</label>
+              <select id="vxTtsVoice">
+                <option value="kokoro:am_michael">Michael (Local GPU — Fastest)</option>
+                <option value="kokoro:am_onyx">Onyx (Local GPU Deep Male)</option>
+                <option value="kokoro:am_fenrir">Fenrir (Local GPU Bold Male)</option>
+                <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural — Legacy Default)</option>
+                <option value="en-US-AvaMultilingualNeural">Ava (Cloud Neural Female)</option>
+                <option value="sapi">Windows Offline SAPI</option>
+              </select>
+            </div>
+            <div>
+              <label>Whisper Model (CPU int8)</label>
+              <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (most accurate)</option></select>
+            </div>
+            <div>
+              <label>VAD Threshold (0.15–0.90)</label>
+              <input id="vxVad" type="number" min="0.15" max="0.90" step="0.05" value="0.45">
+            </div>
+          </div>
+          <div class="ctrl-row" style="margin-top:10px">
+            <button class="btn" id="vxSaveBtn" type="button">Save Voice</button>
+            <button class="btn ok" id="vxTestBtn" type="button">Test Mic (60s)</button>
+            <button class="btn sec" id="vxSpeakBtn" type="button">Test Speaker</button>
+            <button class="btn sec" id="vxInjectBtn" type="button">Send &ldquo;Armory check&rdquo;</button>
+            <span id="vxOut" style="color:var(--mut);font-size:12px"></span>
+          </div>
+          <div id="vxRecent" style="margin-top:10px;color:var(--mut);font-size:12px">No voice utterances captured yet.</div>
+          <details id="vxAbBox" style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line);color:var(--mut);font-size:12px">
+            <summary style="cursor:pointer;font-weight:800;font-size:13px;color:var(--fg)">Dual-Mic A/B Metrics (PowerConf S330 vs. Pixel Phone Mic)</summary>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin:8px 0 6px">
+              <div id="vxAbSummary">Enable Dual-Mic A/B Benchmark or run the 10-Phrase Shootout in Armory Fit to compare catch % and improvement.</div>
+              <button class="btn sec sm" id="vxAbResetBtn" type="button">Reset Passive A/B</button>
+            </div>
+            <div id="vxAbRuns" style="margin-top:8px"></div>
+            <div id="vxAbTrials" style="margin-top:8px"></div>
+          </details>
+        </div>
+      </section>
+
     </div>
-
-    <details style="margin-top:10px">
-      <summary style="cursor:pointer;font-weight:800;font-size:13px;color:var(--mut)">Other Walk-Ins &amp; PR Drop-Ins (5 — Kept Untouched While Iterating on Ryder)</summary>
-      <div id="shGrid" class="show-grid">
-        <div style="color:var(--mut);font-size:12px">Loading shows…</div>
-      </div>
-    </details>
-    <details style="margin-top:12px;border-top:1px solid var(--line);padding-top:10px">
-      <summary style="cursor:pointer;font-weight:800;font-size:13px;color:#7cc4ff">Smart FX Hooks (House Lights Rack &amp; Smith + Fog Machine)</summary>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-top:8px">
-        <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
-        <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-        <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-        <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
-        <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-        <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-        <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
-        <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
-        <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
-      </div>
-      <details style="margin-top:6px">
-        <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Single-Relay Legacy Fallback (optional)</summary>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-top:6px">
-          <div><label>Legacy House Lights IP</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
-          <div><label>Legacy Lights OFF URL</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-          <div><label>Legacy Lights ON URL</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-        </div>
-      </details>
-      <div class="ctrl-row" style="margin-top:10px;flex-wrap:wrap;gap:6px">
-        <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
-        <button class="btn sm ok" id="fxRackOnBtn" type="button">Rack ON</button>
-        <button class="btn sm sec" id="fxRackOffBtn" type="button">Rack OFF</button>
-        <button class="btn sm ok" id="fxSmithOnBtn" type="button">Smith ON</button>
-        <button class="btn sm sec" id="fxSmithOffBtn" type="button">Smith OFF</button>
-        <button class="btn sm ok" id="fxAllOnBtn" type="button">All Lights ON</button>
-        <button class="btn sm sec" id="fxAllOffBtn" type="button">All Lights OFF</button>
-        <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Both Flash</button>
-        <button class="btn sec sm" id="fxTestAltFlashBtn" type="button">Test 4x Alternate Rack ↔ Smith</button>
-        <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
-        <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
-      </div>
-    </details>
-  </div>
-
-  <div class="card" style="margin-top:14px">
-    <h2>
-      <span>Recent Saved Clips</span>
-      <span id="calBadge" class="pill">0 / 5 clips for pose calibration</span>
-    </h2>
-    <div id="clipList" style="color:var(--mut)">No clips saved yet.</div>
   </div>
 </div>
 
@@ -5983,6 +6624,33 @@ const editTarget = {};
 let isDirty = false;
 let toastTimer = null;
 const btnTimers = new WeakMap();
+let activePage = 'overview';
+let latestStatusData = null;
+let latestAudioData = null;
+let latestClipRows = [];
+let latestShowActive = { active: false };
+let latestShowsList = [];
+
+const tsState = {
+  loaded: false,
+  days: [],
+  live: null,
+  selectedDayKey: '',
+  sessionId: '',
+  isLive: false,
+  camera: 'Rack Cam',
+  cameras: [],
+  timeline: null,
+  curMs: 0,
+  inMs: null,
+  outMs: null,
+  playingVideo: false,
+  dragging: false,
+  hoverRatio: null,
+  frameTimer: null,
+  frameAbort: null,
+  frameObjUrl: '',
+};
 
 const mmState = {
   open: false,
@@ -6142,6 +6810,7 @@ function drawFeedToCanvas(canvas, rawImg, rot, tilt, crop, applyCrop) {
 }
 
 function drawAllCanvases() {
+  if (typeof activePage !== 'undefined' && activePage !== 'cameras' && !mmState.open) return;
   if (!cfg || !cfg.cameras) return;
   cfg.cameras.forEach((c, idx) => {
     const rawImg = $(`rawFeed-${sourceSlugOf(c)}`);
@@ -7869,10 +8538,12 @@ async function pollVoiceAb() {
 async function pollStatus() {
   try {
     const st = await fetch('/api/status').then(r => r.json());
+    latestStatusData = st;
     const badge = $('svcBadge');
     badge.textContent = st.recording ? (st.paused ? 'PAUSED' : 'RECORDING') : 'STANDBY RING';
     badge.className = 'pill ' + (st.recording ? 'ok' : 'live');
-    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB · Drag crop corners or <b>4-dot Mirror Masks</b>, or click <b>+ Add View</b> to crop extra stations from a camera.`;
+    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB`;
+    if ($('navBadgeRet') && cfg && cfg.retentionDays) $('navBadgeRet').textContent = `${cfg.retentionDays}d`;
     const bySlug = new Map((st.cameras || []).map(sc => [sc.slug, sc]));
     (cfg?.cameras || []).forEach((cam, idx) => {
       const c = bySlug.get(cam.slug) || st.cameras[idx];
@@ -7938,6 +8609,7 @@ async function pollStatus() {
     if (st.shows && st.shows.active) {
       syncShowActiveBadge(st.shows.active);
     }
+    syncOverview();
   } catch {}
 }
 
@@ -8058,8 +8730,10 @@ function syncHouseAudioUI(ha) {
 async function pollAudioStatus() {
   try {
     const ha = await fetch('/api/audio/status').then(r => r.json());
+    latestAudioData = ha;
     if (ha && ha.config && cfg) cfg.houseAudio = ha.config;
     syncHouseAudioUI(ha);
+    syncOverview();
   } catch {}
 }
 
@@ -8196,17 +8870,22 @@ async function saveDisplaysConfig(triggerBtn) {
 }
 
 async function runDisplayAction(target, action) {
-  $('dpOut').textContent = `Running ${target} ${action}…`;
+  if ($('dpOut')) $('dpOut').textContent = `Running ${target} ${action}…`;
+  if ($('ovDeckOut')) $('ovDeckOut').textContent = `Running ${target} ${action}…`;
   try {
     const r = await fetch('/api/displays/action', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ target, action }),
     }).then(x => x.json());
-    $('dpOut').textContent = r.ok ? `✓ ${r.message || 'Done'}` : `✗ ${r.error || r.message || 'Failed'}`;
+    const txt = r.ok ? `✓ ${r.message || 'Done'}` : `✗ ${r.error || r.message || 'Failed'}`;
+    if ($('dpOut')) $('dpOut').textContent = txt;
+    if ($('ovDeckOut')) $('ovDeckOut').textContent = txt;
+    showToast(txt, r.ok ? 'ok' : 'err');
     if (target === 'avr' || target === 'gym' || target === 'open_gym' || target === 'close_gym' || target === 'spin' || target === 'music' || target === 'cube') await pollAudioStatus();
   } catch {
-    $('dpOut').textContent = '✗ Display command failed';
+    if ($('dpOut')) $('dpOut').textContent = '✗ Display command failed';
+    if ($('ovDeckOut')) $('ovDeckOut').textContent = '✗ Display command failed';
   }
 }
 
@@ -8219,13 +8898,15 @@ function pickDiscoveredRoku(host, mac) {
 async function pollClips() {
   try {
     const clips = await fetch('/api/clips').then(r => r.json());
-    if (clips.clips && clips.clips.length) {
+    latestClipRows = (clips && Array.isArray(clips.clips)) ? clips.clips : [];
+    if (latestClipRows.length) {
       $('clipList').innerHTML = `<table><thead><tr><th>Clip</th><th>Camera</th><th>Duration</th><th>Size</th><th>Drive</th></tr></thead><tbody>` +
-        clips.clips.map(x => `<tr><td><a href="${x.lanUrl}" target="_blank">${x.fileName}</a></td><td>${x.camera}</td><td>${x.durationSec}s</td><td>${(x.bytes/1048576).toFixed(1)} MB</td><td>${x.driveUrl ? `<a href="${x.driveUrl}" target="_blank">Drive ↗</a>` : 'Syncing…'}</td></tr>`).join('') +
+        latestClipRows.map(x => `<tr><td><a href="${x.lanUrl}" target="_blank">${x.fileName}</a></td><td>${x.camera}</td><td>${x.durationSec}s</td><td>${(x.bytes/1048576).toFixed(1)} MB</td><td>${x.driveUrl ? `<a href="${x.driveUrl}" target="_blank">Drive ↗</a>` : 'Syncing…'}</td></tr>`).join('') +
         `</tbody></table>`;
     } else {
       $('clipList').textContent = 'No clips saved yet.';
     }
+    syncOverview();
   } catch {}
 }
 
@@ -8269,8 +8950,12 @@ async function init() {
   populateDisplaysInputs(cfg.displays || {});
   renderCameras();
   wireMaskModal();
+  wireNavigation();
+  wireTapeScrubber();
+  navigatePage(pageFromHash(), false);
   setInterval(drawAllCanvases, 100);
-  await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips(), loadShows()]);
+  await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips(), loadShows(), loadTapes()]);
+  if (activePage === 'footage') ensureScrubberTimeline();
   setInterval(pollStatus, 1000);
   setInterval(pollVoiceStatus, 3000);
   setInterval(pollAudioStatus, 3000);
@@ -8800,15 +9485,20 @@ async function startLocalRyderSim(jumpToSec) {
 }
 
 function syncShowActiveBadge(active) {
+  latestShowActive = active || { active: false };
+  const isLive = Boolean(active && active.active);
   const b = $('shBadge');
-  if (!b) return;
-  if (active && active.active) {
-    b.textContent = `LIVE · ${active.showName || active.showId} (${active.phase || 'running'})`;
-    b.className = 'pill warn';
-  } else {
-    b.textContent = 'IDLE';
-    b.className = 'pill ok';
+  if (b) {
+    if (isLive) {
+      b.textContent = `LIVE · ${active.showName || active.showId} (${active.phase || 'running'})`;
+      b.className = 'pill warn';
+    } else {
+      b.textContent = 'IDLE';
+      b.className = 'pill ok';
+    }
   }
+  if ($('topStopShowBtn')) $('topStopShowBtn').hidden = !isLive;
+  if ($('navDotShow')) $('navDotShow').className = 'dot ' + (isLive ? 'warn' : 'ok');
 }
 
 function populateFxHookInputs(fx) {
@@ -9086,6 +9776,7 @@ function renderShows(data) {
   syncShowActiveBadge(data.active || {});
   populateFxHookInputs(data.fxHooks || {});
   const allShows = Array.isArray(data.shows) ? data.shows : [];
+  latestShowsList = allShows;
   const ryder = allShows.find(s => s.id === 'ryder_walkin');
   populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady), data.stageClients || {}, data.ttsProviders || null);
   const others = allShows.filter(s => s.id !== 'ryder_walkin');
@@ -9164,9 +9855,13 @@ function previewShow(id) {
 
 async function fireShow(id) {
   if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Firing live on Denon…';
+  if ($('ovDeckOut')) $('ovDeckOut').textContent = `Firing ${id}…`;
   try {
     const r = await fetch(`/api/shows/${encodeURIComponent(id)}/fire`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
-    if ($('shOut_' + id)) $('shOut_' + id).textContent = r.ok ? `🔥 Fired (${r.showName || id})` : `✗ ${r.error || 'Failed'}`;
+    const msg = r.ok ? `🔥 Fired (${r.showName || id})` : `✗ ${r.error || 'Failed'}`;
+    if ($('shOut_' + id)) $('shOut_' + id).textContent = msg;
+    if ($('ovDeckOut')) $('ovDeckOut').textContent = msg;
+    showToast(msg, r.ok ? 'ok' : 'err');
     await pollStatus();
   } catch {
     if ($('shOut_' + id)) $('shOut_' + id).textContent = '✗ Fire failed';
@@ -9176,7 +9871,8 @@ async function fireShow(id) {
 async function stopShow() {
   try {
     await fetch('/api/shows/stop', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
-    $('shMsg').textContent = '⏹ Show stopped safely (Denon restored first).';
+    if ($('ovDeckOut')) $('ovDeckOut').textContent = '⏹ Show stopped safely';
+    showToast('⏹ Show stopped safely', 'ok');
     await pollStatus();
   } catch {}
 }
@@ -9623,6 +10319,733 @@ if ($('fxAllOffBtn')) $('fxAllOffBtn').onclick = () => saveFxHooks({ test: 'all_
 if ($('fxTestFlashBtn')) $('fxTestFlashBtn').onclick = () => saveFxHooks({ test: 'lights_flash' });
 if ($('fxTestAltFlashBtn')) $('fxTestAltFlashBtn').onclick = () => saveFxHooks({ test: 'lights_alt_flash' });
 if ($('fxTestFogBtn')) $('fxTestFogBtn').onclick = () => saveFxHooks({ test: 'fog' });
+
+const PAGE_TITLES = {
+  overview: 'Overview',
+  cameras: 'Cameras & Calibration',
+  footage: 'Footage · 14-Day Scrubber',
+  shows: 'Show Lab',
+  gym: 'Gym & Displays',
+  audio: 'Audio & Voice',
+};
+
+function pageFromHash() {
+  const h = String(window.location.hash || '').replace(/^#[/]?/, '').toLowerCase();
+  return Object.prototype.hasOwnProperty.call(PAGE_TITLES, h) ? h : 'overview';
+}
+
+function navigatePage(pageId, pushHash = true) {
+  const next = Object.prototype.hasOwnProperty.call(PAGE_TITLES, pageId) ? pageId : 'overview';
+  activePage = next;
+  document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
+    btn.classList.toggle('on', btn.dataset.nav === next);
+  });
+  document.querySelectorAll('.page[data-page]').forEach(sec => {
+    sec.classList.toggle('active', sec.dataset.page === next);
+  });
+  if ($('pageTitle')) $('pageTitle').textContent = PAGE_TITLES[next] || 'Armory Console';
+  if (pushHash && window.location.hash !== '#' + next) {
+    try { window.history.replaceState(null, '', '#' + next); } catch { window.location.hash = next; }
+  }
+  if (next === 'cameras') {
+    requestAnimationFrame(() => {
+      drawAllCanvases();
+      if (cfg && cfg.cameras) cfg.cameras.forEach((_, idx) => syncCropOverlay(idx));
+    });
+  } else if (next === 'footage') {
+    requestAnimationFrame(() => {
+      ensureScrubberTimeline();
+      drawTapeTimeline();
+    });
+  }
+}
+
+function wireNavigation() {
+  document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
+    btn.addEventListener('click', () => navigatePage(btn.dataset.nav));
+  });
+  window.addEventListener('hashchange', () => navigatePage(pageFromHash(), false));
+  window.addEventListener('resize', () => {
+    if (activePage === 'footage') drawTapeTimeline();
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (mmState.open) return;
+    const tag = (ev.target && ev.target.tagName) || '';
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    const pageKeys = ['overview', 'cameras', 'footage', 'shows', 'gym', 'audio'];
+    const num = Number(ev.key);
+    if (num >= 1 && num <= 6 && !Number.isNaN(num)) {
+      navigatePage(pageKeys[num - 1]);
+      return;
+    }
+    if (activePage === 'footage' && tsState.timeline && tsState.timeline.segmentCount > 0) {
+      if (ev.key === 'ArrowLeft') { ev.preventDefault(); stepScrubSec(ev.shiftKey ? -10 : -2); }
+      else if (ev.key === 'ArrowRight') { ev.preventDefault(); stepScrubSec(ev.shiftKey ? 10 : 2); }
+      else if (ev.key === ' ') { ev.preventDefault(); playTapeWindow(); }
+      else if (ev.key === '[') { setScrubInOut('in'); }
+      else if (ev.key === ']') { setScrubInOut('out'); }
+    }
+  });
+  if ($('topStopShowBtn')) $('topStopShowBtn').onclick = () => { stopLocalRyderSim(); stopShow(); };
+  if ($('ovLightsOnBtn')) $('ovLightsOnBtn').onclick = () => saveFxHooks({ test: 'all_on' }).then(() => showToast('Lights ON command sent', 'ok'));
+  if ($('ovLightsOffBtn')) $('ovLightsOffBtn').onclick = () => saveFxHooks({ test: 'all_off' }).then(() => showToast('Lights OFF command sent', 'ok'));
+}
+
+function fmtDurShort(totalSec) {
+  const s = Math.max(0, Math.round(Number(totalSec) || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const rem = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${rem}s`;
+  return `${rem}s`;
+}
+
+function fmtClock(ms, withSeconds = true) {
+  if (!ms) return '--:--';
+  const d = new Date(ms);
+  return d.toLocaleTimeString([], withSeconds
+    ? { hour: 'numeric', minute: '2-digit', second: '2-digit' }
+    : { hour: 'numeric', minute: '2-digit' });
+}
+
+function syncOverview() {
+  const st = latestStatusData;
+  if (st) {
+    const cams = Array.isArray(st.cameras) ? st.cameras : [];
+    const physConnected = cams.filter(c => c.connected).length;
+    if ($('ovKpiCamsVal')) $('ovKpiCamsVal').textContent = `${physConnected} / ${cams.length} Live`;
+    if ($('ovKpiCamsSub')) $('ovKpiCamsSub').textContent = st.recording ? 'Recording workout session' : 'Standby 2s ring active';
+    if ($('ovKpiCamsPill')) {
+      $('ovKpiCamsPill').textContent = physConnected > 0 ? 'ONLINE' : 'CHECK';
+      $('ovKpiCamsPill').className = 'pill ' + (physConnected > 0 ? 'ok' : 'warn');
+    }
+    if ($('navDotCams')) $('navDotCams').className = 'dot ' + (physConnected > 0 ? 'ok' : 'warn');
+
+    if (st.disk && $('ovKpiDiskVal')) {
+      $('ovKpiDiskVal').textContent = `${st.disk.freeGb} GB free`;
+      $('ovKpiDiskPill').textContent = `${cfg?.retentionDays || 14}D`;
+      $('ovKpiDiskPill').className = 'pill live';
+    }
+
+    const vx = st.voice || {};
+    if ($('ovKpiVoiceVal')) {
+      const vState = !vx.enabled ? 'Disabled' : (vx.armed ? 'Armed' : (vx.listening ? 'Listening' : (vx.ready ? 'Standby' : 'Init…')));
+      $('ovKpiVoiceVal').textContent = vState;
+      $('ovKpiVoiceSub').textContent = `${vx.modelSize || 'base.en'} · ${vx.sseClients || 0} client(s)`;
+      $('ovKpiVoicePill').textContent = vx.listening ? 'ACTIVE' : (vx.ready ? 'READY' : 'OFF');
+      $('ovKpiVoicePill').className = 'pill ' + (vx.listening ? 'ok' : (vx.ready ? 'live' : ''));
+    }
+
+    const wb = st.wallboard || {};
+    const dp = (cfg && cfg.displays) || {};
+    const primHost = (dp.primary && dp.primary.host) || '';
+    const spinHost = (dp.spin && dp.spin.host) || '';
+    if ($('ovKpiDispVal')) {
+      const wbTxt = wb.adbState ? wb.adbState.toUpperCase() : 'UNSET';
+      $('ovKpiDispVal').textContent = `WB ${wbTxt}`;
+      $('ovKpiDispSub').textContent = `${primHost ? 'TV OK' : 'No TV'} · ${spinHost ? 'Spin OK' : 'No Spin'} · Cube ${(dp.cubeHost || '192.168.1.151')}`;
+      $('ovKpiDispPill').textContent = wb.workoutActive ? 'WORKOUT' : 'READY';
+      $('ovKpiDispPill').className = 'pill ' + (wb.workoutActive ? 'ok' : 'live');
+    }
+    if ($('navDotGym')) $('navDotGym').className = 'dot ' + (wb.workoutActive ? 'ok' : 'live');
+  }
+
+  const ha = latestAudioData || (st && st.houseAudio);
+  if (ha && $('ovKpiAudioVal')) {
+    const d = ha.denon || {};
+    const c = ha.cube || {};
+    const dTxt = d.ok ? `Denon ${d.power || 'ON'}` : 'Denon Standby';
+    const cTxt = c.ok ? (c.playing ? 'Cube Playing' : 'Cube Online') : 'Cube Offline';
+    $('ovKpiAudioVal').textContent = dTxt;
+    $('ovKpiAudioSub').textContent = `${cTxt} · Route ${(ha.config && ha.config.outputRoute) || 'auto'}`;
+    $('ovKpiAudioPill').textContent = d.power === 'ON' ? 'ON' : (c.ok ? 'READY' : 'OFF');
+    $('ovKpiAudioPill').className = 'pill ' + (d.power === 'ON' ? 'ok' : (c.ok ? 'live' : ''));
+    if ($('navDotAudio')) {
+      const vxOn = Boolean(st && st.voice && st.voice.listening);
+      $('navDotAudio').className = 'dot ' + ((d.power === 'ON' || vxOn) ? 'ok' : (c.ok ? 'live' : ''));
+    }
+  }
+
+  if ($('ovKpiShowVal')) {
+    const act = latestShowActive || {};
+    if (act.active) {
+      $('ovKpiShowVal').textContent = act.showName || act.showId || 'Playing';
+      $('ovKpiShowSub').textContent = `Phase: ${act.phase || 'running'}`;
+      $('ovKpiShowPill').textContent = 'LIVE';
+      $('ovKpiShowPill').className = 'pill warn';
+    } else {
+      $('ovKpiShowVal').textContent = 'Ready';
+      $('ovKpiShowSub').textContent = `${(latestShowsList || []).length || 6} shows configured`;
+      $('ovKpiShowPill').textContent = 'IDLE';
+      $('ovKpiShowPill').className = 'pill ok';
+    }
+  }
+
+  const days = tsState.days || [];
+  const totalTapes = days.reduce((acc, d) => acc + (d.tapeCount || 0), 0);
+  if ($('ovKpiDiskSub') && tsState.loaded) {
+    $('ovKpiDiskSub').textContent = `${totalTapes} workout tape(s) across ${days.length} day(s)`;
+  }
+  if ($('ovFootageSummary')) {
+    if (!tsState.loaded) {
+      $('ovFootageSummary').textContent = 'Loading tape index…';
+    } else {
+      const latestDay = days[0];
+      const liveTxt = tsState.live ? `Live buffer: <b>${fmtDurShort(tsState.live.durationSec)}</b>` : 'Live ring idle';
+      const dayTxt = latestDay ? `Latest day: <b>${escHtml(latestDay.label)}</b> (${latestDay.tapeCount} session(s), ${fmtDurShort(latestDay.totalDurationSec)})` : 'No saved sessions yet';
+      $('ovFootageSummary').innerHTML = `${dayTxt} · ${liveTxt}`;
+    }
+  }
+  if ($('ovRecentClips')) {
+    const top5 = (latestClipRows || []).slice(0, 5);
+    if (!top5.length) {
+      $('ovRecentClips').textContent = 'No clips saved yet.';
+    } else {
+      $('ovRecentClips').innerHTML = top5.map(x => `<div style="display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-top:1px solid var(--line)"><a href="${x.lanUrl}" target="_blank">${escHtml(x.fileName)}</a><span>${escHtml(x.camera)} · ${x.durationSec}s</span></div>`).join('');
+    }
+  }
+}
+
+async function loadTapes() {
+  try {
+    const r = await fetch('/api/tapes', { cache: 'no-store' }).then(x => x.json());
+    tsState.loaded = true;
+    tsState.days = Array.isArray(r.days) ? r.days : [];
+    tsState.live = r.live || null;
+    if (!tsState.selectedDayKey) {
+      tsState.selectedDayKey = tsState.days.length ? tsState.days[0].date : (tsState.live ? 'live' : '');
+    } else if (tsState.selectedDayKey !== 'live' && !tsState.days.some(d => d.date === tsState.selectedDayKey)) {
+      tsState.selectedDayKey = tsState.days.length ? tsState.days[0].date : (tsState.live ? 'live' : '');
+    }
+    renderTapeDayStrip();
+    if (activePage === 'footage') {
+      ensureScrubberTimeline();
+    }
+    syncOverview();
+  } catch (e) {
+    if ($('tsStatusPill')) { $('tsStatusPill').textContent = 'ERR'; $('tsStatusPill').className = 'pill err'; }
+  }
+}
+
+function ensureScrubberTimeline() {
+  if (!tsState.loaded) return;
+  if (!tsState.timeline && tsState.selectedDayKey) {
+    selectTapeDay(tsState.selectedDayKey, true);
+  } else {
+    drawTapeTimeline();
+  }
+}
+
+function renderTapeDayStrip() {
+  const strip = $('tsDayStrip');
+  if (!strip) return;
+  const pills = [];
+  if (tsState.live) {
+    const on = tsState.selectedDayKey === 'live' ? ' on' : '';
+    pills.push(`<button class="ts-pill${on}" type="button" data-tsday="live"><span class="dot live"></span>Live Buffer (${fmtDurShort(tsState.live.durationSec)})</button>`);
+  }
+  tsState.days.forEach(d => {
+    const on = tsState.selectedDayKey === d.date ? ' on' : '';
+    const hasActive = (d.tapes || []).some(t => t.isActive);
+    const dot = hasActive ? '<span class="dot ok"></span>' : '';
+    pills.push(`<button class="ts-pill${on}" type="button" data-tsday="${escHtml(d.date)}">${dot}${escHtml(d.label)} · ${fmtDurShort(d.totalDurationSec)}</button>`);
+  });
+  strip.innerHTML = pills.length ? pills.join('') : '<span style="color:var(--mut);font-size:12px">No rolling tapes yet.</span>';
+  strip.querySelectorAll('[data-tsday]').forEach(b => {
+    b.onclick = () => selectTapeDay(b.dataset.tsday, false);
+  });
+}
+
+function selectTapeDay(dayKey, forceReload = false) {
+  tsState.selectedDayKey = dayKey;
+  renderTapeDayStrip();
+  if (dayKey === 'live' && tsState.live) {
+    if ($('tsSessionRow')) $('tsSessionRow').hidden = true;
+    selectTapeSession('', tsState.live.cameras || [], true, forceReload);
+    return;
+  }
+  const day = tsState.days.find(d => d.date === dayKey);
+  if (!day || !(day.tapes || []).length) {
+    if ($('tsSessionRow')) $('tsSessionRow').hidden = true;
+    return;
+  }
+  const sessRow = $('tsSessionRow');
+  const sessStrip = $('tsSessionStrip');
+  const tapes = day.tapes;
+  if (sessRow && sessStrip) {
+    if (tapes.length > 1) {
+      sessRow.hidden = false;
+      if (!tapes.some(t => t.sessionId === tsState.sessionId && !tsState.isLive)) {
+        tsState.sessionId = tapes[0].sessionId;
+      }
+      sessStrip.innerHTML = tapes.map(t => {
+        const on = (!tsState.isLive && t.sessionId === tsState.sessionId) ? ' on' : '';
+        const dot = t.isActive ? '<span class="dot ok"></span>' : '';
+        return `<button class="ts-pill${on}" type="button" data-tssess="${escHtml(t.sessionId)}">${dot}${fmtClock(t.startMs, false)} · ${fmtDurShort(t.durationSec)} (${t.sizeMb} MB)</button>`;
+      }).join('');
+      sessStrip.querySelectorAll('[data-tssess]').forEach(b => {
+        b.onclick = () => {
+          const hit = tapes.find(x => x.sessionId === b.dataset.tssess);
+          if (hit) {
+            selectTapeSession(hit.sessionId, hit.cameras || [], false, true);
+            sessStrip.querySelectorAll('[data-tssess]').forEach(x => x.classList.toggle('on', x.dataset.tssess === hit.sessionId));
+          }
+        };
+      });
+    } else {
+      sessRow.hidden = true;
+    }
+  }
+  const chosen = tapes.find(t => !tsState.isLive && t.sessionId === tsState.sessionId) || tapes[0];
+  selectTapeSession(chosen.sessionId, chosen.cameras || [], false, forceReload);
+}
+
+function selectTapeSession(sessionId, cameras, isLive, resetRange = true) {
+  const changed = tsState.sessionId !== sessionId || tsState.isLive !== isLive || resetRange;
+  tsState.sessionId = sessionId;
+  tsState.isLive = Boolean(isLive);
+  tsState.cameras = (cameras && cameras.length) ? cameras : ['Rack Cam', 'Smith Cam'];
+  if (!tsState.cameras.includes(tsState.camera)) {
+    tsState.camera = tsState.cameras[0];
+  }
+  if (changed) {
+    tsState.inMs = null;
+    tsState.outMs = null;
+    tsState.curMs = 0;
+  }
+  renderTapeCamStrip();
+  loadTapeTimeline(!changed);
+}
+
+function renderTapeCamStrip() {
+  const strip = $('tsCamStrip');
+  if (!strip) return;
+  strip.innerHTML = tsState.cameras.map(cam => {
+    const on = cam === tsState.camera ? ' on' : '';
+    return `<button class="ts-pill${on}" type="button" data-tscam="${escHtml(cam)}">${escHtml(cam)}</button>`;
+  }).join('');
+  strip.querySelectorAll('[data-tscam]').forEach(b => {
+    b.onclick = () => selectTapeCamera(b.dataset.tscam);
+  });
+}
+
+function selectTapeCamera(camName) {
+  if (!camName || tsState.camera === camName) return;
+  tsState.camera = camName;
+  renderTapeCamStrip();
+  loadTapeTimeline(true);
+}
+
+async function loadTapeTimeline(preservePlayhead = false) {
+  if ($('tsStatusPill')) { $('tsStatusPill').textContent = 'LOADING…'; $('tsStatusPill').className = 'pill live'; }
+  try {
+    const q = new URLSearchParams({
+      sessionId: tsState.sessionId || '',
+      camera: tsState.camera || 'Rack Cam',
+      buckets: '240',
+    });
+    const tl = await fetch(`/api/tape/timeline?${q.toString()}`, { cache: 'no-store' }).then(x => x.json());
+    tsState.timeline = tl;
+    const nSegs = tl.segmentCount || 0;
+    const bursts = Array.isArray(tl.bursts) ? tl.bursts : [];
+    if ($('tsStatusPill')) {
+      $('tsStatusPill').textContent = nSegs ? `${nSegs} chunks · ${bursts.length} activity` : 'EMPTY';
+      $('tsStatusPill').className = 'pill ' + (nSegs ? 'ok' : 'warn');
+    }
+    if ($('tsStartLbl')) $('tsStartLbl').textContent = fmtClock(tl.minMs);
+    if ($('tsEndLbl')) $('tsEndLbl').textContent = fmtClock(tl.maxMs);
+    if (nSegs > 0) {
+      let targetMs = tsState.curMs;
+      if (!preservePlayhead || targetMs < tl.minMs || targetMs > tl.maxMs) {
+        if (!tsState.isLive && bursts.length) targetMs = bursts[0].startMs;
+        else targetMs = Math.max(tl.minMs, tl.maxMs - 10000);
+      }
+      renderTapeBursts();
+      scrubToMs(targetMs, true);
+    } else {
+      renderTapeBursts();
+      drawTapeTimeline();
+    }
+  } catch {
+    if ($('tsStatusPill')) { $('tsStatusPill').textContent = 'ERR'; $('tsStatusPill').className = 'pill err'; }
+  }
+}
+
+function renderTapeBursts() {
+  const box = $('tsBurstList');
+  const tl = tsState.timeline;
+  if (!box) return;
+  const bursts = (tl && Array.isArray(tl.bursts)) ? tl.bursts : [];
+  if (!bursts.length) {
+    box.innerHTML = '<span style="font-size:12px;color:var(--mut)">No motion bursts ≥8s detected in this camera window — drag the timeline to scrub any moment.</span>';
+    return;
+  }
+  box.innerHTML = bursts.map((b, i) => {
+    const active = tsState.curMs >= b.startMs && tsState.curMs <= b.endMs ? ' on' : '';
+    return `<button class="ts-burst-btn${active}" type="button" data-tsburst="${i}">${fmtClock(b.startMs)} · ${Math.round(b.durationSec || 0)}s</button>`;
+  }).join('');
+  box.querySelectorAll('[data-tsburst]').forEach(btn => {
+    btn.onclick = () => {
+      const b = bursts[Number(btn.dataset.tsburst)];
+      if (!b) return;
+      backToScrubMode();
+      tsState.inMs = b.startMs;
+      tsState.outMs = b.endMs;
+      scrubToMs(b.startMs, true);
+    };
+  });
+}
+
+function timelineEnergyAt(ms) {
+  const tl = tsState.timeline;
+  if (!tl || !Array.isArray(tl.activity) || !tl.activity.length) return 0;
+  const span = Math.max(1, tl.maxMs - tl.minMs);
+  const idx = clamp(Math.floor(((ms - tl.minMs) / span) * tl.activity.length), 0, tl.activity.length - 1);
+  return Number(tl.activity[idx].e || 0);
+}
+
+function drawTapeTimeline() {
+  const canvas = $('tsTimelineCanvas');
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 40) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(rect.width * dpr);
+  const h = Math.round(78 * dpr);
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = '#070b10';
+  ctx.fillRect(0, 0, w, h);
+
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount || !Array.isArray(tl.activity) || !tl.activity.length) {
+    ctx.fillStyle = '#64748b';
+    ctx.font = `${12 * dpr}px system-ui,sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText('No video segments in selected view', w / 2, h / 2 + 4 * dpr);
+    return;
+  }
+
+  const acts = tl.activity;
+  const n = acts.length;
+  const th = Number(tl.threshold || 2.2);
+  const maxE = Math.max(th * 2.5, ...acts.map(a => Number(a.e || 0)), 4.0);
+  const span = Math.max(1, tl.maxMs - tl.minMs);
+  const barTop = 10 * dpr;
+  const baseH = 12 * dpr;
+  const chartH = h - barTop - baseH;
+  const bw = w / n;
+
+  for (let i = 0; i < n; i++) {
+    const a = acts[i];
+    const x = i * bw;
+    const bwFill = Math.max(1, bw - 0.5);
+    const hasVid = a.v !== 0;
+    const eng = Number(a.e || 0);
+    if (hasVid) {
+      ctx.fillStyle = '#1b2838';
+      ctx.fillRect(x, h - baseH, bwFill, baseH);
+    }
+    if (eng > 0.15) {
+      const frac = clamp(eng / maxE, 0.04, 1);
+      const bh = Math.max(2 * dpr, frac * chartH);
+      ctx.fillStyle = eng >= th ? (eng >= th * 1.8 ? '#38bdf8' : '#22c55e') : '#3b5675';
+      ctx.fillRect(x, h - baseH - bh, bwFill, bh);
+    }
+  }
+
+  // Threshold hairline
+  const thY = h - baseH - clamp(th / maxE, 0, 1) * chartH;
+  ctx.strokeStyle = 'rgba(245,158,11,0.38)';
+  ctx.setLineDash([4 * dpr, 4 * dpr]);
+  ctx.lineWidth = Math.max(1, dpr);
+  ctx.beginPath();
+  ctx.moveTo(0, thY);
+  ctx.lineTo(w, thY);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Detected bursts top bar ticks
+  (tl.bursts || []).forEach(b => {
+    const x0 = clamp(((b.startMs - tl.minMs) / span) * w, 0, w);
+    const x1 = clamp(((b.endMs - tl.minMs) / span) * w, x0 + 2 * dpr, w);
+    ctx.fillStyle = '#4ade80';
+    ctx.fillRect(x0, 2 * dpr, x1 - x0, 4 * dpr);
+  });
+
+  // In-Out clip range band
+  if (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs) {
+    const ix0 = clamp(((tsState.inMs - tl.minMs) / span) * w, 0, w);
+    const ix1 = clamp(((tsState.outMs - tl.minMs) / span) * w, ix0 + 2 * dpr, w);
+    ctx.fillStyle = 'rgba(245,158,11,0.22)';
+    ctx.fillRect(ix0, 0, ix1 - ix0, h);
+    ctx.fillStyle = '#f59e0b';
+    ctx.fillRect(ix0, 0, 2 * dpr, h);
+    ctx.fillRect(ix1 - 2 * dpr, 0, 2 * dpr, h);
+  }
+
+  // Hover crosshair
+  if (tsState.hoverRatio != null) {
+    const hx = clamp(tsState.hoverRatio * w, 0, w);
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.fillRect(hx, 0, 1 * dpr, h);
+  }
+
+  // Playhead needle
+  const px = clamp(((tsState.curMs - tl.minMs) / span) * w, 1, w - 2);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(px - 1.5 * dpr, 0, 3 * dpr, h);
+  ctx.beginPath();
+  ctx.arc(px, 6 * dpr, 5 * dpr, 0, Math.PI * 2);
+  ctx.fillStyle = '#2ea0ff';
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.stroke();
+}
+
+function scrubToMs(ms, immediate = false) {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return;
+  const clamped = Math.round(clamp(ms, tl.minMs, tl.maxMs));
+  tsState.curMs = clamped;
+  const eng = timelineEnergyAt(clamped);
+  const th = Number(tl.threshold || 2.2);
+  const actTag = eng >= th ? 'ACTIVE' : 'quiet';
+  if ($('tsTimeHud')) $('tsTimeHud').textContent = `${tsState.camera} · ${fmtClock(clamped)} · motion ${eng.toFixed(1)} (${actTag})`;
+  if ($('tsCurLbl')) $('tsCurLbl').textContent = fmtClock(clamped);
+  drawTapeTimeline();
+  document.querySelectorAll('#tsBurstList .ts-burst-btn').forEach(btn => {
+    const b = (tl.bursts || [])[Number(btn.dataset.tsburst)];
+    btn.classList.toggle('on', Boolean(b && clamped >= b.startMs && clamped <= b.endMs));
+  });
+
+  if (tsState.playingVideo) return;
+  if (tsState.frameTimer) clearTimeout(tsState.frameTimer);
+  const runFetch = async () => {
+    if (tsState.frameAbort) {
+      try { tsState.frameAbort.abort(); } catch {}
+    }
+    tsState.frameAbort = new AbortController();
+    const q = new URLSearchParams({
+      sessionId: tsState.sessionId || '',
+      camera: tsState.camera || 'Rack Cam',
+      tsMs: String(clamped),
+      w: '640',
+    });
+    try {
+      const resp = await fetch(`/api/tape/frame?${q.toString()}`, { signal: tsState.frameAbort.signal });
+      if (!resp.ok) return;
+      const blob = await resp.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const prevUrl = tsState.frameObjUrl;
+      tsState.frameObjUrl = objUrl;
+      if ($('tsFrameImg')) $('tsFrameImg').src = objUrl;
+      if (prevUrl) { try { URL.revokeObjectURL(prevUrl); } catch {} }
+    } catch {}
+  };
+  if (immediate) runFetch();
+  else tsState.frameTimer = setTimeout(runFetch, 55);
+}
+
+function stepScrubSec(deltaSec) {
+  backToScrubMode();
+  scrubToMs((tsState.curMs || 0) + Number(deltaSec) * 1000, true);
+}
+
+function backToScrubMode() {
+  tsState.playingVideo = false;
+  const vid = $('tsVideo');
+  const img = $('tsFrameImg');
+  if (vid) {
+    try { vid.pause(); } catch {}
+    vid.hidden = true;
+  }
+  if (img) img.hidden = false;
+  if ($('tsBackToScrubBtn')) $('tsBackToScrubBtn').hidden = true;
+}
+
+async function playTapeWindow() {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return;
+  const winSec = Number(($('tsWinSec') && $('tsWinSec').value) || 30);
+  let sMs, eMs;
+  if (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs) {
+    sMs = tsState.inMs;
+    eMs = tsState.outMs;
+  } else {
+    sMs = Math.max(tl.minMs, tsState.curMs - 2000);
+    eMs = Math.min(tl.maxMs, sMs + winSec * 1000);
+    if (eMs - sMs < 4000) eMs = Math.min(tl.maxMs, sMs + 4000);
+  }
+  if ($('tsOut')) $('tsOut').textContent = `Rendering ${Math.round((eMs - sMs) / 1000)}s preview MP4…`;
+  try {
+    const r = await fetch('/api/tape/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: tsState.sessionId || '', camera: tsState.camera || 'Rack Cam', startMs: sMs, endMs: eMs }),
+    }).then(x => x.json());
+    if (!r || !r.ok || !r.lanUrl) {
+      if ($('tsOut')) $('tsOut').textContent = `✗ ${(r && r.error) || 'Preview unavailable'}`;
+      return;
+    }
+    tsState.playingVideo = true;
+    const vid = $('tsVideo');
+    const img = $('tsFrameImg');
+    if (img) img.hidden = true;
+    if ($('tsBackToScrubBtn')) $('tsBackToScrubBtn').hidden = false;
+    if (vid) {
+      vid.hidden = false;
+      vid.src = r.lanUrl;
+      vid.playbackRate = Number(($('tsSpeedSel') && $('tsSpeedSel').value) || 1) || 1;
+      vid.play().catch(() => {});
+    }
+    if ($('tsOut')) $('tsOut').textContent = `▶ Playing ${fmtClock(sMs)} – ${fmtClock(eMs)}`;
+  } catch {
+    if ($('tsOut')) $('tsOut').textContent = '✗ Preview failed';
+  }
+}
+
+function jumpActivityBurst(dir) {
+  const tl = tsState.timeline;
+  const bursts = (tl && Array.isArray(tl.bursts)) ? tl.bursts : [];
+  if (!bursts.length) {
+    showToast('No motion bursts ≥8s in this session', 'err');
+    return;
+  }
+  backToScrubMode();
+  const cur = tsState.curMs || tl.minMs;
+  let pick = bursts[0];
+  if (dir > 0) {
+    pick = bursts.find(b => b.startMs > cur + 1500) || bursts[0];
+  } else {
+    const prev = bursts.filter(b => b.startMs < cur - 1500);
+    pick = prev.length ? prev[prev.length - 1] : bursts[bursts.length - 1];
+  }
+  scrubToMs(pick.startMs, true);
+}
+
+function setScrubInOut(which) {
+  if (!tsState.curMs) return;
+  if (which === 'in') {
+    tsState.inMs = tsState.curMs;
+    if (tsState.outMs != null && tsState.outMs <= tsState.inMs) tsState.outMs = null;
+  } else if (which === 'out') {
+    tsState.outMs = tsState.curMs;
+    if (tsState.inMs != null && tsState.outMs <= tsState.inMs) tsState.inMs = Math.max(0, tsState.outMs - 10000);
+  } else {
+    tsState.inMs = null;
+    tsState.outMs = null;
+  }
+  drawTapeTimeline();
+}
+
+async function saveScrubberClip() {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return;
+  const winSec = Number(($('tsWinSec') && $('tsWinSec').value) || 30);
+  const sMs = (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs)
+    ? tsState.inMs
+    : Math.max(tl.minMs, tsState.curMs - 4000);
+  const eMs = (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs)
+    ? tsState.outMs
+    : Math.min(tl.maxMs, sMs + winSec * 1000);
+  const exName = (($('tsClipLabel') && $('tsClipLabel').value.trim()) || 'scrub_clip');
+  const includeAudio = Boolean($('tsIncludeAudio') && $('tsIncludeAudio').checked);
+  if ($('tsOut')) $('tsOut').textContent = 'Cutting clip MP4 & syncing Drive…';
+  try {
+    const r = await fetch('/api/clip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: tsState.sessionId || '',
+        exName,
+        startMs: sMs,
+        endMs: eMs,
+        cameras: [tsState.camera || 'Rack Cam'],
+        includeAudio,
+      }),
+    }).then(x => x.json());
+    if (!r || !r.ok) {
+      if ($('tsOut')) $('tsOut').textContent = `✗ ${(r && r.error) || 'Save failed'}`;
+      return;
+    }
+    if ($('tsOut')) {
+      $('tsOut').innerHTML = `✓ Saved <a href="${escHtml(r.lanUrl)}" target="_blank">${escHtml(r.fileName)}</a> (${r.durationSec}s)`;
+    }
+    showToast(`✓ Saved ${r.fileName}`, 'ok');
+    pollClips();
+  } catch {
+    if ($('tsOut')) $('tsOut').textContent = '✗ Save clip failed';
+  }
+}
+
+function wireTapeScrubber() {
+  const canvas = $('tsTimelineCanvas');
+  if (canvas) {
+    const ratioForEvent = (ev) => {
+      const rect = canvas.getBoundingClientRect();
+      return clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    };
+    canvas.addEventListener('pointerdown', (ev) => {
+      const tl = tsState.timeline;
+      if (!tl || !tl.segmentCount) return;
+      canvas.setPointerCapture(ev.pointerId);
+      tsState.dragging = true;
+      backToScrubMode();
+      const ratio = ratioForEvent(ev);
+      scrubToMs(tl.minMs + ratio * Math.max(1, tl.maxMs - tl.minMs), false);
+    });
+    canvas.addEventListener('pointermove', (ev) => {
+      const tl = tsState.timeline;
+      if (!tl || !tl.segmentCount) return;
+      const ratio = ratioForEvent(ev);
+      tsState.hoverRatio = ratio;
+      const hMs = Math.round(tl.minMs + ratio * Math.max(1, tl.maxMs - tl.minMs));
+      const eng = timelineEnergyAt(hMs);
+      const tip = $('tsHoverTip');
+      if (tip) {
+        tip.hidden = false;
+        tip.style.left = `${(ratio * 100).toFixed(2)}%`;
+        tip.textContent = `${fmtClock(hMs)} · ${eng.toFixed(1)}`;
+      }
+      if (tsState.dragging) scrubToMs(hMs, false);
+      else drawTapeTimeline();
+    });
+    const endDrag = () => {
+      if (!tsState.dragging) return;
+      tsState.dragging = false;
+      scrubToMs(tsState.curMs, true);
+    };
+    canvas.addEventListener('pointerup', endDrag);
+    canvas.addEventListener('pointercancel', endDrag);
+    canvas.addEventListener('pointerleave', () => {
+      tsState.hoverRatio = null;
+      if ($('tsHoverTip')) $('tsHoverTip').hidden = true;
+      drawTapeTimeline();
+    });
+  }
+  document.querySelectorAll('[data-tsstep]').forEach(btn => {
+    btn.onclick = () => stepScrubSec(Number(btn.dataset.tsstep || 0));
+  });
+  if ($('tsRefreshBtn')) $('tsRefreshBtn').onclick = () => loadTapes().then(() => loadTapeTimeline(true));
+  if ($('tsPrevBurstBtn')) $('tsPrevBurstBtn').onclick = () => jumpActivityBurst(-1);
+  if ($('tsNextBurstBtn')) $('tsNextBurstBtn').onclick = () => jumpActivityBurst(1);
+  if ($('tsPlayBtn')) $('tsPlayBtn').onclick = () => playTapeWindow();
+  if ($('tsBackToScrubBtn')) $('tsBackToScrubBtn').onclick = () => backToScrubMode();
+  if ($('tsSpeedSel')) $('tsSpeedSel').onchange = () => {
+    if ($('tsVideo')) $('tsVideo').playbackRate = Number($('tsSpeedSel').value || 1) || 1;
+  };
+  if ($('tsSetInBtn')) $('tsSetInBtn').onclick = () => setScrubInOut('in');
+  if ($('tsSetOutBtn')) $('tsSetOutBtn').onclick = () => setScrubInOut('out');
+  if ($('tsClearRangeBtn')) $('tsClearRangeBtn').onclick = () => setScrubInOut('clear');
+  if ($('tsSaveClipBtn')) $('tsSaveClipBtn').onclick = () => saveScrubberClip();
+}
 
 init();
 </script>
@@ -10686,6 +12109,12 @@ def create_app(service: ArmoryCamService) -> Flask:
         min_dur_sec = float(min_dur_raw) if min_dur_raw is not None else None
         bursts = service.bursts_for_session(sid, around_ms=around_ms, camera=cam, min_dur_sec=min_dur_sec)
         return jsonify({"bursts": bursts})
+
+    @app.get("/api/tapes")
+    def api_tapes() -> Response:
+        resp = jsonify(service.list_tapes())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
 
     @app.get("/api/tape/timeline")
     def api_tape_timeline() -> Response:

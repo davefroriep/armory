@@ -4290,6 +4290,146 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertEqual(asr_dev, "cpu/int8")
         self.assertEqual(calls, [("cuda", "int8_float16"), ("cuda", "float16"), ("cpu", "int8")])
 
+    def test_gemini_tts_coalesce_disk_cache_429_and_14day_scrubber_console(self) -> None:
+        # 1. Gemini implicit '...' pause coalescing + disk cache reuse + 429 friendly message
+        ffmpeg_bin = shutil.which("ffmpeg") or "ffmpeg"
+        tmp = Path(tempfile.mkdtemp(prefix="armory_console_scrub_"))
+        try:
+            cache_dir = tmp / "tts_cache"
+            gem_calls: list[str] = []
+            tone_pcm16 = (
+                np.sin(2.0 * np.pi * 220.0 * np.linspace(0, 0.35, 8400, endpoint=False)) * 12000.0
+            ).astype("<i2").tobytes()
+
+            def fake_gem(prompt_txt: str, _v: str, _style: str) -> bytes:
+                gem_calls.append(prompt_txt)
+                return tone_pcm16
+
+            out1 = tmp / "gem1.wav"
+            sd.synthesize_announcer_wav(
+                "Ladies and gentlemen... Straight out of Brick... Ryder Curry!!",
+                voice="gemini:Fenrir",
+                out_wav=out1,
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                tts_cache_dir=cache_dir,
+                voice_style="HBO ring announcer",
+                tts_secrets={"geminiKey": "AIzaDummyTestKey"},
+                gemini_synth_fn=fake_gem,
+            )
+            self.assertEqual(len(gem_calls), 1)
+            self.assertIn("Ladies and gentlemen ... Straight out of Brick ... Ryder Curry!!", gem_calls[0])
+            self.assertTrue(out1.is_file())
+
+            # Re-rendering with different mastering settings hits disk cache -> 0 new Gemini requests
+            out2 = tmp / "gem2.wav"
+            sd.synthesize_announcer_wav(
+                "Ladies and gentlemen... Straight out of Brick... Ryder Curry!!",
+                voice="gemini:Fenrir",
+                out_wav=out2,
+                ffmpeg_bin=ffmpeg_bin,
+                allow_network=False,
+                tts_cache_dir=cache_dir,
+                reverb_wet=0.14,
+                boost_db=4.0,
+                voice_style="HBO ring announcer",
+                tts_secrets={"geminiKey": "AIzaDummyTestKey"},
+                gemini_synth_fn=fake_gem,
+            )
+            self.assertEqual(len(gem_calls), 1)
+            self.assertTrue(out2.is_file())
+
+            err_msg = sd._format_tts_error(
+                "gemini",
+                RuntimeError("429 RESOURCE_EXHAUSTED quota exceeded 'retryDelay': '21749s'"),
+            )
+            self.assertIn("10 requests/day", err_msg)
+            self.assertIn("~6h 2m", err_msg)
+
+            # 2. 14-day tape discovery (/api/tapes) & zero historical ring bleed
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            try:
+                svc.post_config = None
+                cfg_cams = [
+                    {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.2, "crop": [0, 0, 1, 1], "defish": False},
+                    {"name": "Smith Cam", "slug": "smith_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.2, "crop": [0, 0, 1, 1], "defish": False},
+                ]
+                app = ac.create_app(svc)
+                client = app.test_client()
+                client.post("/api/config", json={"cameras": cfg_cams})
+
+                # Old session on 2026-11-18
+                nov18 = svc.tapes_root / "sess_nov18" / "rack_cam"
+                nov18.mkdir(parents=True, exist_ok=True)
+                for nm in ("seg_20261118_195610.ts", "seg_20261118_195612.ts", "seg_20261118_195620.ts"):
+                    (nov18 / nm).write_bytes(b"ts" * 100)
+                t0 = ac.parse_segment_start_ms("seg_20261118_195610.ts")
+                assert t0 is not None
+                motion_rows = [
+                    {"camera": "Rack Cam", "slug": "rack_cam", "file": f"seg_20261118_1956{10 + i * 2}.ts", "startMs": t0 + i * 2000, "endMs": t0 + (i + 1) * 2000, "energy": 4.2}
+                    for i in range(6)
+                ]
+                (svc.tapes_root / "sess_nov18" / "motion.jsonl").write_text(
+                    "\n".join(json.dumps(r) for r in motion_rows) + "\n", encoding="utf-8"
+                )
+
+                # Session on 2026-11-21
+                nov21 = svc.tapes_root / "sess_nov21" / "smith_cam"
+                nov21.mkdir(parents=True, exist_ok=True)
+                (nov21 / "seg_20261121_141410.ts").write_bytes(b"ts" * 100)
+
+                # Today's live ring segment on disk (must NOT bleed into sess_nov18 timeline!)
+                live_ring = svc.ring_root / "rack_cam"
+                live_ring.mkdir(parents=True, exist_ok=True)
+                (live_ring / "seg_20261122_090000.ts").write_bytes(b"ts" * 100)
+                t_ring_max = ac.parse_segment_start_ms("seg_20261122_090000.ts")
+                assert t_ring_max is not None
+
+                tapes_res = client.get("/api/tapes")
+                self.assertEqual(tapes_res.status_code, 200)
+                tapes_json = tapes_res.get_json()
+                self.assertTrue(tapes_json["ok"])
+                self.assertIsNotNone(tapes_json["live"])
+                self.assertEqual([d["date"] for d in tapes_json["days"]], ["2026-11-21", "2026-11-18"])
+
+                tl_res = client.get("/api/tape/timeline?sessionId=sess_nov18&camera=Rack%20Cam&buckets=60")
+                self.assertEqual(tl_res.status_code, 200)
+                tl_json = tl_res.get_json()
+                self.assertTrue(tl_json["ok"])
+                self.assertLess(tl_json["maxMs"], t_ring_max)
+                self.assertIn("threshold", tl_json)
+                self.assertGreaterEqual(len(tl_json["bursts"]), 1)
+                self.assertIn("v", tl_json["activity"][0])
+
+                # 3. 6-page console overhaul + scrubber UI markers & zero legacy alignment tokens
+                dash = client.get("/").get_data(as_text=True)
+                for tok in (
+                    'data-nav="overview"',
+                    'data-nav="cameras"',
+                    'data-nav="footage"',
+                    'data-nav="shows"',
+                    'data-nav="gym"',
+                    'data-nav="audio"',
+                    'data-page="overview"',
+                    'data-page="cameras"',
+                    'data-page="footage"',
+                    'data-page="shows"',
+                    'data-page="gym"',
+                    'data-page="audio"',
+                    "tsTimelineCanvas",
+                    "tsPlayBtn",
+                    "tsSaveClipBtn",
+                    "tsDayStrip",
+                    "tsBurstList",
+                ):
+                    self.assertIn(tok, dash, msg=f"Missing token: {tok}")
+                for dead_tok in ("alignBar", "pinRefBtn", "realignModeBtn", "driftNtfyBtn", "Secondary / Pinned"):
+                    self.assertNotIn(dead_tok, dash)
+            finally:
+                svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
