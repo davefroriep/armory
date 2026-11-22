@@ -1424,6 +1424,15 @@ def _get_kokoro(models_dir: Path | None, *, allow_fallback: bool = True) -> Any 
     paths = _resolve_kokoro_paths(models_dir, allow_fallback=allow_fallback)
     if paths is None:
         return None
+    try:
+        try:
+            from .room_voice import get_shared_kokoro
+        except ImportError:
+            from room_voice import get_shared_kokoro
+        kokoro, _dev = get_shared_kokoro(paths[0].parent)
+        return kokoro
+    except Exception:
+        pass
     key = (str(paths[0].resolve()), str(paths[1].resolve()))
     with _KOKORO_LOCK:
         inst = _KOKORO_CACHE.get(key)
@@ -2679,6 +2688,8 @@ class ShowDirector:
         self.recent_cues: deque[dict[str, Any]] = deque(maxlen=30)
 
         self._run_lock = threading.Lock()
+        self.log = logging.getLogger("armory-shows")
+        self._http_fail_until: dict[str, float] = {}
         self._active_run_id: int = 0
         self._active_cancel: threading.Event | None = None
         self._active_thread: threading.Thread | None = None
@@ -4197,6 +4208,12 @@ class ShowDirector:
         clean = str(url or "").strip()
         if not clean:
             return {"ok": False, "skipped": True}
+        host_key = urllib.parse.urlsplit(clean).netloc.lower()
+        now_m = time.monotonic()
+        if host_key and self._http_get is None:
+            fail_until = self._http_fail_until.get(host_key, 0.0)
+            if now_m < fail_until:
+                return {"ok": False, "skipped": True, "circuitOpen": True, "url": clean}
         try:
             if self._http_get is not None:
                 code, _ = self._http_get(clean, 1.5)
@@ -4205,8 +4222,12 @@ class ShowDirector:
                 return {"ok": False, "skipped": True, "error": "Network disabled"}
             req = urllib.request.Request(clean, method="GET")
             with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if host_key:
+                    self._http_fail_until.pop(host_key, None)
                 return {"ok": int(resp.status) < 400, "url": clean, "status": int(resp.status)}
         except Exception as exc:
+            if host_key and self._http_get is None:
+                self._http_fail_until[host_key] = time.monotonic() + 10.0
             return {"ok": False, "url": clean, "error": str(exc)}
 
     def _fire_http_hooks_parallel(self, urls: Sequence[str]) -> list[dict[str, Any]]:
@@ -4215,9 +4236,18 @@ class ShowDirector:
             return []
         if len(clean_urls) == 1:
             return [self._fire_http_hook(clean_urls[0])]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(clean_urls)) as ex:
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(clean_urls))
+        try:
             futs = [ex.submit(self._fire_http_hook, u) for u in clean_urls]
-            return [f.result() for f in futs]
+            out: list[dict[str, Any]] = []
+            for u, fut in zip(clean_urls, futs):
+                try:
+                    out.append(fut.result(timeout=2.0))
+                except Exception as exc:
+                    out.append({"ok": False, "url": u, "error": str(exc)})
+            return out
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
 
     def _fire_lights_state(
         self,
@@ -4267,6 +4297,7 @@ class ShowDirector:
         on_urls = all_on if (z_norm not in ("rack", "smith")) else fx.resolve_lights_urls(True, z_norm)
         off_urls = all_off if (z_norm not in ("rack", "smith")) else fx.resolve_lights_urls(False, z_norm)
 
+        deadline = time.monotonic()
         for idx in range(1, count + 1):
             if cancel_ev and cancel_ev.is_set():
                 return
@@ -4283,24 +4314,32 @@ class ShowDirector:
             if z_norm == "alternate" and has_both:
                 step_urls = (rack_on + smith_off) if (idx % 2 == 1) else (smith_on + rack_off)
                 self._fire_http_hooks_parallel(step_urls)
-                if self._wait_cancelable(cancel_ev, on_sec):
+                deadline = time.monotonic() + on_sec if self._has_custom_sleep else (deadline + on_sec)
+                wait_on = on_sec if self._has_custom_sleep else max(0.0, deadline - time.monotonic())
+                if self._wait_cancelable(cancel_ev, wait_on):
                     return
                 if off_sec > 0.0 and not (end_on and idx == count):
                     self._fire_http_hooks_parallel(all_off)
-                    if self._wait_cancelable(cancel_ev, off_sec):
+                    deadline = time.monotonic() + off_sec if self._has_custom_sleep else (deadline + off_sec)
+                    wait_off = off_sec if self._has_custom_sleep else max(0.0, deadline - time.monotonic())
+                    if self._wait_cancelable(cancel_ev, wait_off):
                         return
                 elif not end_on and all_off:
                     self._fire_http_hooks_parallel(all_off)
             else:
                 if on_urls:
                     self._fire_http_hooks_parallel(on_urls)
-                if self._wait_cancelable(cancel_ev, on_sec):
+                deadline = time.monotonic() + on_sec if self._has_custom_sleep else (deadline + on_sec)
+                wait_on = on_sec if self._has_custom_sleep else max(0.0, deadline - time.monotonic())
+                if self._wait_cancelable(cancel_ev, wait_on):
                     return
                 # Skip final OFF if we're finishing ON for the last flash
                 if off_sec > 0.0 and not (end_on and idx == count):
                     if off_urls:
                         self._fire_http_hooks_parallel(off_urls)
-                    if self._wait_cancelable(cancel_ev, off_sec):
+                    deadline = time.monotonic() + off_sec if self._has_custom_sleep else (deadline + off_sec)
+                    wait_off = off_sec if self._has_custom_sleep else max(0.0, deadline - time.monotonic())
+                    if self._wait_cancelable(cancel_ev, wait_off):
                         return
                 elif not end_on and off_urls:
                     self._fire_http_hooks_parallel(off_urls)
@@ -4324,6 +4363,7 @@ class ShowDirector:
             fx = self.fx_hooks
         on_urls = fx.resolve_lights_urls(True, "all")
         off_urls = fx.resolve_lights_urls(False, "all")
+        deadline = time.monotonic()
         for i in range(1, n_pulses + 1):
             if cancel_ev.is_set():
                 return True
@@ -4337,11 +4377,15 @@ class ShowDirector:
             )
             if on_urls:
                 self._fire_http_hooks_parallel(on_urls)
-            if self._wait_cancelable(cancel_ev, on_s):
+            deadline = time.monotonic() + on_s if self._has_custom_sleep else (deadline + on_s)
+            wait_on = on_s if self._has_custom_sleep else max(0.0, deadline - time.monotonic())
+            if self._wait_cancelable(cancel_ev, wait_on):
                 return True
             if off_urls:
                 self._fire_http_hooks_parallel(off_urls)
-            if self._wait_cancelable(cancel_ev, off_s):
+            deadline = time.monotonic() + off_s if self._has_custom_sleep else (deadline + off_s)
+            wait_off = off_s if self._has_custom_sleep else max(0.0, deadline - time.monotonic())
+            if self._wait_cancelable(cancel_ev, wait_off):
                 return True
         return False
 
@@ -4482,21 +4526,37 @@ class ShowDirector:
 
     # ---------- Anti-Roller-Coaster Live Execution ----------
 
-    def _restore_denon_down(self, from_db: float, to_db: float, *, fast: bool = False) -> None:
+    def _restore_denon_down(self, from_db: float, to_db: float, *, fast: bool = False) -> bool:
         if self.house_audio is None:
-            return
+            return False
+        steps = 3 if fast else 6
+        step_ms = 50 if fast else 135
         try:
             if abs(from_db - to_db) > 0.4:
-                self.house_audio.denon._ramp_volume(
-                    from_db,
-                    to_db,
-                    steps=(3 if fast else 6),
-                    step_ms=(50 if fast else 135),
-                )
+                ramp_retry = getattr(self.house_audio.denon, "_ramp_volume_retry", None)
+                if callable(ramp_retry):
+                    ok = bool(ramp_retry(from_db, to_db, steps, step_ms, attempts=3))
+                else:
+                    ok = bool(self.house_audio.denon._ramp_volume(from_db, to_db, steps=steps, step_ms=step_ms))
             else:
-                self.house_audio.denon.send_command(db_to_denon_mv(to_db))
-        except Exception:
-            pass
+                ok = False
+                for attempt in range(3):
+                    res = self.house_audio.denon.send_command(db_to_denon_mv(to_db))
+                    if res.get("ok"):
+                        ok = True
+                        break
+                    if attempt < 2:
+                        time.sleep(0.3)
+            if ok:
+                clear_fn = getattr(self.house_audio.denon, "clear_volume_guard", None)
+                if callable(clear_fn):
+                    clear_fn()
+            else:
+                self.log.warning("Show Denon volume restore failed (%s -> %s dB)", from_db, to_db)
+            return ok
+        except Exception as exc:
+            self.log.warning("Show Denon volume restore error (%s -> %s dB): %s", from_db, to_db, exc)
+            return False
 
     def _run_multimedia_show_sequence(
         self,
@@ -4510,9 +4570,10 @@ class ShowDirector:
         exclude_main_tv: bool = False,
     ) -> dict[str, Any]:
         """Run unified local 1080p MP4 show across Cube + Hisense + SmartSpin + Wallboard with T=0 pre-staging."""
-        prev_db = -35.0
+        prev_db: float | None = None
+        has_baseline = False
         target_db = _clamp(float(spec.denon_vol) - 80.0, -50.0, -5.0)
-        current_db = prev_db
+        current_db = target_db
         denon_raised = False
         denon_restored = False
         cube_ser = ""
@@ -4547,10 +4608,10 @@ class ShowDirector:
             # 1. Snapshot Denon AVR baseline BEFORE raising volume or changing inputs
             if self.house_audio is not None:
                 st = self.house_audio.denon.get_status()
-                if st.get("ok"):
-                    if st.get("volumeDb") is not None:
-                        prev_db = float(st["volumeDb"])
-            current_db = prev_db
+                if st.get("ok") and st.get("volumeDb") is not None:
+                    prev_db = float(st["volumeDb"])
+                    has_baseline = True
+            current_db = prev_db if prev_db is not None else target_db
 
             with self._lock:
                 self._active_state["phase"] = "prestage_displays"
@@ -4732,7 +4793,8 @@ class ShowDirector:
                             pass
 
             prestage: dict[str, Any] = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            ex = concurrent.futures.ThreadPoolExecutor(max_workers=5)
+            try:
                 futs = {
                     "denon": ex.submit(_prep_denon),
                     "tv": ex.submit(_prep_hisense),
@@ -4745,6 +4807,8 @@ class ShowDirector:
                         prestage[key] = fut.result(timeout=12.0)
                     except Exception as exc:
                         prestage[key] = {"ok": False, "error": str(exc)}
+            finally:
+                ex.shutdown(wait=False, cancel_futures=True)
 
             switch_done_mono = time.monotonic()
             out_res["prestage"] = prestage
@@ -4776,7 +4840,10 @@ class ShowDirector:
                     return {"ok": False, "canceled": True}
 
             # 6. Ramp Denon to MV70, then fire clock-synced `stage_play` across stage screens!
-            if self.house_audio is not None:
+            if self.house_audio is not None and has_baseline and prev_db is not None:
+                save_guard = getattr(self.house_audio.denon, "save_volume_guard", None)
+                if callable(save_guard):
+                    save_guard(prev_db)
                 self.house_audio.denon._ramp_volume(prev_db, target_db, steps=4, step_ms=35)
                 current_db = target_db
                 denon_raised = True
@@ -5019,7 +5086,7 @@ class ShowDirector:
                 if cancel_ev.is_set():
                     return {"ok": False, "canceled": True}
 
-            if not any_post_denon and spec.post_overlay_denon_vol <= 0 and denon_raised:
+            if not any_post_denon and spec.post_overlay_denon_vol <= 0 and denon_raised and has_baseline and prev_db is not None:
                 self._restore_denon_down(current_db, prev_db, fast=False)
             denon_restored = True
             self._emit_cue("ended", "(SHOW COMPLETE)", show_id=spec.id, duration_ms=1200)
@@ -5030,7 +5097,7 @@ class ShowDirector:
             return out_res
         finally:
             self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
-            if denon_raised and not denon_restored and self.house_audio is not None:
+            if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
                 self._restore_denon_down(current_db, prev_db, fast=True)
             if self.displays is not None:
                 try:
@@ -5140,9 +5207,10 @@ class ShowDirector:
                     exclude_main_tv=eff_exclude_main,
                 )
 
-        prev_db = -35.0
+        prev_db: float | None = None
+        has_baseline = False
         target_db = _clamp(float(spec.denon_vol) - 80.0, -50.0, -5.0)
-        current_db = prev_db
+        current_db = target_db
         denon_raised = False
         denon_restored = False
         cube_started = False
@@ -5171,14 +5239,16 @@ class ShowDirector:
                     was_standby = st.get("power") != "ON"
                     if st.get("volumeDb") is not None:
                         prev_db = float(st["volumeDb"])
+                        has_baseline = True
                     if was_standby:
                         self.house_audio.denon.send_command("PWON")
                         if self._wait_cancelable(cancel_ev, 0.35):
                             return {"ok": False, "canceled": True}
                         self.house_audio.denon.send_command("SIMPLAY")
                         self.house_audio.denon.send_command("MSMCH STEREO")
-                        prev_db = min(prev_db, target_db)
-            current_db = prev_db
+                        if prev_db is not None:
+                            prev_db = min(prev_db, target_db)
+            current_db = prev_db if prev_db is not None else target_db
 
             # 3. Pre-show smart FX hooks (lights out + fog burst + live SSE cue simulation)
             if spec.lights_out:
@@ -5222,7 +5292,10 @@ class ShowDirector:
                 return {"ok": False, "canceled": True}
 
             # 5. Ramp Denon smoothly up to show target level (e.g., MV70 = -10.0 dB) right during lead-in
-            if self.house_audio is not None:
+            if self.house_audio is not None and has_baseline and prev_db is not None:
+                save_guard = getattr(self.house_audio.denon, "save_volume_guard", None)
+                if callable(save_guard):
+                    save_guard(prev_db)
                 self.house_audio.denon._ramp_volume(prev_db, target_db, steps=4, step_ms=35)
                 current_db = target_db
                 denon_raised = True
@@ -5395,7 +5468,7 @@ class ShowDirector:
                     if self._wait_cancelable(cancel_ev, rem_video):
                         return {"ok": False, "canceled": True}
 
-                if spec.post_overlay_denon_vol <= 0:
+                if spec.post_overlay_denon_vol <= 0 and denon_raised and has_baseline and prev_db is not None:
                     self._restore_denon_down(current_db, prev_db, fast=False)
                 denon_restored = True
                 if self.displays is not None:
@@ -5409,9 +5482,9 @@ class ShowDirector:
                 # Ramp Denon BACK DOWN to prev_db WHILE Cube still holds MAY_DUCK!
                 with self._lock:
                     self._active_state["phase"] = "restoring_denon"
-                if denon_raised:
+                if denon_raised and has_baseline and prev_db is not None:
                     self._restore_denon_down(current_db, prev_db, fast=False)
-                    denon_restored = True
+                denon_restored = True
                 self._wait_cancelable(cancel_ev, 0.35)
 
             self._emit_cue("ended", "(SHOW COMPLETE)", show_id=spec.id, duration_ms=1200)
@@ -5423,7 +5496,7 @@ class ShowDirector:
         finally:
             self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
             # Emergency safety guarantee: ALWAYS ramp Denon back down FIRST before stopping Cube!
-            if denon_raised and not denon_restored and self.house_audio is not None:
+            if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
                 self._restore_denon_down(current_db, prev_db, fast=True)
             if wallboard_youtube_launched:
                 try:

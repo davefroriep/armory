@@ -233,17 +233,66 @@ class DenonAvrClient:
         http_get: Callable[[str, float], tuple[int, bytes]] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         allow_network: bool = True,
+        state_dir: Path | None = None,
     ) -> None:
         self._get_cfg = get_cfg
         self._http_get = http_get
         self._sleep = sleep_fn or time.sleep
         self._allow_network = bool(allow_network)
+        self._guard_path = (Path(state_dir) / "denon_vol_guard.json") if state_dir is not None else None
         self._lock = threading.RLock()
         self._duck_depth = 0
         self._saved_db: float | None = None
         self._ducked_db: float | None = None
+        self._last_ramp_db: float | None = None
         self.last_status: dict[str, Any] = {"ok": False, "error": "Not polled yet"}
         self.last_duck_info: dict[str, Any] = {}
+
+    def save_volume_guard(self, saved_db: float) -> None:
+        if self._guard_path is None:
+            return
+        try:
+            tmp = self._guard_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps({"savedDb": float(saved_db), "ts": time.time()}),
+                encoding="utf-8",
+            )
+            tmp.replace(self._guard_path)
+        except OSError:
+            pass
+
+    def clear_volume_guard(self) -> None:
+        if self._guard_path is None:
+            return
+        try:
+            self._guard_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def restore_stale_volume_guard(self, max_age_sec: float = 1800.0) -> dict[str, Any]:
+        """Recover Denon volume if the process died mid-duck or mid-show within `max_age_sec`."""
+        if self._guard_path is None or not self._guard_path.is_file():
+            return {"ok": False, "skipped": True, "reason": "none"}
+        try:
+            data = json.loads(self._guard_path.read_text(encoding="utf-8"))
+            saved_db = float(data["savedDb"])
+            age_sec = time.time() - float(data.get("ts") or 0.0)
+        except Exception:
+            self.clear_volume_guard()
+            return {"ok": False, "skipped": True, "reason": "invalid"}
+        if age_sec > max_age_sec or age_sec < 0:
+            self.clear_volume_guard()
+            return {"ok": False, "skipped": True, "reason": "expired"}
+        with self._lock:
+            st = self.get_status()
+            now_db = st.get("volumeDb") if st.get("ok") else None
+            if st.get("power") == "ON" and now_db is not None:
+                cfg = self._get_cfg()
+                ok = self._ramp_volume_retry(float(now_db), saved_db, cfg.denon_ramp_steps, cfg.denon_ramp_step_ms)
+                self.clear_volume_guard()
+                return {"ok": ok, "restoredToDb": saved_db, "fromDb": float(now_db)}
+        self.clear_volume_guard()
+        return {"ok": False, "skipped": True, "reason": "denon_offline"}
 
     def _base_url(self, cfg: HouseAudioConfig) -> str:
         host = (cfg.denon_host or "").strip()
@@ -302,6 +351,7 @@ class DenonAvrClient:
         delay_sec = max(0.0, float(step_ms) / 1000.0)
         sent_cmds: list[str] = []
         last_cmd = ""
+        self._last_ramp_db = None
         for i in range(1, n_steps + 1):
             frac = float(i) / float(n_steps)
             step_db = start_db + (end_db - start_db) * frac
@@ -309,12 +359,27 @@ class DenonAvrClient:
             if cmd != last_cmd:
                 res = self.send_command(cmd)
                 if not res.get("ok"):
+                    self._sleep(0.15)
+                    res = self.send_command(cmd)
+                if not res.get("ok"):
                     return bool(sent_cmds)
                 sent_cmds.append(cmd)
                 last_cmd = cmd
+                self._last_ramp_db = round(step_db * 2.0) / 2.0
             if i < n_steps and delay_sec > 0.0:
                 self._sleep(delay_sec)
         return bool(sent_cmds)
+
+    def _ramp_volume_retry(self, start_db: float, end_db: float, steps: int, step_ms: int, attempts: int = 3) -> bool:
+        cur = float(start_db)
+        for attempt in range(max(1, attempts)):
+            if self._ramp_volume(cur, end_db, steps, step_ms):
+                if self._last_ramp_db is None or abs(self._last_ramp_db - end_db) <= 0.6:
+                    return True
+                cur = self._last_ramp_db
+            if attempt + 1 < attempts:
+                self._sleep(0.3)
+        return False
 
     @contextmanager
     def duck_context(self, *, drop_db: float | None = None, force: bool = False) -> Iterator[dict[str, Any]]:
@@ -352,11 +417,13 @@ class DenonAvrClient:
                     if target_db >= current_db - 0.4:
                         info = {"ducked": False, "reason": "at_floor", "volumeDb": current_db}
                     elif self._ramp_volume(current_db, target_db, cfg.denon_ramp_steps, cfg.denon_ramp_step_ms):
+                        actual_ducked = self._last_ramp_db if self._last_ramp_db is not None else target_db
                         self._saved_db = current_db
-                        self._ducked_db = target_db
+                        self._ducked_db = actual_ducked
                         self._duck_depth = 1
                         participating = True
-                        info = {"ducked": True, "fromDb": current_db, "toDb": target_db}
+                        self.save_volume_guard(current_db)
+                        info = {"ducked": True, "fromDb": current_db, "toDb": actual_ducked}
                         self.last_duck_info = {**info, "at": _utc_iso_now()}
                     else:
                         info = {"ducked": False, "reason": "command_failed"}
@@ -375,30 +442,34 @@ class DenonAvrClient:
                         ducked = self._ducked_db
                         self._saved_db = None
                         self._ducked_db = None
-                        if saved is not None and ducked is not None:
-                            st_now = self.get_status()
-                            now_db = st_now.get("volumeDb") if st_now.get("ok") else None
-                            if st_now.get("power") == "ON" and now_db is not None:
-                                if abs(float(now_db) - ducked) <= 1.0:
-                                    self._ramp_volume(
-                                        float(now_db),
-                                        saved,
-                                        cfg_now.denon_ramp_steps,
-                                        cfg_now.denon_ramp_step_ms,
-                                    )
-                                    self.last_duck_info = {
-                                        "ducked": True,
-                                        "restoredToDb": saved,
-                                        "at": _utc_iso_now(),
-                                    }
-                                else:
-                                    self.last_duck_info = {
-                                        "ducked": True,
-                                        "restoreSkipped": "manual_volume_change",
-                                        "nowDb": float(now_db),
-                                        "expectedDuckedDb": ducked,
-                                        "at": _utc_iso_now(),
-                                    }
+                        try:
+                            if saved is not None and ducked is not None:
+                                st_now = self.get_status()
+                                now_db = st_now.get("volumeDb") if st_now.get("ok") else None
+                                if st_now.get("power") == "ON" and now_db is not None:
+                                    if abs(float(now_db) - ducked) <= 1.0:
+                                        restored = self._ramp_volume_retry(
+                                            float(now_db),
+                                            saved,
+                                            cfg_now.denon_ramp_steps,
+                                            cfg_now.denon_ramp_step_ms,
+                                        )
+                                        self.last_duck_info = {
+                                            "ducked": True,
+                                            "restoredToDb": saved,
+                                            "restoreOk": restored,
+                                            "at": _utc_iso_now(),
+                                        }
+                                    else:
+                                        self.last_duck_info = {
+                                            "ducked": True,
+                                            "restoreSkipped": "manual_volume_change",
+                                            "nowDb": float(now_db),
+                                            "expectedDuckedDb": ducked,
+                                            "at": _utc_iso_now(),
+                                        }
+                        finally:
+                            self.clear_volume_guard()
 
 
 def normalize_wav_for_cube(wav_bytes: bytes, target_sr: int = 48_000, target_ch: int = 2) -> bytes:
@@ -965,6 +1036,7 @@ class HouseAudioManager:
             http_get=denon_http_get,
             sleep_fn=sleep_fn,
             allow_network=allow_network,
+            state_dir=root_dir,
         )
         self.cube = FireTvCubeAudioClient(
             http_get=cube_http_get,
@@ -973,6 +1045,16 @@ class HouseAudioManager:
             allow_network=allow_network,
         )
         self.matrix = AudioMatrixStore(root_dir=root_dir)
+        self._probe_cache_ts: float = 0.0
+        self._probe_denon: dict[str, Any] | None = None
+        self._probe_cube: dict[str, Any] | None = None
+        self._last_cube_revive_mono: float = 0.0
+
+    def invalidate_probe_cache(self) -> None:
+        with self._lock:
+            self._probe_cache_ts = 0.0
+            self._probe_denon = None
+            self._probe_cube = None
 
     def get_config(self) -> HouseAudioConfig:
         with self._lock:
@@ -982,6 +1064,9 @@ class HouseAudioManager:
         with self._lock:
             merged = {**self.cfg.to_dict(), **(raw or {})}
             self.cfg = HouseAudioConfig.from_dict(merged)
+            self._probe_cache_ts = 0.0
+            self._probe_denon = None
+            self._probe_cube = None
             return self.cfg
 
     def list_sfx_files(self) -> list[dict[str, Any]]:
@@ -996,6 +1081,27 @@ class HouseAudioManager:
                 continue
             items.append({"name": valid, "bytes": int(p.stat().st_size), "ext": p.suffix.lower()})
         return items
+
+    def _maybe_auto_revive_cube(self, cfg: HouseAudioConfig) -> None:
+        if not self.allow_network or self.adb is None or not cfg.cube_enabled or not cfg.cube_host:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if (now - self._last_cube_revive_mono) < 300.0:
+                return
+            self._last_cube_revive_mono = now
+
+        def _worker() -> None:
+            try:
+                ser = self.cube._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+                st, _ = self.adb._connect_and_status(ser)
+                if st == "device":
+                    self.cube.adb_ensure_service(self.adb, cfg.cube_host, cfg.cube_adb_port, cfg.cube_port)
+                    self.invalidate_probe_cache()
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, name="cube-audio-auto-revive", daemon=True).start()
 
     def resolve_voice_target(
         self,
@@ -1020,7 +1126,10 @@ class HouseAudioManager:
             if inp not in ("MPLAY", "MEDIA PLAYER"):
                 return "s330"
         health = cube_health if cube_health is not None else self.cube.health(cfg.cube_host, cfg.cube_port)
-        return "cube" if health.get("ok") else "s330"
+        res_target = "cube" if health.get("ok") else "s330"
+        if not health.get("ok"):
+            self._maybe_auto_revive_cube(cfg)
+        return res_target
 
     def try_route_voice_pcm(self, mono_pcm: np.ndarray, sr: int, *, kind: str = "tts") -> dict[str, Any]:
         """Route RoomVoice chimes/TTS to Fire TV Cube when active, falling back cleanly to PowerConf S330."""
@@ -1054,6 +1163,7 @@ class HouseAudioManager:
             )
         if res.get("ok"):
             return {"handled": True, "route": "cube", "mode": mode, "durationSec": dur_sec}
+        self._maybe_auto_revive_cube(cfg)
         return {
             "handled": False,
             "route": "s330",
@@ -1202,18 +1312,43 @@ class HouseAudioManager:
         }
         return {**out, "timing": timing}
 
-    def status_dict(self, *, live_probe: bool = True) -> dict[str, Any]:
+    def status_dict(self, *, live_probe: bool = True, force_probe: bool = False) -> dict[str, Any]:
         cfg = self.get_config()
-        denon_st = self.denon.get_status() if live_probe else self.denon.last_status
-        cube_st = (
-            self.cube.health(cfg.cube_host, cfg.cube_port)
-            if (live_probe and cfg.cube_host)
-            else (
+        now = time.monotonic()
+        if live_probe:
+            with self._lock:
+                cache_valid = (
+                    not force_probe
+                    and self._probe_denon is not None
+                    and (now - self._probe_cache_ts) < 10.0
+                )
+                cached_denon = self._probe_denon
+                cached_cube = self._probe_cube
+            if cache_valid:
+                denon_st = cached_denon  # type: ignore[assignment]
+                cube_st = (
+                    cached_cube
+                    if (cfg.cube_host and cached_cube is not None)
+                    else {"ok": False, "unconfigured": True, "error": "Cube IP not configured"}
+                )
+            else:
+                denon_st = self.denon.get_status()
+                cube_st = (
+                    self.cube.health(cfg.cube_host, cfg.cube_port)
+                    if cfg.cube_host
+                    else {"ok": False, "unconfigured": True, "error": "Cube IP not configured"}
+                )
+                with self._lock:
+                    self._probe_denon = denon_st
+                    self._probe_cube = cube_st if cfg.cube_host else None
+                    self._probe_cache_ts = time.monotonic()
+        else:
+            denon_st = self.denon.last_status
+            cube_st = (
                 {"ok": False, "unconfigured": True, "error": "Cube IP not configured"}
                 if not cfg.cube_host
                 else self.cube.last_health
             )
-        )
         return {
             "config": cfg.to_dict(),
             "denon": denon_st,

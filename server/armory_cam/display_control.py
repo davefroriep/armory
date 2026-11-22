@@ -1741,14 +1741,17 @@ class GymDisplayController:
             elif cfg.cube_host:
                 open_tasks["cube"] = lambda: {"cube": self._control_cube("on")}
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(open_tasks)) as pool:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(open_tasks))
+            try:
                 futs = {key: pool.submit(fn) for key, fn in open_tasks.items()}
                 for key, fut in futs.items():
                     try:
-                        results.update(fut.result())
+                        results.update(fut.result(timeout=10.0))
                     except Exception as exc:
                         err_key = "avr" if key == "avr_chain" else key
                         results[err_key] = {"ok": False, "target": err_key, "error": str(exc)}
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
             return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (All 3 TVs, Denon, YouTube Music)"}
         if tgt == "close_gym":
@@ -1764,13 +1767,16 @@ class GymDisplayController:
             if self.get_config().spin.host:
                 close_tasks["spin"] = lambda: self._control_spin("off", sync_denon=False)
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=len(close_tasks)) as pool:
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(close_tasks))
+            try:
                 futs = {key: pool.submit(fn) for key, fn in close_tasks.items()}
                 for key, fut in futs.items():
                     try:
-                        results[key] = fut.result()
+                        results[key] = fut.result(timeout=10.0)
                     except Exception as exc:
                         results[key] = {"ok": False, "target": key, "error": str(exc)}
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
             results["media_pause"] = results["cube"]
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict) and not r.get("skipped"))
             return {"ok": ok, "target": "close_gym", "action": "run", "results": results, "message": "Gym closed"}

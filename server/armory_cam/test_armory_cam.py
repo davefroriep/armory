@@ -1778,7 +1778,7 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertFalse(ping["voice"]["listening"])
 
             # Default & legacy TTS voice normalization + config persistence across service reload
-            self.assertEqual(rv.RoomVoiceConfig().tts_voice, "en-US-AndrewMultilingualNeural")
+            self.assertEqual(rv.RoomVoiceConfig().tts_voice, "kokoro:am_michael")
             self.assertEqual(
                 rv.RoomVoiceConfig.from_dict({"ttsVoice": "en-US-AndrewNeural"}).tts_voice,
                 "en-US-AndrewMultilingualNeural",
@@ -1789,7 +1789,7 @@ class ArmoryCamTests(unittest.TestCase):
             )
             self.assertEqual(
                 rv.RoomVoiceConfig.from_dict({"ttsVoice": "en-US-BrianNeural"}).tts_voice,
-                "en-US-AndrewMultilingualNeural",
+                "kokoro:am_michael",
             )
 
             cfg_res = client.post(
@@ -2863,6 +2863,212 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_delete_clip_rejects_wildcards_and_traversal(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_del_guard_"))
+        try:
+            root = tmp / "camroot"
+            drive_dir = tmp / "drive_clips"
+            svc = ac.ArmoryCamService(root_dir=root, drive_backup_dir=drive_dir)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            day = "2026-11-19"
+            (svc.clips_root / day).mkdir(parents=True, exist_ok=True)
+            (drive_dir / day).mkdir(parents=True, exist_ok=True)
+            fname = "Squat_0_abc120.mp4"
+            local_clip = svc.clips_root / day / fname
+            drive_clip = drive_dir / day / fname
+            local_clip.write_bytes(b"mp4-bytes")
+            drive_clip.write_bytes(b"mp4-bytes")
+            svc.clips_index_path.write_text(
+                json.dumps({"fileName": fname, "lanUrl": f"/clips/{day}/{fname}", "camera": "Rack Cam"}) + "\n",
+                encoding="utf-8",
+            )
+
+            for bad_payload in (
+                {"fileName": "*"},
+                {"fileName": "*.mp4"},
+                {"fileName": f"../{fname}"},
+                {"lanUrl": f"/clips/{day}/*.mp4"},
+                {"lanUrl": "/clips/2026-11-19/Squat_0_abc120.mp4", "fileName": "*.mp4"},
+            ):
+                res = client.post("/api/clip/delete", json=bad_payload)
+                self.assertEqual(res.status_code, 400, msg=str(bad_payload))
+                self.assertFalse(res.get_json()["ok"])
+
+            self.assertTrue(local_clip.is_file())
+            self.assertTrue(drive_clip.is_file())
+            self.assertEqual(len(client.get("/api/clips").get_json()["clips"]), 1)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_cors_origin_enforcement_blocks_external_posts(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_cors_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            evil = client.post("/api/session/start", json={"sessionId": "x"}, headers={"Origin": "https://evil.example"})
+            self.assertEqual(evil.status_code, 403)
+            self.assertIsNone(evil.headers.get("Access-Control-Allow-Origin"))
+            self.assertIsNone(evil.headers.get("Access-Control-Allow-Private-Network"))
+
+            cap = client.post("/api/session/start", json={"sessionId": "s1"}, headers={"Origin": "capacitor://localhost"})
+            self.assertEqual(cap.status_code, 200)
+            self.assertEqual(cap.headers.get("Access-Control-Allow-Origin"), "capacitor://localhost")
+            self.assertIsNone(cap.headers.get("Access-Control-Allow-Private-Network"))
+
+            lan = client.post(
+                "/api/session/stop",
+                json={"sessionId": "s1"},
+                headers={"Origin": "http://192.168.1.50:8766"},
+            )
+            self.assertEqual(lan.status_code, 200)
+            self.assertEqual(lan.headers.get("Access-Control-Allow-Origin"), "http://192.168.1.50:8766")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_sapi_removed_and_prompt_echo_filtering(self) -> None:
+        self.assertFalse(hasattr(rv, "_SapiSynthesizer"))
+        self.assertNotIn("sapi", rv.TTS_VOICES)
+        self.assertEqual(rv.RoomVoiceConfig.from_dict({"ttsVoice": "sapi"}).tts_voice, "kokoro:am_michael")
+        self.assertNotIn('value="sapi"', ac.DASHBOARD_HTML)
+
+        prompt, _hotwords = rv.build_whisper_prompt("armory", ["Bench Press"])
+        long_echo = " ".join(prompt.replace(",", " ").split()[:10])
+        self.assertTrue(rv.is_prompt_echo(long_echo, prompt))
+        for real_cmd in ("Armory Matt just hit a PR", "wake", "log 225 for 10", "Armory next exercise"):
+            self.assertFalse(rv.is_prompt_echo(real_cmd, prompt), msg=real_cmd)
+
+    def test_optiplex_config_backup_and_restore_roundtrip(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_cfg_bkp_"))
+        try:
+            root = tmp / "camroot"
+            drive_dir = tmp / "drive_root" / "Clips"
+            svc = ac.ArmoryCamService(root_dir=root, drive_backup_dir=drive_dir)
+            (root / "shows.json").write_text(json.dumps({"shows": [{"id": "matt_pr"}]}), encoding="utf-8")
+            (root / "tts_secrets.json").write_text(json.dumps({"openaiApiKey": "sk-test-123"}), encoding="utf-8")
+
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            b_res = client.post("/api/config/backup", json={})
+            self.assertEqual(b_res.status_code, 200)
+            b_json = b_res.get_json()
+            self.assertTrue(b_json["ok"])
+            self.assertIn("config.json", b_json["files"])
+            self.assertIn("shows.json", b_json["files"])
+            self.assertIn("tts_secrets.json", b_json["files"])
+
+            bkp_dir = tmp / "drive_root" / "OptiPlex"
+            self.assertTrue((bkp_dir / "manifest.json").is_file())
+            self.assertTrue((bkp_dir / "tts_secrets.json").is_file())
+
+            (root / "shows.json").unlink()
+            (root / "tts_secrets.json").unlink()
+
+            r_res = client.post("/api/config/restore", json={"overwrite": False})
+            self.assertEqual(r_res.status_code, 200)
+            r_json = r_res.get_json()
+            self.assertTrue(r_json["ok"])
+            self.assertIn("shows.json", r_json["restored"])
+            self.assertIn("tts_secrets.json", r_json["restored"])
+            self.assertEqual(json.loads((root / "tts_secrets.json").read_text(encoding="utf-8"))["openaiApiKey"], "sk-test-123")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_denon_partial_ramp_restore_and_manual_override(self) -> None:
+        state: dict[str, object] = {"vol": -16.0, "fail_after": None, "mv_calls": 0}
+
+        def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+            if "formMainZone_MainZoneXmlStatus.xml" in url:
+                xml = (
+                    f"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect>"
+                    f"<MasterVolume><value>{float(state['vol']):.1f}</value></MasterVolume><Mute><value>off</value></Mute></item>"
+                )
+                return 200, xml.encode("utf-8")
+            if "?" in url:
+                cmd = url.split("?", 1)[1]
+                if cmd.startswith("MV"):
+                    state["mv_calls"] = int(state["mv_calls"]) + 1
+                    fail_after = state["fail_after"]
+                    if fail_after is not None and int(state["mv_calls"]) > int(fail_after):
+                        return 500, b""
+                    raw = cmd[2:]
+                    val = int(raw[:2]) + (0.5 if len(raw) == 3 and raw[2] == "5" else 0.0)
+                    state["vol"] = val - 80.0
+            return 200, b""
+
+        cfg = ha.HouseAudioConfig(
+            denon_enabled=True,
+            denon_host="192.168.1.15",
+            denon_duck_enabled=True,
+            denon_duck_threshold_db=-20.0,
+            denon_duck_drop_db=5.0,
+            denon_ramp_steps=4,
+            denon_ramp_step_ms=0,
+        )
+        denon = ha.DenonAvrClient(lambda: cfg, http_get=fake_get, sleep_fn=lambda _s: None, allow_network=True)
+
+        # Partial duck-down (only first 2 MV commands succeed, volume reaches -18.5):
+        # exit still restores cleanly to -16.0 rather than misclassifying as manual knob change.
+        state["fail_after"] = 2
+        with denon.duck_context() as d1:
+            self.assertTrue(d1["ducked"])
+            state["fail_after"] = None
+        self.assertAlmostEqual(float(state["vol"]), -16.0)
+        self.assertIsNone(denon.last_duck_info.get("restoreSkipped"))
+
+        # External manual knob movement mid-duck is still preserved and never overwritten
+        with denon.duck_context() as d2:
+            self.assertTrue(d2["ducked"])
+            state["vol"] = -12.0
+        self.assertAlmostEqual(float(state["vol"]), -12.0)
+        self.assertEqual(denon.last_duck_info.get("restoreSkipped"), "manual_volume_change")
+
+    def test_adb_status_nonblocking_and_failed_sleep_rearms_retry(self) -> None:
+        def offline_runner(cmd: list[str], _to: float) -> tuple[int, str, str]:
+            args = cmd[1:]
+            if args[:1] == ["devices"]:
+                return 0, "List of devices attached\n192.168.1.204:5555\toffline\n", ""
+            return 0, "", ""
+
+        adb = ac.FireTvAdbController(adb_bin="adb.exe", runner=offline_runner, settle_sec=0.0, wol_wait_sec=0.0)
+        cfg = ac.WallboardConfig(enabled=True, fire_tv_host="192.168.1.204")
+
+        # 1. Holding op_lock from another thread must not block status_dict()
+        held = threading.Event()
+        release = threading.Event()
+
+        def blocker() -> None:
+            with adb.op_lock:
+                held.set()
+                release.wait(timeout=2.0)
+
+        t = threading.Thread(target=blocker, daemon=True)
+        t.start()
+        try:
+            self.assertTrue(held.wait(timeout=1.0))
+            t0 = time.monotonic()
+            st = adb.status_dict(cfg)
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 0.2)
+            self.assertEqual(st["fireTvHost"], "192.168.1.204")
+        finally:
+            release.set()
+            t.join(timeout=1.0)
+
+        # 2. Failed auto-sleep on offline TV re-arms a backoff retry rather than clearing pending sleep
+        adb.tv_awake_requested = True
+        now_ms = int(time.time() * 1000)
+        adb.pending_sleep_at_ms = now_ms - 1000
+        res = adb.sleep_now(cfg, reason="workout_end", only_if_pending=True)
+        self.assertFalse(res["ok"])
+        self.assertIsNotNone(adb.pending_sleep_at_ms)
+        self.assertGreater(adb.pending_sleep_at_ms or 0, now_ms)
+        self.assertEqual(adb._sleep_retry_count, 1)
 
 
 class ShowDirectorTests(unittest.TestCase):

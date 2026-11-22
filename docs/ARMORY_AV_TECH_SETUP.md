@@ -9,10 +9,14 @@ Living hardware/A/V topology reference for Dave's home gym (**The Armory**) so A
 - **Primary Training Controller:** **Armory Fit** runs strictly as a native Android APK (`com.froriep.armoryfit`) on Dave's **Google Pixel**.
 - **Gym Wi-Fi & Static/Reserved Hosts:**
   - `192.168.1.152` — **Dell OptiPlex** (`i7-4790` / `GTX 1650`, `S:\` `500 GB`, Windows daily driver, **never sleeps**). Runs `ArmoryCamDVR` on port `8766` (scheduled logon task, zero UAC). Connected locally to Hisense HDMI 1 + desk keyboard/mouse + **Anker PowerConf S330** USB speakerphone (`Room Voice Mic` + Windows dictation).
-  - `192.168.1.15` — **Denon AVR-3313CI** on wired Ethernet (Telnet `:23`, HTTP `:80`, UPnP `:8080`).
+  - `192.168.1.15` — **Denon AVR-3313CI** on wired Ethernet (HTTP `:80` `/goform/...`, UPnP `:8080`).
+  - `192.168.1.151` — **Fire TV Cube** (ADB `:5555` + `ArmoryAudioService` mixer APK on `:8767`).
+  - `192.168.1.230` — **Hisense 43" 43E6QF** Main TV (ADB `:5555`, MAC `bc:09:b9:e7:35:26`, `HDMI 1` OptiPlex / `HDMI 2` Denon).
+  - `192.168.1.220` — **TCL Roku TV (`1080p`)** SmartSpin TV (Roku ECP `:8060`, MAC `44:d8:78:7c:70:99`, `InputHDMI1`).
   - `192.168.1.13` — **Armory-Rack** Wyze Cam v3 (`Thingino` open firmware, `1920×1080 H.264 @ 25 fps + AAC`, `rtsp://.../ch0`).
   - `192.168.1.14` — **Armory-Smith** Wyze Cam v3 (`Thingino` open firmware, `1920×1080 H.264 @ 25 fps + AAC`, `rtsp://.../ch0`).
   - `192.168.1.204` — **Armory Wallboard** 32" Toshiba Fire TV Edition (`TF-32A710U21` / `AFTBAMR311`, ADB `:5555`, Wi-Fi MAC `08:97:98:1f:4c:2b`, Ethernet MAC `08:97:98:22:59:6b`).
+  - **Shelly / FX HTTP Hooks:** Dual-zone Rack & Smith lights + fogger URLs configured in `S:\ArmoryCam\shows.json` (`fxHooks`).
 - **Phone Usage During Training:** Pixel stays close to Dave to log sets and push live state to OptiPlex `:8766`.
 
 ---

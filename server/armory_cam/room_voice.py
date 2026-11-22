@@ -10,8 +10,8 @@ stays unblocked.
 from __future__ import annotations
 
 import asyncio
-import base64
 from collections import Counter, OrderedDict, deque
+import concurrent.futures
 import ctypes
 from dataclasses import dataclass
 import hashlib
@@ -47,19 +47,21 @@ HOST_API_PREFERENCE = (
     "Windows DirectSound",
     "Windows WDM-KS",
 )
-DEFAULT_TTS_VOICE = "en-US-AndrewMultilingualNeural"
+DEFAULT_TTS_VOICE = "kokoro:am_michael"
 TTS_VOICES = (
     "kokoro:am_michael",
     "kokoro:am_onyx",
     "kokoro:am_fenrir",
     "en-US-AndrewMultilingualNeural",
     "en-US-AvaMultilingualNeural",
-    "sapi",
 )
 _LEGACY_TTS_VOICE_MAP = {
     "en-US-AndrewNeural": "en-US-AndrewMultilingualNeural",
     "en-US-AvaNeural": "en-US-AvaMultilingualNeural",
+    "sapi": DEFAULT_TTS_VOICE,
 }
+_KOKORO_NEGATIVE_TTL_SEC = 60.0
+_EDGE_TTS_TIMEOUT_SEC = 3.5
 PREWARM_TTS_PHRASES: tuple[str, ...] = (
     "Armory room mic ready",
     "Armory mic on",
@@ -119,6 +121,10 @@ HALLUCINATION_EXACT = frozenset({
     "hmm",
     "uh",
     "um",
+    "blank audio",
+    "blankaudio",
+    "youre welcome",
+    "you're welcome",
 })
 
 
@@ -148,6 +154,18 @@ def is_hallucination(text: str) -> bool:
         if top_count * 5 >= len(words) * 3:
             return True
     return False
+
+
+def is_prompt_echo(text: str, prompt: str) -> bool:
+    """Detect when Whisper regurgitates a long run of the `initial_prompt` vocabulary list."""
+    t_toks = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    if len(t_toks) < 8:
+        return False
+    p_toks = set(re.findall(r"[a-z0-9]+", str(prompt or "").lower()))
+    if not p_toks:
+        return False
+    matched = sum(1 for tok in t_toks if tok in p_toks)
+    return (matched / float(len(t_toks))) >= 0.70
 
 
 def normalize_wake_text(text: str) -> str:
@@ -211,12 +229,9 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
     """Build concise Whisper `initial_prompt` + `hotwords` seeded with gym commands and current exercises."""
     wake = (wake_word or "armory").strip() or "armory"
     core = [
-        wake,
-        "225 for 10",
-        "135 for 8",
         "check",
         "done",
-        "rpe 8.5",
+        "rpe",
         "next exercise",
         "add set",
         "skip rest",
@@ -248,6 +263,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "smith lights",
     ]
     seen = {x.lower() for x in core}
+    seen.add(wake.lower())
     extras: list[str] = []
     for raw in bias_phrases:
         clean = re.sub(r"\s+", " ", str(raw or "")).strip()
@@ -1063,102 +1079,63 @@ def prepare_speaker_pcm(
     return padded
 
 
-class _SapiSynthesizer:
-    """Persistent hidden PowerShell `System.Speech` WAV synthesizer (offline fallback at natural rate)."""
+_SHARED_KOKORO_LOCK = threading.Lock()
+_SHARED_KOKORO_CACHE: dict[str, tuple[Any, str]] = {}
+_SHARED_KOKORO_FAIL_UNTIL: dict[str, tuple[float, str]] = {}
+_EDGE_FALLBACK_VOICE = "en-US-AndrewMultilingualNeural"
 
-    def __init__(self, max_cache: int = 48) -> None:
-        self._lock = threading.Lock()
-        self._proc: subprocess.Popen[str] | None = None
-        self._cache: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
-        self._max_cache = max_cache
 
-    def close(self) -> None:
-        with self._lock:
-            if self._proc is not None:
-                try:
-                    self._proc.terminate()
-                    self._proc.wait(timeout=2)
-                except Exception:
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                self._proc = None
+def get_shared_kokoro(models_dir: Path | None) -> tuple[Any, str]:
+    """Load or return the process-wide shared Kokoro ONNX session (GPU/CPU) with 60s negative cache."""
+    if models_dir is None:
+        raise FileNotFoundError("Kokoro models_dir not configured")
+    kokoro_dir = (Path(models_dir) / "kokoro") if (Path(models_dir) / "kokoro").is_dir() else Path(models_dir)
+    model_p = (kokoro_dir / "kokoro-v1.0.onnx").resolve()
+    voices_p = (kokoro_dir / "voices-v1.0.bin").resolve()
+    cache_key = f"{model_p}|{voices_p}"
+    now = time.monotonic()
+    with _SHARED_KOKORO_LOCK:
+        cached = _SHARED_KOKORO_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        fail_entry = _SHARED_KOKORO_FAIL_UNTIL.get(cache_key)
+        if fail_entry is not None and now < fail_entry[0]:
+            raise RuntimeError(f"Kokoro temporarily disabled after failure: {fail_entry[1]}")
+        try:
+            if not model_p.is_file() or not voices_p.is_file():
+                raise FileNotFoundError(f"Kokoro model files not found under {kokoro_dir}")
+            _register_cuda_dll_dirs()
+            import onnxruntime as ort
+            from kokoro_onnx import Kokoro
 
-    def _ensure_proc(self) -> subprocess.Popen[str]:
-        if self._proc is not None and self._proc.poll() is None:
-            return self._proc
-        ps_script = (
-            "Add-Type -AssemblyName System.Speech\n"
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer\n"
-            "$s.Rate = 0\n"
-            "while (($line = [Console]::In.ReadLine()) -ne $null) {\n"
-            "  if ($line -eq '') { continue }\n"
-            "  $ms = New-Object System.IO.MemoryStream\n"
-            "  $s.SetOutputToWaveStream($ms)\n"
-            "  $s.Speak($line)\n"
-            "  $s.SetOutputToNull()\n"
-            "  [Console]::Out.WriteLine([Convert]::ToBase64String($ms.ToArray()))\n"
-            "  [Console]::Out.Flush()\n"
-            "  $ms.Dispose()\n"
-            "}\n"
-        )
-        self._proc = subprocess.Popen(
-            ["powershell", "-NoProfile", "-Command", ps_script],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            **_no_window_kwargs(),
-        )
-        return self._proc
-
-    def synthesize(self, text: str) -> tuple[np.ndarray, int] | None:
-        clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
-        if not clean:
-            return None
-        key = clean.lower()
-        with self._lock:
-            cached = self._cache.get(key)
-            if cached is not None:
-                self._cache.move_to_end(key)
-                return cached
-            try:
-                proc = self._ensure_proc()
-                assert proc.stdin is not None and proc.stdout is not None
-                proc.stdin.write(clean + "\n")
-                proc.stdin.flush()
-                b64 = proc.stdout.readline().strip()
-                if not b64:
-                    raise RuntimeError("Empty TTS response")
-                wav_bytes = base64.b64decode(b64)
-                with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
-                    sr = wf.getframerate()
-                    ch = wf.getnchannels()
-                    pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
-                    if ch > 1:
-                        pcm = pcm.reshape(-1, ch).mean(axis=1)
-                self._cache[key] = (pcm, sr)
-                while len(self._cache) > self._max_cache:
-                    self._cache.popitem(last=False)
-                return pcm, sr
-            except Exception:
-                if self._proc is not None:
-                    try:
-                        self._proc.kill()
-                    except Exception:
-                        pass
-                    self._proc = None
-                return None
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            sess = ort.InferenceSession(
+                str(model_p),
+                sess_options=so,
+                providers=[
+                    ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
+                    "CPUExecutionProvider",
+                ],
+            )
+            active = list(sess.get_providers())
+            dev = "cuda" if "CUDAExecutionProvider" in active else "cpu"
+            kokoro = Kokoro.from_session(sess, str(voices_p))
+            kokoro.create("50 for 10, check", voice="am_michael", speed=1.10, lang="en-us")
+            _SHARED_KOKORO_CACHE[cache_key] = (kokoro, dev)
+            _SHARED_KOKORO_FAIL_UNTIL.pop(cache_key, None)
+            return kokoro, dev
+        except Exception as exc:
+            _SHARED_KOKORO_FAIL_UNTIL[cache_key] = (time.monotonic() + _KOKORO_NEGATIVE_TTL_SEC, str(exc))
+            raise
 
 
 class _NeuralTtsSynthesizer:
-    """Microsoft Neural `edge-tts` synthesizer with persistent WAV cache + SAPI5 fallback."""
+    """Kokoro GPU + Microsoft Neural `edge-tts` synthesizer with persistent WAV cache (zero SAPI)."""
 
     def __init__(
         self,
         cache_dir: Path | None = None,
-        sapi_fallback: _SapiSynthesizer | None = None,
         max_cache: int = 64,
         models_dir: Path | None = None,
     ) -> None:
@@ -1166,12 +1143,12 @@ class _NeuralTtsSynthesizer:
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir = Path(models_dir) if models_dir is not None else None
-        self._sapi = sapi_fallback or _SapiSynthesizer()
         self._lock = threading.Lock()
         self._kokoro_lock = threading.Lock()
         self._kokoro: Any = None
         self._kokoro_device: str = ""
         self._kokoro_error: str | None = None
+        self._kokoro_fail_until: float = 0.0
         self._cache: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
         self._max_cache = max_cache
 
@@ -1194,7 +1171,6 @@ class _NeuralTtsSynthesizer:
         with self._kokoro_lock:
             self._kokoro = None
             self._kokoro_device = ""
-        self._sapi.close()
 
     @staticmethod
     def _cache_key(text: str, voice: str, speed: float = 1.0) -> str:
@@ -1206,7 +1182,7 @@ class _NeuralTtsSynthesizer:
 
     def get_cached(self, text: str, voice: str, speed: float = 1.0) -> tuple[np.ndarray, int] | None:
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
-        if not clean or voice == "sapi":
+        if not clean:
             return None
         key = self._cache_key(clean, voice, speed=speed)
         with self._lock:
@@ -1254,37 +1230,19 @@ class _NeuralTtsSynthesizer:
         with self._kokoro_lock:
             if self._kokoro is not None:
                 return self._kokoro
+            now = time.monotonic()
+            if now < self._kokoro_fail_until:
+                raise RuntimeError(self._kokoro_error or "Kokoro temporarily unavailable")
             try:
-                if self.models_dir is None:
-                    raise FileNotFoundError("Kokoro models_dir not configured")
-                model_p = self.models_dir / "kokoro" / "kokoro-v1.0.onnx"
-                voices_p = self.models_dir / "kokoro" / "voices-v1.0.bin"
-                if not model_p.is_file() or not voices_p.is_file():
-                    raise FileNotFoundError(f"Kokoro model files not found under {self.models_dir / 'kokoro'}")
-                _register_cuda_dll_dirs()
-                import onnxruntime as ort
-                from kokoro_onnx import Kokoro
-
-                so = ort.SessionOptions()
-                so.log_severity_level = 3
-                sess = ort.InferenceSession(
-                    str(model_p),
-                    sess_options=so,
-                    providers=[
-                        ("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}),
-                        "CPUExecutionProvider",
-                    ],
-                )
-                active = list(sess.get_providers())
-                dev = "cuda" if "CUDAExecutionProvider" in active else "cpu"
-                kokoro = Kokoro.from_session(sess, str(voices_p))
-                kokoro.create("50 for 10, check", voice="am_michael", speed=1.10, lang="en-us")
+                kokoro, dev = get_shared_kokoro(self.models_dir)
                 self._kokoro = kokoro
                 self._kokoro_device = dev
                 self._kokoro_error = None
+                self._kokoro_fail_until = 0.0
                 return kokoro
             except Exception as exc:
                 self._kokoro_error = str(exc)
+                self._kokoro_fail_until = time.monotonic() + _KOKORO_NEGATIVE_TTL_SEC
                 raise
 
     def _synth_kokoro_pcm(self, text: str, voice: str, speed: float = 1.0) -> tuple[np.ndarray, int]:
@@ -1317,7 +1275,7 @@ class _NeuralTtsSynthesizer:
         last_exc: Exception | None = None
         for attempt in range(1, max(1, attempts) + 1):
             try:
-                mp3_bytes = asyncio.run(_fetch())
+                mp3_bytes = asyncio.run(asyncio.wait_for(_fetch(), timeout=_EDGE_TTS_TIMEOUT_SEC))
                 if not mp3_bytes:
                     raise RuntimeError("Empty edge-tts audio")
                 break
@@ -1350,29 +1308,35 @@ class _NeuralTtsSynthesizer:
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
             return None
-        if voice == "sapi":
-            return self._sapi.synthesize(clean)
-        cached = self.get_cached(clean, voice, speed=speed)
+        eff_voice = _LEGACY_TTS_VOICE_MAP.get(voice, voice)
+        if eff_voice not in TTS_VOICES and not self.is_kokoro_voice(eff_voice):
+            eff_voice = DEFAULT_TTS_VOICE
+        cached = self.get_cached(clean, eff_voice, speed=speed)
         if cached is not None:
             return cached
-        if self.is_kokoro_voice(voice):
+        if self.is_kokoro_voice(eff_voice):
             try:
-                pcm, sr = self._synth_kokoro_pcm(clean, voice, speed=speed)
-                self._put_cached(clean, voice, pcm, sr, speed=speed)
+                pcm, sr = self._synth_kokoro_pcm(clean, eff_voice, speed=speed)
+                self._put_cached(clean, eff_voice, pcm, sr, speed=speed)
                 return pcm, sr
             except Exception:
                 try:
-                    pcm, sr = self._synth_edge_pcm(clean, DEFAULT_TTS_VOICE, speed=speed)
-                    self._put_cached(clean, DEFAULT_TTS_VOICE, pcm, sr, speed=speed)
+                    pcm, sr = self._synth_edge_pcm(clean, _EDGE_FALLBACK_VOICE, speed=speed)
+                    self._put_cached(clean, _EDGE_FALLBACK_VOICE, pcm, sr, speed=speed)
                     return pcm, sr
                 except Exception:
-                    return self._sapi.synthesize(clean)
+                    return None
         try:
-            pcm, sr = self._synth_edge_pcm(clean, voice, speed=speed)
-            self._put_cached(clean, voice, pcm, sr, speed=speed)
+            pcm, sr = self._synth_edge_pcm(clean, eff_voice, speed=speed)
+            self._put_cached(clean, eff_voice, pcm, sr, speed=speed)
             return pcm, sr
         except Exception:
-            return self._sapi.synthesize(clean)
+            try:
+                pcm, sr = self._synth_kokoro_pcm(clean, DEFAULT_TTS_VOICE, speed=speed)
+                self._put_cached(clean, DEFAULT_TTS_VOICE, pcm, sr, speed=speed)
+                return pcm, sr
+            except Exception:
+                return None
 
 
 def _classify_ab_trial(trial: dict[str, Any]) -> str:
@@ -1715,6 +1679,9 @@ class RoomVoiceService:
         self._stream_sr: int = 48_000
         self._stream_dev_name: str = ""
         self._stream_host_api: str = ""
+        self._wasapi_probe_misses: int = 0
+        self._host_api_diag_logged: bool = False
+        self._local_cmd_pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._detector = UtteranceDetector(
             vad_threshold=self.cfg.vad_threshold,
             min_speech_ms=self.cfg.min_speech_ms,
@@ -1722,10 +1689,9 @@ class RoomVoiceService:
             max_utterance_sec=self.cfg.max_utterance_sec,
             rms_gate=self.cfg.rms_gate,
         )
-        self._sapi = _SapiSynthesizer()
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
         models_dir = (root_dir / "models") if root_dir is not None else None
-        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, sapi_fallback=self._sapi, models_dir=models_dir)
+        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, models_dir=models_dir)
         self._winmm_player = _WinMmSpeakerPlayer() if sys.platform == "win32" else None
         self.ab = VoiceAbTracker(root_dir=root_dir)
 
@@ -1757,6 +1723,13 @@ class RoomVoiceService:
                 return
             self._started = True
             self._stop_event.clear()
+            self._wasapi_probe_misses = 0
+            self._host_api_diag_logged = False
+            if self._local_cmd_pool is None:
+                self._local_cmd_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="armory-voice-cmd",
+                )
             if self.cfg.enabled:
                 self._ensure_model_loading_locked()
             t_cap = threading.Thread(target=self._capture_supervisor_loop, name="armory-voice-cap", daemon=True)
@@ -1785,6 +1758,10 @@ class RoomVoiceService:
         for t in self._worker_threads:
             t.join(timeout=1.5)
         self._worker_threads.clear()
+        pool = self._local_cmd_pool
+        self._local_cmd_pool = None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def stop_s330_playback(self) -> None:
         """Cancel any active PowerConf S330 speaker playback cleanly."""
@@ -1801,6 +1778,9 @@ class RoomVoiceService:
             self.cfg = next_cfg
             self.context_wake_word = next_cfg.wake_word
             self._detector.configure(next_cfg)
+            if dev_changed:
+                self._wasapi_probe_misses = 0
+                self._host_api_diag_logged = False
             if model_changed:
                 self._model = None
                 self._model_size_loaded = ""
@@ -1812,7 +1792,6 @@ class RoomVoiceService:
                 and self._started
                 and self._allow_hardware_audio
                 and next_cfg.speaker_readback
-                and next_cfg.tts_voice != "sapi"
             ):
                 threading.Thread(target=self._prewarm_tts_worker, name="armory-voice-ttswarm", daemon=True).start()
             self._bump_status_locked()
@@ -2162,7 +2141,7 @@ class RoomVoiceService:
             return out_dev
 
     def synthesize_tts_pcm(self, text: str, voice: str | None = None) -> tuple[np.ndarray, int] | None:
-        """Synthesize speech into `(mono_float32_pcm, sample_rate)` using configured neural/SAPI voice."""
+        """Synthesize speech into `(mono_float32_pcm, sample_rate)` using configured neural voice."""
         clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
         if not clean:
             return None
@@ -2182,6 +2161,8 @@ class RoomVoiceService:
             return False
         duck_ctx_factory = None
         if allow_router and self._house_audio_router is not None:
+            est_dur = float(mono_pcm.size) / float(max(1, src_sr))
+            self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + est_dur + 0.70)
             try:
                 route_res = self._house_audio_router(mono_pcm, src_sr, kind=kind)
             except Exception as exc:
@@ -2189,8 +2170,8 @@ class RoomVoiceService:
                 route_res = None
             if isinstance(route_res, dict):
                 if route_res.get("handled"):
-                    dur = float(route_res.get("durationSec") or (float(mono_pcm.size) / float(max(1, src_sr))))
-                    self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur + 0.70)
+                    # Blocking HTTP play finished; hold mic closed briefly for room reverb tail only.
+                    self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.55)
                     return True
                 duck_ctx_factory = route_res.get("duckContext")
         if not self._allow_hardware_audio:
@@ -2282,13 +2263,20 @@ class RoomVoiceService:
                     if rendered:
                         pcm, sr = rendered
                         self._play_pcm_blocking(pcm, sr, lead_ms=160, tail_ms=120, target_peak=0.84, kind="tts")
+                    else:
+                        with self.lock:
+                            cached_chime = self._commit_chime_cache
+                        if cached_chime is None:
+                            cached_chime = _load_commit_chime_pcm(self._root_dir)
+                            with self.lock:
+                                self._commit_chime_cache = cached_chime
+                        cpcm, csr = cached_chime
+                        self._play_pcm_blocking(cpcm, csr, lead_ms=140, tail_ms=80, target_peak=0.72, kind="chime")
             except Exception as exc:
                 self.log.debug("Speaker worker error: %s", exc)
 
     def _prewarm_tts_worker(self) -> None:
         voice = self.cfg.tts_voice
-        if voice == "sapi":
-            return
         if getattr(self._tts, "is_kokoro_voice", lambda _v: False)(voice):
             try:
                 self._tts._ensure_kokoro()
@@ -2383,7 +2371,8 @@ class RoomVoiceService:
         eff_speed = float(speed or 1.0)
         if self._started:
             try:
-                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 2.4)
+                est_dur = min(2.4, max(0.9, 0.70 + 0.055 * len(clean)))
+                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + est_dur)
                 item: tuple[Any, ...] = (clean, voice, eff_speed) if abs(eff_speed - 1.0) >= 0.01 else (clean, voice)
                 self._speaker_queue.put_nowait(("tts", item))
                 return True
@@ -2397,24 +2386,43 @@ class RoomVoiceService:
 
     # ---------- capture & ASR loops ----------
 
-    def _open_stream(self) -> bool:
+    def _open_stream(self, *, force_reinit: bool = False) -> bool:
         with self._audio_lock:
             if self._stream is not None:
                 return True
             with _PORTAUDIO_LOCK:
-                try:
-                    sd._terminate()
-                    sd._initialize()
-                except Exception:
-                    pass
-                snap = list_audio_devices(force_refresh=True)
-            dev = resolve_audio_device("in", self.cfg.device_match, snap)
+                if force_reinit:
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
+                snap = list_audio_devices(force_refresh=force_reinit)
+                dev = resolve_audio_device("in", self.cfg.device_match, snap)
+                if dev is None and not force_reinit:
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
+                    snap = list_audio_devices(force_refresh=True)
+                    dev = resolve_audio_device("in", self.cfg.device_match, snap)
             if dev is None:
                 with self.lock:
                     self.last_error = f"Audio input '{self.cfg.device_match}' not connected"
                     self.listening = False
                     self._bump_status_locked()
                 return False
+
+            if dev["hostApi"] != "Windows WASAPI" and not self._host_api_diag_logged:
+                self._host_api_diag_logged = True
+                q = (self.cfg.device_match or "").lower()
+                avail = [
+                    f"{d.get('name')} [{d.get('hostApi')}]"
+                    for d in snap.get("inputs", [])
+                    if not q or q in str(d.get("name", "")).lower()
+                ]
+                self.log.info("WASAPI not chosen for '%s'; candidates=%s", self.cfg.device_match, avail)
 
             sr = int(dev["sampleRate"] or 48_000)
             max_ch = max(1, int(dev["channels"] or 1))
@@ -2466,6 +2474,8 @@ class RoomVoiceService:
                     self._stream_sr = sr
                     self._stream_dev_name = dev["name"]
                     self._stream_host_api = dev["hostApi"]
+                    if dev["hostApi"] == "Windows WASAPI":
+                        self._wasapi_probe_misses = 0
                     self._detector.reset()
                     with self.lock:
                         self.listening = True
@@ -2476,6 +2486,13 @@ class RoomVoiceService:
                 except Exception as exc:
                     last_err = str(exc)
 
+            if not force_reinit:
+                with _PORTAUDIO_LOCK:
+                    try:
+                        sd._terminate()
+                        sd._initialize()
+                    except Exception:
+                        pass
             with self.lock:
                 self.listening = False
                 self.last_error = last_err or f"Could not open {dev['name']}"
@@ -2507,13 +2524,17 @@ class RoomVoiceService:
 
     def _capture_supervisor_loop(self) -> None:
         last_wasapi_probe = time.monotonic()
+        probe_intervals = (30.0, 120.0, 600.0)
+        pending_force_reinit = False
         while not self._stop_event.is_set():
             want = self.should_capture_now()
             if want:
                 if self._stream is None:
-                    if not self._open_stream():
+                    if not self._open_stream(force_reinit=pending_force_reinit):
+                        pending_force_reinit = False
                         self._stop_event.wait(2.5)
                         continue
+                    pending_force_reinit = False
                     last_wasapi_probe = time.monotonic()
                 else:
                     # Check stream health
@@ -2525,15 +2546,21 @@ class RoomVoiceService:
                         self._close_stream()
                         self._stop_event.wait(1.0)
                         continue
-                    # If on WDM-KS fallback (RDP) and currently idle, periodically check if WASAPI returned
+                    # If on WDM-KS fallback (RDP) and idle, probe WASAPI with exponential backoff (stop after 3 misses)
                     if (
                         self._stream_host_api == "Windows WDM-KS"
+                        and self._wasapi_probe_misses < len(probe_intervals)
                         and not self._detector._in_speech
-                        and (time.monotonic() - last_wasapi_probe) >= 30.0
+                        and (time.time() * 1000.0) >= self.armed_until_ms
+                        and time.monotonic() >= self._mute_until_mono
                     ):
-                        last_wasapi_probe = time.monotonic()
-                        self._close_stream()
-                        continue
+                        interval = probe_intervals[self._wasapi_probe_misses]
+                        if (time.monotonic() - last_wasapi_probe) >= interval:
+                            self._wasapi_probe_misses += 1
+                            last_wasapi_probe = time.monotonic()
+                            pending_force_reinit = True
+                            self._close_stream()
+                            continue
             else:
                 if self._stream is not None:
                     self._close_stream()
@@ -2550,27 +2577,32 @@ class RoomVoiceService:
             model = self._model
         prompt, hotwords = build_whisper_prompt(wake, phrases)
         if fn is not None:
-            return str(fn(audio16, prompt, hotwords) or "").strip()
-        if model is None:
+            raw = str(fn(audio16, prompt, hotwords) or "").strip()
+        elif model is None:
             return ""
-        prepared = prepare_asr_audio(audio16)
-        segs, _info = model.transcribe(
-            prepared,
-            language="en",
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            condition_on_previous_text=False,
-            vad_filter=False,
-            no_speech_threshold=0.72,
-            log_prob_threshold=-1.2,
-            repetition_penalty=1.15,
-            no_repeat_ngram_size=3,
-            max_new_tokens=36,
-            initial_prompt=prompt,
-            hotwords=hotwords,
-        )
-        return " ".join(s.text.strip() for s in segs).strip()
+        else:
+            prepared = prepare_asr_audio(audio16)
+            segs, _info = model.transcribe(
+                prepared,
+                language="en",
+                beam_size=1,
+                best_of=1,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                vad_filter=False,
+                no_speech_threshold=0.72,
+                log_prob_threshold=-1.2,
+                repetition_penalty=1.15,
+                no_repeat_ngram_size=3,
+                max_new_tokens=36,
+                initial_prompt=prompt,
+                hotwords=hotwords,
+            )
+            raw = " ".join(s.text.strip() for s in segs).strip()
+        if raw and is_prompt_echo(raw, prompt):
+            self.log.debug("Dropped Whisper prompt-echo hallucination: %s", raw)
+            return ""
+        return raw
 
     def _asr_worker_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -2589,4 +2621,11 @@ class RoomVoiceService:
             dt_ms = int(round((time.perf_counter() - t0) * 1000.0))
             if not text or is_hallucination(text):
                 continue
+            pool = self._local_cmd_pool
+            if pool is not None:
+                try:
+                    pool.submit(self._emit_transcript, text, dt_ms, False)
+                    continue
+                except Exception:
+                    pass
             self._emit_transcript(text, latency_ms=dt_ms, force_emit=False)

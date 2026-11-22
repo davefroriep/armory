@@ -14,17 +14,21 @@ import base64
 import bisect
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+import ctypes
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import glob
 import json
 import logging
+import logging.handlers
 import math
 import os
 from pathlib import Path
 import queue
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -39,6 +43,7 @@ import uuid
 import cv2
 from flask import Flask, Response, jsonify, request
 import numpy as np
+from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
 try:
@@ -711,6 +716,86 @@ def _subprocess_no_window_kwargs() -> dict[str, Any]:
     return {}
 
 
+_WIN_JOB_LOCK = threading.Lock()
+_WIN_JOB_HANDLE: int | None = None
+
+
+def _ensure_windows_kill_on_close_job() -> int | None:
+    """Create a process-wide Windows Job Object with KILL_ON_JOB_CLOSE so hard kills never orphan ffmpeg."""
+    global _WIN_JOB_HANDLE
+    if os.name != "nt":
+        return None
+    with _WIN_JOB_LOCK:
+        if _WIN_JOB_HANDLE is not None:
+            return _WIN_JOB_HANDLE or None
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            k32.CreateJobObjectW.restype = ctypes.c_void_p
+            k32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            k32.SetInformationJobObject.restype = ctypes.c_int
+            k32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            k32.AssignProcessToJobObject.restype = ctypes.c_int
+
+            class _IO_COUNTERS(ctypes.Structure):
+                _fields_ = [("r", ctypes.c_uint64 * 6)]
+
+            class _BASIC(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", ctypes.c_uint32),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", ctypes.c_uint32),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", ctypes.c_uint32),
+                    ("SchedulingClass", ctypes.c_uint32),
+                ]
+
+            class _EXTENDED(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", _BASIC),
+                    ("IoInfo", _IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            hjob = k32.CreateJobObjectW(None, None)
+            if not hjob:
+                _WIN_JOB_HANDLE = 0
+                return None
+            info = _EXTENDED()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = k32.SetInformationJobObject(hjob, 9, ctypes.byref(info), ctypes.sizeof(info))
+            if not ok:
+                k32.CloseHandle(hjob)
+                _WIN_JOB_HANDLE = 0
+                return None
+            _WIN_JOB_HANDLE = int(hjob)
+            return _WIN_JOB_HANDLE
+        except Exception:
+            _WIN_JOB_HANDLE = 0
+            return None
+
+
+def _assign_child_to_job(proc: subprocess.Popen[Any]) -> None:
+    if os.name != "nt" or proc is None:
+        return
+    hjob = _ensure_windows_kill_on_close_job()
+    if not hjob:
+        return
+    handle = getattr(proc, "_handle", None)
+    if not handle:
+        return
+    try:
+        ctypes.windll.kernel32.AssignProcessToJobObject(ctypes.c_void_p(hjob), ctypes.c_void_p(int(handle)))
+    except Exception:
+        pass
+
+
 def parse_segment_start_ms(file_name: str) -> int | None:
     """Parse local wall-clock epoch ms from FFmpeg `-strftime 1` name `seg_YYYYMMDD_HHMMSS.ts`."""
     m = SEG_NAME_RE.match(file_name)
@@ -1262,8 +1347,8 @@ def compute_motion_energy_from_frames(
     return min(100.0, best)
 
 
-def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000) -> tuple[int, list[np.ndarray]]:
-    """Read up to 4 sampled raw BGR frames and duration (ms) from an MPEG-TS segment in a single decode pass."""
+def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w: int = 480) -> tuple[int, list[np.ndarray]]:
+    """Read up to 4 downscaled BGR frames and duration (ms) from an MPEG-TS segment in one sequential pass."""
     cap = cv2.VideoCapture(str(seg_path))
     if not cap.isOpened():
         return fallback_dur_ms, []
@@ -1273,34 +1358,36 @@ def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000) -> tu
         if not np.isfinite(fps) or fps <= 1.0 or fps > 120.0:
             fps = 20.0
 
+        def _shrink(frm: np.ndarray) -> np.ndarray:
+            if max_w > 0 and frm.shape[1] > max_w:
+                h2 = max(2, int(round(frm.shape[0] * (float(max_w) / float(frm.shape[1])))))
+                return cv2.resize(frm, (max_w, h2), interpolation=cv2.INTER_AREA)
+            return frm
+
         frames: list[np.ndarray] = []
         if total >= 4:
-            idxs = sorted({0, total // 3, (2 * total) // 3, total - 1})
-            for idx in idxs:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            target_set = {0, total // 3, (2 * total) // 3, total - 1}
+            for i in range(total):
+                if not cap.grab():
+                    break
+                if i in target_set:
+                    ok, frm = cap.retrieve()
+                    if ok and frm is not None:
+                        frames.append(_shrink(frm))
+        else:
+            # No reliable frame count: sample sequentially up to 4 frames spread across the file
+            all_read: list[np.ndarray] = []
+            while len(all_read) < 120:
                 ok, frm = cap.read()
-                if ok and frm is not None:
-                    frames.append(frm)
-        if len(frames) < 2:
-            frames.clear()
-            cap.release()
-            cap = cv2.VideoCapture(str(seg_path))
-            if cap.isOpened():
-                if total >= 4:
-                    target_set = {0, total // 3, (2 * total) // 3, total - 1}
-                    for i in range(total):
-                        if not cap.grab():
-                            break
-                        if i in target_set:
-                            ok, frm = cap.retrieve()
-                            if ok and frm is not None:
-                                frames.append(frm)
-                else:
-                    while len(frames) < 4:
-                        ok, frm = cap.read()
-                        if not ok or frm is None:
-                            break
-                        frames.append(frm)
+                if not ok or frm is None:
+                    break
+                all_read.append(frm)
+            if len(all_read) >= 4:
+                n = len(all_read)
+                for idx in sorted({0, n // 3, (2 * n) // 3, n - 1}):
+                    frames.append(_shrink(all_read[idx]))
+            else:
+                frames = [_shrink(f) for f in all_read]
 
         dur_ms = int(round((total / fps) * 1000)) if total >= 2 else fallback_dur_ms
         if dur_ms < 400 or dur_ms > 20_000:
@@ -1703,7 +1790,9 @@ class FireTvAdbController:
         self._wol_sender = wol_sender or send_wol_magic_packet
         self.wol_wait_sec = max(0.0, float(wol_wait_sec))
         self.wol_retries = max(1, int(wol_retries))
-        self.lock = threading.RLock()
+        self.state_lock = threading.RLock()
+        self.lock = self.state_lock
+        self.op_lock = threading.Lock()
         self.adb_state = "unconfigured"
         self.last_model = ""
         self.last_action = ""
@@ -1712,6 +1801,9 @@ class FireTvAdbController:
         self.tv_awake_requested = False
         self.pending_sleep_at_ms: int | None = None
         self.pending_sleep_reason = ""
+        self._wake_in_flight = False
+        self._last_wake_fail_mono = 0.0
+        self._sleep_retry_count = 0
 
     @staticmethod
     def _default_runner(cmd: list[str], timeout: float) -> tuple[int, str, str]:
@@ -1832,7 +1924,7 @@ class FireTvAdbController:
         return "offline", "ADB connect retry exhausted"
 
     def connect_and_probe(self, cfg: WallboardConfig) -> dict[str, Any]:
-        with self.lock:
+        with self.state_lock:
             ser = self.serial(cfg)
             if not ser:
                 self.adb_state = "unconfigured"
@@ -1845,31 +1937,35 @@ class FireTvAdbController:
                     "model": "",
                     "message": 'Enter the 32" Fire TV IP address first.',
                 }
+        with self.op_lock:
             st, detail = self._connect_and_status(ser)
             if st == "device":
                 try:
                     rc_m, out_m, _ = self._run(["-s", ser, "shell", "getprop", "ro.product.model"], timeout=4.0)
                     model = out_m.strip().splitlines()[0] if rc_m == 0 and out_m.strip() else ""
                     self._apply_wallboard_tv_settings(ser, suppress_screensaver=False)
+                finally:
+                    self.disconnect_serial(ser)
+                with self.state_lock:
                     self.adb_state = "ready"
                     if model:
                         self.last_model = model
                     self.last_error = ""
                     self.last_action = f"probe ({ser})"
-                    return {
-                        "ok": True,
-                        "configured": True,
-                        "state": "ready",
-                        "serial": ser,
-                        "model": self.last_model,
-                        "message": f"Connected ({self.last_model or ser})",
-                    }
-                finally:
-                    self.disconnect_serial(ser)
+                    cur_model = self.last_model
+                return {
+                    "ok": True,
+                    "configured": True,
+                    "state": "ready",
+                    "serial": ser,
+                    "model": cur_model,
+                    "message": f"Connected ({cur_model or ser})",
+                }
             if st == "unauthorized":
-                self.adb_state = "unauthorized"
                 msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
-                self.last_error = msg
+                with self.state_lock:
+                    self.adb_state = "unauthorized"
+                    self.last_error = msg
                 return {
                     "ok": False,
                     "configured": True,
@@ -1879,9 +1975,10 @@ class FireTvAdbController:
                     "message": msg,
                 }
             self._evict_serial(ser)
-            self.adb_state = "offline"
             msg = self._offline_diagnostic_message(ser, detail)
-            self.last_error = msg
+            with self.state_lock:
+                self.adb_state = "offline"
+                self.last_error = msg
             return {
                 "ok": False,
                 "configured": True,
@@ -1893,32 +1990,35 @@ class FireTvAdbController:
 
     @staticmethod
     def _launch_cmd(cfg: WallboardConfig, wallboard_url: str, ser: str) -> list[str]:
+        safe_url = shlex.quote(wallboard_url)
         if cfg.display_client == "armory":
             return [
                 "-s", ser, "shell", "am", "start", "-W", "-a", "android.intent.action.VIEW",
-                "-d", wallboard_url, "-n", "com.froriep.armorywallboard/.WallboardActivity",
+                "-d", safe_url, "-n", "com.froriep.armorywallboard/.WallboardActivity",
             ]
         if cfg.display_client == "fully":
             return [
                 "-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW",
-                "-d", wallboard_url, "-n", "de.ozerov.fully/.MainActivity",
+                "-d", safe_url, "-n", "de.ozerov.fully/.MainActivity",
             ]
         if cfg.display_client == "custom":
-            if cfg.custom_component.strip():
+            comp = cfg.custom_component.strip()
+            if comp:
                 return [
                     "-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW",
-                    "-d", wallboard_url, "-n", cfg.custom_component.strip(),
+                    "-d", safe_url, "-n", shlex.quote(comp),
                 ]
-            return ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", wallboard_url]
+            return ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", safe_url]
         return [
             "-s", ser, "shell", "am", "start", "-W", "-a", "android.intent.action.VIEW",
-            "-d", wallboard_url, "-n", "com.amazon.cloud9/.BrowserActivity",
+            "-d", safe_url, "-n", "com.amazon.cloud9/.BrowserActivity",
         ]
 
     def wake_and_launch(self, cfg: WallboardConfig, wallboard_url: str, force: bool = False) -> dict[str, Any]:
-        with self.lock:
+        with self.state_lock:
             self.pending_sleep_at_ms = None
             self.pending_sleep_reason = ""
+            self._sleep_retry_count = 0
             ser = self.serial(cfg)
             if not cfg.enabled or not ser:
                 self.adb_state = "disabled" if not cfg.enabled else "unconfigured"
@@ -1942,76 +2042,105 @@ class FireTvAdbController:
                     "model": self.last_model,
                     "message": "Fire TV wake already active",
                 }
-            st, detail = self._connect_and_status(ser)
-            if st == "offline" and cfg.fire_tv_mac.strip():
-                sent_macs = self._wol_sender(cfg.fire_tv_mac)
-                if sent_macs:
-                    for _ in range(self.wol_retries):
-                        if self.wol_wait_sec > 0:
-                            time.sleep(self.wol_wait_sec)
-                        st, detail = self._connect_and_status(ser, reset_offline=True)
-                        if st != "offline":
-                            break
-            if st == "unauthorized":
-                self.adb_state = "unauthorized"
-                msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
-                self.last_error = msg
-                return {"ok": False, "configured": True, "state": "unauthorized", "serial": ser, "message": msg}
-            if st != "device":
-                self._evict_serial(ser)
-                self.adb_state = "offline"
-                msg = self._offline_diagnostic_message(ser, detail)
-                self.last_error = msg
-                return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
-
-            try:
-                rc_w, out_w, err_w = self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_WAKEUP"], timeout=5.0)
-                if rc_w != 0:
-                    self.adb_state = "offline"
-                    msg = f"Wake keyevent failed: {(err_w or out_w).strip()}"
-                    self.last_error = msg
-                    return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
-
-                if self.settle_sec > 0:
-                    time.sleep(self.settle_sec)
-
-                self._apply_wallboard_tv_settings(ser, suppress_screensaver=cfg.suppress_screensaver)
-
-                rc_l, out_l, err_l = self._run(self._launch_cmd(cfg, wallboard_url, ser), timeout=8.0)
-                if cfg.display_client == "silk" and (rc_l != 0 or "Error" in f"{out_l}\n{err_l}"):
-                    rc_l, out_l, err_l = self._run(
-                        ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", wallboard_url, "-p", "com.amazon.cloud9"],
-                        timeout=8.0,
-                    )
-
-                if rc_l != 0:
-                    self.adb_state = "ready"
-                    msg = f"Awoke TV but browser launch failed: {(err_l or out_l).strip()}"
-                    self.last_error = msg
-                    return {"ok": False, "configured": True, "state": "ready", "serial": ser, "message": msg}
-
-                self.tv_awake_requested = True
-                self.last_wake_ms = int(time.time() * 1000)
-                self.adb_state = "awake"
-                self.last_action = f"wake -> {cfg.display_client}"
-                self.last_error = ""
+            if self._wake_in_flight and not force:
                 return {
                     "ok": True,
+                    "skipped": True,
                     "configured": True,
-                    "state": "awake",
+                    "state": self.adb_state,
                     "serial": ser,
                     "model": self.last_model,
-                    "message": f"Awoke {self.last_model or ser} & opened {cfg.display_client}",
+                    "message": "Fire TV wake already in progress",
                 }
-            finally:
-                self.disconnect_serial(ser)
+            self._wake_in_flight = True
+
+        try:
+            with self.op_lock:
+                st, detail = self._connect_and_status(ser)
+                if st == "offline" and cfg.fire_tv_mac.strip():
+                    sent_macs = self._wol_sender(cfg.fire_tv_mac)
+                    if sent_macs:
+                        for _ in range(self.wol_retries):
+                            if self.wol_wait_sec > 0:
+                                time.sleep(self.wol_wait_sec)
+                            st, detail = self._connect_and_status(ser, reset_offline=True)
+                            if st != "offline":
+                                break
+                if st == "unauthorized":
+                    msg = "Click 'Always allow from this computer' on the 32\" Fire TV screen, then retry."
+                    with self.state_lock:
+                        self.adb_state = "unauthorized"
+                        self.last_error = msg
+                        self._last_wake_fail_mono = time.monotonic()
+                    return {"ok": False, "configured": True, "state": "unauthorized", "serial": ser, "message": msg}
+                if st != "device":
+                    self._evict_serial(ser)
+                    msg = self._offline_diagnostic_message(ser, detail)
+                    with self.state_lock:
+                        self.adb_state = "offline"
+                        self.last_error = msg
+                        self._last_wake_fail_mono = time.monotonic()
+                    return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
+
+                try:
+                    rc_w, out_w, err_w = self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_WAKEUP"], timeout=5.0)
+                    if rc_w != 0:
+                        msg = f"Wake keyevent failed: {(err_w or out_w).strip()}"
+                        with self.state_lock:
+                            self.adb_state = "offline"
+                            self.last_error = msg
+                            self._last_wake_fail_mono = time.monotonic()
+                        return {"ok": False, "configured": True, "state": "offline", "serial": ser, "message": msg}
+
+                    if self.settle_sec > 0:
+                        time.sleep(self.settle_sec)
+
+                    self._apply_wallboard_tv_settings(ser, suppress_screensaver=cfg.suppress_screensaver)
+
+                    rc_l, out_l, err_l = self._run(self._launch_cmd(cfg, wallboard_url, ser), timeout=8.0)
+                    if cfg.display_client == "silk" and (rc_l != 0 or "Error" in f"{out_l}\n{err_l}"):
+                        rc_l, out_l, err_l = self._run(
+                            ["-s", ser, "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(wallboard_url), "-p", "com.amazon.cloud9"],
+                            timeout=8.0,
+                        )
+
+                    if rc_l != 0:
+                        msg = f"Awoke TV but browser launch failed: {(err_l or out_l).strip()}"
+                        with self.state_lock:
+                            self.adb_state = "ready"
+                            self.last_error = msg
+                            self._last_wake_fail_mono = time.monotonic()
+                        return {"ok": False, "configured": True, "state": "ready", "serial": ser, "message": msg}
+
+                    with self.state_lock:
+                        self.tv_awake_requested = True
+                        self.last_wake_ms = int(time.time() * 1000)
+                        self.adb_state = "awake"
+                        self.last_action = f"wake -> {cfg.display_client}"
+                        self.last_error = ""
+                        self._last_wake_fail_mono = 0.0
+                        cur_model = self.last_model
+                    return {
+                        "ok": True,
+                        "configured": True,
+                        "state": "awake",
+                        "serial": ser,
+                        "model": cur_model,
+                        "message": f"Awoke {cur_model or ser} & opened {cfg.display_client}",
+                    }
+                finally:
+                    self.disconnect_serial(ser)
+        finally:
+            with self.state_lock:
+                self._wake_in_flight = False
 
     def schedule_sleep(self, cfg: WallboardConfig, delay_sec: float = 0.0, reason: str = "") -> dict[str, Any]:
         if delay_sec <= 0:
             return self.sleep_now(cfg, reason=reason)
-        with self.lock:
+        with self.state_lock:
             self.pending_sleep_at_ms = int(time.time() * 1000) + int(delay_sec * 1000)
             self.pending_sleep_reason = reason or "workout_end"
+            self._sleep_retry_count = 0
             return {
                 "ok": True,
                 "scheduledDelaySec": delay_sec,
@@ -2019,28 +2148,49 @@ class FireTvAdbController:
                 "message": f"Sleep scheduled in {int(delay_sec)}s",
             }
 
-    def sleep_now(self, cfg: WallboardConfig, reason: str = "") -> dict[str, Any]:
-        with self.lock:
-            self.pending_sleep_at_ms = None
-            self.pending_sleep_reason = ""
-            self.tv_awake_requested = False
-            ser = self.serial(cfg)
-            if not ser:
-                self.adb_state = "unconfigured"
-                self.last_action = f"sleep skipped ({reason or 'unconfigured'})"
-                return {
-                    "ok": False,
-                    "configured": False,
-                    "state": "unconfigured",
-                    "serial": "",
-                    "message": "Fire TV IP not configured yet",
-                }
+    def sleep_now(self, cfg: WallboardConfig, reason: str = "", *, only_if_pending: bool = False) -> dict[str, Any]:
+        with self.op_lock:
+            with self.state_lock:
+                if only_if_pending and self.pending_sleep_at_ms is None and not self.tv_awake_requested:
+                    return {
+                        "ok": True,
+                        "skipped": True,
+                        "state": self.adb_state,
+                        "serial": self.serial(cfg),
+                        "message": "Sleep canceled by active workout",
+                    }
+                ser = self.serial(cfg)
+                if not ser:
+                    self.pending_sleep_at_ms = None
+                    self.pending_sleep_reason = ""
+                    self.tv_awake_requested = False
+                    self._sleep_retry_count = 0
+                    self.adb_state = "unconfigured"
+                    self.last_action = f"sleep skipped ({reason or 'unconfigured'})"
+                    return {
+                        "ok": False,
+                        "configured": False,
+                        "state": "unconfigured",
+                        "serial": "",
+                        "message": "Fire TV IP not configured yet",
+                    }
             st, detail = self._connect_and_status(ser)
             if st != "device":
                 self._evict_serial(ser)
-                self.adb_state = st
                 msg = self._offline_diagnostic_message(ser, detail) if st == "offline" else f"Sleep failed ({st}): {detail}"
-                self.last_error = msg
+                with self.state_lock:
+                    self.adb_state = st
+                    self.last_error = msg
+                    if reason != "manual" and self._sleep_retry_count < 3:
+                        self._sleep_retry_count += 1
+                        backoff = (30, 60, 120)[self._sleep_retry_count - 1]
+                        self.pending_sleep_at_ms = int(time.time() * 1000) + backoff * 1000
+                        self.pending_sleep_reason = reason or "retry_sleep"
+                    else:
+                        self.pending_sleep_at_ms = None
+                        self.pending_sleep_reason = ""
+                        self.tv_awake_requested = False
+                        self._sleep_retry_count = 0
                 return {"ok": False, "configured": True, "state": st, "serial": ser, "message": msg}
             try:
                 if cfg.suppress_screensaver:
@@ -2056,16 +2206,22 @@ class FireTvAdbController:
                     time.sleep(min(0.25, self.settle_sec))
             finally:
                 self.disconnect_serial(ser)
-            self.adb_state = "asleep"
-            self.last_action = f"sleep ({reason or 'manual'})"
-            self.last_error = ""
+            with self.state_lock:
+                self.pending_sleep_at_ms = None
+                self.pending_sleep_reason = ""
+                self.tv_awake_requested = False
+                self._sleep_retry_count = 0
+                self.adb_state = "asleep"
+                self.last_action = f"sleep ({reason or 'manual'})"
+                self.last_error = ""
+                cur_model = self.last_model
             return {
                 "ok": True,
                 "configured": True,
                 "state": "asleep",
                 "serial": ser,
-                "model": self.last_model,
-                "message": f"Slept {self.last_model or ser}",
+                "model": cur_model,
+                "message": f"Slept {cur_model or ser}",
             }
 
     def check_timers(
@@ -2077,7 +2233,7 @@ class FireTvAdbController:
     ) -> dict[str, Any] | None:
         cur_ms = now_ms if now_ms is not None else int(time.time() * 1000)
         reason_to_sleep: str | None = None
-        with self.lock:
+        with self.state_lock:
             if self.pending_sleep_at_ms is not None and cur_ms >= self.pending_sleep_at_ms:
                 if cfg.sleep_on_stop:
                     reason_to_sleep = self.pending_sleep_reason or "workout_end"
@@ -2092,7 +2248,7 @@ class FireTvAdbController:
             ):
                 reason_to_sleep = "idle_timeout"
         if reason_to_sleep:
-            return self.sleep_now(cfg, reason=reason_to_sleep)
+            return self.sleep_now(cfg, reason=reason_to_sleep, only_if_pending=True)
         return None
 
     def status_dict(self, cfg: WallboardConfig) -> dict[str, Any]:
@@ -2438,7 +2594,17 @@ class ArmoryCamService:
 
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._proc_urls: dict[str, str] = {}
+        self._worker_by_slug: dict[str, threading.Thread] = {}
         self._worker_threads: list[threading.Thread] = []
+        self._clips_index_lock = threading.RLock()
+        self._backup_lock = threading.Lock()
+        self._last_camera_ui_mono: float = 0.0
+        self._last_poll_ok_ms: int = 0
+        self._cal_cache_sig: tuple[Any, ...] | None = None
+        self._clips_cache_sig: tuple[int, int] | None = None
+        self._clips_cache_rows: list[dict[str, Any]] = []
+        self._drive_neg_cache: dict[str, float] = {}
+        self._last_long_prune_mono: float = 0.0
         self._stop_event = threading.Event()
         self._started = False
 
@@ -2611,6 +2777,115 @@ class ArmoryCamService:
         tmp = self.config_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         tmp.replace(self.config_path)
+        if self._started:
+            self.trigger_optiplex_config_backup_async()
+
+    def _optiplex_backup_dir(self) -> Path | None:
+        raw = self.drive_backup_dir.strip()
+        if not raw:
+            return None
+        p = Path(raw)
+        base = p.parent if p.name.lower() == "clips" else p
+        if not base.exists() and not base.parent.exists():
+            return None
+        return base / "OptiPlex"
+
+    def backup_optiplex_configs(self) -> dict[str, Any]:
+        """Mirror OptiPlex JSON configs & TTS API keys atomically to `<DriveBackupRoot>/OptiPlex/`."""
+        bdir = self._optiplex_backup_dir()
+        if bdir is None:
+            return {"ok": False, "skipped": True, "error": "Drive backup directory unavailable"}
+        names = (
+            "config.json",
+            "shows.json",
+            "tts_secrets.json",
+            "voice_ab_runs.json",
+            "wallboard_standby.json",
+        )
+        copied: list[str] = []
+        with self._backup_lock:
+            bdir.mkdir(parents=True, exist_ok=True)
+            for fname in names:
+                src = self.root / fname
+                if not src.is_file():
+                    continue
+                try:
+                    data = src.read_bytes()
+                    dst = bdir / fname
+                    tmp = bdir / f".{fname}.{threading.get_ident()}.tmp"
+                    tmp.write_bytes(data)
+                    tmp.replace(dst)
+                    copied.append(fname)
+                except OSError as exc:
+                    self.log.debug("OptiPlex backup skip %s: %s", fname, exc)
+            now_iso = datetime.now().astimezone().isoformat(timespec="seconds")
+            manifest = {"backedUpAt": now_iso, "host": socket.gethostname(), "files": copied}
+            mtmp = bdir / f".manifest.{threading.get_ident()}.tmp"
+            mtmp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+            mtmp.replace(bdir / "manifest.json")
+        return {"ok": True, "dir": str(bdir), "files": copied, "backedUpAt": now_iso}
+
+    def trigger_optiplex_config_backup_async(self) -> None:
+        if not self.drive_backup_dir.strip():
+            return
+
+        def _worker() -> None:
+            try:
+                self.backup_optiplex_configs()
+            except Exception as exc:
+                self.log.debug("OptiPlex config backup error: %s", exc)
+
+        threading.Thread(target=_worker, name="optiplex-cfg-backup", daemon=True).start()
+
+    def restore_optiplex_configs(self, overwrite: bool = False) -> dict[str, Any]:
+        """Restore OptiPlex JSON configs & TTS secrets from `<DriveBackupRoot>/OptiPlex/` after backing up current."""
+        bdir = self._optiplex_backup_dir()
+        if bdir is None or not bdir.is_dir():
+            return {"ok": False, "error": "OptiPlex Drive backup folder not found"}
+        names = (
+            "config.json",
+            "shows.json",
+            "tts_secrets.json",
+            "voice_ab_runs.json",
+            "wallboard_standby.json",
+        )
+        restored: list[str] = []
+        skipped: list[str] = []
+        pre_dir = self.root / f"_pre_restore_{int(time.time())}"
+        with self._backup_lock:
+            for fname in names:
+                src = bdir / fname
+                if not src.is_file():
+                    continue
+                dst = self.root / fname
+                if dst.is_file() and not overwrite:
+                    skipped.append(fname)
+                    continue
+                raw = src.read_text(encoding="utf-8")
+                json.loads(raw)  # Validate JSON before touching live files
+                if dst.is_file():
+                    pre_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(dst, pre_dir / fname)
+                tmp = self.root / f".{fname}.restore.tmp"
+                tmp.write_text(raw, encoding="utf-8")
+                tmp.replace(dst)
+                restored.append(fname)
+        if "config.json" in restored:
+            with self.lock:
+                self.load_or_init_config()
+                if self._started:
+                    self._restart_capture_workers()
+        if "shows.json" in restored or "tts_secrets.json" in restored:
+            try:
+                self.shows._load_or_init()
+            except Exception:
+                pass
+        return {
+            "ok": True,
+            "restored": restored,
+            "skipped": skipped,
+            "preRestoreBackup": str(pre_dir) if pre_dir.exists() else "",
+        }
 
     def _forward_voice_to_wallboard_source(self, transcript: str) -> None:
         clean = str(transcript or "").strip()
@@ -2641,6 +2916,12 @@ class ArmoryCamService:
         return f"http://{detect_lan_ip()}:{port}/wallboard"
 
     def trigger_adb_wake_async(self, force: bool = False) -> None:
+        with self.adb.state_lock:
+            if not force:
+                if self.adb._wake_in_flight:
+                    return
+                if self.adb._last_wake_fail_mono > 0.0 and (time.monotonic() - self.adb._last_wake_fail_mono) < 45.0:
+                    return
         with self.lock:
             cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
             url = self.effective_wallboard_url()
@@ -2724,6 +3005,8 @@ class ArmoryCamService:
             refresh_bump = bool(self.bump_alert_ntfy and ("cameras" in raw or "bumpAlertNtfy" in raw))
             if refresh_bump:
                 self._bump_strikes.clear()
+        if self._started and "cameras" in raw:
+            threading.Thread(target=self._purge_orphaned_thumb_dirs, name="thumb-orphan-purge", daemon=True).start()
         if refresh_bump and self._started:
             threading.Thread(target=self.capture_bump_baseline, name="bump-baseline-refresh", daemon=True).start()
         if self._started and ("cameras" in raw or "driveBackupDir" in raw):
@@ -2760,10 +3043,14 @@ class ArmoryCamService:
             self._restart_capture_workers()
             poll_t = threading.Thread(target=self._segment_poll_loop, name="armory-cam-poller", daemon=True)
             poll_t.start()
-            self._worker_threads.append(poll_t)
+            adb_t = threading.Thread(target=self._adb_timer_loop, name="wallboard-adb-timers", daemon=True)
+            adb_t.start()
             backfill_t = threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True)
             backfill_t.start()
-            self._worker_threads.append(backfill_t)
+            purge_t = threading.Thread(target=self._purge_orphaned_thumb_dirs, name="thumb-orphan-purge", daemon=True)
+            purge_t.start()
+            self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
+            self._worker_threads.extend([poll_t, adb_t, backfill_t, purge_t])
             self.room_audio.start()
             if self._voice_autostart:
                 self.voice.start()
@@ -2774,6 +3061,14 @@ class ArmoryCamService:
                 )
                 denon_t.start()
                 self._worker_threads.append(denon_t)
+                guard_t = threading.Thread(
+                    target=self.house_audio.denon.restore_stale_volume_guard,
+                    name="denon-vol-guard-restore",
+                    daemon=True,
+                )
+                guard_t.start()
+                self._worker_threads.append(guard_t)
+        self.trigger_optiplex_config_backup_async()
 
     def _denon_ip_control_watch_loop(self) -> None:
         """One-shot watcher: when Denon comes online, verify or safely enable IP Control = Always On."""
@@ -2821,15 +3116,34 @@ class ArmoryCamService:
             delay_sec = 60.0
 
     def stop_background(self) -> None:
+        t0 = time.monotonic()
+        self.log.info("Shutting down ArmoryCamService background workers...")
         self._stop_event.set()
         self.shows.stop_active_show()
         self.voice.stop()
         self.room_audio.stop()
         self.live_hub.stop_all()
         with self.lock:
-            for slug in list(self._procs.keys()):
-                self._stop_proc(slug)
+            procs = list(self._procs.values())
+            self._procs.clear()
+            self._proc_urls.clear()
             self._started = False
+        for proc in procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        deadline = time.monotonic() + 2.5
+        for proc in procs:
+            rem = max(0.05, deadline - time.monotonic())
+            try:
+                proc.wait(timeout=rem)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self.log.info("ArmoryCamService stopped in %.2fs", time.monotonic() - t0)
 
     def _stop_proc(self, slug: str) -> None:
         self._proc_urls.pop(slug, None)
@@ -2854,12 +3168,13 @@ class ArmoryCamService:
                 self._stop_proc(slug)
         for cam in self.cameras:
             self.ring_segments.setdefault(cam.slug, [])
+        self._worker_threads = [t for t in self._worker_threads if t.is_alive()]
         for cam in self._physical_cameras():
             (self.ring_root / cam.slug).mkdir(parents=True, exist_ok=True)
             has_views = bool(self._views_for_source(cam.slug, enabled_only=True))
             if has_views and cam.rtsp_url:
-                existing = self._procs.get(cam.slug)
-                if existing and existing.poll() is None and self._proc_urls.get(cam.slug) == cam.rtsp_url:
+                existing_t = self._worker_by_slug.get(cam.slug)
+                if existing_t and existing_t.is_alive() and self._proc_urls.get(cam.slug) == cam.rtsp_url:
                     continue
                 self.cam_connected[cam.slug] = False
                 self._proc_urls[cam.slug] = cam.rtsp_url
@@ -2870,6 +3185,7 @@ class ArmoryCamService:
                     daemon=True,
                 )
                 t.start()
+                self._worker_by_slug[cam.slug] = t
                 self._worker_threads.append(t)
             else:
                 self.cam_connected[cam.slug] = False
@@ -2901,14 +3217,9 @@ class ArmoryCamService:
                 cam.rtsp_url,
                 "-map",
                 "0:v:0",
-                "-map",
-                "0:a?",
                 "-c:v",
                 "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "96k",
+                "-an",
                 "-f",
                 "segment",
                 "-segment_time",
@@ -2940,7 +3251,9 @@ class ArmoryCamService:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    **_subprocess_no_window_kwargs(),
                 )
+                _assign_child_to_job(proc)
                 with self.lock:
                     self._procs[cam.slug] = proc
 
@@ -3011,53 +3324,83 @@ class ArmoryCamService:
             backoff = 2.0 if uptime > 20.0 else min(15.0, backoff * 1.5)
             self._stop_event.wait(backoff)
 
+    def _adb_timer_loop(self) -> None:
+        """Runs Wallboard idle/post-workout ADB sleep checks off the DVR segment poller thread."""
+        while not self._stop_event.is_set():
+            try:
+                with self.lock:
+                    wb_cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
+                with self.wallboard.cond:
+                    last_active_ms = self.wallboard.last_active_push_ms
+                    workout_active = self.wallboard.workout_active
+                self.adb.check_timers(wb_cfg, last_active_ms, workout_active)
+            except Exception as exc:
+                self.log.debug("ADB timer loop error: %s", exc)
+            self._stop_event.wait(2.0)
+
     def _segment_poll_loop(self) -> None:
         last_prune = 0.0
         last_bump = 0.0
         while not self._stop_event.is_set():
             now = time.time()
-            with self.lock:
-                phys_cams = self._physical_cameras()
-                wb_cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
-            for cam in phys_cams:
-                self._ingest_closed_segments(cam, now)
-            with self.wallboard.cond:
-                last_active_ms = self.wallboard.last_active_push_ms
-                workout_active = self.wallboard.workout_active
-            self.adb.check_timers(wb_cfg, last_active_ms, workout_active)
-            if now - last_bump > 30.0:
-                last_bump = now
-                try:
-                    self.check_camera_bump_background(now)
-                except Exception as exc:
-                    self.log.debug("Background bump check error: %s", exc)
-            enabled_phys_slugs = [c.slug for c in phys_cams if c.enabled]
-            with self.lock:
+            try:
+                with self.lock:
+                    phys_cams = self._physical_cameras()
+                    rec_active = bool(self.recording and not self.paused)
+                need_energy = rec_active or ((time.monotonic() - self._last_camera_ui_mono) < 15.0)
+                for cam in phys_cams:
+                    try:
+                        self._ingest_closed_segments(cam, now, compute_energy=need_energy)
+                    except Exception as exc:
+                        self.log.exception("[%s] Segment ingest error: %s", cam.name, exc)
+                if now - last_bump > 30.0:
+                    last_bump = now
+                    try:
+                        self.check_camera_bump_background(now)
+                    except Exception as exc:
+                        self.log.debug("Background bump check error: %s", exc)
+                enabled_phys_slugs = [c.slug for c in phys_cams if c.enabled]
                 should_refresh_preview = False
-                if enabled_phys_slugs:
-                    if self._preview_last_refresh_s == 0.0:
-                        all_conn = all(self.cam_connected.get(s, False) for s in enabled_phys_slugs)
-                        any_ready = any(
-                            self.cam_connected.get(s, False) or bool(self.ring_segments.get(s))
-                            for s in enabled_phys_slugs
-                        )
-                        if all_conn or (any_ready and (now - self._preview_started_at_s) >= 12.0):
+                with self.lock:
+                    if enabled_phys_slugs:
+                        if self._preview_last_refresh_s == 0.0:
+                            all_conn = all(self.cam_connected.get(s, False) for s in enabled_phys_slugs)
+                            any_ready = any(
+                                self.cam_connected.get(s, False) or bool(self.ring_segments.get(s))
+                                for s in enabled_phys_slugs
+                            )
+                            if all_conn or (any_ready and (now - self._preview_started_at_s) >= 12.0):
+                                self._preview_last_refresh_s = now
+                                should_refresh_preview = True
+                        elif (
+                            (now - self._preview_last_refresh_s) >= PREVIEW_DRIVE_INTERVAL_SEC
+                            and not (self.recording and not self.paused)
+                        ):
                             self._preview_last_refresh_s = now
                             should_refresh_preview = True
-                    elif (
-                        (now - self._preview_last_refresh_s) >= PREVIEW_DRIVE_INTERVAL_SEC
-                        and not (self.recording and not self.paused)
-                    ):
-                        self._preview_last_refresh_s = now
-                        should_refresh_preview = True
-            if should_refresh_preview:
-                self._trigger_preview_refresh_async()
-            if now - last_prune > 60.0:
-                last_prune = now
-                self._prune_storage(now)
+                if should_refresh_preview:
+                    try:
+                        self._trigger_preview_refresh_async()
+                    except Exception as exc:
+                        self.log.debug("Preview refresh trigger error: %s", exc)
+                if now - last_prune > 60.0:
+                    last_prune = now
+                    try:
+                        self._prune_storage(now)
+                    except Exception as exc:
+                        self.log.exception("Storage prune error: %s", exc)
+                self._last_poll_ok_ms = int(time.time() * 1000)
+            except Exception as exc:
+                self.log.exception("Segment poll loop unexpected error: %s", exc)
             self._stop_event.wait(0.8)
 
-    def _ingest_closed_segments(self, cam: CameraConfig, now_s: float) -> None:
+    def _ingest_closed_segments(
+        self,
+        cam: CameraConfig,
+        now_s: float,
+        *,
+        compute_energy: bool = True,
+    ) -> None:
         cdir = self.ring_root / cam.slug
         if not cdir.exists():
             return
@@ -3082,27 +3425,33 @@ class ArmoryCamService:
                     self.seen_files.add(key)
                 continue
 
-            dur_ms, raw_frames = extract_ts_sampled_frames(p)
+            if compute_energy:
+                dur_ms, raw_frames = extract_ts_sampled_frames(p)
+            else:
+                dur_ms, raw_frames = 2000, []
             rot_cache: dict[tuple[int, float], list[np.ndarray]] = {}
             view_results: list[tuple[CameraConfig, SegmentInfo]] = []
             for v in views:
-                tkey = (normalize_rotate(v.rotate), normalize_tilt(v.tilt))
-                if tkey not in rot_cache:
-                    rot_cache[tkey] = (
-                        [
-                            apply_frame_transform(frm, rotate=tkey[0], tilt=tkey[1], apply_crop=False)
-                            for frm in raw_frames
-                        ]
-                        if tkey != (0, 0.0)
-                        else raw_frames
+                if raw_frames:
+                    tkey = (normalize_rotate(v.rotate), normalize_tilt(v.tilt))
+                    if tkey not in rot_cache:
+                        rot_cache[tkey] = (
+                            [
+                                apply_frame_transform(frm, rotate=tkey[0], tilt=tkey[1], apply_crop=False)
+                                for frm in raw_frames
+                            ]
+                            if tkey != (0, 0.0)
+                            else raw_frames
+                        )
+                    energy = (
+                        compute_motion_energy_from_frames(
+                            rot_cache[tkey], roi=v.effective_roi(), exclusions=v.exclusions
+                        )
+                        if rot_cache[tkey]
+                        else 0.0
                     )
-                energy = (
-                    compute_motion_energy_from_frames(
-                        rot_cache[tkey], roi=v.effective_roi(), exclusions=v.exclusions
-                    )
-                    if rot_cache[tkey]
-                    else 0.0
-                )
+                else:
+                    energy = 0.0
                 info = SegmentInfo(
                     path=p,
                     start_ms=start_ms,
@@ -3115,7 +3464,8 @@ class ArmoryCamService:
             with self.lock:
                 self.seen_files.add(key)
                 for v, info in view_results:
-                    self.latest_energy[v.slug] = info.energy
+                    if compute_energy:
+                        self.latest_energy[v.slug] = info.energy
                     bucket = self.ring_segments.setdefault(v.slug, [])
                     bucket.append(info)
                     if len(bucket) > 600:
@@ -3145,80 +3495,166 @@ class ArmoryCamService:
             "endMs": info.end_ms,
             "energy": info.energy,
         }
-        with motion_file.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(sample) + "\n")
+        try:
+            with motion_file.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(sample) + "\n")
+        except OSError as exc:
+            self.log.debug("Failed writing motion.jsonl: %s", exc)
 
-    def _prune_storage(self, now_s: float) -> None:
+    def _purge_orphaned_thumb_dirs(self) -> int:
+        """Delete stale crop-key thumbnail directories no longer matching active camera views."""
+        if not self.thumbs_root.is_dir():
+            return 0
+        with self.lock:
+            expected: dict[str, set[str]] = {}
+            for c in self.cameras:
+                expected.setdefault(c.slug, set()).add(self._crop_cache_key(c))
+        removed = 0
+        try:
+            with os.scandir(self.thumbs_root) as cam_entries:
+                for cam_ent in cam_entries:
+                    if not cam_ent.is_dir(follow_symlinks=False):
+                        continue
+                    valid_keys = expected.get(cam_ent.name, set())
+                    try:
+                        with os.scandir(cam_ent.path) as ck_entries:
+                            for ck_ent in ck_entries:
+                                if ck_ent.is_dir(follow_symlinks=False) and ck_ent.name not in valid_keys:
+                                    shutil.rmtree(ck_ent.path, ignore_errors=True)
+                                    removed += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return removed
+
+    def _prune_ring(self, now_s: float) -> None:
         ring_cutoff = now_s - max(RING_KEEP_MIN_SEC, self.pre_roll_sec * 2)
         with self.lock:
             phys_cams = self._physical_cameras()
+        live_paths: set[str] = set()
         for cam in phys_cams:
             cdir = self.ring_root / cam.slug
-            if not cdir.exists():
+            if not cdir.is_dir():
                 continue
-            for p in cdir.glob("seg_*.ts"):
-                try:
-                    if p.stat().st_mtime < ring_cutoff:
-                        p.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            try:
+                with os.scandir(cdir) as entries:
+                    for ent in entries:
+                        if not ent.name.startswith("seg_") or not ent.name.endswith(".ts"):
+                            continue
+                        try:
+                            if ent.stat(follow_symlinks=False).st_mtime < ring_cutoff:
+                                Path(ent.path).unlink(missing_ok=True)
+                            else:
+                                live_paths.add(ent.path)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
         with self.lock:
             cutoff_ms = int(ring_cutoff * 1000)
             for slug, segs in self.ring_segments.items():
                 self.ring_segments[slug] = [s for s in segs if s.end_ms >= cutoff_ms]
+            self.seen_files.intersection_update(live_paths)
 
+    def _prune_long_term(self, now_s: float) -> None:
         tape_cutoff = now_s - (self.retention_days * 86_400)
-        for sdir in self.tapes_root.iterdir():
-            if not sdir.is_dir():
-                continue
-            if self.active_session_id and sdir.name == safe_slug(self.active_session_id, "session"):
-                continue
+        active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
+        if self.tapes_root.is_dir():
             try:
-                if sdir.stat().st_mtime < tape_cutoff:
-                    shutil.rmtree(sdir, ignore_errors=True)
+                with os.scandir(self.tapes_root) as entries:
+                    for ent in entries:
+                        if not ent.is_dir(follow_symlinks=False) or ent.name == active_slug:
+                            continue
+                        try:
+                            if ent.stat(follow_symlinks=False).st_mtime < tape_cutoff:
+                                shutil.rmtree(ent.path, ignore_errors=True)
+                        except OSError:
+                            pass
             except OSError:
                 pass
 
-        if self.thumbs_root.exists():
-            for jpg_p in self.thumbs_root.rglob("*.jpg"):
+        # Free-disk safety trim (< 15 GB free -> prune oldest inactive tapes)
+        try:
+            min_free = 15 * (1024**3)
+            if self.tapes_root.is_dir() and shutil.disk_usage(self.root).free < min_free:
+                cands: list[tuple[float, str]] = []
+                with os.scandir(self.tapes_root) as entries:
+                    for ent in entries:
+                        if ent.is_dir(follow_symlinks=False) and ent.name != active_slug:
+                            try:
+                                cands.append((ent.stat(follow_symlinks=False).st_mtime, ent.path))
+                            except OSError:
+                                pass
+                cands.sort(key=lambda x: x[0])
+                for _, spath in cands:
+                    if shutil.disk_usage(self.root).free >= min_free:
+                        break
+                    shutil.rmtree(spath, ignore_errors=True)
+        except OSError:
+            pass
+
+        if self.thumbs_root.is_dir():
+            stack = [self.thumbs_root]
+            dirs_bottom_up: list[Path] = []
+            while stack:
+                cur_dir = stack.pop()
                 try:
-                    if jpg_p.stat().st_mtime < tape_cutoff:
-                        jpg_p.unlink(missing_ok=True)
+                    with os.scandir(cur_dir) as entries:
+                        for ent in entries:
+                            if ent.is_dir(follow_symlinks=False):
+                                sub = Path(ent.path)
+                                stack.append(sub)
+                                dirs_bottom_up.append(sub)
+                            elif ent.name.endswith(".jpg"):
+                                try:
+                                    if ent.stat(follow_symlinks=False).st_mtime < tape_cutoff:
+                                        Path(ent.path).unlink(missing_ok=True)
+                                except OSError:
+                                    pass
                 except OSError:
                     pass
-            for dir_p in sorted(self.thumbs_root.rglob("*"), reverse=True):
-                if dir_p.is_dir():
-                    try:
-                        if not any(dir_p.iterdir()):
+            for dir_p in reversed(dirs_bottom_up):
+                try:
+                    with os.scandir(dir_p) as sub_it:
+                        if next(sub_it, None) is None:
                             dir_p.rmdir()
-                    except OSError:
-                        pass
+                except OSError:
+                    pass
 
         self.room_audio.prune(now_s, self.retention_days)
 
-        if self.previews_root.exists():
-            for tmp_p in self.previews_root.glob(".*.mp4"):
-                try:
-                    if tmp_p.stat().st_mtime < now_s - 300:
-                        tmp_p.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        if self.previews_root.is_dir():
             prev_cutoff = now_s - PREVIEW_KEEP_SEC
             kept_previews: list[tuple[float, Path]] = []
-            for p in self.previews_root.glob("*.mp4"):
-                if p.name.startswith("."):
-                    continue
-                try:
-                    mtime = p.stat().st_mtime
-                except OSError:
-                    continue
-                if mtime < prev_cutoff:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                else:
-                    kept_previews.append((mtime, p))
+            try:
+                with os.scandir(self.previews_root) as entries:
+                    for ent in entries:
+                        if not ent.is_file(follow_symlinks=False):
+                            continue
+                        p = Path(ent.path)
+                        if ent.name.startswith("."):
+                            try:
+                                if ent.stat(follow_symlinks=False).st_mtime < now_s - 300:
+                                    p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                            continue
+                        if not ent.name.endswith(".mp4"):
+                            continue
+                        try:
+                            mtime = ent.stat(follow_symlinks=False).st_mtime
+                        except OSError:
+                            continue
+                        if mtime < prev_cutoff:
+                            try:
+                                p.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        else:
+                            kept_previews.append((mtime, p))
+            except OSError:
+                pass
             if len(kept_previews) > PREVIEW_MAX_FILES:
                 kept_previews.sort(key=lambda item: item[0])
                 for _, stale_p in kept_previews[: len(kept_previews) - PREVIEW_MAX_FILES]:
@@ -3226,6 +3662,13 @@ class ArmoryCamService:
                         stale_p.unlink(missing_ok=True)
                     except OSError:
                         pass
+
+    def _prune_storage(self, now_s: float, *, force_long: bool = False) -> None:
+        self._prune_ring(now_s)
+        now_m = time.monotonic()
+        if force_long or self._last_long_prune_mono == 0.0 or (now_m - self._last_long_prune_mono) >= 900.0:
+            self._last_long_prune_mono = now_m
+            self._prune_long_term(now_s)
 
     def start_session(self, session_id: str, name: str = "") -> None:
         clean_id = safe_slug(session_id, f"sess_{int(time.time())}")
@@ -4246,6 +4689,8 @@ class ArmoryCamService:
         first_start_ms = segs[0].start_ms
         ss_sec = max(0.0, (start_ms - first_start_ms) / 1000.0)
         dur_sec = max(0.5, (end_ms - start_ms) / 1000.0)
+        enc_timeout = max(60, int(dur_sec * 1.5) + 30)
+        mux_timeout = max(45, int(dur_sec) + 30)
         tag = uuid.uuid4().hex[:8]
         concat_path = out_path.parent / f".concat_{tag}.txt"
         tmp_vid = out_path.with_name(f".{out_path.stem}.{tag}.vid.mp4")
@@ -4296,7 +4741,12 @@ class ArmoryCamService:
                 "+faststart",
                 str(tmp_vid),
             ]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=enc_timeout)
+            except subprocess.TimeoutExpired:
+                self.log.warning("FFmpeg clip encode timed out after %ss", enc_timeout)
+                tmp_vid.unlink(missing_ok=True)
+                return False
             if res.returncode != 0 or not tmp_vid.exists() or tmp_vid.stat().st_size == 0:
                 self.log.warning("FFmpeg clip failed: %s", res.stderr.strip())
                 tmp_vid.unlink(missing_ok=True)
@@ -4326,7 +4776,12 @@ class ArmoryCamService:
                     "+faststart",
                     str(tmp_mux),
                 ]
-                mres = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=45)
+                try:
+                    mres = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=mux_timeout)
+                except subprocess.TimeoutExpired:
+                    self.log.warning("FFmpeg audio mux timed out after %ss", mux_timeout)
+                    tmp_mux.unlink(missing_ok=True)
+                    return False
                 if mres.returncode != 0 or not tmp_mux.exists() or tmp_mux.stat().st_size == 0:
                     self.log.warning("FFmpeg audio mux failed: %s", mres.stderr.strip())
                     tmp_mux.unlink(missing_ok=True)
@@ -4529,9 +4984,11 @@ class ArmoryCamService:
             **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
             **({"driveUrl": drive_info["driveUrl"]} if drive_info.get("driveUrl") else {}),
         }
-        with self.lock:
+        with self._clips_index_lock:
             with self.clips_index_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps({k: v for k, v in meta.items() if k != "thumb"}) + "\n")
+            self._clips_cache_sig = None
+            self._cal_cache_sig = None
         self.check_calibration_milestones()
         return meta
 
@@ -4845,55 +5302,125 @@ class ArmoryCamService:
             pass
         return 0
 
+    @staticmethod
+    def _is_valid_clip_filename(name: str) -> bool:
+        if not name or any(ch in name for ch in ("/", "\\", "*", "?", "[", "]", "\x00")):
+            return False
+        if ".." in name or name in (".", ".."):
+            return False
+        if not name.lower().endswith(".mp4"):
+            return False
+        return Path(name).name == name
+
     def recent_clips(self, limit: int = 20) -> list[dict[str, Any]]:
         if not self.clips_index_path.exists():
             return []
         with self.lock:
             backup_dir = self.drive_backup_dir.strip()
-        out: list[dict[str, Any]] = []
-        for line in reversed(self.clips_index_path.read_text(encoding="utf-8").splitlines()):
-            if not line.strip():
-                continue
+        with self._clips_index_lock:
             try:
-                item = json.loads(line)
-            except Exception:
-                continue
-            if backup_dir and not item.get("driveUrl"):
+                st = self.clips_index_path.stat()
+                sig = (int(st.st_mtime_ns), int(st.st_size))
+            except OSError:
+                return []
+            if sig != self._clips_cache_sig:
+                parsed: list[dict[str, Any]] = []
+                for line in reversed(self.clips_index_path.read_text(encoding="utf-8").splitlines()):
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    if isinstance(obj, dict):
+                        parsed.append(obj)
+                self._clips_cache_sig = sig
+                self._clips_cache_rows = parsed
+                self._drive_neg_cache.clear()
+            rows = [dict(r) for r in self._clips_cache_rows[: max(0, int(limit))]]
+
+        now_mono = time.monotonic()
+        if backup_dir:
+            b_path = Path(backup_dir)
+            for item in rows:
+                if item.get("driveUrl"):
+                    continue
                 fname = str(item.get("fileName") or "").strip()
                 parts = [p for p in str(item.get("lanUrl") or "").split("/") if p]
                 day_str = parts[1] if len(parts) >= 3 and parts[0] == "clips" else ""
-                if fname and day_str:
-                    fid = read_google_drive_file_id(Path(backup_dir) / day_str / fname)
-                    url = google_drive_view_url(fid)
-                    if fid and url:
-                        item["driveFileId"] = fid
-                        item["driveUrl"] = url
-            out.append(item)
-            if len(out) >= limit:
-                break
-        return out
+                if not (fname and day_str and self._is_valid_clip_filename(fname)):
+                    continue
+                cache_key = f"{day_str}/{fname}"
+                if self._drive_neg_cache.get(cache_key, 0.0) > now_mono:
+                    continue
+                fid = read_google_drive_file_id(b_path / day_str / fname)
+                url = google_drive_view_url(fid)
+                if fid and url:
+                    item["driveFileId"] = fid
+                    item["driveUrl"] = url
+                    with self._clips_index_lock:
+                        for cached_row in self._clips_cache_rows:
+                            if cached_row.get("fileName") == fname:
+                                cached_row["driveFileId"] = fid
+                                cached_row["driveUrl"] = url
+                else:
+                    self._drive_neg_cache[cache_key] = now_mono + 60.0
+        return rows
 
     def _resolve_clip_candidates(
         self, lan_url: str = "", file_name: str = ""
     ) -> tuple[str, str, list[str], list[Path]]:
         raw_url = str(lan_url or "").strip()
+        raw_fname = str(file_name or "").strip()
+        if raw_fname and not self._is_valid_clip_filename(raw_fname):
+            return raw_url, "", [], []
+
         rel_path = ""
         if "/clips/" in raw_url:
             rel_path = raw_url.split("/clips/", 1)[1].split("?", 1)[0].strip("/")
+        elif raw_url and not raw_fname:
+            return raw_url, "", [], []
+
         parts = [p for p in rel_path.split("/") if p] if rel_path else []
-        clean_fname = Path(str(file_name or "").strip()).name
-        target_name = Path(parts[-1]).name if parts else clean_fname
+        if any(p in (".", "..") or any(ch in p for ch in ("*", "?", "[", "]", "\\", "\x00")) for p in parts):
+            return raw_url, "", [], []
+
+        if parts:
+            cand_name = parts[-1]
+            if not self._is_valid_clip_filename(cand_name):
+                return raw_url, "", [], []
+            if len(parts) >= 2 and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[-2]):
+                return raw_url, "", [], []
+            target_name = cand_name
+        else:
+            target_name = raw_fname
+
+        if not self._is_valid_clip_filename(target_name):
+            return raw_url, "", parts, []
+
         candidates: list[Path] = []
-        if len(parts) >= 2 and target_name:
+        if len(parts) >= 2:
             candidates.append(self.clips_root / parts[-2] / target_name)
-        elif target_name:
-            candidates.extend(self.clips_root.glob(f"*/{target_name}"))
+        elif self.clips_root.is_dir():
+            try:
+                with os.scandir(self.clips_root) as it:
+                    for ent in it:
+                        if not ent.is_dir(follow_symlinks=False):
+                            continue
+                        cand = Path(ent.path) / target_name
+                        if cand.is_file():
+                            candidates.append(cand)
+                            break
+            except OSError:
+                pass
         return raw_url, target_name, parts, candidates
 
     def _find_clip_index_row(self, target_name: str) -> dict[str, Any] | None:
         if not target_name or not self.clips_index_path.exists():
             return None
-        for line in reversed(self.clips_index_path.read_text(encoding="utf-8").splitlines()):
+        with self._clips_index_lock:
+            lines = self.clips_index_path.read_text(encoding="utf-8").splitlines()
+        for line in reversed(lines):
             if not line.strip():
                 continue
             try:
@@ -4918,6 +5445,8 @@ class ArmoryCamService:
         """Losslessly strip or mux 14-day PowerConf S330 room audio on an existing saved MP4 clip."""
         base_resolved = self.clips_root.resolve()
         _raw_url, target_name, _parts, candidates = self._resolve_clip_candidates(lan_url, file_name)
+        if not target_name:
+            return {"ok": False, "error": "Invalid clip filename"}, 400
         target: Path | None = None
         for cand in candidates:
             try:
@@ -5018,7 +5547,7 @@ class ArmoryCamService:
             **({"driveFileId": drive_info["driveFileId"]} if drive_info.get("driveFileId") else {}),
             **({"driveUrl": drive_info["driveUrl"]} if drive_info.get("driveUrl") else {}),
         }
-        with self.lock:
+        with self._clips_index_lock:
             lines: list[str] = []
             replaced = False
             if self.clips_index_path.exists():
@@ -5043,17 +5572,29 @@ class ArmoryCamService:
             tmp_idx = self.clips_index_path.with_suffix(".jsonl.tmp")
             tmp_idx.write_text("\n".join(lines) + "\n", encoding="utf-8")
             tmp_idx.replace(self.clips_index_path)
+            self._clips_cache_sig = None
         return updated, 200
 
     def delete_clip(self, lan_url: str = "", file_name: str = "") -> dict[str, Any]:
         """Delete a saved MP4 from local `clips_root`, Google Drive mirror, and `index.jsonl` (preserves raw tapes)."""
         base_resolved = self.clips_root.resolve()
-        raw_url, target_name, parts, candidates = self._resolve_clip_candidates(lan_url, file_name)
+        _raw_url, target_name, parts, candidates = self._resolve_clip_candidates(lan_url, file_name)
+        if not target_name:
+            return {
+                "ok": False,
+                "error": "Invalid clip filename",
+                "fileName": "",
+                "localDeleted": False,
+                "driveDeleted": False,
+            }
 
         local_deleted = False
         drive_deleted = False
         with self.lock:
             backup_dir = self.drive_backup_dir.strip()
+        backup_resolved = Path(backup_dir).resolve() if backup_dir else None
+
+        with self._clips_index_lock:
             for cand in candidates:
                 try:
                     resolved = cand.resolve()
@@ -5066,23 +5607,37 @@ class ArmoryCamService:
                         local_deleted = True
                     except OSError:
                         pass
-                if backup_dir and len(rel.parts) >= 2:
-                    d_file = Path(backup_dir) / rel.parts[-2] / rel.parts[-1]
-                    if d_file.is_file():
+                if backup_resolved is not None and len(rel.parts) >= 2 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", rel.parts[-2]):
+                    d_file = (backup_resolved / rel.parts[-2] / rel.parts[-1]).resolve()
+                    try:
+                        d_file.relative_to(backup_resolved)
+                    except ValueError:
+                        d_file = None  # type: ignore[assignment]
+                    if d_file is not None and d_file.is_file():
                         try:
                             d_file.unlink()
                             drive_deleted = True
                         except OSError:
                             pass
-            if backup_dir and target_name and not drive_deleted and len(parts) >= 2:
-                d_file = Path(backup_dir) / parts[-2] / target_name
-                if d_file.is_file():
+            if (
+                backup_resolved is not None
+                and not drive_deleted
+                and len(parts) >= 2
+                and re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[-2])
+            ):
+                d_file = (backup_resolved / parts[-2] / target_name).resolve()
+                try:
+                    d_file.relative_to(backup_resolved)
+                    ok_drive_rel = True
+                except ValueError:
+                    ok_drive_rel = False
+                if ok_drive_rel and d_file.is_file():
                     try:
                         d_file.unlink()
                         drive_deleted = True
                     except OSError:
                         pass
-            if self.clips_index_path.exists() and (target_name or raw_url):
+            if self.clips_index_path.exists():
                 kept: list[str] = []
                 for line in self.clips_index_path.read_text(encoding="utf-8").splitlines():
                     if not line.strip():
@@ -5094,14 +5649,14 @@ class ArmoryCamService:
                         continue
                     fname = str(obj.get("fileName") or "")
                     lurl = str(obj.get("lanUrl") or "")
-                    if (target_name and fname == target_name) or (
-                        target_name and lurl.endswith(f"/{target_name}")
-                    ):
+                    if fname == target_name or lurl.endswith(f"/{target_name}"):
                         continue
                     kept.append(line)
                 tmp = self.clips_index_path.with_suffix(".jsonl.tmp")
                 tmp.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
                 tmp.replace(self.clips_index_path)
+            self._clips_cache_sig = None
+            self._cal_cache_sig = None
 
         return {
             "ok": True,
@@ -5234,13 +5789,26 @@ class ArmoryCamService:
 
     def calibration_status(self) -> dict[str, Any]:
         """Return unique clean clip count and notified pose-calibration milestones."""
-        with self.lock:
-            clip_count = (
-                len({p.name for p in self.clips_root.glob("*/*.mp4") if p.is_file()})
-                if self.clips_root.exists()
-                else 0
-            )
-            notified: list[int] = []
+        names: set[str] = set()
+        if self.clips_root.exists():
+            try:
+                with os.scandir(self.clips_root) as it:
+                    for ent in it:
+                        if not ent.is_dir(follow_symlinks=False):
+                            continue
+                        try:
+                            with os.scandir(ent.path) as sub_it:
+                                for f_ent in sub_it:
+                                    if f_ent.name.lower().endswith(".mp4") and f_ent.is_file(follow_symlinks=False):
+                                        names.add(f_ent.name)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        clip_count = len(names)
+
+        notified: list[int] = []
+        with self._clips_index_lock:
             if self.cal_state_path.is_file():
                 try:
                     raw = json.loads(self.cal_state_path.read_text(encoding="utf-8"))
@@ -5257,7 +5825,7 @@ class ArmoryCamService:
 
     def check_calibration_milestones(self) -> list[int]:
         """Persist newly reached calibration clip milestones (5 / 15 / 50) and fire ntfy alert once per tier."""
-        with self.lock:
+        with self._clips_index_lock:
             st = self.calibration_status()
             count = int(st["clipCount"])
             notified = list(st["notified"])
@@ -5271,6 +5839,7 @@ class ArmoryCamService:
                 encoding="utf-8",
             )
             tmp.replace(self.cal_state_path)
+        with self.lock:
             topic = self.ntfy_topic
 
         if topic:
@@ -5318,33 +5887,40 @@ class ArmoryCamService:
                 }
                 for c in self.cameras
             ]
-            wb_cfg = self.wallboard_cfg
-            wb_status = {
-                **self.adb.status_dict(wb_cfg),
-                **self.wallboard.status_dict(),
-                "wallboardUrl": self.effective_wallboard_url(),
-                "wakeOnStart": wb_cfg.wake_on_start,
-                "sleepOnStop": wb_cfg.sleep_on_stop,
-                "idleSleepSec": wb_cfg.idle_sleep_sec,
-                "displayClient": wb_cfg.display_client,
-                "enabled": wb_cfg.enabled,
-            }
-            return {
-                "service": "armory-cam",
-                "serverEpochMs": int(time.time() * 1000),
-                "recording": self.recording,
-                "paused": self.paused,
-                "bumpAlertNtfy": self.bump_alert_ntfy,
-                "disk": self.disk_stats(),
-                "calibration": self.calibration_status(),
-                "preview": self.preview_drive_info(),
-                "cameras": cams,
-                "wallboard": wb_status,
-                "voice": self.voice.status_dict(),
-                "houseAudio": self.house_audio.status_dict(live_probe=False),
-                "displays": self.displays.status_dict(live_probe=False),
-                "shows": self.shows.status_dict(),
-            }
+            wb_cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
+            wb_url = self.effective_wallboard_url()
+            rec = self.recording
+            paused = self.paused
+            bump_alert_ntfy = self.bump_alert_ntfy
+            last_poll_ok_ms = self._last_poll_ok_ms
+
+        wb_status = {
+            **self.adb.status_dict(wb_cfg),
+            **self.wallboard.status_dict(),
+            "wallboardUrl": wb_url,
+            "wakeOnStart": wb_cfg.wake_on_start,
+            "sleepOnStop": wb_cfg.sleep_on_stop,
+            "idleSleepSec": wb_cfg.idle_sleep_sec,
+            "displayClient": wb_cfg.display_client,
+            "enabled": wb_cfg.enabled,
+        }
+        return {
+            "service": "armory-cam",
+            "serverEpochMs": int(time.time() * 1000),
+            "lastPollOkMs": last_poll_ok_ms,
+            "recording": rec,
+            "paused": paused,
+            "bumpAlertNtfy": bump_alert_ntfy,
+            "disk": self.disk_stats(),
+            "calibration": self.calibration_status(),
+            "preview": self.preview_drive_info(),
+            "cameras": cams,
+            "wallboard": wb_status,
+            "voice": self.voice.status_dict(),
+            "houseAudio": self.house_audio.status_dict(live_probe=False),
+            "displays": self.displays.status_dict(live_probe=False),
+            "shows": self.shows.status_dict(),
+        }
 
     def _wake_wallboard_sync(self, force: bool = True) -> dict[str, Any]:
         with self.lock:
@@ -5855,6 +6431,7 @@ DASHBOARD_HTML = """<!doctype html>
               <button class="btn sec" type="button" onclick="navigatePage('shows')">🎬 Ryder Intro Simulator</button>
               <button class="btn sec" type="button" onclick="navigatePage('gym')">📺 Configure Displays / IP</button>
               <button class="btn sec" type="button" onclick="navigatePage('audio')">🎙️ Test S330 Mic / Denon</button>
+              <button class="btn sec" type="button" id="ovBackupCfgBtn">💾 Back up OptiPlex Configs</button>
             </div>
           </div>
         </div>
@@ -6543,13 +7120,12 @@ DASHBOARD_HTML = """<!doctype html>
                 <option value="kokoro:am_michael">Michael (Local GPU — Fastest)</option>
                 <option value="kokoro:am_onyx">Onyx (Local GPU Deep Male)</option>
                 <option value="kokoro:am_fenrir">Fenrir (Local GPU Bold Male)</option>
-                <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural — Legacy Default)</option>
+                <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural)</option>
                 <option value="en-US-AvaMultilingualNeural">Ava (Cloud Neural Female)</option>
-                <option value="sapi">Windows Offline SAPI</option>
               </select>
             </div>
             <div>
-              <label>Whisper Model (CPU int8)</label>
+              <label id="vxModelLbl">Whisper Model</label>
               <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (most accurate)</option></select>
             </div>
             <div>
@@ -6753,11 +7329,14 @@ function sourceSlugOf(cam) {
 function syncRawFeeds() {
   const box = $('rawFeeds');
   if (!box || !cfg) return;
+  const wantFeeds = !document.hidden && (activePage === 'cameras' || (mmState && mmState.open));
   const activePhys = new Map();
-  for (const c of cfg.cameras) {
-    if (!c.sourceSlug && c.rtspUrl) {
-      const hasEnabledView = cfg.cameras.some(v => sourceSlugOf(v) === c.slug && v.enabled);
-      if (hasEnabledView) activePhys.set(c.slug, c);
+  if (wantFeeds) {
+    for (const c of cfg.cameras) {
+      if (!c.sourceSlug && c.rtspUrl) {
+        const hasEnabledView = cfg.cameras.some(v => sourceSlugOf(v) === c.slug && v.enabled);
+        if (hasEnabledView) activePhys.set(c.slug, c);
+      }
     }
   }
   Array.from(box.children).forEach(el => {
@@ -6868,6 +7447,7 @@ function drawFeedToCanvas(canvas, rawImg, rot, tilt, crop, applyCrop) {
 }
 
 function drawAllCanvases() {
+  if (document.hidden) return;
   if (typeof activePage !== 'undefined' && activePage !== 'cameras' && !mmState.open) return;
   if (!cfg || !cfg.cameras) return;
   cfg.cameras.forEach((c, idx) => {
@@ -7577,6 +8157,7 @@ function openMaskModal(idx, opts = {}) {
 
   $('maskModal').hidden = false;
   document.body.style.overflow = 'hidden';
+  syncRawFeeds();
   updateModalMediaSrc();
   fitInitialModalView();
   drawAllCanvases();
@@ -7610,6 +8191,7 @@ function closeMaskModal() {
   document.body.style.overflow = '';
   const img = $('mmStream');
   if (img) img.removeAttribute('src');
+  syncRawFeeds();
   syncCropOverlay(mmState.camIdx);
 }
 
@@ -8451,14 +9033,18 @@ function syncVoiceUI(vx) {
     testBtn.textContent = vx.testRemainingSec > 0 ? `Stop Test (${vx.testRemainingSec}s)` : 'Test Mic (60s)';
     testBtn.dataset.testing = vx.testRemainingSec > 0 ? '1' : '0';
   }
+  const ml = $('vxModelLbl');
+  if (ml) {
+    ml.textContent = vx.asrDevice ? `Whisper Model (${String(vx.asrDevice).toUpperCase()})` : 'Whisper Model';
+  }
   const msgEl = $('vxMsg');
   if (msgEl) {
     const parts = [
-      `Mic: <b>${vx.device || 'PowerConf S330'}</b>${vx.hostApi ? ` (${vx.hostApi})` : ''}`,
-      `Model: <b>${vx.modelSize || 'base.en'}</b>`,
-      `SSE: <b>${vx.sseClients || 0}</b>`,
+      `Mic: <b>${escHtml(vx.device || 'PowerConf S330')}</b>${vx.hostApi ? ` (${escHtml(vx.hostApi)})` : ''}`,
+      `Model: <b>${escHtml(vx.modelSize || 'base.en')}</b>${vx.asrDevice ? ` (${escHtml(vx.asrDevice)})` : ''}`,
+      `SSE: <b>${Number(vx.sseClients || 0)}</b>`,
     ];
-    if (vx.error) parts.push(`<span style="color:var(--amber)">${vx.error}</span>`);
+    if (vx.error) parts.push(`<span style="color:var(--amber)">${escHtml(vx.error)}</span>`);
     else if (!vx.listening && vx.enabled) parts.push('Shared mic closed until active Lift workout');
     msgEl.innerHTML = parts.join(' · ');
   }
@@ -8471,7 +9057,7 @@ function syncVoiceUI(vx) {
       recEl.innerHTML = `<table><thead><tr><th>Time</th><th>Heard</th><th>Wake</th><th>ASR</th><th>Pixel Ack</th></tr></thead><tbody>` +
         rows.map(r => {
           const ts = new Date(r.tsMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-          return `<tr><td>${ts}</td><td>${r.transcript}</td><td>${r.emitted ? '<span class="pill ok">SENT</span>' : '<span class="pill">IGNORED</span>'}</td><td>${r.latencyMs} ms</td><td>${r.ackText || '—'}</td></tr>`;
+          return `<tr><td>${escHtml(ts)}</td><td>${escHtml(r.transcript)}</td><td>${r.emitted ? '<span class="pill ok">SENT</span>' : '<span class="pill">IGNORED</span>'}</td><td>${Number(r.latencyMs || 0)} ms</td><td>${escHtml(r.ackText || '—')}</td></tr>`;
         }).join('') +
         `</tbody></table>`;
     }
@@ -8490,10 +9076,10 @@ async function pollVoiceStatus() {
         vx.devices.inputs.forEach(d => {
           if (d.name && !seen.has(d.name)) {
             seen.add(d.name);
-            opts.push(`<option value="${d.name.replace(/"/g, '&quot;')}">${d.name} (${d.hostApi})</option>`);
+            opts.push(`<option value="${escHtml(d.name)}">${escHtml(d.name)} (${escHtml(d.hostApi)})</option>`);
           }
         });
-        if (cur && !seen.has(cur)) opts.push(`<option value="${cur.replace(/"/g, '&quot;')}">${cur}</option>`);
+        if (cur && !seen.has(cur)) opts.push(`<option value="${escHtml(cur)}">${escHtml(cur)}</option>`);
         if (document.activeElement !== sel) {
           sel.innerHTML = opts.join('');
           sel.value = cur;
@@ -8512,7 +9098,7 @@ async function saveVoiceConfig(triggerBtn) {
     deviceMatch: $('vxDevice').value || 'PowerConf S330',
     speakerReadback: $('vxReadback').value === '1',
     setCommitMode: $('vxSetCommitMode').value || 'voice',
-    ttsVoice: $('vxTtsVoice').value || 'en-US-AndrewMultilingualNeural',
+    ttsVoice: $('vxTtsVoice').value || 'kokoro:am_michael',
     modelSize: $('vxModel').value || 'base.en',
     vadThreshold: Number($('vxVad').value) || 0.45,
   };
@@ -8600,7 +9186,7 @@ async function pollStatus() {
     const badge = $('svcBadge');
     badge.textContent = st.recording ? (st.paused ? 'PAUSED' : 'RECORDING') : 'STANDBY RING';
     badge.className = 'pill ' + (st.recording ? 'ok' : 'live');
-    $('subInfo').innerHTML = `Storage: <code>${st.disk.root}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB`;
+    $('subInfo').innerHTML = `Storage: <code>${escHtml(st.disk.root)}</code> · <b>${st.disk.freeGb} GB</b> free / ${st.disk.totalGb} GB`;
     if ($('navBadgeRet') && cfg && cfg.retentionDays) $('navBadgeRet').textContent = `${cfg.retentionDays}d`;
     const bySlug = new Map((st.cameras || []).map(sc => [sc.slug, sc]));
     (cfg?.cameras || []).forEach((cam, idx) => {
@@ -8635,14 +9221,14 @@ async function pollStatus() {
       wbBadge.textContent = wb.workoutActive ? `LIVE · ${(wb.mode || 'WORKOUT').toUpperCase()}` : stTxt;
       wbBadge.className = 'pill ' + ((wb.adbState === 'awake' || wb.adbState === 'ready' || wb.workoutActive) ? 'ok' : 'live');
       const parts = [
-        `URL: <code>${wb.wallboardUrl}</code>`,
-        `SSE Displays: <b>${wb.clients}</b>`,
-        `Mode: <b>${wb.mode || 'standby'}</b>`,
-        wb.adbBinFound ? (wb.fireTvModel ? `TV: <b>${wb.fireTvModel}</b>` : (wb.fireTvHost ? `TV: <code>${wb.fireTvHost}</code>` : 'TV IP not set yet')) : 'adb.exe missing',
+        `URL: <code>${escHtml(wb.wallboardUrl)}</code>`,
+        `SSE Displays: <b>${Number(wb.clients || 0)}</b>`,
+        `Mode: <b>${escHtml(wb.mode || 'standby')}</b>`,
+        wb.adbBinFound ? (wb.fireTvModel ? `TV: <b>${escHtml(wb.fireTvModel)}</b>` : (wb.fireTvHost ? `TV: <code>${escHtml(wb.fireTvHost)}</code>` : 'TV IP not set yet')) : 'adb.exe missing',
       ];
       if (wb.pendingSleepSec > 0) parts.push(`Sleep in ${wb.pendingSleepSec}s`);
-      if (wb.lastError) parts.push(`<span style="color:var(--amber)">${wb.lastError}</span>`);
-      else if (wb.lastAction) parts.push(`Last: ${wb.lastAction}`);
+      if (wb.lastError) parts.push(`<span style="color:var(--amber)">${escHtml(wb.lastError)}</span>`);
+      else if (wb.lastAction) parts.push(`Last: ${escHtml(wb.lastAction)}`);
       $('wbMsg').innerHTML = parts.join(' · ');
     }
     if (st.calibration) {
@@ -8959,13 +9545,23 @@ async function pollClips() {
     latestClipRows = (clips && Array.isArray(clips.clips)) ? clips.clips : [];
     if (latestClipRows.length) {
       $('clipList').innerHTML = `<table><thead><tr><th>Clip</th><th>Camera</th><th>Duration</th><th>Size</th><th>Drive</th></tr></thead><tbody>` +
-        latestClipRows.map(x => `<tr><td><a href="${x.lanUrl}" target="_blank">${x.fileName}</a></td><td>${x.camera}</td><td>${x.durationSec}s</td><td>${(x.bytes/1048576).toFixed(1)} MB</td><td>${x.driveUrl ? `<a href="${x.driveUrl}" target="_blank">Drive ↗</a>` : 'Syncing…'}</td></tr>`).join('') +
+        latestClipRows.map(x => `<tr><td><a href="${escHtml(x.lanUrl)}" target="_blank">${escHtml(x.fileName)}</a></td><td>${escHtml(x.camera)}</td><td>${Number(x.durationSec || 0)}s</td><td>${(Number(x.bytes || 0)/1048576).toFixed(1)} MB</td><td>${x.driveUrl ? `<a href="${escHtml(x.driveUrl)}" target="_blank">Drive ↗</a>` : 'Syncing…'}</td></tr>`).join('') +
         `</tbody></table>`;
     } else {
       $('clipList').textContent = 'No clips saved yet.';
     }
     syncOverview();
   } catch {}
+}
+
+function pollLoop(fn, ms, pageFilter) {
+  let busy = false;
+  return setInterval(async () => {
+    if (busy || document.hidden) return;
+    if (pageFilter && !pageFilter()) return;
+    busy = true;
+    try { await fn(); } finally { busy = false; }
+  }, ms);
 }
 
 async function init() {
@@ -8990,7 +9586,7 @@ async function init() {
   $('vxMode').value = vx.listenMode === 'always' ? 'always' : 'workout';
   $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
   $('vxSetCommitMode').value = vx.setCommitMode === 'chime' ? 'chime' : 'voice';
-  $('vxTtsVoice').value = vx.ttsVoice || 'en-US-AndrewMultilingualNeural';
+  $('vxTtsVoice').value = vx.ttsVoice || 'kokoro:am_michael';
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);
   populateHouseAudioInputs(cfg.houseAudio || {});
@@ -9014,11 +9610,40 @@ async function init() {
   setInterval(drawAllCanvases, 100);
   await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips(), loadShows(), loadTapes()]);
   if (activePage === 'footage') ensureScrubberTimeline();
-  setInterval(pollStatus, 1000);
-  setInterval(pollVoiceStatus, 3000);
-  setInterval(pollAudioStatus, 3000);
-  setInterval(pollVoiceAb, 4000);
-  setInterval(pollClips, 6000);
+  pollLoop(pollStatus, 2000);
+  pollLoop(pollVoiceStatus, 3000, () => activePage === 'audio' || activePage === 'overview');
+  pollLoop(pollAudioStatus, 5000, () => activePage === 'audio' || activePage === 'gym' || activePage === 'overview');
+  pollLoop(pollVoiceAb, 5000, () => activePage === 'audio');
+  pollLoop(pollClips, 8000, () => activePage === 'overview' || activePage === 'footage');
+  document.addEventListener('visibilitychange', () => {
+    syncRawFeeds();
+    if (!document.hidden) {
+      pollStatus();
+      if (activePage === 'audio' || activePage === 'overview') pollVoiceStatus();
+      if (activePage === 'audio' || activePage === 'gym' || activePage === 'overview') pollAudioStatus();
+      if (activePage === 'footage' || activePage === 'overview') pollClips();
+    }
+  });
+  if ($('ovBackupCfgBtn')) {
+    $('ovBackupCfgBtn').onclick = async () => {
+      const btn = $('ovBackupCfgBtn');
+      setBtnFeedback(btn, 'saving', 'Backing up…');
+      try {
+        const r = await fetch('/api/config/backup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' }).then(x => x.json());
+        if (r && r.ok) {
+          const n = Array.isArray(r.files) ? r.files.length : 0;
+          setBtnFeedback(btn, 'saved', `✓ ${n} backed up`, 2500);
+          showToast(`✓ Backed up ${n} OptiPlex config(s) to Drive`, 'ok');
+        } else {
+          setBtnFeedback(btn, 'save-err', '✗ Backup failed', 3000);
+          showToast(`✗ ${(r && r.error) || 'OptiPlex backup unavailable'}`, 'err');
+        }
+      } catch {
+        setBtnFeedback(btn, 'save-err', '✗ Backup failed', 3000);
+        showToast('✗ OptiPlex backup failed', 'err');
+      }
+    };
+  }
 }
 
 ['retDays', 'preRoll', 'driveDir', 'wbHost', 'wbMac', 'wbPort', 'wbIdleMin'].forEach(id => {
@@ -10405,6 +11030,7 @@ function navigatePage(pageId, pushHash = true) {
   if (pushHash && window.location.hash !== '#' + next) {
     try { window.history.replaceState(null, '', '#' + next); } catch { window.location.hash = next; }
   }
+  syncRawFeeds();
   if (next === 'cameras') {
     requestAnimationFrame(() => {
       drawAllCanvases();
@@ -10415,6 +11041,15 @@ function navigatePage(pageId, pushHash = true) {
       ensureScrubberTimeline();
       drawTapeTimeline();
     });
+    pollClips();
+  } else if (next === 'audio') {
+    pollVoiceStatus();
+    pollAudioStatus();
+    pollVoiceAb();
+  } else if (next === 'gym') {
+    pollAudioStatus();
+  } else if (next === 'overview') {
+    pollClips();
   }
 }
 
@@ -11143,17 +11778,74 @@ def parse_http_range(range_header: str | None, file_size: int) -> tuple[int, int
     return (start, end)
 
 
+def _is_allowed_origin(origin: str) -> bool:
+    raw = str(origin or "").strip()
+    if not raw:
+        return True
+    if raw in ("capacitor://localhost", "ionic://localhost"):
+        return True
+    try:
+        u = urllib.parse.urlparse(raw)
+    except Exception:
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    host = u.hostname.lower().rstrip(".")
+    if host in ("localhost", "127.0.0.1", "::1") or host.endswith(".local"):
+        return True
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        a, b = int(parts[0]), int(parts[1])
+        if a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31):
+            return True
+    return False
+
+
+def _parse_num(val: Any, default: Any, lo: float, hi: float, *, as_int: bool = False) -> Any:
+    if val is None or val == "":
+        return default
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(n):
+        return default
+    clamped = max(lo, min(hi, n))
+    return int(round(clamped)) if as_int else clamped
+
+
 def create_app(service: ArmoryCamService) -> Flask:
     app = Flask("armory-cam")
+    app.config["MAX_CONTENT_LENGTH"] = 260 * 1024 * 1024
+
+    @app.before_request
+    def check_mutating_origin() -> Response | None:
+        origin = (request.headers.get("Origin") or "").strip()
+        if request.method in ("POST", "PUT", "DELETE", "PATCH") and origin and not _is_allowed_origin(origin):
+            return jsonify({"ok": False, "error": "Origin not allowed"}), 403
+        return None
 
     @app.after_request
     def add_cors(resp: Response) -> Response:
-        resp.headers["Access-Control-Allow-Origin"] = "*"
+        origin = (request.headers.get("Origin") or "").strip()
+        if origin:
+            if _is_allowed_origin(origin):
+                resp.headers["Access-Control-Allow-Origin"] = origin
+                resp.headers["Vary"] = "Origin"
+        else:
+            resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
         resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
-        resp.headers["Access-Control-Allow-Private-Network"] = "true"
         return resp
+
+    @app.errorhandler(Exception)
+    def handle_app_exception(exc: Exception) -> tuple[Response, int] | Response:
+        if isinstance(exc, HTTPException):
+            code = int(exc.code or 500)
+            return jsonify({"ok": False, "error": str(exc.description or exc.name)}), code
+        service.log.exception("Unhandled HTTP route error: %s", exc)
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
 
     @app.route("/<path:dummy>", methods=["OPTIONS"])
     @app.route("/", methods=["OPTIONS"])
@@ -11247,6 +11939,18 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         service.update_config(body)
         return jsonify({"ok": True})
+
+    @app.post("/api/config/backup")
+    def api_config_backup() -> Response:
+        res = service.backup_optiplex_configs()
+        return jsonify(res), (200 if res.get("ok") else 500)
+
+    @app.post("/api/config/restore")
+    def api_config_restore() -> Response:
+        body = request.get_json(silent=True) or {}
+        overwrite = bool(body.get("overwrite", False)) if isinstance(body, dict) else False
+        res = service.restore_optiplex_configs(overwrite=overwrite)
+        return jsonify(res), (200 if res.get("ok") else 404)
 
     @app.get("/wallboard")
     @app.get("/wallboard/")
@@ -11380,7 +12084,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         state_obj = body.get("state") if isinstance(body.get("state"), dict) else None
         reason = str(body.get("reason") or "workout_finished")
-        delay_sec = max(0.0, float(body.get("delaySec", 0) or 0))
+        delay_sec = float(_parse_num(body.get("delaySec"), 0.0, 0.0, 86400.0))
         sync_flag = bool(body.get("sync", False))
         service.wallboard.update_state(state_obj, workout_active=False)
         service.voice.set_wallboard_active(False)
@@ -11538,7 +12242,8 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.get("/api/audio/status")
     def api_audio_status() -> Response:
-        resp = jsonify(service.house_audio.status_dict(live_probe=True))
+        fresh = request.args.get("fresh") in ("1", "true", "yes")
+        resp = jsonify(service.house_audio.status_dict(live_probe=True, force_probe=fresh))
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
@@ -11551,20 +12256,19 @@ def create_app(service: ArmoryCamService) -> Flask:
             service.house_audio_cfg = service.house_audio.update_config(body)
             service.save_config()
             cfg_dict = service.house_audio_cfg.to_dict()
-        return jsonify({"ok": True, "config": cfg_dict, "status": service.house_audio.status_dict(live_probe=True)})
+        service.house_audio.invalidate_probe_cache()
+        return jsonify({"ok": True, "config": cfg_dict, "status": service.house_audio.status_dict(live_probe=True, force_probe=True)})
 
     @app.post("/api/audio/denon/test-duck")
     def api_audio_denon_test_duck() -> Response:
         body = request.get_json(silent=True) or {}
-        try:
-            hold_sec = max(0.3, min(5.0, float(body.get("holdSec", 1.2) or 1.2)))
-        except (TypeError, ValueError):
-            hold_sec = 1.2
+        hold_sec = float(_parse_num(body.get("holdSec"), 1.2, 0.3, 5.0))
         drop_raw = body.get("dropDb")
-        drop_db = float(drop_raw) if drop_raw is not None else None
+        drop_db = _parse_num(drop_raw, None, 1.0, 25.0) if drop_raw is not None else None
         with service.house_audio.denon.duck_context(drop_db=drop_db, force=True) as duck_info:
             if duck_info.get("ducked"):
                 service.house_audio.denon._sleep(hold_sec)
+        service.house_audio.invalidate_probe_cache()
         return jsonify({
             "ok": bool(duck_info.get("ducked")),
             "duck": duck_info,
@@ -11576,10 +12280,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         cfg = service.house_audio.get_config()
         host = str(body.get("host") or cfg.cube_host or "").strip()
-        try:
-            adb_port = max(1, min(65535, int(body.get("adbPort", cfg.cube_adb_port))))
-        except (TypeError, ValueError):
-            adb_port = cfg.cube_adb_port
+        adb_port = int(_parse_num(body.get("adbPort"), cfg.cube_adb_port, 1, 65535, as_int=True))
         res = service.house_audio.cube.adb_probe_and_audit(service.adb, host, adb_port, cfg.cube_port)
         return jsonify(res)
 
@@ -11588,11 +12289,9 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         cfg = service.house_audio.get_config()
         host = str(body.get("host") or cfg.cube_host or "").strip()
-        try:
-            adb_port = max(1, min(65535, int(body.get("adbPort", cfg.cube_adb_port))))
-        except (TypeError, ValueError):
-            adb_port = cfg.cube_adb_port
+        adb_port = int(_parse_num(body.get("adbPort"), cfg.cube_adb_port, 1, 65535, as_int=True))
         res = service.house_audio.cube.adb_ensure_service(service.adb, host, adb_port, cfg.cube_port)
+        service.house_audio.invalidate_probe_cache()
         return jsonify(res)
 
     @app.post("/api/audio/test-play")
@@ -11691,10 +12390,13 @@ def create_app(service: ArmoryCamService) -> Flask:
             if not action:
                 return jsonify({"ok": False, "error": "Provide action"}), 400
             res = service.displays.execute_many([str(t) for t in targets], action)
+            service.house_audio.invalidate_probe_cache()
             return jsonify(res), (200 if res.get("ok") else 400)
         if not target or not action:
             return jsonify({"ok": False, "error": "Provide target and action"}), 400
         res = service.displays.execute(target, action)
+        if target in ("avr", "cube", "gym", "open_gym", "close_gym", "spin", "music"):
+            service.house_audio.invalidate_probe_cache()
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.post("/api/displays/discover-roku")
@@ -11748,6 +12450,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             body = request.get_json(silent=True) or {}
             try:
                 status = service.shows.update_tts_secrets(body)
+                service.trigger_optiplex_config_backup_async()
                 return jsonify({"ok": True, **status, **service.shows.list_voices()})
             except Exception as exc:
                 return jsonify({"ok": False, "error": str(exc)}), 400
@@ -11917,6 +12620,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         rebuild = bool(body.get("rebuild", True))
         try:
             res = service.shows.update_show(show_id, body, rebuild=rebuild)
+            service.trigger_optiplex_config_backup_async()
             return jsonify(res)
         except KeyError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
@@ -12010,24 +12714,24 @@ def create_app(service: ArmoryCamService) -> Flask:
             fog_url = service.shows.fx_hooks.resolve_fog_url()
             res["tested"] = "fog"
             res["hookResult"] = service.shows._fire_http_hook(fog_url) if fog_url else {"ok": False, "error": "Fog IP/URL not set"}
+        service.trigger_optiplex_config_backup_async()
         return jsonify(res)
 
     @app.get("/api/clips")
     def api_clips() -> Response:
-        try:
-            limit = max(1, min(200, int(request.args.get("limit", 30))))
-        except (TypeError, ValueError):
-            limit = 30
+        limit = int(_parse_num(request.args.get("limit"), 30, 1, 200, as_int=True))
         return jsonify({"clips": service.recent_clips(limit)})
 
     @app.post("/api/clip/delete")
     def api_clip_delete() -> Response:
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid delete payload"}), 400
         res = service.delete_clip(
             lan_url=str(body.get("lanUrl") or ""),
             file_name=str(body.get("fileName") or ""),
         )
-        return jsonify(res)
+        return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.get("/api/snapshot")
     def api_snapshot() -> Response:
@@ -12055,6 +12759,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         defish_ov: bool | None = None
         if defish_arg is not None:
             defish_ov = defish_arg in ("1", "true", "yes")
+        service._last_camera_ui_mono = time.monotonic()
         jpg = service.get_snapshot_jpeg(
             cam,
             raw=raw,
@@ -12085,6 +12790,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 return Response(status=404)
         slug = cam.slug
         ch = service.live_hub.get_channel(media_slug)
+        service._last_camera_ui_mono = time.monotonic()
 
         def generate():
             last_seq = 0
@@ -12102,6 +12808,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                     last_seq = ch.seq
                     raw_jpg = ch.latest_jpeg
                 last_frame_at = time.time()
+                service._last_camera_ui_mono = time.monotonic()
 
                 payload = raw_jpg
                 if not raw:
@@ -12160,11 +12867,9 @@ def create_app(service: ArmoryCamService) -> Flask:
     @app.get("/api/bursts")
     def api_bursts() -> Response:
         sid = request.args.get("sessionId", "")
-        around_raw = request.args.get("aroundMs")
-        around_ms = int(float(around_raw)) if around_raw is not None else None
+        around_ms = _parse_num(request.args.get("aroundMs"), None, 0, 9_000_000_000_000, as_int=True)
         cam = request.args.get("camera")
-        min_dur_raw = request.args.get("minDurSec")
-        min_dur_sec = float(min_dur_raw) if min_dur_raw is not None else None
+        min_dur_sec = _parse_num(request.args.get("minDurSec"), None, 0.1, 3600.0)
         bursts = service.bursts_for_session(sid, around_ms=around_ms, camera=cam, min_dur_sec=min_dur_sec)
         return jsonify({"bursts": bursts})
 
@@ -12178,22 +12883,17 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_tape_timeline() -> Response:
         sid = request.args.get("sessionId", "")
         cam = request.args.get("camera", "Rack Cam")
-        buckets_raw = request.args.get("buckets")
-        buckets = int(buckets_raw) if buckets_raw else 80
+        buckets = int(_parse_num(request.args.get("buckets"), 80, 10, 400, as_int=True))
         return jsonify(service.tape_timeline(cam, sid, buckets=buckets))
 
     @app.get("/api/tape/pack")
     def api_tape_pack() -> Response:
         sid = request.args.get("sessionId", "")
         cam = request.args.get("camera", "Rack Cam")
-        s_raw = request.args.get("startMs")
-        e_raw = request.args.get("endMs")
-        c_raw = request.args.get("count")
-        w_raw = request.args.get("w")
-        start_ms = int(float(s_raw)) if s_raw is not None and s_raw != "" else None
-        end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else None
-        count = int(c_raw) if c_raw else 80
-        max_w = int(w_raw) if w_raw else DEFAULT_SCRUB_THUMB_W
+        start_ms = _parse_num(request.args.get("startMs"), None, 0, 9_000_000_000_000, as_int=True)
+        end_ms = _parse_num(request.args.get("endMs"), None, 0, 9_000_000_000_000, as_int=True)
+        count = int(_parse_num(request.args.get("count"), 80, 1, 240, as_int=True))
+        max_w = int(_parse_num(request.args.get("w"), DEFAULT_SCRUB_THUMB_W, 80, 1920, as_int=True))
         resp = jsonify(
             service.tape_frame_pack(
                 cam,
@@ -12211,10 +12911,9 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_tape_frame() -> Response:
         sid = request.args.get("sessionId", "")
         cam = request.args.get("camera", "Rack Cam")
-        ts_raw = request.args.get("tsMs")
-        ts_ms = int(float(ts_raw)) if ts_raw is not None else int(time.time() * 1000)
-        w_raw = request.args.get("w")
-        max_w = int(w_raw) if w_raw else 480
+        now_ms = int(time.time() * 1000)
+        ts_ms = int(_parse_num(request.args.get("tsMs"), now_ms, 0, 9_000_000_000_000, as_int=True))
+        max_w = int(_parse_num(request.args.get("w"), 480, 80, 1920, as_int=True))
         jpg = service.get_tape_frame_jpeg(cam, sid, ts_ms, max_w=max_w)
         if not jpg:
             return Response(status=404)
@@ -12306,10 +13005,13 @@ def create_app(service: ArmoryCamService) -> Flask:
     @app.post("/api/clip")
     def api_clip() -> Response:
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid clip payload"}), 400
         sid = str(body.get("sessionId") or "")
         ex_name = str(body.get("exName") or body.get("exId") or "lift")
-        start_ms = int(body.get("startMs") or (time.time() * 1000 - 20_000))
-        end_ms = int(body.get("endMs") or time.time() * 1000)
+        now_ms = int(time.time() * 1000)
+        start_ms = int(_parse_num(body.get("startMs"), now_ms - 20_000, 0, 9_000_000_000_000, as_int=True))
+        end_ms = int(_parse_num(body.get("endMs"), now_ms, 0, 9_000_000_000_000, as_int=True))
         cam_override = body.get("camera")
         cams_raw = body.get("cameras")
         cams_list = (
@@ -12337,11 +13039,13 @@ def create_app(service: ArmoryCamService) -> Flask:
     @app.post("/api/clip/auto-pr")
     def api_clip_auto_pr() -> Response:
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid auto-PR payload"}), 400
         sid = str(body.get("sessionId") or "")
         ex_name = str(body.get("exName") or body.get("exId") or "PR")
-        set_at_ms = int(body.get("setAtMs") or time.time() * 1000)
-        prev_raw = body.get("prevSetAtMs")
-        prev_ms = int(prev_raw) if prev_raw is not None else None
+        now_ms = int(time.time() * 1000)
+        set_at_ms = int(_parse_num(body.get("setAtMs"), now_ms, 0, 9_000_000_000_000, as_int=True))
+        prev_ms = _parse_num(body.get("prevSetAtMs"), None, 0, 9_000_000_000_000, as_int=True)
         cam_raw = body.get("camera")
         cam_override = str(cam_raw).strip() if cam_raw else None
         cams_raw = body.get("cameras")
@@ -12385,13 +13089,13 @@ def create_app(service: ArmoryCamService) -> Flask:
     @app.post("/api/clip/audio")
     def api_clip_audio() -> Response:
         body = request.get_json(silent=True) or {}
+        if not isinstance(body, dict):
+            return jsonify({"ok": False, "error": "Invalid clip audio payload"}), 400
         lan_url = str(body.get("lanUrl") or "")
         file_name = str(body.get("fileName") or "")
         include_audio = bool(body.get("includeAudio", False))
-        s_raw = body.get("startMs")
-        e_raw = body.get("endMs")
-        start_ms = int(float(s_raw)) if s_raw is not None and s_raw != "" else None
-        end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else None
+        start_ms = _parse_num(body.get("startMs"), None, 0, 9_000_000_000_000, as_int=True)
+        end_ms = _parse_num(body.get("endMs"), None, 0, 9_000_000_000_000, as_int=True)
         payload, status_code = service.set_clip_audio(
             lan_url=lan_url,
             file_name=file_name,
@@ -12453,20 +13157,59 @@ def create_app(service: ArmoryCamService) -> Flask:
 
 
 def run_server(root_dir: Path | None = None, port_override: int | None = None) -> None:
-    svc = ArmoryCamService(root_dir=root_dir)
-    log_file = svc.logs_root / "server.log"
+    eff_root = Path(root_dir) if root_dir is not None else default_root_dir()
+    logs_root = eff_root / "logs"
+    logs_root.mkdir(parents=True, exist_ok=True)
+    log_file = logs_root / "server.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=5,
+                encoding="utf-8",
+            ),
             logging.StreamHandler(sys.stdout),
         ],
+        force=True,
     )
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+    def _log_sys_exc(exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            return
+        logging.critical("Uncaught exception", exc_info=(exc_type, exc_val, exc_tb))
+
+    def _log_thread_exc(args: Any) -> None:
+        logging.critical(
+            "Uncaught thread exception in %s",
+            getattr(getattr(args, "thread", None), "name", "?"),
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _log_sys_exc
+    threading.excepthook = _log_thread_exc
+
+    svc = ArmoryCamService(root_dir=eff_root)
     port = port_override or svc.port
     app = create_app(svc)
     svc.start_background()
     server = make_server("0.0.0.0", port, app, threaded=True)
+
+    def _request_shutdown(signum: int, _frame: Any) -> None:
+        logging.info("Received signal %s; shutting down cleanly...", signum)
+        threading.Thread(target=server.shutdown, name="http-shutdown", daemon=True).start()
+
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig_obj = getattr(signal, sig_name, None)
+        if sig_obj is not None:
+            try:
+                signal.signal(sig_obj, _request_shutdown)
+            except (OSError, ValueError):
+                pass
+
     logging.info("Armory Cam listening on http://0.0.0.0:%d (root=%s, ffmpeg=%s)", port, svc.root, svc.ffmpeg)
     try:
         server.serve_forever()

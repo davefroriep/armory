@@ -160,29 +160,48 @@ public class ArmoryAudioService extends Service {
     }
 
     private void runAcceptLoop() {
-        try {
-            ServerSocket ss = new ServerSocket();
-            ss.setReuseAddress(true);
-            ss.bind(new InetSocketAddress("0.0.0.0", LISTEN_PORT));
-            synchronized (this) {
-                serverSocket = ss;
-            }
-            while (running.get() && !ss.isClosed()) {
-                final Socket client = ss.accept();
-                if (httpPool != null && !httpPool.isShutdown()) {
-                    httpPool.execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            handleClient(client);
-                        }
-                    });
-                } else {
-                    closeQuietly(client);
+        while (running.get()) {
+            try {
+                ServerSocket ss;
+                synchronized (this) {
+                    ss = serverSocket;
+                    if (ss == null || ss.isClosed()) {
+                        ss = new ServerSocket();
+                        ss.setReuseAddress(true);
+                        ss.bind(new InetSocketAddress("0.0.0.0", LISTEN_PORT));
+                        serverSocket = ss;
+                    }
                 }
-            }
-        } catch (IOException e) {
-            if (running.get()) {
-                lastError.set("HTTP server bind/accept error: " + e.getMessage());
+                while (running.get() && !ss.isClosed()) {
+                    try {
+                        final Socket client = ss.accept();
+                        if (httpPool != null && !httpPool.isShutdown()) {
+                            httpPool.execute(new Runnable() {
+                                @Override
+                                public void run() {
+                                    handleClient(client);
+                                }
+                            });
+                        } else {
+                            closeQuietly(client);
+                        }
+                    } catch (IOException acceptErr) {
+                        if (!running.get() || ss.isClosed()) {
+                            break;
+                        }
+                        lastError.set("HTTP accept error: " + acceptErr.getMessage());
+                        sleepInterruptibly(200L);
+                    } catch (Exception execErr) {
+                        if (running.get()) {
+                            lastError.set("HTTP dispatch error: " + execErr.getMessage());
+                        }
+                    }
+                }
+            } catch (IOException e) {
+                if (running.get()) {
+                    lastError.set("HTTP server bind/accept error: " + e.getMessage());
+                    sleepInterruptibly(1000L);
+                }
             }
         }
     }
@@ -647,6 +666,14 @@ public class ArmoryAudioService extends Service {
                 if (mp.isPlaying()) {
                     mp.stop();
                 }
+            } catch (Exception ignored) {
+            }
+            try {
+                mp.reset();
+            } catch (Exception ignored) {
+            }
+            try {
+                mp.release();
             } catch (Exception ignored) {
             }
         }
