@@ -2280,6 +2280,14 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertEqual(dc.parse_display_voice_command("Armory turn off hisense")["action"], "off")
         self.assertEqual(dc.parse_display_voice_command("Armory switch primary to PC")["action"], "hdmi1")
         self.assertEqual(dc.parse_display_voice_command("Armory switch TV to Fire TV")["action"], "hdmi2")
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn on Fire TV Cube"), {"target": "cube", "targets": ["cube"], "action": "on", "speech": "Fire TV Cube on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn off Fire TV Cube"), {"target": "cube", "targets": ["cube"], "action": "off", "speech": "Fire TV Cube off"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, sleep the cube"), {"target": "cube", "targets": ["cube"], "action": "off", "speech": "Fire TV Cube off"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, wake up Fire TV Cube"), {"target": "cube", "targets": ["cube"], "action": "on", "speech": "Fire TV Cube on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, switch on Fire TV Cube"), {"target": "cube", "targets": ["cube"], "action": "on", "speech": "Fire TV Cube on"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, switch off Fire TV Cube"), {"target": "cube", "targets": ["cube"], "action": "off", "speech": "Fire TV Cube off"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, Fire TV Cube home"), {"target": "cube", "targets": ["cube"], "action": "home", "speech": "Fire TV Cube home"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV and Fire TV Cube"), {"target": "multi", "targets": ["tv", "cube"], "action": "on", "speech": "TV and Fire TV Cube on"})
         self.assertEqual(dc.parse_display_voice_command("Armory sleep wallboard"), {"target": "wallboard", "targets": ["wallboard"], "action": "off", "speech": "Wallboard off"})
         self.assertEqual(dc.parse_display_voice_command("Armory turn off denon")["target"], "avr")
         self.assertEqual(dc.parse_display_voice_command("Armory, play music"), {"target": "music", "targets": ["music"], "action": "play", "speech": "Playing music"})
@@ -2307,6 +2315,10 @@ class ArmoryCamTests(unittest.TestCase):
             adb_cmds.append(cmd)
             if "devices" in cmd:
                 return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n192.168.1.151:5555\tdevice\n", ""
+            if "ro.product.model" in cmd:
+                return 0, "AFTGAZL\n", ""
+            if "dumpsys" in cmd and "power" in cmd:
+                return 0, "  mWakefulness=Awake\nDisplay Power: state=ON\n", ""
             return 0, "connected", ""
 
         fake_adb = ac.FireTvAdbController(adb_bin="adb", runner=fake_runner, settle_sec=0.0)
@@ -2418,11 +2430,27 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertTrue(any("https://www.youtube.com/playlist?list=PLgym99" in " ".join(c) and "192.168.1.151:5555" in c for c in adb_cmds))
 
         adb_cmds.clear()
+        self.assertTrue(ctrl.execute("cube", "on")["ok"])
+        self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "224"] for c in adb_cmds))
+        self.assertFalse(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "26"] for c in adb_cmds))
+        self.assertTrue(ctrl.execute("cube", "off")["ok"])
+        self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "127"] for c in adb_cmds))
+        self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "223"] for c in adb_cmds))
+        self.assertTrue(ctrl.execute("cube", "home")["ok"])
+        self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "3"] for c in adb_cmds))
+        cube_probe = ctrl.probe_cube()
+        self.assertTrue(cube_probe["ok"])
+        self.assertEqual(cube_probe["model"], "AFTGAZL")
+        self.assertEqual(cube_probe["wakefulness"], "Awake")
+        self.assertEqual(cube_probe["displayPower"], "ON")
+
+        adb_cmds.clear()
         denon_cmds.clear()
         wb_calls.clear()
         cg = ctrl.execute("close_gym", "run")
         self.assertTrue(cg["ok"])
         self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "127"] for c in adb_cmds))
+        self.assertTrue(any("192.168.1.151:5555" in c and c[-3:] == ["input", "keyevent", "223"] for c in adb_cmds))
         self.assertIn("PWSTANDBY", denon_cmds)
         self.assertEqual(wb_calls, ["sleep"])
 
@@ -2452,6 +2480,10 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIn("dpPrimHost", dash)
             self.assertIn("dpSpinHost", dash)
             self.assertIn("dpMusicUrl", dash)
+            self.assertIn('data-dpact="cube:on"', dash)
+            self.assertIn('data-dpact="cube:off"', dash)
+            self.assertIn('data-dpact="cube:home"', dash)
+            self.assertIn("dpProbeCubeBtn", dash)
 
             svc.voice._stop_event.clear()
             stream = svc.voice.subscribe_sse()
@@ -2492,6 +2524,15 @@ class ArmoryCamTests(unittest.TestCase):
             act_res = client.post("/api/displays/action", json={"target": "tv", "action": "on"})
             self.assertEqual(act_res.status_code, 200)
             self.assertTrue(act_res.get_json()["ok"])
+
+            cube_act_res = client.post("/api/displays/action", json={"target": "cube", "action": "on"})
+            self.assertEqual(cube_act_res.status_code, 200)
+            self.assertTrue(cube_act_res.get_json()["ok"])
+
+            cube_st_res = client.get("/api/displays/status?probe=cube")
+            self.assertEqual(cube_st_res.status_code, 200)
+            self.assertTrue(cube_st_res.get_json()["cube"]["probe"]["ok"])
+            self.assertEqual(cube_st_res.get_json()["cube"]["probe"]["model"], "AFTGAZL")
 
             multi_res = client.post("/api/displays/action", json={"targets": ["tv", "wallboard"], "action": "on"})
             self.assertEqual(multi_res.status_code, 200)

@@ -5622,7 +5622,7 @@ DASHBOARD_HTML = """<!doctype html>
       <span id="dpBadge" class="pill">READY</span>
     </h2>
     <div id="dpMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">
-      Discrete IP power &amp; input commands (never toggles). Displays: <strong>TV</strong> (Hisense), <strong>Wallboard</strong>, and <strong>SmartSpin TV</strong>. Voice: <code>&ldquo;Armory, open the gym&rdquo;</code>, <code>&ldquo;Armory, close the gym&rdquo;</code>, <code>&ldquo;Armory, turn on TV and wallboard&rdquo;</code>, <code>&ldquo;Armory, turn on all TVs&rdquo;</code>, <code>&ldquo;Armory, switch TV to PC&rdquo;</code>.
+      Discrete IP power &amp; input commands (never toggles). Devices: <strong>TV</strong> (Hisense), <strong>Wallboard</strong>, <strong>SmartSpin TV</strong>, <strong>Fire TV Cube</strong>, and <strong>Denon</strong>. Voice: <code>&ldquo;Armory, open the gym&rdquo;</code>, <code>&ldquo;Armory, close the gym&rdquo;</code>, <code>&ldquo;Armory, turn on Fire TV Cube&rdquo;</code>, <code>&ldquo;Armory, sleep Fire TV Cube&rdquo;</code>, <code>&ldquo;Armory, turn on all TVs&rdquo;</code>, <code>&ldquo;Armory, switch TV to PC&rdquo;</code>.
     </div>
     <div class="ctrl-row" style="margin-top:0;margin-bottom:10px">
       <button class="btn ok sm" type="button" data-dpact="open_gym:run">Open Gym</button>
@@ -5642,6 +5642,9 @@ DASHBOARD_HTML = """<!doctype html>
       <button class="btn sec sm" type="button" data-dpact="avr:mch_stereo">Denon Multi-Ch</button>
       <button class="btn sec sm" type="button" data-dpact="avr:monitor1">Denon Monitor 1</button>
       <button class="btn sec sm" type="button" data-dpact="avr:monitor_auto">Denon Dual</button>
+      <button class="btn ok sm" type="button" data-dpact="cube:on">Cube ON</button>
+      <button class="btn sec sm" type="button" data-dpact="cube:off">Cube OFF</button>
+      <button class="btn sec sm" type="button" data-dpact="cube:home">Cube Home</button>
     </div>
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
       <div><label>TV IP (Hisense)</label><input id="dpPrimHost" type="text" value="192.168.1.230"></div>
@@ -5670,6 +5673,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="ctrl-row" style="margin-top:10px">
       <button class="btn" id="dpSaveBtn" type="button">Save Displays</button>
       <button class="btn sec" id="dpProbePrimBtn" type="button">Probe TV ADB</button>
+      <button class="btn sec" id="dpProbeCubeBtn" type="button">Probe Cube ADB</button>
       <button class="btn sec" id="dpFindRokuBtn" type="button">Find Roku TVs</button>
       <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
     </div>
@@ -8135,6 +8139,7 @@ function syncDisplaysUI(ds) {
   if (!ds) return;
   const spin = ds.spin || {};
   const prim = (ds.primary && ds.primary.probe) || {};
+  const cube = (ds.cube && ds.cube.probe) || {};
   const badge = $('dpBadge');
   if (badge) {
     if (spin.ok) {
@@ -8143,9 +8148,15 @@ function syncDisplaysUI(ds) {
     } else if (prim.ok) {
       badge.textContent = `TV ${prim.displayPower || 'OK'}`;
       badge.className = 'pill ok';
+    } else if (cube.ok) {
+      badge.textContent = 'TV READY';
+      badge.className = 'pill ok';
     } else {
       badge.textContent = 'TV READY';
       badge.className = 'pill live';
+    }
+    if (cube.ok) {
+      badge.textContent += ` · CUBE ${cube.displayPower || cube.wakefulness || 'OK'}`;
     }
   }
 }
@@ -8193,7 +8204,7 @@ async function runDisplayAction(target, action) {
       body: JSON.stringify({ target, action }),
     }).then(x => x.json());
     $('dpOut').textContent = r.ok ? `✓ ${r.message || 'Done'}` : `✗ ${r.error || r.message || 'Failed'}`;
-    if (target === 'avr' || target === 'gym' || target === 'open_gym' || target === 'close_gym' || target === 'spin' || target === 'music') await pollAudioStatus();
+    if (target === 'avr' || target === 'gym' || target === 'open_gym' || target === 'close_gym' || target === 'spin' || target === 'music' || target === 'cube') await pollAudioStatus();
   } catch {
     $('dpOut').textContent = '✗ Display command failed';
   }
@@ -8413,12 +8424,24 @@ $('dpProbePrimBtn').onclick = async () => {
   await saveDisplaysConfig();
   $('dpOut').textContent = 'Probing Primary Display ADB…';
   try {
-    const r = await fetch('/api/displays/status?probe=1').then(x => x.json());
+    const r = await fetch('/api/displays/status?probe=primary').then(x => x.json());
     const p = (r.primary && r.primary.probe) || {};
     $('dpOut').textContent = p.ok ? `✓ ${p.message}` : (p.message || 'Offline');
     syncDisplaysUI(r);
   } catch {
     $('dpOut').textContent = 'Probe failed';
+  }
+};
+$('dpProbeCubeBtn').onclick = async () => {
+  await saveDisplaysConfig();
+  $('dpOut').textContent = 'Probing Fire TV Cube ADB…';
+  try {
+    const r = await fetch('/api/displays/status?probe=cube').then(x => x.json());
+    const c = (r.cube && r.cube.probe) || {};
+    $('dpOut').textContent = c.ok ? `✓ ${c.message}` : (c.message || 'Offline');
+    syncDisplaysUI(r);
+  } catch {
+    $('dpOut').textContent = 'Cube probe failed';
   }
 };
 $('dpFindRokuBtn').onclick = async () => {
@@ -10154,10 +10177,15 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.get("/api/displays/status")
     def api_displays_status() -> Response:
-        probe_flag = request.args.get("probe") in ("1", "true", "yes")
-        if probe_flag:
+        probe_raw = (request.args.get("probe") or "").strip().lower()
+        if probe_raw == "cube":
+            service.displays.probe_cube()
+        elif probe_raw in ("primary", "tv"):
             service.displays.probe_primary()
-        resp = jsonify(service.displays.status_dict(live_probe=probe_flag))
+        elif probe_raw in ("1", "true", "yes"):
+            service.displays.probe_primary()
+            service.displays.probe_cube()
+        resp = jsonify(service.displays.status_dict(live_probe=(probe_raw in ("1", "true", "yes"))))
         resp.headers["Cache-Control"] = "no-store"
         return resp
 

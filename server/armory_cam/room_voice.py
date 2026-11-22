@@ -228,6 +228,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "open the gym",
         "close the gym",
         "SmartSpin TV",
+        "Fire TV Cube",
         "wallboard",
         "play music",
         "pause music",

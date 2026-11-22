@@ -344,6 +344,7 @@ _DISPLAY_SPEECH_LABELS = {
     "tv": "TV",
     "wallboard": "Wallboard",
     "spin": "SmartSpin TV",
+    "cube": "Fire TV Cube",
     "avr": "Denon",
 }
 
@@ -423,12 +424,12 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
 
     # 2. Explicit HDMI / input switching on Main TV (Hisense)
     if re.search(r"\b(hdmi\s*1|hdmi\s*one|optiplex|pc|computer|desktop)\b", cmd) and re.search(
-        r"\b(switch|set|change|put|show|go|to|input|hdmi|main|primary|hisense|tv|display)\b", cmd
+        r"\b(switch\s+(?!on\b|off\b)|set|change|put|show|go|to|input|hdmi|main|primary|hisense|tv|display)\b", cmd
     ):
         return {"target": "tv", "targets": ["tv"], "action": "hdmi1", "speech": "TV on PC"}
 
     if re.search(r"\b(hdmi\s*2|hdmi\s*two|fire\s*tv|cube|denon)\b", cmd) and re.search(
-        r"\b(switch|set|change|put|show|go|to|input|hdmi)\b", cmd
+        r"\b(switch\s+(?!on\b|off\b)|set|change|put|show|go|to|input|hdmi)\b", cmd
     ):
         return {"target": "tv", "targets": ["tv"], "action": "hdmi2", "speech": "TV on Fire TV"}
 
@@ -437,6 +438,10 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
         r"\b(multi\s*channel|multi\s*ch|all\s*speakers)\b", cmd
     ):
         return {"target": "avr", "targets": ["avr"], "action": "mch_stereo", "speech": "Denon multi channel stereo"}
+
+    # 3b. Fire TV Cube Home screen
+    if re.search(r"\b(?:fire\s*tv(?:\s+cube)?|cube)\b", cmd) and re.search(r"\bhome\b", cmd):
+        return {"target": "cube", "targets": ["cube"], "action": "home", "speech": "Fire TV Cube home"}
 
     # 4. Determine power action (on vs off)
     action: str | None = None
@@ -472,6 +477,10 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
         (
             "wallboard",
             r"\b(?:wall\s*board(?:\s+(?:tv|display|screen))?|32\s*(?:inch)?\s*tv|toshiba(?:\s+tv)?)\b",
+        ),
+        (
+            "cube",
+            r"\b(?:fire\s*tv(?:\s+cube)?|cube)\b",
         ),
         (
             "avr",
@@ -533,6 +542,7 @@ class GymDisplayController:
         self._sleep = sleep_fn or time.sleep
         self._allow_network = bool(allow_network)
         self.last_primary_probe: dict[str, Any] = {}
+        self.last_cube_probe: dict[str, Any] = {}
         self.last_spin_info: dict[str, Any] = {}
 
     def get_config(self) -> GymDisplaysConfig:
@@ -667,6 +677,46 @@ class GymDisplayController:
             "message": f"{model or ser} · {disp_m.group(1) if disp_m else '?'} · {active_inp.group(1) if active_inp else '?'}",
         }
         self.last_primary_probe = res
+        return res
+
+    def probe_cube(self) -> dict[str, Any]:
+        """Probe Fire TV Cube ADB wakefulness & display power state without waking the device."""
+        cfg = self.get_config()
+        ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+        if not ser:
+            res = {"ok": False, "state": "unconfigured", "message": "Fire TV Cube IP not set."}
+            self.last_cube_probe = res
+            return res
+        if self.adb is None:
+            res = {"ok": False, "state": "error", "serial": ser, "message": "ADB controller unavailable."}
+            self.last_cube_probe = res
+            return res
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            res = {"ok": False, "state": st, "serial": ser, "message": f"ADB {st}: {detail}"}
+            self.last_cube_probe = res
+            return res
+
+        def _sh(*args: str) -> str:
+            rc, out, _ = self.adb._run(["-s", ser, "shell", *args], timeout=4.5)
+            return out.strip() if rc == 0 else ""
+
+        model = (_sh("getprop", "ro.product.model").splitlines() or [""])[0].strip()
+        pwr = _sh("dumpsys", "power")
+        wake_m = re.search(r"mWakefulness=(\w+)", pwr)
+        disp_m = re.search(r"Display Power:\s*state=(\w+)", pwr)
+        wakefulness = wake_m.group(1) if wake_m else ""
+        display_power = disp_m.group(1) if disp_m else ""
+        res = {
+            "ok": True,
+            "state": "device",
+            "serial": ser,
+            "model": model,
+            "wakefulness": wakefulness,
+            "displayPower": display_power,
+            "message": f"{model or ser} · {wakefulness or '?'} · Display {display_power or '?'}",
+        }
+        self.last_cube_probe = res
         return res
 
     def _control_primary(self, action: str) -> dict[str, Any]:
@@ -902,6 +952,51 @@ class GymDisplayController:
     def _pause_cube_media(self) -> dict[str, Any]:
         return self._cube_media_keyevent("127", "Paused Fire TV Cube media")
 
+    def _control_cube(self, action: str) -> dict[str, Any]:
+        cfg = self.get_config()
+        ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+        if not ser or self.adb is None:
+            return {"ok": False, "target": "cube", "action": action, "error": "Fire TV Cube IP or ADB missing"}
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            return {"ok": False, "target": "cube", "action": action, "state": st, "error": f"Cube ADB {st}: {detail}"}
+
+        if action == "on":
+            rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+            return {
+                "ok": rc == 0,
+                "target": "cube",
+                "action": "on",
+                "serial": ser,
+                "message": "Fire TV Cube woken (discrete KEYCODE_WAKEUP)" if rc == 0 else (err or out).strip(),
+            }
+
+        if action == "off":
+            self.adb._run(["-s", ser, "shell", "input", "keyevent", "127"], timeout=4.0)
+            self._sleep(0.15)
+            rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "223"], timeout=4.0)
+            return {
+                "ok": rc == 0,
+                "target": "cube",
+                "action": "off",
+                "serial": ser,
+                "message": "Fire TV Cube put to sleep (discrete KEYCODE_SLEEP)" if rc == 0 else (err or out).strip(),
+            }
+
+        if action == "home":
+            self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+            self._sleep(0.2)
+            rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "3"], timeout=4.0)
+            return {
+                "ok": rc == 0,
+                "target": "cube",
+                "action": "home",
+                "serial": ser,
+                "message": "Fire TV Cube Home (KEYCODE_HOME)" if rc == 0 else (err or out).strip(),
+            }
+
+        return {"ok": False, "target": "cube", "action": action, "error": f"Unsupported Cube action: {action}"}
+
     def _control_music(self, action: str) -> dict[str, Any]:
         raw_act = str(action or "").strip()
         low = raw_act.lower()
@@ -1114,6 +1209,8 @@ class GymDisplayController:
             t = str(raw_t or "").strip().lower()
             if t == "primary":
                 t = "tv"
+            elif t in ("firetv", "fire_tv", "fire_tv_cube"):
+                t = "cube"
             if t and t not in ordered:
                 ordered.append(t)
         if not ordered:
@@ -1140,6 +1237,8 @@ class GymDisplayController:
 
         if tgt in ("primary", "tv"):
             return self._control_primary(act)
+        if tgt in ("cube", "firetv", "fire_tv", "fire_tv_cube"):
+            return self._control_cube(act)
         if tgt == "spin":
             return self._control_spin(act)
         if tgt == "avr":
@@ -1185,11 +1284,15 @@ class GymDisplayController:
                 results["wallboard"] = self._wake_wallboard_fn(True)
             if cfg.open_gym_play_music:
                 results["music"] = self._launch_cube_youtube_music()
+            elif cfg.cube_host:
+                results["cube"] = self._control_cube("on")
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
             return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (All 3 TVs, Denon, YouTube Music)"}
         if tgt == "close_gym":
             results = {}
-            results["media_pause"] = self._pause_cube_media()
+            cube_off = self._control_cube("off")
+            results["cube"] = cube_off
+            results["media_pause"] = cube_off
             results["tv"] = self._control_primary("off")
             results["avr"] = self._control_avr("off")
             if self._sleep_wallboard_fn is not None:
@@ -1218,6 +1321,11 @@ class GymDisplayController:
                 "host": cfg.primary.host,
                 "mac": cfg.primary.mac,
                 "probe": self.last_primary_probe,
+            },
+            "cube": {
+                "host": cfg.cube_host,
+                "adbPort": int(cfg.cube_adb_port),
+                "probe": self.last_cube_probe,
             },
             "spin": spin_info,
         }
