@@ -91,7 +91,7 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
   {
     title: 'Gym Camera DVR, Buddy & Guest Clips',
     slot: 'cam_arm',
-    examples: ['record', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith', 'guest record', 'guest smith', 'buddy mode on', 'buddy mode off', 'buddy mode'],
+    examples: ['record', 'record this', 'record me', 'film this', 'camera', 'record rack', 'record smith', 'clip that', 'clip rack', 'clip smith', 'guest record', 'guest smith', 'buddy mode on', 'buddy mode off', 'buddy mode'],
   },
   {
     title: 'Wallboard TV Video Replay',
@@ -366,7 +366,9 @@ function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
   if (/^(?:finish|end|complete)\s+workout\b/.test(tail)) return { kind: 'finish_workout' };
   if (/^clip\s+that\b/.test(tail)) return { kind: 'cam_clip_last' };
 
-  const recCam = tail.match(/^record\s+(?:the\s+)?(rack|smith\s+wide|smith|fly\s+machine|fly|leg\s+machine|leg)\b/);
+  const recCam = tail.match(
+    /^(?:record|film)\s+(?:(?:me|this(?:\s+set)?|my\s+set|set)\s+)?(?:on\s+)?(?:the\s+)?(rack|smith\s+wide|smith|fly\s+machine|fly|leg\s+machine|leg)\b/,
+  );
   if (recCam) {
     const k = recCam[1].replace(/\s+/g, ' ');
     const camMap: Record<string, string> = {
@@ -380,6 +382,8 @@ function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
     };
     return camMap[k] ? { kind: 'cam_arm', camera: camMap[k] } : { kind: 'cam_arm' };
   }
+  if (/^(?:record|film)\s+(?:this(?:\s+set)?|my\s+set|me|set)\b/.test(tail)) return { kind: 'cam_arm' };
+  if (/^(?:start|stop)\s+recording\b/.test(tail)) return { kind: 'cam_arm' };
 
   const buddyLead = tail.match(/^buddy\s+mode\s+(on|off)\b/);
   if (buddyLead) return { kind: 'buddy_mode', on: buddyLead[1] === 'on' };
@@ -504,13 +508,15 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases, allo
     return camera ? { kind: 'cam_guest', camera } : { kind: 'cam_guest' };
   }
   const camArmA = tail.match(
-    new RegExp(`^(?:(${CAM_TOK_RE})\\s+)?(?:camera|cam|record(?:\\s+set)?|start\\s+camera|arm\\s+camera|stop\\s+camera)(?:\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?)?$`),
+    new RegExp(
+      `^(?:(${CAM_TOK_RE})\\s+)?(?:camera|cam|(?:record|film)(?:\\s+(?:me|this(?:\\s+set)?|my\\s+set|that|set))?|(?:start|arm|stop)\\s+(?:camera|recording))(?:\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?)?$`,
+    ),
   );
   if (camArmA) {
     const camera = mapCamTok(camArmA[1] || camArmA[2]);
     return camera ? { kind: 'cam_arm', camera } : { kind: 'cam_arm' };
   }
-  const camArmB = tail.match(new RegExp(`^(?:start|arm|record|camera)\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?$`));
+  const camArmB = tail.match(new RegExp(`^(?:start|arm|record|film|camera)\\s+(?:on\\s+)?(?:the\\s+)?(${CAM_TOK_RE})(?:\\s+cam(?:era)?)?$`));
   if (camArmB) {
     const camera = mapCamTok(camArmB[1]);
     return camera ? { kind: 'cam_arm', camera } : { kind: 'cam_arm' };
