@@ -6771,6 +6771,7 @@ DASHBOARD_HTML = """<!doctype html>
             <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
             <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
             <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
+            <div><label>Smart Fogger v3.1 IP / Host</label><input id="fxTheaterHost" type="text" placeholder="smart-fogger.local or 192.168.1.xxx"></div>
             <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
             <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
           </div>
@@ -6793,6 +6794,19 @@ DASHBOARD_HTML = """<!doctype html>
             <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Both Flash</button>
             <button class="btn sec sm" id="fxTestAltFlashBtn" type="button">Test 4x Alternate Rack ↔ Smith</button>
             <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
+            <select id="fxTheaterTestScene" style="width:auto;min-width:155px">
+              <option value="jenna">jenna (Missy UV/Gold)</option>
+              <option value="avenleigh">avenleigh (Pink VIP)</option>
+              <option value="vip_gold">vip_gold (Velvet Rope)</option>
+              <option value="vip_prism">vip_prism (Modern Prism)</option>
+              <option value="thunder">thunder (Storm)</option>
+              <option value="fireworks">fireworks (PR Pyro)</option>
+              <option value="bench_hype">bench_hype (Forge Red)</option>
+              <option value="walkin">walkin (Crimson)</option>
+              <option value="pr">pr (PR Blast)</option>
+            </select>
+            <button class="btn sec sm" id="fxTestTheaterBtn" type="button">Test Theater Scene</button>
+            <button class="btn sec sm" id="fxStopTheaterBtn" type="button">Stop Theater FX</button>
             <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
           </div>
         </div>
@@ -10231,6 +10245,7 @@ function populateFxHookInputs(fx) {
   if ($('fxLightsSmithOffUrl')) $('fxLightsSmithOffUrl').value = fx.lightsSmithOffUrl || '';
   if ($('fxLightsSmithOnUrl')) $('fxLightsSmithOnUrl').value = fx.lightsSmithOnUrl || '';
   if ($('fxFogHost')) $('fxFogHost').value = fx.fogHost || '';
+  if ($('fxTheaterHost')) $('fxTheaterHost').value = fx.theaterHost || '';
   if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
   if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 30);
 }
@@ -10506,7 +10521,23 @@ function renderShows(data) {
     const id = escHtml(s.id);
     const trigs = (s.triggers || []).map(t => `<code>"Armory, ${escHtml(t)}"</code>`).join(' ');
     const srcTag = s.sourceUploaded ? `<span class="pill ok">CUSTOM: ${escHtml(s.sourceFile)}</span>` : '<span class="pill">DEMO TRACK</span>';
+    const vidPill = (s.showVideoReady && s.hasSourceVideo) ? '<span class="pill ok">3-SCREEN MP4 READY</span>' : '';
     const durTag = s.previewReady ? `${s.previewDurationSec}s ready` : 'Not built';
+    const theaterOpts = [
+      ['', 'None'],
+      ['jenna', 'jenna (Missy UV/Gold)'],
+      ['avenleigh', 'avenleigh (Pink VIP)'],
+      ['vip_prism', 'vip_prism (Modern Prism)'],
+      ['vip_gold', 'vip_gold (Velvet Gold)'],
+      ['walkin', 'walkin (Crimson Comet)'],
+      ['pr', 'pr (PR Gold Burst)'],
+      ['thunder', 'thunder (Storm Indigo)'],
+      ['fireworks', 'fireworks (Pyro Sky)'],
+      ['bench_hype', 'bench_hype (Forge Red)'],
+    ].map(([val, lbl]) => `<option value="${val}" ${(s.theaterScene || '') === val ? 'selected' : ''}>${lbl}</option>`).join('');
+    const videoEl = (s.showVideoReady && s.hasSourceVideo)
+      ? `<video controls preload="none" src="/api/shows/${id}/show.mp4" style="width:100%;max-height:220px;border-radius:8px;background:#000"></video>`
+      : '';
     return `
       <div class="show-item" data-showid="${id}">
         <div class="show-head">
@@ -10514,9 +10545,10 @@ function renderShows(data) {
             <div style="font-weight:900;font-size:14px">${escHtml(s.name)}</div>
             <div class="show-trigs">${trigs}</div>
           </div>
-          <div style="display:flex;gap:6px;align-items:center">${srcTag}<span class="pill live">${durTag}</span></div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${vidPill}${srcTag}<span class="pill live">${durTag}</span></div>
         </div>
         <audio class="show-audio" id="shAudio_${id}" controls preload="none" src="/api/shows/${id}/preview.wav"></audio>
+        ${videoEl}
         <div class="ctrl-row" style="margin-top:0">
           <button class="btn sm ok" type="button" onclick="previewShow('${id}')">▶ Preview Locally</button>
           <button class="btn sm" type="button" onclick="fireShow('${id}')">🔥 Fire Live (Denon ${s.denonVol})</button>
@@ -10529,6 +10561,7 @@ function renderShows(data) {
             <option value="takeover" ${s.cubeMode==='takeover'?'selected':''}>takeover</option>
             <option value="overlay" ${s.cubeMode==='overlay'?'selected':''}>overlay</option>
           </select></div>
+          <div><label>Theater LED Scene</label><select id="shTheater_${id}">${theaterOpts}</select></div>
           <div><label>Start (s)</label><input id="shStart_${id}" type="number" min="0" step="0.25" value="${s.songStartSec}"></div>
           <div><label>Dur (s)</label><input id="shDur_${id}" type="number" min="0" max="65" step="0.5" value="${s.songDurationSec}"></div>
           <div><label>Fade (s)</label><input id="shFade_${id}" type="number" min="0.3" max="10" step="0.2" value="${s.fadeOutSec}"></div>
@@ -10615,6 +10648,7 @@ async function saveShowConfig(id, btn) {
     fadeOutSec: Number($('shFade_' + id).value || 2.5),
   };
   if ($('shFlash_' + id)) body.lightsFlashCount = Math.max(0, Math.min(6, Math.round(Number($('shFlash_' + id).value || 0))));
+  if ($('shTheater_' + id)) body.theaterScene = $('shTheater_' + id).value || '';
   if ($('shCheer_' + id)) body.addCheer = Boolean($('shCheer_' + id).checked);
   if ($('shAnn_' + id)) body.announcerText = $('shAnn_' + id).value.trim();
   if ($('shYt_' + id)) body.youtubeUrl = $('shYt_' + id).value.trim();
@@ -10671,6 +10705,7 @@ async function saveFxHooks(extraBody) {
     lightsSmithOffUrl: ($('fxLightsSmithOffUrl') && $('fxLightsSmithOffUrl').value.trim()) || '',
     lightsSmithOnUrl: ($('fxLightsSmithOnUrl') && $('fxLightsSmithOnUrl').value.trim()) || '',
     fogHost: ($('fxFogHost') && $('fxFogHost').value.trim()) || '',
+    theaterHost: ($('fxTheaterHost') && $('fxTheaterHost').value.trim()) || '',
     fogTriggerUrl: ($('fxFogUrl') && $('fxFogUrl').value.trim()) || '',
     fogBurstSec: Number(($('fxFogBurst') && $('fxFogBurst').value) || 4.0),
     ...(extraBody || {}),
@@ -11037,6 +11072,8 @@ if ($('fxAllOffBtn')) $('fxAllOffBtn').onclick = () => saveFxHooks({ test: 'all_
 if ($('fxTestFlashBtn')) $('fxTestFlashBtn').onclick = () => saveFxHooks({ test: 'lights_flash' });
 if ($('fxTestAltFlashBtn')) $('fxTestAltFlashBtn').onclick = () => saveFxHooks({ test: 'lights_alt_flash' });
 if ($('fxTestFogBtn')) $('fxTestFogBtn').onclick = () => saveFxHooks({ test: 'fog' });
+if ($('fxTestTheaterBtn')) $('fxTestTheaterBtn').onclick = () => saveFxHooks({ test: 'theater_scene', testScene: ($('fxTheaterTestScene') && $('fxTheaterTestScene').value) || 'jenna' });
+if ($('fxStopTheaterBtn')) $('fxStopTheaterBtn').onclick = () => saveFxHooks({ test: 'theater_stop' });
 
 const PAGE_TITLES = {
   overview: 'Overview',
@@ -12749,6 +12786,23 @@ def create_app(service: ArmoryCamService) -> Flask:
             fog_url = service.shows.fx_hooks.resolve_fog_url()
             res["tested"] = "fog"
             res["hookResult"] = service.shows._fire_http_hook(fog_url) if fog_url else {"ok": False, "error": "Fog IP/URL not set"}
+        elif test_kind == "theater_scene":
+            test_sc = str(body.get("testScene") or "jenna").strip().lower()
+            t_url = service.shows.fx_hooks.resolve_theater_scene_url(test_sc, duration_ms=12000, fog_ms=0)
+            res["tested"] = f"theater_scene:{test_sc}"
+            res["hookResult"] = (
+                service.shows._fire_http_hook(t_url)
+                if t_url
+                else {"ok": False, "skipped": True, "error": "Smart Fogger v3.1 IP not set"}
+            )
+        elif test_kind == "theater_stop":
+            s_url = service.shows.fx_hooks.resolve_theater_stop_url()
+            res["tested"] = "theater_stop"
+            res["hookResult"] = (
+                service.shows._fire_http_hook(s_url)
+                if s_url
+                else {"ok": False, "skipped": True, "error": "Smart Fogger v3.1 IP not set"}
+            )
         service.trigger_optiplex_config_backup_async()
         return jsonify(res)
 

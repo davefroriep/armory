@@ -292,6 +292,10 @@ def _norm_trigger_text(text: str) -> str:
     s = re.sub(r"\bryder's\b", "ryder is", s)
     s = re.sub(r"\bgabe's\b", "gabe is", s)
     s = re.sub(r"\bjosh's\b", "josh is", s)
+    s = re.sub(r"\bjenna's\b", "jenna is", s)
+    s = re.sub(r"\bavenleigh's\b", "avenleigh is", s)
+    s = re.sub(r"\bjared's\b", "jared is", s)
+    s = re.sub(r"\bmark's\b", "mark is", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -303,11 +307,31 @@ def _strip_optional_wake(text: str, wake_word: str = "armory") -> str:
 
 
 VALID_FX_ZONES = ("all", "rack", "smith", "alternate")
+VALID_THEATER_SCENES = (
+    "",
+    "walkin",
+    "pr",
+    "jenna",
+    "avenleigh",
+    "vip_gold",
+    "vip_prism",
+    "thunder",
+    "fireworks",
+    "bench_hype",
+)
+
+
+def _clean_host(host: str) -> str:
+    h = str(host or "").strip()
+    for pfx in ("http://", "https://"):
+        if h.lower().startswith(pfx):
+            h = h[len(pfx):]
+    return h.rstrip("/")
 
 
 @dataclass
 class SmartFxConfig:
-    """Optional local HTTP hooks for dual-zone Shelly lighting (Rack + Smith) and fog triggers."""
+    """Optional local HTTP hooks for dual-zone Shelly lighting (Rack + Smith), Smart Fogger v3.1, and fog triggers."""
 
     lights_host: str = ""
     lights_off_url: str = ""
@@ -321,6 +345,7 @@ class SmartFxConfig:
     fog_host: str = ""
     fog_trigger_url: str = ""
     fog_burst_sec: float = 4.0
+    theater_host: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -336,6 +361,7 @@ class SmartFxConfig:
             "fogHost": self.fog_host,
             "fogTriggerUrl": self.fog_trigger_url,
             "fogBurstSec": round(float(self.fog_burst_sec), 1),
+            "theaterHost": self.theater_host,
         }
 
     @classmethod
@@ -359,6 +385,7 @@ class SmartFxConfig:
             fog_host=str(raw.get("fogHost", "") or "").strip(),
             fog_trigger_url=str(raw.get("fogTriggerUrl", "") or "").strip(),
             fog_burst_sec=burst,
+            theater_host=str(raw.get("theaterHost", "") or "").strip(),
         )
 
     @staticmethod
@@ -399,10 +426,39 @@ class SmartFxConfig:
         sec_str = f"{_clamp(val, 1.0, 60.0):.1f}".rstrip("0").rstrip(".")
         if self.fog_trigger_url:
             return self.fog_trigger_url.replace("{sec}", sec_str)
-        host = self.fog_host.strip()
+        host = _clean_host(self.fog_host)
+        if host:
+            return f"http://{host}/rpc/Switch.Set?id=0&on=true&toggle_after={sec_str}"
+        t_host = _clean_host(self.theater_host)
+        if t_host:
+            return f"http://{t_host}/api/trigger?sec={sec_str}"
+        return ""
+
+    def resolve_theater_scene_url(
+        self,
+        scene: str,
+        *,
+        duration_ms: int = 0,
+        fog_ms: int | None = None,
+    ) -> str:
+        host = _clean_host(self.theater_host)
+        sc = str(scene or "").strip().lower()
+        if not host or not sc or sc not in VALID_THEATER_SCENES:
+            return ""
+        params = [f"mode={urllib.parse.quote(sc)}"]
+        if int(duration_ms or 0) > 0:
+            dur = min(300_000, max(1_000, int(duration_ms)))
+            params.append(f"ms={dur}")
+        if fog_ms is not None:
+            fms = max(0, min(60_000, int(fog_ms)))
+            params.append(f"fog_ms={fms}")
+        return f"http://{host}/api/scene?" + "&".join(params)
+
+    def resolve_theater_stop_url(self) -> str:
+        host = _clean_host(self.theater_host)
         if not host:
             return ""
-        return f"http://{host}/rpc/Switch.Set?id=0&on=true&toggle_after={sec_str}"
+        return f"http://{host}/api/stop"
 
 
 VALID_FX_CUE_TYPES = ("flash", "lights_off", "lights_on", "fog")
@@ -636,6 +692,7 @@ class ShowSpec:
     custom_overlay_voice_file: str = ""
     intro_start_sec: float = 2.3
     exclude_main_tv: bool = False
+    theater_scene: str = ""
     speech_cues: list[dict[str, Any]] = field(default_factory=list)
     fx_cues: list[dict[str, Any]] = field(default_factory=list)
 
@@ -700,6 +757,7 @@ class ShowSpec:
             "customOverlayVoiceFile": self.custom_overlay_voice_file,
             "introStartSec": round(float(self.intro_start_sec), 2),
             "excludeMainTv": bool(self.exclude_main_tv),
+            "theaterScene": self.theater_scene,
             "speechCues": list(self.speech_cues),
             "fxCues": list(self.fx_cues),
         }
@@ -782,6 +840,9 @@ class ShowSpec:
                 ]
 
         fx_cues = _normalize_fx_cues(raw.get("fxCues") or [])
+        t_scene = str(raw.get("theaterScene", "") or "").strip().lower()
+        if t_scene not in VALID_THEATER_SCENES:
+            t_scene = ""
 
         return cls(
             id=sid,
@@ -829,6 +890,7 @@ class ShowSpec:
             custom_overlay_voice_file=co_valid,
             intro_start_sec=_clamp(_f("introStartSec", 2.3), 0.0, 15.0),
             exclude_main_tv=bool(raw.get("excludeMainTv", False)),
+            theater_scene=t_scene,
             speech_cues=speech_cues,
             fx_cues=fx_cues,
         )
@@ -868,6 +930,7 @@ def default_shows() -> list[ShowSpec]:
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=9.5,
+            theater_scene="fireworks",
         ),
         ShowSpec(
             id="matt_walkin",
@@ -899,6 +962,7 @@ def default_shows() -> list[ShowSpec]:
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
+            theater_scene="walkin",
         ),
         ShowSpec(
             id="ryder_walkin",
@@ -952,36 +1016,204 @@ def default_shows() -> list[ShowSpec]:
             voice_reverb_wet=0.06,
             voice_boost_db=2.0,
             voice_style=DEFAULT_RYDER_VOICE_STYLE,
+            theater_scene="thunder",
+        ),
+        ShowSpec(
+            id="jenna_walkin",
+            name="Jenna Walk-In · Rockstar Headliner (Missy Elliott — Lose Control)",
+            kind="debut_video",
+            enabled=True,
+            triggers=[
+                "jenna is here",
+                "jenna just got here",
+                "jenna walk in",
+                "jenna entrance",
+                "rockstar walk in",
+            ],
+            denon_vol=70,
+            cube_mode="takeover",
+            overlay_gain=1.0,
+            announcer_text=(
+                "Ladies and gentlemen! ... Clear the floor! ... "
+                "Headlining tonight at The Armory... the one, the only... JENNA!!"
+            ),
+            announcer_voice=DEFAULT_ANNOUNCER_VOICE,
+            announcer_rate="-4%",
+            announcer_pitch="",
+            demo_style="hype",
+            song_start_sec=0.0,
+            song_duration_sec=0.0,
+            fade_out_sec=2.2,
+            trim_leading_silence=True,
+            add_cheer=True,
+            cheer_delay_sec=0.0,
+            add_thunder=False,
+            lights_out=True,
+            lights_flash_count=1,
+            trigger_fog=True,
+            fog_burst_sec=3.5,
+            lightning_flash_sec=0.0,
+            intro_start_sec=0.4,
+            youtube_url="https://www.youtube.com/watch?v=aOt4xRE05wQ",
+            video_source_file="jenna_walkin_video.mp4",
+            three_screen_video=True,
+            video_hold_sec=42.0,
+            voice_reverb_wet=0.06,
+            voice_boost_db=2.0,
+            voice_style=(
+                "Charismatic MTV VMA and Super Bowl Halftime live concert host. "
+                "Electric, stylish, rockstar energy, exploding with excitement on JENNA."
+            ),
+            theater_scene="jenna",
+        ),
+        ShowSpec(
+            id="avenleigh_walkin",
+            name="Avenleigh Walk-In · Pink VIP Stage (J.Lo ft. Pitbull — On The Floor)",
+            kind="debut_video",
+            enabled=True,
+            triggers=[
+                "avenleigh is here",
+                "avenleigh just got here",
+                "avenleigh walk in",
+                "avenleigh entrance",
+                "avenly is here",
+                "avenly just got here",
+                "avenly walk in",
+                "avenlee is here",
+                "avenlee walk in",
+            ],
+            denon_vol=68,
+            cube_mode="takeover",
+            overlay_gain=1.0,
+            announcer_text=(
+                "Put your hands together! ... Live on the VIP stage... "
+                "the star of the show... AVENLEIGH!!"
+            ),
+            announcer_voice=DEFAULT_ANNOUNCER_VOICE,
+            announcer_rate="-4%",
+            announcer_pitch="",
+            demo_style="hype",
+            song_start_sec=0.0,
+            song_duration_sec=0.0,
+            fade_out_sec=2.2,
+            trim_leading_silence=True,
+            add_cheer=True,
+            cheer_delay_sec=0.0,
+            add_thunder=False,
+            lights_out=True,
+            lights_flash_count=1,
+            trigger_fog=True,
+            fog_burst_sec=3.5,
+            lightning_flash_sec=0.0,
+            intro_start_sec=0.4,
+            youtube_url="https://www.youtube.com/shorts/ET3HB1xzx14",
+            video_source_file="avenleigh_walkin_video.mp4",
+            three_screen_video=True,
+            video_hold_sec=45.0,
+            voice_reverb_wet=0.05,
+            voice_boost_db=2.0,
+            voice_style=(
+                "Warm, joyful, sparkling pop-concert arena MC welcoming a young superstar "
+                "onto a bright pink VIP dance stage. Upbeat, enthusiastic, fun."
+            ),
+            theater_scene="avenleigh",
         ),
         ShowSpec(
             id="jared_mark_walkin",
-            name="Jared & Mark Walk-In (All the Way From Beantown)",
-            kind="walkin",
+            name="Jared & Mark Walk-In · Modern Prism VIP (Whitney Houston)",
+            kind="debut_video",
             enabled=True,
             triggers=[
                 "jared and mark are here",
                 "jared and mark just got here",
                 "jared and mark walk in",
                 "mark and jared are here",
-                "beantown walk in",
+                "mark and jared just got here",
+                "mark and jared walk in",
+                "jared and mark prism",
             ],
             denon_vol=70,
-            cube_mode="duck",
+            cube_mode="takeover",
             overlay_gain=1.0,
             announcer_text=(
-                "Ladies and gentlemen! All the way from Beantown... "
-                "stepping into The Armory... Jared... and Mark!!"
+                "Ladies and gentlemen! ... Lights down, volume up! ... "
+                "Stepping into The Armory... your guests of honor... JARED... and MARK!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
-            announcer_rate="-7%",
-            announcer_pitch="-4Hz",
+            announcer_rate="-5%",
+            announcer_pitch="",
             demo_style="anthem",
             song_start_sec=0.0,
-            song_duration_sec=18.0,
+            song_duration_sec=0.0,
             fade_out_sec=2.5,
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
+            add_thunder=False,
+            lights_out=True,
+            lights_flash_count=1,
+            trigger_fog=True,
+            fog_burst_sec=3.5,
+            lightning_flash_sec=0.0,
+            intro_start_sec=0.4,
+            youtube_url="https://www.youtube.com/watch?v=id2-K3daNRQ",
+            video_source_file="jared_mark_prism_video.mp4",
+            three_screen_video=True,
+            video_hold_sec=42.0,
+            voice_reverb_wet=0.05,
+            voice_boost_db=2.0,
+            voice_style=(
+                "Sleek, classy, celebratory prime-time awards-show host. "
+                "Warm, charismatic, high-energy welcome without sports-announcer cliches."
+            ),
+            theater_scene="vip_prism",
+        ),
+        ShowSpec(
+            id="jared_mark_vip",
+            name="Jared & Mark Walk-In · Velvet Rope VIP (Whitney Houston)",
+            kind="debut_video",
+            enabled=True,
+            triggers=[
+                "jared and mark vip",
+                "jared and mark gold",
+                "mark and jared vip",
+                "velvet rope walk in",
+            ],
+            denon_vol=70,
+            cube_mode="takeover",
+            overlay_gain=1.0,
+            announcer_text=(
+                "Ladies and gentlemen! ... Roll out the red carpet! ... "
+                "The VIPs have officially entered the building... give it up for JARED... and MARK!!"
+            ),
+            announcer_voice=DEFAULT_ANNOUNCER_VOICE,
+            announcer_rate="-5%",
+            announcer_pitch="",
+            demo_style="anthem",
+            song_start_sec=0.0,
+            song_duration_sec=0.0,
+            fade_out_sec=2.5,
+            trim_leading_silence=True,
+            add_cheer=True,
+            cheer_delay_sec=0.0,
+            add_thunder=False,
+            lights_out=True,
+            lights_flash_count=1,
+            trigger_fog=True,
+            fog_burst_sec=3.5,
+            lightning_flash_sec=0.0,
+            intro_start_sec=0.4,
+            youtube_url="https://www.youtube.com/watch?v=id2-K3daNRQ",
+            video_source_file="jared_mark_vip_video.mp4",
+            three_screen_video=True,
+            video_hold_sec=42.0,
+            voice_reverb_wet=0.05,
+            voice_boost_db=2.0,
+            voice_style=(
+                "Glamorous red-carpet gala and VIP lounge host. "
+                "Smooth, upbeat, genuinely warm and celebratory."
+            ),
+            theater_scene="vip_gold",
         ),
         ShowSpec(
             id="gabe_walkin",
@@ -2480,12 +2712,24 @@ def _probe_media_duration_sec(media_path: Path, ffmpeg_bin: str) -> float:
     return 0.0
 
 
+def _intro_tint_for_scene(scene: str) -> tuple[int, int, int]:
+    """Return radial intro glow RGB tint tuned to each Smart Fogger theater scene."""
+    table = {
+        "jenna": (185, 65, 255),
+        "avenleigh": (255, 60, 175),
+        "vip_gold": (255, 195, 75),
+        "vip_prism": (190, 230, 255),
+    }
+    return table.get(str(scene or "").strip().lower(), (255, 255, 255))
+
+
 def _generate_intro_pulse_video(
     out_mp4: Path,
     *,
     duration_sec: float,
     lightning_sec: float = 0.75,
     flash_count: int = 2,
+    tint_rgb: tuple[int, int, int] = (255, 255, 255),
     ffmpeg_bin: str,
     width: int = 1920,
     height: int = 1080,
@@ -2509,6 +2753,12 @@ def _generate_intro_pulse_video(
     t_pulse0 = (lightning_sec + 0.85) if lightning_sec > 0.0 else 0.90
     period = 1.50
 
+    tr = int(max(0, min(255, tint_rgb[0])))
+    tg = int(max(0, min(255, tint_rgb[1])))
+    tb = int(max(0, min(255, tint_rgb[2])))
+    use_rgb = (tr, tg, tb) != (255, 255, 255)
+    tint_vec = np.array([tr, tg, tb], dtype=np.float32)
+
     frames = bytearray()
     for i in range(n_frames):
         t = float(i) / float(fps)
@@ -2528,7 +2778,7 @@ def _generate_intro_pulse_video(
             elif 0.24 <= dt < 0.56:
                 full_white = 0.86 * math.exp(-(dt - 0.24) * 9.0)
 
-        # 2. Escalating rhythmic white-to-black pulses under announcer build
+        # 2. Escalating rhythmic glow pulses under announcer build
         if t >= t_pulse0 and rem > strobe_guard:
             p_pos = t - t_pulse0
             idx = int(p_pos // period)
@@ -2562,9 +2812,17 @@ def _generate_intro_pulse_video(
 
         if full_white >= radial_white:
             lum = flat * min(1.0, max(0.0, full_white))
+            if use_rgb:
+                u8 = np.clip(np.round(lum[:, :, None] * 255.0), 0, 255).astype(np.uint8)
+                u8 = np.repeat(u8, 3, axis=2)
+            else:
+                u8 = np.clip(np.round(lum * 255.0), 0, 255).astype(np.uint8)
         else:
             lum = radial * min(1.0, max(0.0, radial_white))
-        u8 = np.clip(np.round(lum * 255.0), 0, 255).astype(np.uint8)
+            if use_rgb:
+                u8 = np.clip(np.round(lum[:, :, None] * tint_vec[None, None, :]), 0, 255).astype(np.uint8)
+            else:
+                u8 = np.clip(np.round(lum * 255.0), 0, 255).astype(np.uint8)
         frames.extend(u8.tobytes())
 
     tmp_mp4 = out_mp4.with_name(f"{out_mp4.stem}.tmp{out_mp4.suffix}")
@@ -2574,7 +2832,7 @@ def _generate_intro_pulse_video(
         "-f",
         "rawvideo",
         "-pix_fmt",
-        "gray",
+        "rgb24" if use_rgb else "gray",
         "-s",
         f"{gw}x{gh}",
         "-r",
@@ -2981,6 +3239,8 @@ class ShowDirector:
                             self.fx_hooks = SmartFxConfig.from_dict(raw["fxHooks"])
                         raw_shows = raw.get("shows")
                         if isinstance(raw_shows, dict):
+                            if any(sid not in raw_shows for sid in default_map):
+                                dirty = True
                             for sid, sraw in raw_shows.items():
                                 if isinstance(sraw, dict):
                                     s_merged = {"id": sid, **sraw}
@@ -3009,6 +3269,17 @@ class ShowDirector:
                                         ):
                                             s_merged[k] = d_ryder[k]
                                         dirty = True
+                                    # Migrate legacy Beantown placeholder on jared_mark_walkin cleanly
+                                    if sid == "jared_mark_walkin" and "beantown" in json.dumps(sraw).lower():
+                                        s_merged = default_map["jared_mark_walkin"].to_dict()
+                                        dirty = True
+                                    if (
+                                        sid in default_map
+                                        and not str(s_merged.get("theaterScene") or "").strip()
+                                        and default_map[sid].theater_scene
+                                    ):
+                                        s_merged["theaterScene"] = default_map[sid].theater_scene
+                                        dirty = True
                                     spec = ShowSpec.from_dict(s_merged)
                                     self.shows[spec.id] = spec
                                     if spec.id not in self._show_order:
@@ -3019,16 +3290,25 @@ class ShowDirector:
             if dirty:
                 self._save_locked()
             ry = self.shows.get("ryder_walkin")
-            default_ry_vid = self.sources_dir / "ryder_walkin_video.mp4"
-            ry_dirty = False
-            if ry and not ry.video_source_file and default_ry_vid.is_file() and default_ry_vid.stat().st_size > 1000:
-                ry = ShowSpec.from_dict({**ry.to_dict(), "videoSourceFile": "ryder_walkin_video.mp4"})
-                ry_dirty = True
             if ry and not ry.voice_style:
                 ry = ShowSpec.from_dict({**ry.to_dict(), "voiceStyle": DEFAULT_RYDER_VOICE_STYLE})
-                ry_dirty = True
-            if ry_dirty and ry is not None:
                 self.shows["ryder_walkin"] = ry
+                self._save_locked()
+            auto_videos = (
+                ("ryder_walkin", "ryder_walkin_video.mp4"),
+                ("jenna_walkin", "jenna_walkin_video.mp4"),
+                ("avenleigh_walkin", "avenleigh_walkin_video.mp4"),
+                ("jared_mark_walkin", "jared_mark_prism_video.mp4"),
+                ("jared_mark_vip", "jared_mark_vip_video.mp4"),
+            )
+            av_dirty = False
+            for av_sid, av_file in auto_videos:
+                cur_sp = self.shows.get(av_sid)
+                av_path = self.sources_dir / av_file
+                if cur_sp and not cur_sp.video_source_file and av_path.is_file() and av_path.stat().st_size > 1000:
+                    self.shows[av_sid] = ShowSpec.from_dict({**cur_sp.to_dict(), "videoSourceFile": av_file})
+                    av_dirty = True
+            if av_dirty:
                 self._save_locked()
 
     def _save_locked(self) -> None:
@@ -3344,6 +3624,8 @@ class ShowDirector:
                 f"l={spec.lightning_flash_sec:.2f}",
                 f"is={spec.intro_start_sec:.2f}",
                 f"fc={spec.lights_flash_count}",
+                f"ts={spec.theater_scene}",
+                f"th={int(bool(spec.add_thunder))}",
                 f"ov={spec.overlay_at_sec:.2f}:{spec.overlay_text}",
                 f"sc={json.dumps(spec.speech_cues, sort_keys=True)}",
             ]
@@ -3377,6 +3659,7 @@ class ShowDirector:
                     duration_sec=max(1.5, raw_intro_dur),
                     lightning_sec=spec.lightning_flash_sec,
                     flash_count=spec.lights_flash_count,
+                    tint_rgb=_intro_tint_for_scene(spec.theater_scene),
                     ffmpeg_bin=self.ffmpeg_bin,
                 )
                 intro_target_samples = max(1, int(round(intro_video_dur * STAGE_VIDEO_SR)))
@@ -3827,10 +4110,11 @@ class ShowDirector:
         *,
         lightning_flash_sec: float = 0.75,
         add_cheer: bool = True,
+        add_thunder: bool = True,
         intro_start_sec: float = 2.3,
         extra_intro_cues: Sequence[tuple[float, np.ndarray]] = (),
     ) -> np.ndarray:
-        """Mix main + extra intro speech over ducked thunder rumble, crack, and stadium crowd cheer."""
+        """Mix main + extra intro speech over optional thunder rumble/crack and stadium crowd cheer."""
         pre_thunder_n = int(round(max(0.0, float(intro_start_sec)) * SHOW_SR))
         post_tail_n = int(round(1.6 * SHOW_SR))
         max_speech_end = pre_thunder_n + ann_pcm.shape[0]
@@ -3847,42 +4131,45 @@ class ShowDirector:
         for off, cue_pcm in extra_offsets:
             mix_into(speech_bus, cue_pcm, off, gain=1.0)
 
-        crack_sec = lightning_flash_sec or 0.75
-        thunder_raw = load_studio_fx_stereo(
-            self.fx_dir,
-            "thunder_rumble.wav",
-            total_sec,
-            allow_default_fallback=self.allow_network,
-            swell_sec=0.15,
-            fade_out_sec=1.1,
-            sr=SHOW_SR,
-        )
-        if thunder_raw is None:
-            thunder_raw = synth_thunder_rumble_stereo(
+        if add_thunder:
+            crack_sec = lightning_flash_sec or 0.75
+            thunder_raw = load_studio_fx_stereo(
+                self.fx_dir,
+                "thunder_rumble.wav",
                 total_sec,
+                allow_default_fallback=self.allow_network,
+                swell_sec=0.15,
+                fade_out_sec=1.1,
                 sr=SHOW_SR,
-                crack_at_sec=crack_sec,
             )
-        crack_pcm = load_studio_fx_stereo(
-            self.fx_dir,
-            "thunder_crack.wav",
-            min(4.0, total_sec),
-            allow_default_fallback=self.allow_network,
-            swell_sec=0.02,
-            fade_out_sec=1.2,
-            sr=SHOW_SR,
-        )
-        if crack_pcm is not None:
-            crack_off = int(round(crack_sec * SHOW_SR))
-            mix_into(thunder_raw, crack_pcm, crack_off, gain=0.82)
-        bed = duck_bed_under_speech(
-            thunder_raw,
-            speech_bus,
-            0,
-            sr=SHOW_SR,
-            duck_gain=0.14,
-            base_gain=0.88,
-        )
+            if thunder_raw is None:
+                thunder_raw = synth_thunder_rumble_stereo(
+                    total_sec,
+                    sr=SHOW_SR,
+                    crack_at_sec=crack_sec,
+                )
+            crack_pcm = load_studio_fx_stereo(
+                self.fx_dir,
+                "thunder_crack.wav",
+                min(4.0, total_sec),
+                allow_default_fallback=self.allow_network,
+                swell_sec=0.02,
+                fade_out_sec=1.2,
+                sr=SHOW_SR,
+            )
+            if crack_pcm is not None:
+                crack_off = int(round(crack_sec * SHOW_SR))
+                mix_into(thunder_raw, crack_pcm, crack_off, gain=0.82)
+            bed = duck_bed_under_speech(
+                thunder_raw,
+                speech_bus,
+                0,
+                sr=SHOW_SR,
+                duck_gain=0.14,
+                base_gain=0.88,
+            )
+        else:
+            bed = np.zeros((total_n, 2), dtype=np.float32)
         if add_cheer:
             cheer_full = np.zeros((total_n, 2), dtype=np.float32)
             c_start = min(
@@ -4066,6 +4353,7 @@ class ShowDirector:
                 ann_pcm,
                 lightning_flash_sec=spec.lightning_flash_sec or 0.75,
                 add_cheer=spec.add_cheer,
+                add_thunder=spec.add_thunder,
                 intro_start_sec=spec.intro_start_sec,
                 extra_intro_cues=extra_intro,
             )
@@ -4558,6 +4846,98 @@ class ShowDirector:
             self.log.warning("Show Denon volume restore error (%s -> %s dB): %s", from_db, to_db, exc)
             return False
 
+    def _trigger_pre_show_fx(
+        self,
+        spec: ShowSpec,
+        fx: SmartFxConfig,
+        *,
+        scene_dur_ms: int,
+        out_res: dict[str, Any],
+    ) -> tuple[bool, bool]:
+        """Fire lights-off, Smart Fogger v3.1 theater scene, and non-duplicated fog burst."""
+        lights_turned_off = False
+        theater_started = False
+        if spec.lights_out:
+            out_res["lightsOff"] = self._fire_lights_state(
+                False, tag="lights_off", label="(LIGHTS OFF)", show_id=spec.id, duration_ms=1500
+            )
+            lights_turned_off = True
+
+        burst_val = spec.fog_burst_sec if spec.fog_burst_sec > 0.0 else fx.fog_burst_sec
+        fog_ms = int(round(burst_val * 1000)) if spec.trigger_fog else 0
+        has_theater = bool(spec.theater_scene and fx.theater_host.strip())
+        separate_fog_relay = bool(
+            fx.fog_trigger_url
+            or (fx.fog_host and fx.fog_host.strip().lower() != fx.theater_host.strip().lower())
+        )
+
+        if has_theater:
+            scene_fog_ms = fog_ms if (spec.trigger_fog and not separate_fog_relay) else 0
+            theater_url = fx.resolve_theater_scene_url(
+                spec.theater_scene,
+                duration_ms=scene_dur_ms,
+                fog_ms=scene_fog_ms,
+            )
+            if theater_url:
+                self._emit_cue(
+                    "theater_fx",
+                    f"(THEATER FX · {spec.theater_scene.upper()})",
+                    show_id=spec.id,
+                    duration_ms=scene_dur_ms,
+                    scene=spec.theater_scene,
+                    fogMs=scene_fog_ms,
+                )
+                out_res["theaterFx"] = self._fire_http_hook(theater_url)
+                theater_started = True
+                if scene_fog_ms > 0:
+                    burst_str = f"{float(burst_val):.1f}".rstrip("0").rstrip(".")
+                    self._emit_cue(
+                        "fog",
+                        f"(TRIGGER FOG · {burst_str}s)",
+                        show_id=spec.id,
+                        duration_ms=scene_fog_ms,
+                        fogSec=float(burst_val),
+                    )
+                    out_res["fog"] = out_res["theaterFx"]
+
+        if spec.trigger_fog and (not has_theater or separate_fog_relay):
+            burst_str = f"{float(burst_val):.1f}".rstrip("0").rstrip(".")
+            self._emit_cue(
+                "fog",
+                f"(TRIGGER FOG · {burst_str}s)",
+                show_id=spec.id,
+                duration_ms=int(burst_val * 1000),
+                fogSec=float(burst_val),
+            )
+            fog_url = fx.resolve_fog_url(burst_sec=burst_val)
+            if fog_url:
+                out_res["fog"] = self._fire_http_hook(fog_url)
+
+        return lights_turned_off, theater_started
+
+    def _cleanup_post_show_fx(
+        self,
+        spec: ShowSpec,
+        fx: SmartFxConfig,
+        *,
+        theater_started: bool,
+        lights_turned_off: bool,
+        lights_restored: bool,
+    ) -> None:
+        """Stop Smart Fogger scene and restore house lights if a show exits early or kept them off."""
+        if theater_started:
+            stop_u = fx.resolve_theater_stop_url()
+            if stop_u:
+                self._fire_http_hook(stop_u)
+        if lights_turned_off and not lights_restored:
+            self._fire_lights_state(
+                True,
+                tag="lights_on",
+                label="(SAFETY HOUSE LIGHTS ON)",
+                show_id=spec.id,
+                duration_ms=1500,
+            )
+
     def _run_multimedia_show_sequence(
         self,
         spec: ShowSpec,
@@ -4576,6 +4956,9 @@ class ShowDirector:
         current_db = target_db
         denon_raised = False
         denon_restored = False
+        theater_started = False
+        lights_turned_off = False
+        lights_restored = False
         cube_ser = ""
         cube_stage_launched = False
         prev_media: dict[str, Any] = {}
@@ -4622,24 +5005,11 @@ class ShowDirector:
                 duration_ms=3000,
             )
 
-            # 2. Fire Lights Out + Fog Machine immediately so fog builds while TVs lock HDMI
-            if spec.lights_out:
-                out_res["lightsOff"] = self._fire_lights_state(
-                    False, tag="lights_off", label="(LIGHTS OFF)", show_id=spec.id, duration_ms=1500
-                )
-            if spec.trigger_fog:
-                burst_val = spec.fog_burst_sec if spec.fog_burst_sec > 0.0 else fx.fog_burst_sec
-                burst_str = f"{float(burst_val):.1f}".rstrip("0").rstrip(".")
-                self._emit_cue(
-                    "fog",
-                    f"(TRIGGER FOG · {burst_str}s)",
-                    show_id=spec.id,
-                    duration_ms=int(burst_val * 1000),
-                    fogSec=float(burst_val),
-                )
-                fog_url = fx.resolve_fog_url(burst_sec=burst_val)
-                if fog_url:
-                    out_res["fog"] = self._fire_http_hook(fog_url)
+            # 2. Fire Lights Out + Theater FX + Fog Machine immediately so fog builds while TVs lock HDMI
+            mm_scene_dur_ms = int(max(15_000, min(300_000, round((total_dur + 2.0) * 1000))))
+            lights_turned_off, theater_started = self._trigger_pre_show_fx(
+                spec, fx, scene_dur_ms=mm_scene_dur_ms, out_res=out_res
+            )
 
             # 3. Broadcast stage_prepare immediately so already-open Wallboard blanks to #000 & buffers MP4
             base_url = self._resolve_stage_base_url()
@@ -5004,6 +5374,7 @@ class ShowDirector:
                         show_id=spec.id,
                         duration_ms=2500,
                     )
+                    lights_restored = True
                 elif kind == "speech_cue":
                     with self._lock:
                         self._active_state["phase"] = "overlay_duck"
@@ -5049,10 +5420,15 @@ class ShowDirector:
                         self._fire_lights_state(
                             False, zone=zone_fx, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
                         )
+                        if zone_fx == "all":
+                            lights_turned_off = True
+                            lights_restored = False
                     elif fx_type == "lights_on":
                         self._fire_lights_state(
                             True, zone=zone_fx, tag="lights_on", label="(LIGHTS ON · FX)", show_id=spec.id, duration_ms=1200
                         )
+                        if zone_fx == "all":
+                            lights_restored = True
                     elif fx_type == "fog":
                         b_str = f"{dur_fx:.1f}".rstrip("0").rstrip(".")
                         self._emit_cue(
@@ -5097,6 +5473,13 @@ class ShowDirector:
             return out_res
         finally:
             self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
+            self._cleanup_post_show_fx(
+                spec,
+                fx,
+                theater_started=theater_started,
+                lights_turned_off=lights_turned_off,
+                lights_restored=lights_restored,
+            )
             if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
                 self._restore_denon_down(current_db, prev_db, fast=True)
             if self.displays is not None:
@@ -5213,6 +5596,9 @@ class ShowDirector:
         current_db = target_db
         denon_raised = False
         denon_restored = False
+        theater_started = False
+        lights_turned_off = False
+        lights_restored = False
         cube_started = False
         wallboard_youtube_launched = False
         out_res: dict[str, Any] = {"ok": True, "showId": spec.id}
@@ -5250,24 +5636,19 @@ class ShowDirector:
                             prev_db = min(prev_db, target_db)
             current_db = prev_db if prev_db is not None else target_db
 
-            # 3. Pre-show smart FX hooks (lights out + fog burst + live SSE cue simulation)
-            if spec.lights_out:
-                out_res["lightsOff"] = self._fire_lights_state(
-                    False, tag="lights_off", label="(LIGHTS OFF)", show_id=spec.id, duration_ms=1500
+            # 3. Pre-show smart FX hooks (lights out + Theater FX + fog burst + live SSE cue simulation)
+            seq_scene_dur_ms = int(
+                max(
+                    15_000,
+                    min(
+                        300_000,
+                        round((preview_dur + (float(spec.video_hold_sec or 45.0) if spec.three_screen_video else 2.0)) * 1000),
+                    ),
                 )
-            if spec.trigger_fog:
-                burst_val = spec.fog_burst_sec if spec.fog_burst_sec > 0.0 else fx.fog_burst_sec
-                burst_str = f"{float(burst_val):.1f}".rstrip("0").rstrip(".")
-                self._emit_cue(
-                    "fog",
-                    f"(TRIGGER FOG · {burst_str}s)",
-                    show_id=spec.id,
-                    duration_ms=int(burst_val * 1000),
-                    fogSec=float(burst_val),
-                )
-                fog_url = fx.resolve_fog_url(burst_sec=burst_val)
-                if fog_url:
-                    out_res["fog"] = self._fire_http_hook(fog_url)
+            )
+            lights_turned_off, theater_started = self._trigger_pre_show_fx(
+                spec, fx, scene_dur_ms=seq_scene_dur_ms, out_res=out_res
+            )
 
             # 4. PHASE 1 (ANTI-ROLLER-COASTER ENTRY): Cube ducks FIRST during 220ms silent lead-in
             if self.house_audio is not None:
@@ -5394,6 +5775,7 @@ class ShowDirector:
                         show_id=spec.id,
                         duration_ms=2500,
                     )
+                    lights_restored = True
                 elif spec.lights_out:
                     self._fire_lights_state(
                         True,
@@ -5402,6 +5784,7 @@ class ShowDirector:
                         show_id=spec.id,
                         duration_ms=2500,
                     )
+                    lights_restored = True
 
                 # Optional mid-video YouTube duck + personal overlay + Denon drop (e.g., 1:20 -> MV55)
                 if spec.overlay_text and spec.overlay_at_sec > 0.0:
@@ -5495,6 +5878,13 @@ class ShowDirector:
             return out_res
         finally:
             self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
+            self._cleanup_post_show_fx(
+                spec,
+                fx,
+                theater_started=theater_started,
+                lights_turned_off=lights_turned_off,
+                lights_restored=lights_restored,
+            )
             # Emergency safety guarantee: ALWAYS ramp Denon back down FIRST before stopping Cube!
             if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
                 self._restore_denon_down(current_db, prev_db, fast=True)
@@ -5593,6 +5983,13 @@ class ShowDirector:
                 pass
         if broadcast_stop:
             self._broadcast_stage_event("stage_stop", runId=run_id, showId="")
+        with self._lock:
+            stop_theater_url = self.fx_hooks.resolve_theater_stop_url() if was_active else ""
+        if stop_theater_url:
+            try:
+                self._fire_http_hook(stop_theater_url)
+            except Exception:
+                pass
         if restore_wallboard and (not was_active or (t is not None and t.is_alive())):
             try:
                 self._restore_wallboard_tv(force_stop_youtube=False)

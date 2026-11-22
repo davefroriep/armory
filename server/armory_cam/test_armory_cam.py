@@ -3469,7 +3469,20 @@ class ShowDirectorTests(unittest.TestCase):
             j_lst = lst.get_json()
             self.assertTrue(j_lst["ok"])
             ids = {s["id"] for s in j_lst["shows"]}
-            self.assertEqual(ids, {"matt_pr", "matt_walkin", "ryder_walkin", "jared_mark_walkin", "gabe_walkin", "josh_walkin"})
+            self.assertEqual(
+                ids,
+                {
+                    "matt_pr",
+                    "matt_walkin",
+                    "ryder_walkin",
+                    "jenna_walkin",
+                    "avenleigh_walkin",
+                    "jared_mark_walkin",
+                    "jared_mark_vip",
+                    "gabe_walkin",
+                    "josh_walkin",
+                },
+            )
 
             # Preview WAV builds cleanly, has instant non-silent onset in first 150ms and clean faded tail
             prev = client.get("/api/shows/matt_pr/preview.wav")
@@ -4894,6 +4907,98 @@ class ShowDirectorTests(unittest.TestCase):
                     self.assertNotIn(dead_tok, dash)
             finally:
                 svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_personalized_walkins_smart_fogger_theater_hooks_and_no_beantown(self) -> None:
+        # 1. SmartFxConfig theater URL resolution & fog fallback to theaterHost
+        fx_t = sd.SmartFxConfig(theater_host="192.168.1.95")
+        self.assertEqual(
+            fx_t.resolve_theater_scene_url("jenna", duration_ms=48000, fog_ms=3500),
+            "http://192.168.1.95/api/scene?mode=jenna&ms=48000&fog_ms=3500",
+        )
+        self.assertEqual(fx_t.resolve_theater_stop_url(), "http://192.168.1.95/api/stop")
+        self.assertEqual(fx_t.resolve_fog_url(3.5), "http://192.168.1.95/api/trigger?sec=3.5")
+        self.assertEqual(fx_t.resolve_theater_scene_url("invalid_mode"), "")
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_vip_walkins_"))
+        try:
+            # Seed legacy shows.json with deprecated Beantown text on jared_mark_walkin to verify migration
+            legacy_cfg = {
+                "fxHooks": {"theaterHost": "192.168.1.95", "lightsHost": "192.168.1.60"},
+                "shows": {
+                    "jared_mark_walkin": {
+                        "id": "jared_mark_walkin",
+                        "name": "Jared & Mark Walk-In (All the Way From Beantown)",
+                        "triggers": ["jared and mark are here", "beantown walk in"],
+                        "announcerText": "All the way from Beantown... Jared and Mark!!",
+                    }
+                },
+            }
+            (tmp / "shows.json").write_text(json.dumps(legacy_cfg), encoding="utf-8")
+
+            http_hits: list[str] = []
+
+            def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+                http_hits.append(url)
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, b"<item><Power><value>ON</value></Power><MasterVolume><value>-30.0</value></MasterVolume></item>"
+                return 200, b'{"ok":true}'
+
+            ham = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15", cube_enabled=True, cube_host="192.168.1.151"),
+                allow_network=False,
+                denon_http_get=fake_get,
+                cube_http_post=lambda _u, _b, _h, _t: (200, b'{"ok":true}'),
+                sleep_fn=lambda _s: None,
+            )
+            director = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                allow_network=False,
+                http_get=fake_get,
+                sleep_fn=lambda _s: None,
+            )
+
+            # 2. Voice trigger matching for Jenna, Avenleigh (incl. ASR spellings), Jared & Mark Prism + VIP
+            self.assertEqual(director.match_voice_command("Armory, Jenna just got here")["showId"], "jenna_walkin")
+            self.assertEqual(director.match_voice_command("Armory, Avenleigh is here")["showId"], "avenleigh_walkin")
+            self.assertEqual(director.match_voice_command("Armory, Avenly walk in")["showId"], "avenleigh_walkin")
+            self.assertEqual(director.match_voice_command("Armory, Avenlee is here")["showId"], "avenleigh_walkin")
+            self.assertEqual(director.match_voice_command("Armory, Jared and Mark are here")["showId"], "jared_mark_walkin")
+            self.assertEqual(director.match_voice_command("Armory, Jared and Mark VIP")["showId"], "jared_mark_vip")
+
+            # Assert zero Beantown/Boston references remain after migration
+            for sid in ("jared_mark_walkin", "jared_mark_vip"):
+                sp = director.get_show(sid)
+                assert sp is not None
+                blob = json.dumps(sp.to_dict()).lower()
+                self.assertNotIn("beantown", blob)
+                self.assertNotIn("boston", blob)
+
+            # 3. Preview builds cleanly on non-thunder debut shows (add_thunder=False)
+            p_jenna = director.build_show_preview("jenna_walkin", force=True)
+            p_aven = director.build_show_preview("avenleigh_walkin", force=True)
+            self.assertTrue(p_jenna["ok"])
+            self.assertTrue(p_aven["ok"])
+
+            # 4. Firing show with theaterHost fires /api/scene once (no double /api/trigger fog), restores lights & stops FX in finally
+            http_hits.clear()
+            # Clear youtube_url on a copy or fire jared_mark_vip without displays to test _run_show_sequence theater hooks
+            director.update_show("jenna_walkin", {"youtubeUrl": "", "threeScreenVideo": False}, rebuild=False)
+            res = director.fire_show("jenna_walkin", async_run=False)
+            self.assertTrue(res["ok"])
+            scene_calls = [u for u in http_hits if "/api/scene?" in u]
+            trigger_calls = [u for u in http_hits if "/api/trigger?" in u]
+            stop_calls = [u for u in http_hits if u == "http://192.168.1.95/api/stop"]
+            self.assertEqual(len(scene_calls), 1)
+            self.assertIn("mode=jenna", scene_calls[0])
+            self.assertIn("fog_ms=3500", scene_calls[0])
+            self.assertEqual(len(trigger_calls), 0)
+            self.assertGreaterEqual(len(stop_calls), 1)
+            self.assertIn("http://192.168.1.60/rpc/Switch.Set?id=0&on=false", http_hits)
+            self.assertIn("http://192.168.1.60/rpc/Switch.Set?id=0&on=true", http_hits)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
