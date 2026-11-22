@@ -62,10 +62,12 @@ export const hrLink = new PolarLink();
 export const bikeLink = new NusBikeLink('armory.ble.airbike', {
   services: [NUS_SERVICE],
   names: ['AssaultBike'],
+  namePrefix: 'AssaultBike',
   matches: (n) => n === 'AssaultBike',
 });
 export const spinLink = new NusBikeLink('armory.ble.spin', {
   services: [NUS_SERVICE],
   names: ['SS2K_Tuner'],
+  namePrefix: 'SS2K',
   matches: (n) => /^SS2K/i.test(n),
 });

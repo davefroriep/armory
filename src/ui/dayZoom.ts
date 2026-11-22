@@ -192,11 +192,16 @@ export function renderCompletedLiftSlot(
 /** Rich completed cardio slot showing duration, average/max power, HR, energy and RPE. */
 export function renderCompletedCardioSlot(m: WorkoutMeta): string {
   const mins = Math.max(1, Math.round(m.seconds / 60));
+  const avgW = Math.round(m.avgW);
+  const maxW = Math.round(m.maxW);
+  const avgHr = Math.round(m.avgHr);
+  const maxHr = Math.round(m.maxHr);
+  const kj = Math.round(m.kj);
   const pills = [
     hms(m.seconds),
-    m.avgW > 0 ? `${m.avgW} W avg${m.maxW > 0 ? ` · ${m.maxW} W max` : ''}` : '',
-    m.avgHr > 0 ? `${m.avgHr} bpm avg${m.maxHr > 0 ? ` · ${m.maxHr} max` : ''}` : '',
-    m.kj > 0 ? `${m.kj} kJ` : '',
+    avgW > 0 ? `${avgW} W avg${maxW > 0 ? ` · ${maxW} W max` : ''}` : '',
+    avgHr > 0 ? `${avgHr} bpm avg${maxHr > 0 ? ` · ${maxHr} max` : ''}` : '',
+    kj > 0 ? `${kj} kJ` : '',
     m.rpe != null ? `RPE ${m.rpe}` : '',
   ].filter(Boolean);
   return `<div class="sh-slot done">
@@ -211,11 +216,11 @@ export function renderCompletedCardioSlot(m: WorkoutMeta): string {
   </div>`;
 }
 
-function renderItemList(items: { exId: string; sets: number; ss?: boolean; rx?: ExerciseRx }[], lookup: ZoomLookup, templateId?: string): string {
+function renderItemList(items: { exId: string; sets: number; ss?: boolean; rx?: ExerciseRx }[], lookup: ZoomLookup, templateId?: string, week?: number): string {
   const labs = labels(items);
   const rows = items.map((it, idx) => {
     const ex = lookup.exOf(it.exId);
-    const rx = resolvePrescription(ex, { rx: it.rx, sets: it.sets, base1RmKg: lookup.e1rmOf?.(it.exId) ?? null, unit: lookup.unit });
+    const rx = resolvePrescription(ex, { rx: it.rx, sets: it.sets, week, base1RmKg: lookup.e1rmOf?.(it.exId) ?? null, unit: lookup.unit });
     const prev = lookup.prevOf(it.exId);
     const best = prev?.sets.filter((x) => x.done && x.kind !== 'w').slice(-1)[0];
     const prevTxt = best ? setText(best, ex, lookup.unit) : '';
@@ -242,7 +247,7 @@ function slotBadgeAndClass(state: SlotState): { badge: string; cls: string } {
 }
 
 /** Planned, externally completed, or skipped slot view with matched local routine exercises/sets/notes. */
-export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: ZoomLookup, planSlot?: string): string {
+export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: ZoomLookup, planSlot?: string, week?: number): string {
   const mins = Math.round(slot.seconds / 60);
   const { badge, cls } = slotBadgeAndClass(state);
   const doBtn = state === 'pending' && planSlot
@@ -250,7 +255,7 @@ export function renderPlannedSlot(slot: PlanSlot, state: SlotState, lookup: Zoom
     : '';
   if (slot.equipment === 'strength') {
     const r = matchRoutineByTitle(slot.name, lookup.routines);
-    const detail = r ? renderItemList(r.items, lookup, r.id) : `<p class="sh-text">${esc(slot.description)}</p>`;
+    const detail = r ? renderItemList(r.items, lookup, r.id, week) : `<p class="sh-text">${esc(slot.description)}</p>`;
     return `<div class="sh-slot${cls}">
       <div class="sh-slot-h">
         <span class="cal-ico strength">${ICON.strength}</span>
@@ -419,8 +424,8 @@ export function renderDayZoomCard(args: {
   const isRestPref = restDay != null && dayOfWeek(ymd) === restDay;
 
   const pendingList = [
-    ...res.pendingExtras.map((x) => ({ kind: 'extra' as const, x, key: extraKey(x.id) })),
-    ...res.pendingSlots.map(({ p, slot, slotIndex }) => ({ kind: 'plan' as const, slot, key: slotKey(p.step.index, slotIndex) })),
+    ...res.pendingExtras.map((x) => ({ kind: 'extra' as const, x, key: extraKey(x.id), week: res.week })),
+    ...res.pendingSlots.map(({ p, slot, slotIndex }) => ({ kind: 'plan' as const, slot, key: slotKey(p.step.index, slotIndex), week: p.step.week })),
   ];
   const singlePendingKey = pendingList.length === 1 ? pendingList[0].key : null;
 
@@ -428,12 +433,12 @@ export function renderDayZoomCard(args: {
     ...res.liftsDone.map((s) => renderCompletedLiftSlot(s, lookup)),
     ...res.cardioDone.map((cm) => renderCompletedCardioSlot(cm)),
     ...res.doneExtras.map((x) => renderExtraSlot(x, 'done', lookup)),
-    ...res.externalDoneSlots.map(({ slot }) => renderPlannedSlot(slot, 'done', lookup)),
+    ...res.externalDoneSlots.map(({ p, slot }) => renderPlannedSlot(slot, 'done', lookup, undefined, p.step.week)),
     ...res.skippedExtras.map((x) => renderExtraSlot(x, 'skipped', lookup)),
-    ...res.skippedSlots.map(({ slot }) => renderPlannedSlot(slot, 'skipped', lookup)),
+    ...res.skippedSlots.map(({ p, slot }) => renderPlannedSlot(slot, 'skipped', lookup, undefined, p.step.week)),
     ...pendingList.map((item) => item.kind === 'extra'
       ? renderExtraSlot(item.x, 'pending', lookup, singlePendingKey ? undefined : item.key)
-      : renderPlannedSlot(item.slot, 'pending', lookup, singlePendingKey ? undefined : item.key)),
+      : renderPlannedSlot(item.slot, 'pending', lookup, singlePendingKey ? undefined : item.key, item.week)),
   ];
 
   const body = slotCards.length

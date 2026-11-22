@@ -22,8 +22,8 @@ export function backupCardHtml(statsLine: string): string {
     statusTxt = `Last auto-backup: <b>${esc(when)}</b> (${st.lifts} lifts · ${st.cardio} cardio · ${st.routines} days)`;
   }
   const dirNote = isNative()
-    ? `Auto-saves after workouts &amp; daily to <b>${BACKUP_DIR_LABEL}</b> (point DriveSync here → Google Drive <b>Backups/ArmoryFit Backup</b>).`
-    : 'Exports complete Strength + Cardio + rolling schedule + settings (API key excluded).';
+    ? `Auto-saves after workouts &amp; daily (settings + API key included) to <b>${BACKUP_DIR_LABEL}</b> (point DriveSync here → Google Drive <b>Backups/ArmoryFit Backup</b>).`
+    : 'Exports complete Strength + Cardio + rolling schedule + settings &amp; API key.';
   return `<section class="card" data-backup-card>
     <div class="hint">${esc(statsLine)}</div>
     <div class="hint" data-bk-status>${statusTxt}</div>
@@ -72,7 +72,7 @@ export function wireBackupCard(root: HTMLElement, onRestored?: () => void): () =
         const cardioN = parsed.app === 'armory-fit-backup' ? (parsed.workoutsMeta?.filter((m) => m.equipment !== 'strength').length ?? 0) : 0;
         const ok = await confirmSheet(
           'Restore backup?',
-          `${picked.fileName}: ${parsed.sessions.length} lifts${cardioN ? `, ${cardioN} cardio` : ''}, ${parsed.routines?.length ?? 0} days. Matching IDs are restored; your Intervals API key stays intact.`,
+          `${picked.fileName}: ${parsed.sessions.length} lifts${cardioN ? `, ${cardioN} cardio` : ''}, ${parsed.routines?.length ?? 0} days. Matching IDs are restored; settings and Intervals API key are restored when present in the backup (a pre-restore snapshot is saved first).`,
           'Restore',
         );
         if (!ok) return;

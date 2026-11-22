@@ -6,6 +6,8 @@ export interface DeviceSpec {
   services: string[];
   /** Exact advertised names accepted in addition to the service filter (web chooser only). */
   names?: string[];
+  /** Advertised device name prefix filter for native BLE picker. */
+  namePrefix?: string;
   /** Used to re-find an already-granted device without the chooser (web). */
   matches(name: string): boolean;
 }
@@ -135,14 +137,20 @@ class NativeTransport implements BleTransport {
 
   private init(): Promise<void> {
     // Requests BLUETOOTH_SCAN / BLUETOOTH_CONNECT on first use (Android 12+).
-    this.ready ??= BleClient.initialize({ androidNeverForLocation: true });
+    this.ready ??= BleClient.initialize({ androidNeverForLocation: true }).catch((e) => {
+      this.ready = null;
+      throw e;
+    });
     return this.ready;
   }
 
   async pick(spec: DeviceSpec): Promise<string | null> {
     try {
       await this.init();
-      const d = await BleClient.requestDevice({ services: spec.services });
+      const d = await BleClient.requestDevice({
+        services: spec.services,
+        ...(spec.namePrefix ? { namePrefix: spec.namePrefix } : {}),
+      });
       this.names.set(d.deviceId, d.name ?? '');
       return d.deviceId;
     } catch (e) {

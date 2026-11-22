@@ -1,3 +1,4 @@
+import { clearBackInterceptor, setBackInterceptor } from '../nav';
 import { syncModalInert, wireModalBackdrop } from './dom';
 
 /**
@@ -12,8 +13,18 @@ export class LeaveGuard {
 
   constructor(private readonly isActive: () => boolean) {}
 
+  private onNativeBack = (): boolean => {
+    if (!this.isActive()) {
+      this.dispose();
+      return false;
+    }
+    this.showModal();
+    return true;
+  };
+
   /** Call when the workout starts. */
   arm(): void {
+    setBackInterceptor(this.onNativeBack);
     if (this.pushed) return;
     history.pushState({ armoryGuard: true }, '', location.href);
     this.pushed = true;
@@ -22,6 +33,7 @@ export class LeaveGuard {
 
   /** Call when the workout ends normally: drops the extra history entry so Back works as usual again. */
   disarm(): void {
+    clearBackInterceptor(this.onNativeBack);
     window.removeEventListener('popstate', this.onPop);
     this.closeModal();
     if (this.pushed) {
@@ -32,6 +44,7 @@ export class LeaveGuard {
 
   /** Call on screen teardown (no history changes: the route is already changing). */
   dispose(): void {
+    clearBackInterceptor(this.onNativeBack);
     window.removeEventListener('popstate', this.onPop);
     this.closeModal();
     this.pushed = false;
@@ -77,12 +90,13 @@ export class LeaveGuard {
   }
 
   private leave(): void {
+    clearBackInterceptor(this.onNativeBack);
     window.removeEventListener('popstate', this.onPop);
     this.closeModal();
     if (this.pushed) {
       this.pushed = false;
-      // Return directly to Home instead of walking back through intermediate tabs.
-      location.hash = '#/';
     }
+    // Return directly to Home instead of walking back through intermediate tabs.
+    location.hash = '#/';
   }
 }

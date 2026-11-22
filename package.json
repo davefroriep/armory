@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host",
-    "build": "node scripts/bump-rev.mjs && tsc --noEmit && vite build",
+    "build": "tsc --noEmit && node scripts/bump-rev.mjs && vite build",
     "preview": "vite preview --host",
     "build:ci": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",

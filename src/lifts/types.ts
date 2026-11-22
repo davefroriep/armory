@@ -51,6 +51,8 @@ export interface LiftSet {
   /** The value is a suggestion (last time / forward-populated), not typed by the user. */
   wAuto?: boolean;
   rAuto?: boolean;
+  /** Protects prescribed per-set ramps/targets from being overwritten by forward-fill from an earlier set. */
+  rxLock?: boolean;
   /** Epoch ms the set was logged. */
   at?: number;
 }

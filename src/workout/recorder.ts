@@ -15,7 +15,10 @@ export class Recorder {
   private wSum = 0;
   private cadSum = 0;
   private frames = 0;
-  private base: { dist: number; kcal: number } | null = null;
+  private accDist = 0;
+  private accKcal = 0;
+  private lastRawDist: number | null = null;
+  private lastRawKcal: number | null = null;
   private kjAcc = 0;
   private wTotal = 0;
   private hrTotal = 0;
@@ -46,6 +49,13 @@ export class Recorder {
           if (s.hr >= 0.88 * hrMax) this.z5Seconds++;
         }
       }
+      const tail = resumeFrom.samples[resumeFrom.samples.length - 1];
+      if (tail) {
+        this.accDist = tail.dist;
+        this.accKcal = tail.kcal;
+        this.lastDist = tail.dist;
+        this.lastKcal = tail.kcal;
+      }
       this.nextT = resumeFrom.samples.length;
       return;
     }
@@ -63,9 +73,23 @@ export class Recorder {
   get avgW(): number { return this.nextT ? this.wTotal / this.nextT : 0; }
   get avgHr(): number { return this.hrCount ? this.hrTotal / this.hrCount : 0; }
 
+  private accumulateBikeTotals(): void {
+    if (this.lastRawDist == null || this.lastRawKcal == null) {
+      this.lastRawDist = live.dist;
+      this.lastRawKcal = live.kcal;
+      return;
+    }
+    const dDist = live.dist >= this.lastRawDist ? live.dist - this.lastRawDist : live.dist;
+    const dKcal = live.kcal >= this.lastRawKcal ? live.kcal - this.lastRawKcal : live.kcal;
+    if (dDist > 0) this.accDist += dDist;
+    if (dKcal > 0) this.accKcal += dKcal;
+    this.lastRawDist = live.dist;
+    this.lastRawKcal = live.kcal;
+  }
+
   /** Call for every bike frame while running. */
   onFrame(): void {
-    if (!this.base) this.base = { dist: live.dist, kcal: live.kcal };
+    this.accumulateBikeTotals();
     this.wSum += live.w;
     this.cadSum += live.cad;
     this.frames++;
@@ -93,12 +117,13 @@ export class Recorder {
    */
   tick(elapsed: number, targetRpm: number, now = Date.now()): void {
     const bike = bikeFresh();
+    if (bike) this.accumulateBikeTotals();
     while (this.nextT <= Math.floor(elapsed)) {
       const w = this.frames && bike ? this.wSum / this.frames : bike ? live.w : 0;
       const cad = this.frames && bike ? this.cadSum / this.frames : bike ? live.cad : 0;
       const hr = hrAtTime(now - (elapsed - this.nextT) * 1000);
-      const dist = this.base ? Math.max(0, live.dist - this.base.dist) : 0;
-      const kcal = this.base ? Math.max(0, live.kcal - this.base.kcal) : 0;
+      const dist = this.accDist;
+      const kcal = this.accKcal;
       this.lastDist = dist;
       this.lastKcal = kcal;
       const s: Sample = { t: this.nextT, w, cad, hr, dist, kcal, tr: targetRpm };

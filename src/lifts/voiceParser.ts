@@ -391,7 +391,7 @@ function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
   return null;
 }
 
-function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): VoiceIntent | null {
+function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases, allowNoisy = true): VoiceIntent | null {
   let tail = tailRaw.trim().replace(/^[.,!?:;\s]+|[.,!?:;\s]+$/g, '');
   if (!tail) return { kind: 'arm_wake' };
 
@@ -583,7 +583,34 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases): Voi
     return { kind: 'log_current', reps: Number(rOnlyM[1]), ...(rpe != null ? { rpe } : {}) };
   }
 
-  return parseLeadingNoisyTail(tail, rpe);
+  if (allowNoisy) return parseLeadingNoisyTail(tail, rpe);
+  return null;
+}
+
+function validateVoiceIntent(intent: VoiceIntent | null): VoiceIntent | null {
+  if (!intent) return null;
+  switch (intent.kind) {
+    case 'log_current':
+      if (intent.reps != null && (intent.reps < 1 || intent.reps > 100)) return null;
+      if (intent.seconds != null && (intent.seconds < 1 || intent.seconds > 600)) return null;
+      if (intent.weight != null && (intent.weight < 0 || intent.weight > 1500)) return null;
+      return intent;
+    case 'set_only':
+      if (intent.reps != null && (intent.reps < 1 || intent.reps > 100)) return null;
+      if (intent.weight != null && (intent.weight < 0 || intent.weight > 1500)) return null;
+      return intent;
+    case 'start_hold':
+      if (intent.seconds != null && (intent.seconds < 1 || intent.seconds > 600)) return null;
+      return intent;
+    case 'rest_add':
+      if (Math.abs(intent.deltaSec) < 1 || Math.abs(intent.deltaSec) > 600) return null;
+      return intent;
+    case 'wb_replay':
+      if (intent.setNum != null && (intent.setNum < 1 || intent.setNum > 50)) return null;
+      return intent;
+    default:
+      return intent;
+  }
 }
 
 function buildWakeRegex(wakeWord?: string): RegExp {
@@ -725,11 +752,11 @@ export function parseVoiceTranscript(
   if (lastEnd >= 0) {
     const tail = norm.slice(lastEnd).trim();
     if (!tail) return { kind: 'arm_wake' };
-    return parseBodytail(tail, opts.customAliases);
+    return validateVoiceIntent(parseBodytail(tail, opts.customAliases, true));
   }
 
   if (opts.requireWake === false || opts.armed) {
-    return parseBodytail(norm, opts.customAliases);
+    return validateVoiceIntent(parseBodytail(norm, opts.customAliases, opts.requireWake === false));
   }
   return null;
 }

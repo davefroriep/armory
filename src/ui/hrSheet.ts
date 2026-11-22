@@ -5,7 +5,7 @@ import { bodyProfile, kcalFromSamples } from '../domain/energy';
 import { recoveryLimitBpm } from '../domain/gate';
 import { active } from '../lifts/active';
 import { getSettings } from '../store/settings';
-import { esc, mmss } from './dom';
+import { mmss } from './dom';
 import { ZONE_COLOR, ZONE_NAME, hrDropStats, hrZone } from './hr';
 import { openSheet } from './lifts/kit';
 
@@ -88,6 +88,37 @@ export function openHrSheet(): void {
   activeHrSheet = sh;
 
   const host = sh.body.querySelector<HTMLElement>('#hrBody')!;
+  host.innerHTML = `<div class="hr-hero" id="hrHero" style="--zc:#8a94a3">
+      <div class="hr-top">
+        <span class="hr-conn" id="hrConn"><i id="hrDot"></i><span id="hrConnTxt"></span></span>
+        <span class="hr-zpill" id="hrZpill"></span>
+      </div>
+      <div class="hr-bpm" id="hrBpm">-- <small>BPM</small></div>
+    </div>
+
+    <div class="hr-spark-card">
+      <div class="hr-spark-h"><span>LAST 2 MIN</span><b id="hrDropTxt"></b></div>
+      <div id="hrSparkBox"></div>
+    </div>
+
+    <div class="hr-sec-h"><span id="hrScope"></span><span id="hrMaxCfg"></span></div>
+    <div class="stats three hr-stats">
+      <div><small>AVG HR</small><b id="hrAvg">--</b></div>
+      <div><small>MAX HR</small><b id="hrMax">--</b></div>
+      <div><small>~KCAL</small><b id="hrKcal">--</b></div>
+    </div>
+
+    <div class="hr-zones-card">
+      <div class="card-h"><span>TIME IN ZONE</span></div>
+      <div class="zones">${[1, 2, 3, 4, 5].map((zn) => `<div class="zrow"><span>Z${zn}</span><i><u id="hrZbar${zn}" style="width:0%;background:${ZONE_COLOR[zn]}"></u></i><b id="hrZsec${zn}">0:00</b></div>`).join('')}</div>
+    </div>
+
+    <div class="hr-acts" id="hrActs">
+      <button class="btn primary big" type="button" data-hr-conn id="hrConnBtn" hidden></button>
+      <button class="btn big" type="button" data-hr-close>Close</button>
+    </div>`;
+
+  const q = (id: string) => host.querySelector<HTMLElement>('#' + id)!;
 
   const render = (): void => {
     if (dead) return;
@@ -139,44 +170,36 @@ export function openHrSheet(): void {
     const kcal = prof && samples.length ? kcalFromSamples(samples, prof) : null;
     const totalSec = Math.max(1, secs.slice(1).reduce((a, b) => a + b, 0));
 
-    const zoneBars = [1, 2, 3, 4, 5]
-      .map(
-        (zn) => `<div class="zrow"><span>Z${zn}</span><i><u style="width:${(secs[zn] / totalSec) * 100}%;background:${ZONE_COLOR[zn]}"></u></i><b>${mmss(secs[zn])}</b></div>`,
-      )
-      .join('');
+    q('hrHero').style.setProperty('--zc', zCol);
+    q('hrDot').className = hrLink.connected || cfg.simulator ? 'on' : '';
+    q('hrConnTxt').textContent = statusTxt;
+    const zp = q('hrZpill');
+    zp.style.color = zCol;
+    zp.style.background = `${zCol}22`;
+    zp.style.boxShadow = `inset 0 0 0 1px ${zCol}66`;
+    zp.textContent = zLabel;
+    const bpmEl = q('hrBpm');
+    bpmEl.style.color = zCol;
+    bpmEl.innerHTML = `${hr > 0 ? hr : '--'} <small>BPM</small>`;
+
+    q('hrDropTxt').textContent = dropText;
+    q('hrSparkBox').innerHTML = renderSparkline(pts2m, now, 120_000, recLimit, zCol);
+
+    q('hrScope').textContent = scopeLabel;
+    q('hrMaxCfg').textContent = `HRmax ${cfg.hrMax}`;
+    q('hrAvg').textContent = avgHr ? String(avgHr) : '--';
+    q('hrMax').textContent = maxHr ? String(maxHr) : '--';
+    q('hrKcal').textContent = kcal != null ? String(kcal) : '--';
+
+    for (const zn of [1, 2, 3, 4, 5]) {
+      q(`hrZbar${zn}`).style.width = `${(secs[zn] / totalSec) * 100}%`;
+      q(`hrZsec${zn}`).textContent = mmss(secs[zn]);
+    }
 
     const showConnBtn = !cfg.simulator && !hrLink.connected && hrLink.state !== 'unsupported';
-    const connLabel = hrLink.hasDevice ? 'Reconnect Polar H10' : 'Pair Polar H10';
-
-    host.innerHTML = `<div class="hr-hero" style="--zc:${zCol}">
-        <div class="hr-top">
-          <span class="hr-conn"><i class="${hrLink.connected || cfg.simulator ? 'on' : ''}"></i>${esc(statusTxt)}</span>
-          <span class="hr-zpill" style="color:${zCol};background:${zCol}22;box-shadow:inset 0 0 0 1px ${zCol}66">${esc(zLabel)}</span>
-        </div>
-        <div class="hr-bpm" style="color:${zCol}">${hr > 0 ? hr : '--'} <small>BPM</small></div>
-      </div>
-
-      <div class="hr-spark-card">
-        <div class="hr-spark-h"><span>LAST 2 MIN</span><b>${esc(dropText)}</b></div>
-        ${renderSparkline(pts2m, now, 120_000, recLimit, zCol)}
-      </div>
-
-      <div class="hr-sec-h"><span>${scopeLabel}</span><span>HRmax ${cfg.hrMax}</span></div>
-      <div class="stats three hr-stats">
-        <div><small>AVG HR</small><b>${avgHr || '--'}</b></div>
-        <div><small>MAX HR</small><b>${maxHr || '--'}</b></div>
-        <div><small>~KCAL</small><b>${kcal != null ? kcal : '--'}</b></div>
-      </div>
-
-      <div class="hr-zones-card">
-        <div class="card-h"><span>TIME IN ZONE</span></div>
-        <div class="zones">${zoneBars}</div>
-      </div>
-
-      <div class="hr-acts">
-        ${showConnBtn ? `<button class="btn primary big" type="button" data-hr-conn>${connLabel}</button>` : ''}
-        <button class="btn big" type="button" data-hr-close>Close</button>
-      </div>`;
+    const connBtn = q('hrConnBtn');
+    connBtn.hidden = !showConnBtn;
+    if (showConnBtn) connBtn.textContent = hrLink.hasDevice ? 'Reconnect Polar H10' : 'Pair Polar H10';
   };
 
   sh.body.addEventListener('click', (e) => {

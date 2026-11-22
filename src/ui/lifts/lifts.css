@@ -174,8 +174,8 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .xname b { font-size: 1.04rem; color: var(--blue); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .xname small { color: var(--mut); font-size: .7rem; }
 .xnote { display: block; width: 100%; text-align: left; margin: 0 0 6px; padding: 8px 10px; border-radius: 10px; background: rgba(245, 158, 11, .09); color: #fcd34d; font-size: .8rem; line-height: 1.35; white-space: pre-wrap; }
-.xth, .srow { display: grid; grid-template-columns: 34px minmax(52px, 1fr) 66px 52px 32px 40px; gap: 5px; align-items: center; }
-.xth.t-row, .srow.t-row { grid-template-columns: 34px minmax(44px, 1fr) 56px 46px 40px 30px 38px; gap: 4px; }
+.xth, .srow { display: grid; grid-template-columns: 34px minmax(48px, 1fr) 64px 50px 32px 44px; gap: 5px; align-items: center; }
+.xth.t-row, .srow.t-row { grid-template-columns: 34px minmax(40px, 1fr) 54px 44px 40px 30px 44px; gap: 4px; }
 .shold { height: 40px; border-radius: 10px; background: rgba(30, 155, 255, .14); color: var(--blue); font-size: .76rem; font-weight: 900; font-variant-numeric: tabular-nums; display: grid; place-items: center; }
 .shold:active { transform: scale(.94); }
 .shold.on { background: var(--amber); color: #191000; }
@@ -196,8 +196,8 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .sprev { color: var(--mut); font-size: .8rem; font-weight: 600; font-variant-numeric: tabular-nums; text-align: center; padding: 8px 0; border-radius: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sprev:disabled { opacity: .5; }
 .srow input { width: 100%; height: 40px; border-radius: 10px; background: var(--card2); border: 1.5px solid transparent; color: #fff; text-align: center; font-size: 1.08rem; font-weight: 800; font-variant-numeric: tabular-nums; user-select: text; -webkit-user-select: text; font-family: inherit; padding: 0 2px; }
-.srow input.auto { color: #4c5665; }
-.srow input::placeholder { color: #3e4857; }
+.srow input.auto { color: #8a94a3; font-style: italic; }
+.srow input::placeholder { color: #647082; }
 .srow input:focus { outline: none; border-color: var(--blue); background: #0f2233; color: #fff; }
 .srow.done .snum { background: rgba(26, 31, 38, .55); color: #94a3b8; }
 .srow.done input:not(:focus) { background: rgba(26, 31, 38, .55); color: #cbd5e1; }
@@ -208,7 +208,7 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .svid.rec { background: rgba(239, 68, 68, .18); color: #f87171; box-shadow: inset 0 0 0 1.5px rgba(239, 68, 68, .65); animation: camPulse 1.15s ease-in-out infinite; }
 .svid.saving { background: rgba(245, 158, 11, .18); color: #fcd34d; box-shadow: inset 0 0 0 1.5px rgba(245, 158, 11, .65); animation: camPulse 1.15s ease-in-out infinite; }
 @keyframes camPulse { 0%, 100% { box-shadow: inset 0 0 0 1.5px rgba(239, 68, 68, .75), 0 0 0 0 rgba(239, 68, 68, .45); } 50% { box-shadow: inset 0 0 0 1.5px rgba(239, 68, 68, .75), 0 0 0 5px rgba(239, 68, 68, 0); } }
-.schk { height: 40px; border-radius: 10px; background: var(--card2); color: #4b5563; display: grid; place-items: center; padding: 0; transition: color .12s, background .12s, transform .1s; }
+.schk { height: 44px; border-radius: 10px; background: var(--card2); color: #4b5563; display: grid; place-items: center; padding: 0; transition: color .12s, background .12s, transform .1s; }
 .schk svg { width: 19px; height: 19px; }
 .schk:active { transform: scale(.92); }
 .schk.on { background: transparent; color: var(--green); }
@@ -276,6 +276,9 @@ body.dock-open .restbar { bottom: calc(63px + var(--sab)); }
 .dock.reps .dk.pre { background: #17212c; color: #93c5fd; box-shadow: inset 0 0 0 1px rgba(30, 155, 255, .25); }
 .dock.reps .dk.pre.on { background: var(--blue); color: #00131f; box-shadow: none; }
 .dock.reps .dk.log { flex: 1.45; font-size: .82rem; white-space: nowrap; }
+.dock.compact { gap: 5px; padding-left: 8px; padding-right: 8px; }
+.dock.compact .dk { font-size: .82rem; padding: 0 2px; }
+.dock.compact .dk.log { flex: 1.4; font-size: .8rem; white-space: nowrap; }
 
 /* set sheet */
 .vrow { min-height: 4px; }

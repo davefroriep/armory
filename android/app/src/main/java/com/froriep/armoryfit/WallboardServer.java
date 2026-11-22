@@ -27,6 +27,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 /**
  * Lightweight local Wi-Fi HTTP + SSE server embedded inside the Pixel APK.
@@ -55,11 +58,21 @@ final class WallboardServer {
     private static final class ClientStream {
         final Socket socket;
         final OutputStream out;
+        final AtomicReference<byte[]> pending = new AtomicReference<>();
+        final AtomicBoolean draining = new AtomicBoolean(false);
 
         ClientStream(Socket socket, OutputStream out) {
             this.socket = socket;
             this.out = out;
         }
+    }
+
+    private static final Pattern LAN_ORIGIN_RE = Pattern.compile(
+            "^https?://(?:localhost|127\\.0\\.0\\.1|10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3})(?::\\d{1,5})?$",
+            Pattern.CASE_INSENSITIVE);
+
+    private static boolean isLanOrigin(String origin) {
+        return origin != null && LAN_ORIGIN_RE.matcher(origin.trim()).matches();
     }
 
     private WallboardServer() {}
@@ -98,11 +111,11 @@ final class WallboardServer {
             running = true;
 
             connExec = Executors.newCachedThreadPool();
-            sseExec = Executors.newSingleThreadExecutor();
+            sseExec = Executors.newFixedThreadPool(8);
             pingExec = Executors.newSingleThreadScheduledExecutor();
             pingExec.scheduleWithFixedDelay(() -> {
                 if (sseClients.isEmpty() || sseExec == null) return;
-                sseExec.execute(() -> writeAll(": ping\n\n".getBytes(StandardCharsets.UTF_8)));
+                writeAll(": ping\n\n".getBytes(StandardCharsets.UTF_8), false);
             }, 15, 15, TimeUnit.SECONDS);
 
             acceptThread = new Thread(() -> acceptLoop(ss), "ArmoryWallboardAccept");
@@ -159,7 +172,7 @@ final class WallboardServer {
         ExecutorService ex = sseExec;
         if (running && ex != null && !sseClients.isEmpty()) {
             byte[] frame = ("data: " + clean + "\n\n").getBytes(StandardCharsets.UTF_8);
-            ex.execute(() -> writeAll(frame));
+            writeAll(frame, true);
         }
         return sseClients.size();
     }
@@ -215,16 +228,49 @@ final class WallboardServer {
         }
     }
 
-    private static void writeAll(byte[] payload) {
+    private static void writeAll(byte[] payload, boolean isData) {
+        ExecutorService ex = sseExec;
+        if (ex == null || ex.isShutdown()) return;
         for (ClientStream cs : sseClients) {
-            try {
+            if (isData) {
+                cs.pending.set(payload);
+            } else {
+                cs.pending.compareAndSet(null, payload);
+            }
+            if (cs.draining.compareAndSet(false, true)) {
+                try {
+                    ex.execute(() -> drainClient(cs));
+                } catch (Exception ignored) {
+                    cs.draining.set(false);
+                }
+            }
+        }
+    }
+
+    private static void drainClient(ClientStream cs) {
+        try {
+            while (running && !cs.socket.isClosed() && sseClients.contains(cs)) {
+                byte[] frame = cs.pending.getAndSet(null);
+                if (frame == null) break;
                 synchronized (cs.out) {
-                    cs.out.write(payload);
+                    cs.out.write(frame);
                     cs.out.flush();
                 }
-            } catch (IOException e) {
-                sseClients.remove(cs);
-                try { cs.socket.close(); } catch (IOException ignored) {}
+            }
+        } catch (IOException e) {
+            sseClients.remove(cs);
+            try { cs.socket.close(); } catch (IOException ignored) {}
+        } finally {
+            cs.draining.set(false);
+            if (running && !cs.socket.isClosed() && sseClients.contains(cs) && cs.pending.get() != null) {
+                ExecutorService ex = sseExec;
+                if (ex != null && !ex.isShutdown() && cs.draining.compareAndSet(false, true)) {
+                    try {
+                        ex.execute(() -> drainClient(cs));
+                    } catch (Exception ignored) {
+                        cs.draining.set(false);
+                    }
+                }
             }
         }
     }
@@ -244,7 +290,7 @@ final class WallboardServer {
 
             String[] req = lines[0].split(" ");
             if (req.length < 2) {
-                sendText(out, 400, "Bad Request", "text/plain; charset=utf-8", "Bad Request", null);
+                sendText(out, 400, "Bad Request", "text/plain; charset=utf-8", "Bad Request", null, null);
                 return;
             }
             String method = req[0].toUpperCase();
@@ -253,27 +299,40 @@ final class WallboardServer {
             String path = q >= 0 ? rawPath.substring(0, q) : rawPath;
 
             int contentLength = 0;
+            String origin = null;
             for (int i = 1; i < lines.length; i++) {
                 int colon = lines[i].indexOf(':');
-                if (colon > 0 && lines[i].substring(0, colon).trim().equalsIgnoreCase("Content-Length")) {
-                    try { contentLength = Integer.parseInt(lines[i].substring(colon + 1).trim()); }
-                    catch (NumberFormatException ignored) {}
+                if (colon > 0) {
+                    String hName = lines[i].substring(0, colon).trim();
+                    String hVal = lines[i].substring(colon + 1).trim();
+                    if (hName.equalsIgnoreCase("Content-Length")) {
+                        try { contentLength = Integer.parseInt(hVal); }
+                        catch (NumberFormatException ignored) {}
+                    } else if (hName.equalsIgnoreCase("Origin")) {
+                        origin = hVal;
+                    }
                 }
             }
 
             if ("OPTIONS".equals(method)) {
+                if (origin != null && !origin.isEmpty() && !isLanOrigin(origin)) {
+                    sendText(out, 403, "Forbidden", "application/json; charset=utf-8", "{\"error\":\"Origin not allowed\"}", null, null);
+                    return;
+                }
+                String corsOrigin = (origin != null && !origin.isEmpty()) ? origin : null;
                 sendText(out, 204, "No Content", "text/plain; charset=utf-8", "",
-                        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n");
+                        "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n",
+                        corsOrigin);
                 return;
             }
 
             if ("GET".equals(method) && ("/".equals(path) || "/index.html".equals(path))) {
-                sendText(out, 200, "OK", "text/html; charset=utf-8", htmlPage, null);
+                sendText(out, 200, "OK", "text/html; charset=utf-8", htmlPage, null, "*");
                 return;
             }
 
             if ("GET".equals(method) && "/state".equals(path)) {
-                sendText(out, 200, "OK", "application/json; charset=utf-8", latestStateJson, null);
+                sendText(out, 200, "OK", "application/json; charset=utf-8", latestStateJson, null, "*");
                 return;
             }
 
@@ -303,9 +362,14 @@ final class WallboardServer {
             if ("POST".equals(method) && "/api/voice".equals(path)) {
                 InetAddress remote = sock.getInetAddress();
                 if (remote == null || (!remote.isLoopbackAddress() && !remote.isSiteLocalAddress())) {
-                    sendText(out, 403, "Forbidden", "application/json; charset=utf-8", "{\"error\":\"LAN only\"}", null);
+                    sendText(out, 403, "Forbidden", "application/json; charset=utf-8", "{\"error\":\"LAN only\"}", null, null);
                     return;
                 }
+                if (origin != null && !origin.isEmpty() && !isLanOrigin(origin)) {
+                    sendText(out, 403, "Forbidden", "application/json; charset=utf-8", "{\"error\":\"Origin not allowed\"}", null, null);
+                    return;
+                }
+                String corsOrigin = (origin != null && !origin.isEmpty()) ? origin : null;
                 int len = Math.max(0, Math.min(MAX_BODY_BYTES, contentLength));
                 byte[] bodyBytes = new byte[len];
                 int read = 0;
@@ -322,11 +386,11 @@ final class WallboardServer {
                 if (!transcript.isEmpty()) {
                     WorkoutServicePlugin.deliverExternalVoice(transcript, "lan");
                 }
-                sendText(out, 200, "OK", "application/json; charset=utf-8", "{\"ok\":true}", null);
+                sendText(out, 200, "OK", "application/json; charset=utf-8", "{\"ok\":true}", null, corsOrigin);
                 return;
             }
 
-            sendText(out, 404, "Not Found", "text/plain; charset=utf-8", "Not Found", null);
+            sendText(out, 404, "Not Found", "text/plain; charset=utf-8", "Not Found", null, null);
         } catch (IOException ignored) {
         } finally {
             if (!upgradedSse) {
@@ -354,13 +418,16 @@ final class WallboardServer {
         return null;
     }
 
-    private static void sendText(OutputStream out, int code, String reason, String mime, String body, String extraHdrs) throws IOException {
+    private static void sendText(OutputStream out, int code, String reason, String mime, String body, String extraHdrs, String corsOrigin) throws IOException {
         byte[] bytes = body != null ? body.getBytes(StandardCharsets.UTF_8) : new byte[0];
         StringBuilder sb = new StringBuilder();
         sb.append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n");
         sb.append("Content-Type: ").append(mime).append("\r\n");
         sb.append("Cache-Control: no-store\r\n");
-        sb.append("Access-Control-Allow-Origin: *\r\n");
+        if (corsOrigin != null && !corsOrigin.isEmpty()) {
+            sb.append("Access-Control-Allow-Origin: ").append(corsOrigin).append("\r\n");
+            if (!"*".equals(corsOrigin)) sb.append("Vary: Origin\r\n");
+        }
         sb.append("Connection: close\r\n");
         if (extraHdrs != null) sb.append(extraHdrs);
         sb.append("Content-Length: ").append(bytes.length).append("\r\n\r\n");

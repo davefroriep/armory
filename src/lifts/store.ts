@@ -465,23 +465,34 @@ class LiftStore {
     };
   }
 
-  /** Merge a backup in (existing ids are overwritten, nothing else is touched). */
+  /** Merge a backup in cleanly without clobbering an active workout or a newer finished local session. */
   async importAll(b: LiftBackup): Promise<{ sessions: number; routines: number; exercises: number }> {
     if (b?.app !== 'armory-lifts' || !Array.isArray(b.sessions)) throw new Error('Not an Armory lift backup');
-    const sessions = b.sessions.filter((s) => s?.id && Array.isArray(s.exs) && s.status !== 'active');
+    const incoming = b.sessions.filter((s) => s?.id && Array.isArray(s.exs) && s.status !== 'active');
+    const sessionsToWrite: LiftSession[] = [];
+    for (const s of incoming) {
+      const existing = this.sessions.get(s.id);
+      if (existing) {
+        if (existing.status === 'active') continue;
+        const curTs = existing.endMs ?? existing.startMs;
+        const incTs = s.endMs ?? s.startMs;
+        if (existing.status === 'done' && curTs > incTs) continue;
+      }
+      sessionsToWrite.push(s);
+    }
     const routines = (b.routines ?? []).filter((r) => r?.id && Array.isArray(r.items));
     const exercises = (b.exercises ?? []).filter((r) => r?.id);
     const videos = (b.videos ?? []).filter((v) => v?.id && v?.sessionId && v?.exId && v?.setId);
-    sessions.forEach((s) => this.sessions.set(s.id, s));
+    sessionsToWrite.forEach((s) => this.sessions.set(s.id, s));
     routines.forEach((r) => this.routines.set(r.id, r));
     exercises.forEach((r) => this.rows.set(r.id, r));
     videos.forEach((v) => this.videos.set(v.id, v));
     this.touch();
-    await idbPutMany('lift_sessions', sessions);
+    if (sessionsToWrite.length) await idbPutMany('lift_sessions', sessionsToWrite);
     await idbPutMany('lift_routines', routines);
     await idbPutMany('lift_ex', exercises);
     if (videos.length) await idbPutMany('lift_videos', videos);
-    return { sessions: sessions.length, routines: routines.length, exercises: exercises.length };
+    return { sessions: sessionsToWrite.length, routines: routines.length, exercises: exercises.length };
   }
 }
 

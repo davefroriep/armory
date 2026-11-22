@@ -7,7 +7,7 @@ import type { CustomVoiceAliases, VoiceAliasSlot } from '../lifts/voiceParser';
 export interface Settings {
   /** Intervals.icu athlete id (not a secret). */
   athleteId: string;
-  /** Intervals.icu API key. Baked via build-time env or pasted in Settings; never committed to git. */
+  /** Intervals.icu API key. Stored per-device in localStorage & DriveSync backup; never baked into the APK. */
   apiKey: string;
   /** Threshold power (W) used to scale AirBike Z2/Z5 targets (% FTP). */
   ftp: number;
@@ -85,12 +85,11 @@ export interface Settings {
 
 const KEY = 'armory.settings.v1';
 export const ROOM_VOICE_MIG_KEY = 'armory.mig.room_voice_default.v1';
-const BAKED_KEY = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_INTERVALS_API_KEY ?? '').trim();
 const BAKED_PREVIEW_URL = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_GYM_CAM_PREVIEW_URL ?? '').trim();
 
 export const DEFAULTS: Settings = {
   athleteId: 'i758105',
-  apiKey: BAKED_KEY,
+  apiKey: '',
   ftp: 182,
   ftpAutoSync: false,
   intervalsEftp: null,

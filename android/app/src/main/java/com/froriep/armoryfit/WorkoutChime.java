@@ -33,7 +33,7 @@ final class WorkoutChime {
     private WorkoutChime() {}
 
     static File cacheFile(Context c) {
-        return new File(c.getCacheDir(), FILE_NAME);
+        return new File(c.getFilesDir(), FILE_NAME);
     }
 
     static synchronized void cacheWav(Context c, String wavBase64) {

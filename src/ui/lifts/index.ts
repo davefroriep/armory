@@ -25,7 +25,7 @@ const SUB: Record<string, Build> = {
   routine: (h, a) => routineScreen(h, a),
   exercise: (h, a) => exerciseScreen(h, a),
   settings: (h) => liftSettingsScreen(h),
-  hr: (h) => strengthHrScreen(h),
+  hr: (h, _a, q) => strengthHrScreen(h, q),
 };
 
 /**

@@ -59,7 +59,8 @@ final class WorkoutNotif {
                 .setSilent(true)
                 .setCategory(NotificationCompat.CATEGORY_WORKOUT)
                 .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-                .setContentIntent(openAppIntent(c));
+                .setContentIntent(openAppIntent(c))
+                .addAction(0, "End", serviceActionIntent(c, WorkoutForegroundService.ACTION_STOP_WORKOUT, 0, 104));
         if (startEpochMs > 0L) {
             b.setWhen(startEpochMs).setShowWhen(true).setUsesChronometer(true);
             if (Build.VERSION.SDK_INT >= 24) b.setChronometerCountDown(false);

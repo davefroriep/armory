@@ -17,7 +17,7 @@ import { calendar } from './intervals/calendar';
 import { forceCloseApp, isNative } from './native/service';
 import { ensureDailyBackup, initAutoBackup } from './store/backup';
 import { kickSensors, releaseBike } from './ble/sources';
-import { parentHash } from './nav';
+import { consumeBackInterceptor, parentHash } from './nav';
 import { syncModalInert, wireModalBackdrop } from './ui/dom';
 
 type Screen = (root: HTMLElement, args: string[], query: URLSearchParams) => (() => void) | void;
@@ -146,6 +146,7 @@ if (isNative()) {
       topModal.dispatchEvent(new CustomEvent('armory:dismiss'));
       return;
     }
+    if (consumeBackInterceptor()) return;
     const backToday = document.querySelector<HTMLElement>('[data-back-today]');
     if (backToday) {
       backToday.click();

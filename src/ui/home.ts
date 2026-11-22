@@ -3,6 +3,8 @@ import { PHASE1_PLAN, buildWeekGlimpse, dayOfWeek, projectPlan, shiftYmd } from 
 import { calendar, localDate } from '../intervals/calendar';
 import { pendingCount, retryPending, syncWorkout, discard } from '../workout/sync';
 import { allMeta, getSamples, putMeta } from '../store/db';
+import { BACKUP_DIR_LABEL, lastBackupStatus, runBackupNow } from '../store/backup';
+import { isNative } from '../native/service';
 import { getSettings, settingsChanged } from '../store/settings';
 import { summarize } from '../workout/summary';
 import type { Equipment, WorkoutMeta } from '../types';
@@ -82,24 +84,42 @@ export function homeScreen(root: HTMLElement): () => void {
   const loadDynamic = async () => {
     const [metas] = await Promise.all([allMeta(), lifts.ready]);
     if (dead) return;
-    calendar.backfillLegacySkippedZ5(metas);
     const grouped = groupDayLogs(lifts.finished(), metas);
     dayLogsByDate = grouped.byDate;
     loggedByDate = grouped.summaryByDate;
     // A lift-tracker workout in progress is resumed from the top banner, never "recovered" as a bare HR file.
-    const activeIncomplete = metas.filter((m) => m.status === 'active' && m.seconds === 0 && !lifts.sessions.has(m.id));
+    const activeIncomplete = metas.filter((m) => (m.status === 'active' || m.status === 'finished') && !lifts.sessions.has(m.id));
     const pend = await pendingCount();
     let h = '';
     for (const m of activeIncomplete) {
-      const canResume = (m.equipment === 'airbike' || m.equipment === 'spin') && m.programId;
+      const canCardioResume = m.status === 'active' && (m.equipment === 'airbike' || m.equipment === 'spin') && !!m.programId;
+      const canRuckResume = m.status === 'active' && m.programId === 'ruck';
+      const resumeHref = canCardioResume
+        ? `#/${esc(m.equipment)}/p/${esc(m.programId)}?resume=${esc(m.id)}`
+        : canRuckResume
+          ? `#/strength/hr?resume=${esc(m.id)}`
+          : '';
+      const whenTxt = new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      const msgTxt = m.status === 'finished'
+        ? `${esc(m.name)} — finished at ${whenTxt} before saving.`
+        : `${esc(m.name)} — started ${whenTxt}. The app closed before you finished.`;
       h += `<section class="card warn"><b>Unfinished workout</b>
-        <p>${esc(m.name)} — started ${new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}. The app closed before you finished.</p>
-        <div class="row">${canResume ? `<a class="btn primary sm" href="#/${esc(m.equipment)}/p/${esc(m.programId)}?resume=${esc(m.id)}">Resume</a>` : ''}<button class="btn ${canResume ? '' : 'primary '}sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
+        <p>${msgTxt}</p>
+        <div class="row">${resumeHref ? `<a class="btn primary sm" href="${resumeHref}">Resume</a>` : ''}<button class="btn ${resumeHref ? '' : 'primary '}sm" data-recover="${m.id}">Save &amp; upload</button><button class="btn sm" data-drop="${m.id}">Discard</button></div></section>`;
     }
     if (pend) {
       const why = metas.find((m) => m.status === 'saved' && m.upload === 'pending')?.lastError;
       h += `<section class="card warn"><b>${pend} workout${pend > 1 ? 's' : ''} waiting to upload</b>
         <p>Saved on this phone. ${esc(why ?? 'Intervals.icu wasn’t reachable.')}</p><div class="row"><button class="btn primary sm" data-retry>Retry now</button></div></section>`;
+    }
+    if (isNative()) {
+      const bk = lastBackupStatus();
+      const stale = !!bk && !bk.error && Date.now() - bk.atMs > 2 * 86_400_000;
+      if (bk?.error || stale) {
+        h += `<section class="card warn"><b>${bk.error ? 'Auto-backup failed' : 'Backup needs refresh'}</b>
+          <p>${bk.error ? esc(bk.error) : `Last DriveSync backup was on ${esc(bk.ymd)}.`}</p>
+          <div class="row"><button class="btn primary sm" type="button" data-bk-home-now>Back up now</button></div></section>`;
+      }
     }
     banners = h;
     paint();
@@ -167,6 +187,12 @@ export function homeScreen(root: HTMLElement): () => void {
     }
     if (t.closest('[data-retry]')) {
       await retryPending();
+      await loadDynamic();
+      return;
+    }
+    if (t.closest('[data-bk-home-now]')) {
+      const st = await runBackupNow();
+      toast(st.error ? `Backup failed: ${st.error}` : `Saved to ${BACKUP_DIR_LABEL}`);
       await loadDynamic();
     }
   };

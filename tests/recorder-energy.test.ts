@@ -139,4 +139,21 @@ describe('HR-based calories (Keytel et al. 2005)', () => {
     expect(live.dist).toBe(distAfter1s);
     expect(live.kcal).toBe(kcalAfter1s);
   });
+
+  it('preserves monotonic distance and kcal across a mid-ride bike counter reset to 0', () => {
+    const now = Date.now();
+    const rec = new Recorder('rec-reset', 'airbike', 'free', 'Free', null, 185);
+    pushBike({ dev: 'airbike', w: 200, cad: 55, spd: 28, dist: 0, kcal: 0 }, now);
+    rec.onFrame();
+    pushBike({ dev: 'airbike', w: 200, cad: 55, spd: 28, dist: 200, kcal: 14 }, now);
+    rec.onFrame();
+    // Simulate AirBike console sleep/reset back to 0, then climbing again
+    pushBike({ dev: 'airbike', w: 180, cad: 50, spd: 25, dist: 0, kcal: 0 }, now);
+    rec.onFrame();
+    pushBike({ dev: 'airbike', w: 190, cad: 52, spd: 26, dist: 35, kcal: 3 }, now);
+    rec.onFrame();
+    rec.tick(0, 0, now);
+    expect(rec.lastDist).toBe(235);
+    expect(rec.lastKcal).toBe(17);
+  });
 });

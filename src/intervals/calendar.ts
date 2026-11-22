@@ -1,18 +1,15 @@
 import { Emitter } from '../emitter';
 import {
-  PHASE1_PLAN, UPPER1_FINISH_ITEMS, isPlanExternalId, parseExtraKey, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
-  type ExtraWorkout, type ExtraWorkoutItem, type LocalTodayItem, type PlanStep, type QueueState,
+  planById, isPlanExternalId, parseExtraKey, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
+  type ExtraWorkout, type ExtraWorkoutItem, type LocalTodayItem, type PlanStep, type QueueState, type RollingPlan,
 } from '../domain/plan';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
-import type { WorkoutMeta } from '../types';
 import { createManualActivity, deleteEvent, fetchActivities, fetchEvents, hasKey, syncAthleteFtp } from './api';
 
 export type TodayItem = LocalTodayItem;
 export type CalendarStatus = 'nokey' | 'loading' | 'ok' | 'error';
 
 const LEGACY_CLEANUP_KEY = 'armory.cleanup_staged_events.v1';
-const LEGACY_SKIP_Z5_KEY = 'armory.backfill_skipped_z5.v1';
-const LEGACY_U1_FINISH_KEY = 'armory.extra_u1_finish_2026_11_16.v1';
 let lastFtpSync = 0;
 
 export const localDate = (d = new Date()): string =>
@@ -44,12 +41,17 @@ class Calendar {
   private activeDay = localDate();
   private lastRefreshMs = 0;
   private midnightTimer: ReturnType<typeof setTimeout> | null = null;
+  private markingSlots = new Set<string>();
+
+  private plan(q: QueueState = getSettings().queue): RollingPlan {
+    return planById(q.planId);
+  }
 
   constructor() {
-    this.seedYesterdayUpper1Makeup();
     this.syncLocalState();
     settingsChanged.on(() => {
-      this.items = todayItemsFromQueue(PHASE1_PLAN, getSettings().queue, localDate());
+      const q = getSettings().queue;
+      this.items = todayItemsFromQueue(this.plan(q), q, localDate());
     });
     if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       this.scheduleMidnightRollover();
@@ -75,8 +77,9 @@ class Calendar {
     const today = localDate();
     const s = getSettings();
     const inputQ = overrideQueue ?? s.queue;
+    const plan = this.plan(inputQ);
     const ops = reconcileQueue({
-      plan: PHASE1_PLAN,
+      plan,
       state: inputQ,
       activities: [],
       today,
@@ -86,51 +89,7 @@ class Calendar {
     if (JSON.stringify(ops.nextState) !== JSON.stringify(s.queue)) {
       updateSettings({ queue: ops.nextState });
     }
-    this.items = todayItemsFromQueue(PHASE1_PLAN, ops.nextState, today);
-  }
-
-  /** One-time local seed adding the 4 skipped Upper 1 exercises from Nov 16 onto Today's Strength work. */
-  private seedYesterdayUpper1Makeup(): void {
-    if (typeof localStorage === 'undefined' || localStorage.getItem(LEGACY_U1_FINISH_KEY)) return;
-    localStorage.setItem(LEGACY_U1_FINISH_KEY, '1');
-    const today = localDate();
-    if (today > '2026-11-18') return;
-    const s = getSettings();
-    const extras = [...(s.queue.extras ?? [])];
-    if (extras.some((x) => x.id === 'u1-finish-2026-11-16')) return;
-    extras.push({
-      id: 'u1-finish-2026-11-16',
-      name: 'Upper 1 (Finish)',
-      date: today,
-      equipment: 'strength',
-      seconds: 1800,
-      description: 'Skipped from yesterday Upper 1: Seated DB Shoulder Press / Pull-Up · DB Lateral Raise / Cable Triceps Pushdown',
-      items: UPPER1_FINISH_ITEMS.map((it) => ({ ...it })),
-    });
-    updateSettings({ queue: { ...s.queue, extras } });
-  }
-
-  /** One-time local migration so yesterday's skipped AirBike Z5 shows as `(skipped)` rather than `✓`. */
-  backfillLegacySkippedZ5(metas: WorkoutMeta[]): void {
-    if (typeof localStorage === 'undefined' || localStorage.getItem(LEGACY_SKIP_Z5_KEY)) return;
-    localStorage.setItem(LEGACY_SKIP_Z5_KEY, '1');
-    const s = getSettings();
-    if (s.queue.stepIndex > 1 && !s.queue.skippedSlots?.['1:1']) {
-      const d = s.queue.stepDates?.[1] ?? '2026-11-16';
-      const didAirbike = metas.some(
-        (m) => m.status === 'saved' && m.equipment === 'airbike' && localDate(new Date(m.startEpochMs)) === d,
-      );
-      if (!didAirbike) {
-        updateSettings({
-          queue: {
-            ...s.queue,
-            skippedSlots: { ...(s.queue.skippedSlots ?? {}), '1:1': d },
-          },
-        });
-        this.syncLocalState();
-        this.changed.emit();
-      }
-    }
+    this.items = todayItemsFromQueue(plan, ops.nextState, today);
   }
 
   /** Rolls over Today if the local calendar date changed (e.g. left open overnight) and refreshes when stale. */
@@ -155,15 +114,16 @@ class Calendar {
     return this.items.filter((i) => i.equipment === eq);
   }
 
-  /** Active rolling-plan step (or null if Phase 1 is complete). */
+  /** Active rolling-plan step (or null if active block is complete). */
   currentStep(): PlanStep | null {
-    return PHASE1_PLAN.steps[getSettings().queue.stepIndex] ?? null;
+    const q = getSettings().queue;
+    return this.plan(q).steps[q.stepIndex] ?? null;
   }
 
   /** Non-null when today's remaining work is pushed/staged to tomorrow (or a future date). */
   upcomingStep(): { title: string; date: string } | null {
     const s = getSettings();
-    const step = PHASE1_PLAN.steps[s.queue.stepIndex];
+    const step = this.plan(s.queue).steps[s.queue.stepIndex];
     if (!step) return null;
     const today = localDate();
     if (s.queue.stagedDate && s.queue.stagedDate > today) {
@@ -221,8 +181,9 @@ class Calendar {
 
       const activities = await fetchActivities(addDays(today, -3), tomorrow);
       const s = getSettings();
+      const plan = this.plan(s.queue);
       const ops = reconcileQueue({
-        plan: PHASE1_PLAN,
+        plan,
         state: s.queue,
         activities,
         today,
@@ -232,7 +193,7 @@ class Calendar {
       if (JSON.stringify(ops.nextState) !== JSON.stringify(s.queue)) {
         updateSettings({ queue: ops.nextState });
       }
-      this.items = todayItemsFromQueue(PHASE1_PLAN, ops.nextState, today);
+      this.items = todayItemsFromQueue(plan, ops.nextState, today);
       this.status = 'ok';
       this.error = '';
 
@@ -250,21 +211,48 @@ class Calendar {
 
   /** Marks one planned slot (or extra carry-over workout) complete locally and logs to Intervals.icu if configured. */
   async markSlotDone(planSlot: string): Promise<void> {
-    const today = localDate();
-    const exId = parseExtraKey(planSlot);
-    if (exId) {
-      const ex = getSettings().queue.extras?.find((x) => x.id === exId);
-      if (!ex) return;
+    if (this.markingSlots.has(planSlot)) return;
+    this.markingSlots.add(planSlot);
+    try {
+      const today = localDate();
+      const exId = parseExtraKey(planSlot);
+      if (exId) {
+        const ex = getSettings().queue.extras?.find((x) => x.id === exId);
+        if (!ex) return;
+        this.markSlotDoneEarly(planSlot, null, today);
+        if (hasKey()) {
+          try {
+            const actId = await createManualActivity({
+              startLocalIso: localIsoNow(),
+              name: ex.name,
+              description: 'Marked done in Armory Fit',
+              seconds: ex.seconds || 1800,
+              type: 'WeightTraining',
+              externalId: `armory-done-extra-${exId}-${today}`,
+              pairedEventId: null,
+            });
+            const cur = getSettings();
+            const consumedIds = Array.from(new Set([...cur.queue.consumedIds, String(actId)])).slice(-40);
+            updateSettings({ queue: { ...cur.queue, consumedIds } });
+          } catch { /* offline fallback already recorded locally */ }
+        }
+        return;
+      }
+
+      const plan = this.plan();
+      const parsed = parseSlotKey(planSlot);
+      const slot = parsed ? plan.steps[parsed.stepIndex]?.slots[parsed.slotIndex] : undefined;
+      if (!parsed || !slot) return;
       this.markSlotDoneEarly(planSlot, null, today);
       if (hasKey()) {
         try {
           const actId = await createManualActivity({
             startLocalIso: localIsoNow(),
-            name: ex.name,
+            name: slot.name,
             description: 'Marked done in Armory Fit',
-            seconds: ex.seconds || 1800,
-            type: 'WeightTraining',
-            externalId: `armory-done-extra-${exId}-${Date.now().toString(36)}`,
+            seconds: slot.seconds || 2400,
+            type: slot.intervalsType,
+            externalId: `armory-done-${plan.id}-${parsed.stepIndex}-${parsed.slotIndex}-${today}`,
             pairedEventId: null,
           });
           const cur = getSettings();
@@ -272,28 +260,8 @@ class Calendar {
           updateSettings({ queue: { ...cur.queue, consumedIds } });
         } catch { /* offline fallback already recorded locally */ }
       }
-      return;
-    }
-
-    const parsed = parseSlotKey(planSlot);
-    const slot = parsed ? PHASE1_PLAN.steps[parsed.stepIndex]?.slots[parsed.slotIndex] : undefined;
-    if (!parsed || !slot) return;
-    this.markSlotDoneEarly(planSlot, null, today);
-    if (hasKey()) {
-      try {
-        const actId = await createManualActivity({
-          startLocalIso: localIsoNow(),
-          name: slot.name,
-          description: 'Marked done in Armory Fit',
-          seconds: slot.seconds || 2400,
-          type: slot.intervalsType,
-          externalId: `armory-done-${parsed.stepIndex}-${parsed.slotIndex}-${Date.now().toString(36)}`,
-          pairedEventId: null,
-        });
-        const cur = getSettings();
-        const consumedIds = Array.from(new Set([...cur.queue.consumedIds, String(actId)])).slice(-40);
-        updateSettings({ queue: { ...cur.queue, consumedIds } });
-      } catch { /* offline fallback already recorded locally */ }
+    } finally {
+      this.markingSlots.delete(planSlot);
     }
   }
 
@@ -403,8 +371,9 @@ class Calendar {
 
   /** Shifts the rolling queue to `stepIndex` starting Today (marking bypassed incomplete slots `(skipped)`). */
   setStep(stepIndex: number): void {
-    const clamped = Math.max(0, Math.min(stepIndex, PHASE1_PLAN.steps.length));
     const s = getSettings();
+    const plan = this.plan(s.queue);
+    const clamped = Math.max(0, Math.min(stepIndex, plan.steps.length));
     const today = localDate();
     const doneEarly = { ...(s.queue.doneEarly ?? {}) };
     const skippedSlots = { ...(s.queue.skippedSlots ?? {}) };
@@ -413,7 +382,7 @@ class Calendar {
 
     if (clamped > s.queue.stepIndex) {
       for (let i = s.queue.stepIndex; i < clamped; i++) {
-        const step = PHASE1_PLAN.steps[i];
+        const step = plan.steps[i];
         if (!step) continue;
         for (let si = 0; si < step.slots.length; si++) {
           const k = slotKey(i, si);
@@ -426,7 +395,7 @@ class Calendar {
       }
     }
 
-    const targetStep = PHASE1_PLAN.steps[clamped];
+    const targetStep = plan.steps[clamped];
     if (targetStep) {
       for (let si = 0; si < targetStep.slots.length; si++) {
         const k = slotKey(clamped, si);
@@ -441,7 +410,7 @@ class Calendar {
       ...s.queue,
       stepIndex: clamped,
       completedSlots: [],
-      stagedDate: clamped < PHASE1_PLAN.steps.length ? today : null,
+      stagedDate: clamped < plan.steps.length ? today : null,
       slotDates: {},
       doneEarly,
       skippedSlots,

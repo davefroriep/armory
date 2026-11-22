@@ -1979,6 +1979,26 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
     angleCache.clear();
   };
 
+  const setAngleCache = (
+    key: string,
+    entry: { playUrl: string; objectUrl: string; blob: Blob | null; lanUrl: string; fileName: string },
+  ): void => {
+    if (angleCache.has(key)) {
+      const prev = angleCache.get(key)!;
+      if (prev.objectUrl && prev.objectUrl !== entry.objectUrl) URL.revokeObjectURL(prev.objectUrl);
+      angleCache.delete(key);
+    }
+    while (angleCache.size >= 2) {
+      const curSrc = vid?.getAttribute('src') || vid?.src || '';
+      const evictKey = [...angleCache.keys()].find((k) => angleCache.get(k)?.playUrl !== curSrc) ?? angleCache.keys().next().value;
+      if (!evictKey) break;
+      const old = angleCache.get(evictKey);
+      if (old?.objectUrl) URL.revokeObjectURL(old.objectUrl);
+      angleCache.delete(evictKey);
+    }
+    angleCache.set(key, entry);
+  };
+
   const refreshRailView = (wantZoom: boolean): void => {
     railView = computeTrimViewport(st, wantZoom);
     railZoomed = railView.zoomed;
@@ -2212,7 +2232,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       const tCtrl = new AbortController();
       const onParentAbort = () => tCtrl.abort();
       dlCtrl.signal.addEventListener('abort', onParentAbort, { once: true });
-      const timer = setTimeout(() => tCtrl.abort(), 12_000);
+      const timer = setTimeout(() => tCtrl.abort(), 30_000);
       try {
         const res = await fetch(lanUrl, { signal: tCtrl.signal, cache: 'no-store' });
         if (res.ok) {
@@ -2338,7 +2358,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
           return;
         }
         hit = { ...dl, lanUrl: sib.lanUrl, fileName: sib.fileName || '' };
-        angleCache.set(cKey, hit);
+        setAngleCache(cKey, hit);
       }
       viewCam = cam;
       viewLanUrl = hit.lanUrl;
@@ -2381,7 +2401,7 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
         return;
       }
       hit = { ...dl, lanUrl: prev.lanUrl, fileName: prev.fileName };
-      angleCache.set(cKey, hit);
+      setAngleCache(cKey, hit);
     }
     viewCam = cam;
     viewLanUrl = hit.lanUrl;
@@ -2851,8 +2871,8 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
       const expLanUrl = viewLanUrl || meta!.lanUrl;
       if (isNative()) {
         const uri = !viewIsPreview && !viewSiblingMeta && meta!.uri?.startsWith('content://') ? meta!.uri : undefined;
-        const base64 = !uri && expBlob ? await blobToBase64(expBlob) : undefined;
-        const httpUrl = !uri && !base64 && expLanUrl ? expLanUrl : undefined;
+        const httpUrl = !uri && expLanUrl ? expLanUrl : undefined;
+        const base64 = !uri && !httpUrl && expBlob ? await blobToBase64(expBlob) : undefined;
         if (!uri && !httpUrl && !base64) {
           toast('Clip not cached offline yet — connect to Gym Wi-Fi or Google Drive');
           return;

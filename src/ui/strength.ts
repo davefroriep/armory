@@ -3,6 +3,7 @@ import { hrFresh, live } from '../ble/telemetry';
 import { ensureSensors } from '../ble/sources';
 import { isNative, workoutService } from '../native/service';
 import { bodyProfile, kcalFromSamples } from '../domain/energy';
+import { allMeta, getMeta, getSamples } from '../store/db';
 import { getSettings } from '../store/settings';
 import { discard } from '../workout/sync';
 import { Recorder } from '../workout/recorder';
@@ -27,7 +28,7 @@ function loadPackLb(): number {
  * Outdoor Ruck / HR-only logger (`#/strength/hr`) powered by the Polar H10 chest strap.
  * Records 1 Hz HR + Keytel kcal and uploads to Intervals.icu as a Walk/Hike activity.
  */
-export function strengthHrScreen(root: HTMLElement): () => void {
+export function strengthHrScreen(root: HTMLElement, query?: URLSearchParams): () => void {
   ensureSensors({ bike: false });
 
   let packLb = loadPackLb();
@@ -38,6 +39,7 @@ export function strengthHrScreen(root: HTMLElement): () => void {
   let timer: ReturnType<typeof setInterval> | null = null;
   let lock: WakeLockSentinel | null = null;
   let lastSvc = 0;
+  let dead = false;
   let offChips: (() => void) | null = null;
   let offRec: (() => void) | null = null;
   const guard = new LeaveGuard(() => state === 'running' || state === 'paused');
@@ -218,11 +220,40 @@ export function strengthHrScreen(root: HTMLElement): () => void {
   };
 
   paintReady();
+  void (async () => {
+    const resumeId = query?.get('resume');
+    const meta = resumeId
+      ? await getMeta(resumeId)
+      : (await allMeta()).find((m) => m.status === 'active' && m.programId === 'ruck');
+    if (dead || state !== 'ready' || !meta || meta.status !== 'active' || meta.programId !== 'ruck') return;
+    const samples = await getSamples(meta.id);
+    if (dead || state !== 'ready') return;
+    const pm = (meta.notes || meta.name || '').match(/(\d+)\s*lb/i);
+    if (pm) {
+      const p = Number(pm[1]);
+      if (PACK_OPTIONS.includes(p)) packLb = p;
+    } else if (/outdoor/i.test(meta.name)) {
+      packLb = 0;
+    }
+    root.querySelectorAll<HTMLElement>('[data-pack]').forEach((b) =>
+      b.classList.toggle('on', Number(b.dataset.pack) === packLb),
+    );
+    rec = new Recorder(meta.id, 'strength', 'ruck', meta.name, meta.eventId, getSettings().hrMax, { meta, samples });
+    accMs = samples.length * 1000;
+    t0 = Date.now();
+    state = 'paused';
+    offRec = rec.attach(() => (state === 'running' ? { elapsed: elapsed(), targetRpm: 0 } : null));
+    guard.arm();
+    $('#pauseSub', root).textContent = `${hms(samples.length)} recovered · ready to resume`;
+    $('#pauseModal', root).hidden = false;
+    paintLive();
+  })();
   timer = setInterval(paintLive, 250);
 
   const unload = (e: BeforeUnloadEvent) => { if (state === 'running' || state === 'paused') e.preventDefault(); };
   window.addEventListener('beforeunload', unload);
   return () => {
+    dead = true;
     if (timer) clearInterval(timer);
     offRec?.();
     guard.dispose();

@@ -41,6 +41,7 @@ class WallboardController {
   private lastRelayPushMs = 0;
   private lastStandbySig = '';
   private lastStandbyPushMs = 0;
+  private lastSnapKey = '';
 
   private relayBaseUrl(): string {
     return (getSettings().gymCamUrl || 'http://192.168.1.152:8766').trim().replace(/\/+$/, '');
@@ -65,7 +66,16 @@ class WallboardController {
     hrBeat.on(throttled);
     bikeFrame.on(throttled);
     active.tick.on(throttled);
-    wallboardSnapChanged.on(immediate);
+    wallboardSnapChanged.on(() => {
+      const s = buildWallboardState();
+      const key = `${s.mode}|${s.cardio?.phase ?? ''}|${s.cardio?.paused ?? ''}|${s.replay?.url ?? ''}|${s.lift?.hold?.active ?? ''}`;
+      if (key !== this.lastSnapKey) {
+        this.lastSnapKey = key;
+        immediate();
+      } else {
+        throttled();
+      }
+    });
     settingsChanged.on(() => {
       void this.syncFromSettings();
       immediate();

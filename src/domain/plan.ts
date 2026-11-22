@@ -356,6 +356,15 @@ export const PHASE1_PLAN: RollingPlan = {
   steps: buildPhase1Steps(),
 };
 
+const PLANS: Record<string, RollingPlan> = {
+  [PHASE1_PLAN.id]: PHASE1_PLAN,
+};
+
+/** Resolves a training block by `planId` (defaults to `PHASE1_PLAN`). */
+export function planById(planId?: string | null): RollingPlan {
+  return (planId && PLANS[planId]) || PHASE1_PLAN;
+}
+
 /**
  * Pure rolling-queue reconciliation: matches external completed activities (e.g. MyWhoosh rides) against
  * the local queue, absorbs skipped/early/carried-over slots, and advances `stepIndex` cleanly.

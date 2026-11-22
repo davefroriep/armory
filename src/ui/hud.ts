@@ -1,4 +1,4 @@
-import { bikeFrame, bikeFresh, hrFresh, live } from '../ble/telemetry';
+import { bikeFrame, bikeFresh, hrBeat, hrFresh, live } from '../ble/telemetry';
 import { spinLink } from '../ble/devices';
 import { sim } from '../ble/sim';
 import { bikeStatusNote, ensureSensors } from '../ble/sources';
@@ -55,7 +55,9 @@ class Hud {
   private offFrame: (() => void) | null = null;
   private offRec: (() => void) | null = null;
   private offSmooth: (() => void) | null = null;
+  private offBgDrive: (() => void) | null = null;
   private offChips: (() => void) | null = null;
+  private lastBgDriveAt = 0;
   private lock: WakeLockSentinel | null = null;
   private lastIndex = -2;
   private lockSince: number | null = null;
@@ -98,6 +100,16 @@ class Hud {
       this.wAvg.push(t, f.w);
     });
     this.timer = setInterval(() => this.loop(), 100);
+    const bgTick = (): void => {
+      if (!document.hidden || this.engine.state !== 'running') return;
+      const now = Date.now();
+      if (now - this.lastBgDriveAt < 200) return;
+      this.lastBgDriveAt = now;
+      this.loop();
+    };
+    const offBgHr = hrBeat.on(bgTick);
+    const offBgBike = bikeFrame.on(bgTick);
+    this.offBgDrive = () => { offBgHr(); offBgBike(); };
     const vis = () => { if (!document.hidden && this.active) void this.acquireLock(); };
     const unload = (e: BeforeUnloadEvent) => { if (this.active) e.preventDefault(); };
     document.addEventListener('visibilitychange', vis);
@@ -108,6 +120,7 @@ class Hud {
       this.offFrame?.();
       this.offRec?.();
       this.offSmooth?.();
+      this.offBgDrive?.();
       this.offChips?.();
       audio.setMetronome(false, null);
       sim.setTarget(0, 0);
@@ -247,7 +260,16 @@ class Hud {
 
   private bind(): void {
     const on = (id: string, fn: () => void) => this.root.querySelector('#' + id)!.addEventListener('click', fn);
-    on('skip', () => { if (this.engine.skip(Date.now()) && getSettings().haptics) buzz([60]); this.loop(); });
+    on('skip', () => {
+      if (this.engine.skip(Date.now())) {
+        if (this.rec) {
+          this.rec.meta.releasedGates = this.engine.exportReleased();
+          void putMeta(this.rec.meta);
+        }
+        if (getSettings().haptics) buzz([60]);
+      }
+      this.loop();
+    });
     on('go', () => (this.engine.state === 'ready' ? this.start() : this.pause()));
     on('resume', () => this.resume());
     on('finish', () => this.finish());
@@ -284,7 +306,7 @@ class Hud {
     const s = getSettings();
     this.rec = new Recorder(meta.id, meta.equipment, meta.programId, meta.name, meta.eventId, s.hrMax, { meta, samples }, meta.planSlot ?? null);
     this.attachRecorderSensors();
-    this.engine.hydratePaused(samples.length);
+    this.engine.hydratePaused(samples.length, meta.releasedGates);
     this.guard.arm();
     this.el.go.textContent = 'PAUSED';
     this.el.go.classList.add('pause');
@@ -461,8 +483,14 @@ class Hud {
     const hrNow = hrFresh() ? live.hr : null;
     const hrLimit = recoveryLimitBpm(st.hrMax, st.recoveryHrPct);
     if (running) {
-      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: st.recoveryMode, lead: st.metroLead || 5 });
-      if (released !== null && st.haptics) buzz([80, 60, 80]);
+      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: st.recoveryMode, lead: st.metroLead ?? 5, debounceMs: 2500 });
+      if (released !== null) {
+        if (this.rec) {
+          this.rec.meta.releasedGates = this.engine.exportReleased();
+          void putMeta(this.rec.meta);
+        }
+        if (st.haptics) buzz([80, 60, 80]);
+      }
     }
     const elapsed = this.engine.elapsed(now);
     const loc = this.engine.locate(now);

@@ -115,7 +115,7 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
         if (cm) return renderCompletedCardioSlot(cm);
       }
     }
-    return renderPlannedSlot(slot, state, lookup);
+    return renderPlannedSlot(slot, state, lookup, undefined, p.step.week);
   }).join('');
 
   const acts: string[] = [];
@@ -405,8 +405,6 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
     };
 
     const load = async (): Promise<void> => {
-      const metas = await allMeta();
-      calendar.backfillLegacySkippedZ5(metas);
       loggedByDate = await collectLoggedByDate();
       paint();
     };

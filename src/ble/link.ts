@@ -186,17 +186,26 @@ export abstract class BleLink {
         this.setState(this.state === 'lost' ? 'lost' : 'connecting');
         if (this.dropping) await this.dropping;
         if (!this.wanted || !this.id) break;
+        const id = this.id;
         this.attempts++;
         const gen = ++this.gen;
         try {
-          await transport.connect(this.id, () => this.onDrop(gen), CONNECT_TIMEOUT_MS);
-          await this.subscribe(this.id);
-          this.deviceName = transport.name(this.id);
+          await transport.connect(id, () => this.onDrop(gen), CONNECT_TIMEOUT_MS);
+          if (!this.wanted || gen !== this.gen) {
+            await this.dropLink(id);
+            return;
+          }
+          await this.subscribe(id);
+          if (!this.wanted || gen !== this.gen) {
+            await this.dropLink(id);
+            return;
+          }
+          this.deviceName = transport.name(id);
           this.setState('connected');
           return;
         } catch (e) {
           this.lastError = (e as Error)?.message ?? String(e);
-          await this.dropLink(this.id);
+          await this.dropLink(id);
           if (!this.wanted) break;
           this.setState('lost');
           linkStatus.emit();

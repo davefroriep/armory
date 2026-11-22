@@ -5,7 +5,13 @@ export class Emitter<T = void> {
     return () => this.fns.delete(fn);
   }
   emit(v: T): void {
-    for (const f of [...this.fns]) f(v);
+    for (const f of [...this.fns]) {
+      try {
+        f(v);
+      } catch (err) {
+        console.error('[Emitter]', err);
+      }
+    }
   }
 }
 

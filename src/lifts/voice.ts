@@ -171,6 +171,9 @@ class VoiceController {
   private lastSpokenText = '';
   private lastSpokenAt = 0;
   private lastCommitModeLocalAt = 0;
+  private lastExecIntentKey = '';
+  private lastExecSource: NativeVoiceEvent['source'] | null = null;
+  private lastExecAtMs = 0;
 
   isArmed(now = Date.now()): boolean {
     return now < this.armedUntilMs;
@@ -967,6 +970,19 @@ class VoiceController {
       return;
     }
 
+    if (
+      !this.shootoutActive &&
+      !abActive &&
+      intent &&
+      intent.kind !== 'arm_wake' &&
+      ev.source !== this.lastExecSource &&
+      voiceIntentKey(intent) === this.lastExecIntentKey &&
+      now - this.lastExecAtMs < 2500
+    ) {
+      this.changed.emit();
+      return;
+    }
+
     if (abActive) {
       const matchedCmd = !!intent && intent.kind !== 'arm_wake';
       const hasWake = pool.some((c) => hasWakeWord(c, wakeWord));
@@ -1007,6 +1023,11 @@ class VoiceController {
         this.changed.emit();
       }
       return;
+    }
+    if (intent.kind !== 'arm_wake') {
+      this.lastExecIntentKey = voiceIntentKey(intent);
+      this.lastExecSource = ev.source;
+      this.lastExecAtMs = now;
     }
     this.executeIntent(intent, true, ev.source);
   }
@@ -1443,7 +1464,7 @@ class VoiceController {
 
     this.lastLoggedExUid = se.uid;
     active.ensureStarted(s);
-    active.afterSetLogged(s, cur.exIdx);
+    active.afterSetLogged(s, cur.exIdx, cur.setIdx);
     this.cursor = advanceCursorAfterLog(s.exs, { exIdx: cur.exIdx, setIdx: cur.setIdx });
     lifts.saveSession(s, true);
     if (wasArmed) {

@@ -49,4 +49,6 @@ export interface WorkoutMeta {
   lastError: string | null;
   /** Per-rep / recovery progress line appended to the Intervals.icu description. */
   notes?: string;
+  /** Released/skipped cardio segment durations (segment index -> real length in seconds) for crash resume. */
+  releasedGates?: Record<number, number>;
 }

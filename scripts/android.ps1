@@ -15,6 +15,29 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 if ($NoBump) { npm run build:ci } else { npm run build }
 if ($LASTEXITCODE) { throw 'web build failed' }
+
+$secretNeedles = [System.Collections.Generic.List[string]]::new()
+$secretNeedles.Add('VITE_INTERVALS_API_KEY')
+if ($env:VITE_INTERVALS_API_KEY -and $env:VITE_INTERVALS_API_KEY.Trim()) {
+  $secretNeedles.Add($env:VITE_INTERVALS_API_KEY.Trim())
+}
+if (Test-Path '.env.local') {
+  foreach ($line in (Get-Content '.env.local')) {
+    if ($line -match '^\s*VITE_INTERVALS_API_KEY\s*=\s*(.+?)\s*$') {
+      $val = $Matches[1].Trim().Trim('"').Trim("'")
+      if ($val) { $secretNeedles.Add($val) }
+    }
+  }
+}
+foreach ($f in (Get-ChildItem 'dist' -Recurse -File)) {
+  $text = [System.IO.File]::ReadAllText($f.FullName)
+  foreach ($needle in $secretNeedles) {
+    if ($text.Contains($needle, [System.StringComparison]::Ordinal)) {
+      throw "Secret leak detected in dist/$($f.Name)"
+    }
+  }
+}
+
 npx cap sync android
 if ($LASTEXITCODE) { throw 'cap sync failed' }
 
@@ -31,7 +54,15 @@ Copy-Item -Force $builtApk $apk
 Write-Host "APK: $((Resolve-Path $apk).Path)"
 if ($Install) { & "$env:ANDROID_HOME\platform-tools\adb.exe" install -r $apk }
 if ($Publish) {
+  $dirty = git status --porcelain --untracked-files=no
+  if ($LASTEXITCODE -or $dirty) { throw 'tracked working tree is dirty; commit before publishing' }
+  npx vitest run
+  if ($LASTEXITCODE) { throw 'vitest failed before publish' }
   $rev = Get-Content rev.json -Raw | ConvertFrom-Json
+  $gradle = Get-Content 'android\app\build.gradle' -Raw
+  if ($gradle -notmatch 'versionCode\s+(\d+)' -or [int]$Matches[1] -ne [int]$rev.build) {
+    throw "android/app/build.gradle versionCode mismatch (expected $($rev.build))"
+  }
   $tag = "v$($rev.major).$($rev.build)"
   $gh = 'C:\Program Files\GitHub CLI\gh.exe'
   $stage = Join-Path ([System.IO.Path]::GetTempPath()) 'armory-fit.apk'
@@ -44,7 +75,7 @@ if ($Publish) {
   if ($exists) {
     & $gh release upload $tag $stage --clobber
   } else {
-    & $gh release create $tag $stage --title "Armory Fit $tag" --notes "Android APK build ($tag)" --latest
+    & $gh release create $tag $stage --target main --title "Armory Fit $tag" --notes "Android APK build ($tag)" --latest
   }
   if ($LASTEXITCODE) { throw "gh release publish failed for $tag" }
   Write-Host "Release URL: https://github.com/davefroriep/armory/releases/latest/download/armory-fit.apk"

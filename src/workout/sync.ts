@@ -8,11 +8,24 @@ import type { WorkoutMeta } from '../types';
 import { syncLiftWorkout } from '../lifts/intervals';
 import { lifts } from '../lifts/store';
 
+const inflightSync = new Map<string, Promise<WorkoutMeta>>();
+
 /**
  * Uploads a saved workout to Intervals.icu. Two idempotent steps (TCX upload, then RPE/type patch)
  * so a failure at either one is retried later without duplicating the activity.
+ * Concurrent calls for the same workout id coalesce on the active promise.
  */
-export async function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
+export function syncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
+  const active = inflightSync.get(meta.id);
+  if (active) return active;
+  const run = runSyncWorkout(meta).finally(() => {
+    inflightSync.delete(meta.id);
+  });
+  inflightSync.set(meta.id, run);
+  return run;
+}
+
+async function runSyncWorkout(meta: WorkoutMeta): Promise<WorkoutMeta> {
   // Lift-tracker sessions carry a full set-by-set log: they have their own (HR or manual) upload path.
   if (meta.equipment === 'strength') {
     await lifts.ready;
@@ -72,6 +85,7 @@ export async function retryPending(): Promise<number> {
     if (m.status === 'saved' && m.upload === 'pending') {
       const r = await syncWorkout(m);
       if (r.upload === 'done') done++;
+      else if (r.lastError && /HTTP (?:401|403)\b/.test(r.lastError)) break;
     }
   }
   return done;

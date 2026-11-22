@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { bpmForRpm, rpmForWatts, wattsForRpm } from '../src/domain/airbikeCurve';
 import { PROGRAMS, SPIN_PROGRAMS, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds } from '../src/domain/programs';
 import { locate } from '../src/domain/timeline';
+import { Emitter } from '../src/emitter';
 import { WorkoutEngine } from '../src/domain/engine';
 import { gateOpen } from '../src/domain/gate';
 import { arrange, moveProgram, restoreOrder, toggleHidden } from '../src/domain/library';
@@ -277,6 +278,58 @@ describe('engine with gated recoveries', () => {
     const t = (REST1_START + 100) * 1000;
     expect(e.remainingNominal(t)).toBe(33 * 60 - (REST1_START + 100));
     expect(e.remainingNominal((REST1_START + 250) * 1000)).toBe(33 * 60 - (REST1_START + 180));
+  });
+});
+
+describe('Wave 2 engine hydration, gate debounce & Emitter isolation', () => {
+  it('debounces HR gate recovery across 2500ms and resets if HR spikes back up', () => {
+    const prog: ConstructorParameters<typeof WorkoutEngine>[0] = {
+      id: 'test-gated',
+      name: 'Test Gated',
+      intervalsName: 'Test Gated',
+      blurb: 'test',
+      group: 'z5',
+      zone: 'Z5',
+      segments: [
+        { kind: 'work', label: 'WORK', seconds: 60, rpm: 60 },
+        { kind: 'rest', label: 'REST', seconds: 60, rpm: null, gate: { minSec: 60, maxSec: 180 } },
+        { kind: 'work', label: 'WORK', seconds: 60, rpm: 60 },
+      ],
+    };
+    const e = new WorkoutEngine(prog);
+    e.start(0);
+    // Enter gated window at 130s (70s into rest; minSec=60, maxSec=180)
+    expect(e.checkGate(130_000, { hr: 115, hrLimit: 120, mode: 'gated', lead: 5, debounceMs: 2500 })).toBeNull();
+    expect(e.checkGate(131_000, { hr: 115, hrLimit: 120, mode: 'gated', lead: 5, debounceMs: 2500 })).toBeNull();
+    // Spike above hrLimit resets debounce window
+    expect(e.checkGate(131_500, { hr: 128, hrLimit: 120, mode: 'gated', lead: 5, debounceMs: 2500 })).toBeNull();
+    expect(e.checkGate(132_000, { hr: 115, hrLimit: 120, mode: 'gated', lead: 5, debounceMs: 2500 })).toBeNull();
+    expect(e.checkGate(134_000, { hr: 115, hrLimit: 120, mode: 'gated', lead: 5, debounceMs: 2500 })).toBeNull();
+    // Full 2500ms sustained below hrLimit releases gate
+    expect(e.checkGate(134_500, { hr: 115, hrLimit: 120, mode: 'gated', lead: 5, debounceMs: 2500 })).toBe(1);
+    const released = e.exportReleased();
+    expect(released[1]).toBeCloseTo(79.5, 5);
+
+    const resumed = new WorkoutEngine(prog);
+    resumed.hydratePaused(140, released);
+    expect(resumed.state).toBe('paused');
+    expect(resumed.elapsed(999_000)).toBe(140);
+    expect(resumed.exportReleased()).toEqual(released);
+  });
+
+  it('isolates failing listeners inside Emitter.emit', () => {
+    const em = new Emitter<number>();
+    const seen: number[] = [];
+    const origErr = console.error;
+    console.error = () => {};
+    try {
+      em.on(() => { throw new Error('boom'); });
+      em.on((v) => { seen.push(v); });
+      expect(() => em.emit(42)).not.toThrow();
+      expect(seen).toEqual([42]);
+    } finally {
+      console.error = origErr;
+    }
   });
 });
 

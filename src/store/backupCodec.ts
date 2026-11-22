@@ -6,7 +6,8 @@ import type { Settings } from './settings';
 
 export interface FullBackup {
   app: 'armory-fit-backup';
-  v: 2;
+  v: 2 | 3;
+  schema?: 3;
   rev?: string;
   exportedMs: number;
   sessions: LiftSession[];
@@ -16,10 +17,10 @@ export interface FullBackup {
   workoutsMeta: WorkoutMeta[];
   workoutSamples: Record<string, Sample[]>;
   liftSettings: LiftSettings;
-  appSettings: Omit<Settings, 'apiKey'>;
+  appSettings: Omit<Settings, 'apiKey'> & { apiKey?: string };
 }
 
-/** Pure builder so v2 backup snapshots can be assembled and tested without IndexedDB or DOM. */
+/** Pure builder so v2/v3 backup snapshots can be assembled and tested without IndexedDB or DOM. */
 export function assembleFullBackup(args: {
   exportedMs: number;
   rev?: string;
@@ -28,11 +29,14 @@ export function assembleFullBackup(args: {
   workoutSamples: Record<string, Sample[]>;
   liftSettings: LiftSettings;
   appSettings: Settings;
+  includeSecrets?: boolean;
 }): FullBackup {
-  const { apiKey: _stripKey, ...safeAppSettings } = args.appSettings;
+  const { apiKey, ...restAppSettings } = args.appSettings;
+  const appSettings = args.includeSecrets === false ? restAppSettings : { ...restAppSettings, apiKey };
   return {
     app: 'armory-fit-backup',
     v: 2,
+    schema: 3,
     ...(args.rev ? { rev: args.rev } : {}),
     exportedMs: args.exportedMs,
     sessions: args.liftBackup.sessions,
@@ -42,13 +46,13 @@ export function assembleFullBackup(args: {
     workoutsMeta: args.workoutsMeta,
     workoutSamples: args.workoutSamples,
     liftSettings: args.liftSettings,
-    appSettings: safeAppSettings,
+    appSettings,
   };
 }
 
 export function parseBackupJson(raw: string): FullBackup | LiftBackup {
   const parsed = JSON.parse(raw) as Record<string, unknown> | null;
-  if (parsed?.app === 'armory-fit-backup' && parsed.v === 2 && Array.isArray(parsed.sessions)) {
+  if (parsed?.app === 'armory-fit-backup' && (parsed.v === 2 || parsed.v === 3) && Array.isArray(parsed.sessions)) {
     return parsed as unknown as FullBackup;
   }
   if (parsed?.app === 'armory-lifts' && Array.isArray(parsed.sessions)) {

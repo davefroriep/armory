@@ -1,7 +1,8 @@
 import { Emitter } from '../emitter';
+import { defaultQueueState } from '../domain/plan';
 import { calendar, localDate } from '../intervals/calendar';
 import { shareImage } from '../lifts/share';
-import { liftSettings, updateLiftSettings } from '../lifts/settings';
+import { liftSettings, liftSettingsChanged, updateLiftSettings } from '../lifts/settings';
 import { lifts } from '../lifts/store';
 import { isNative, pickNativeBackupFile, writeNativeBackupFile } from '../native/service';
 import { REV } from '../rev';
@@ -50,16 +51,19 @@ function saveStatus(st: BackupStatus): void {
   backupChanged.emit(st);
 }
 
-export async function buildFullBackup(): Promise<FullBackup> {
+export async function buildFullBackup(opts: { includeSamples?: boolean; includeSecrets?: boolean } = {}): Promise<FullBackup> {
+  const { includeSamples = true, includeSecrets = true } = opts;
   await lifts.ready;
   const metas = (await allMeta()).filter((m) => m.status === 'saved');
   const workoutSamples: Record<string, Sample[]> = {};
-  await Promise.all(
-    metas.map(async (m) => {
-      const smp = await getSamples(m.id);
-      if (smp.length) workoutSamples[m.id] = smp;
-    }),
-  );
+  if (includeSamples) {
+    await Promise.all(
+      metas.map(async (m) => {
+        const smp = await getSamples(m.id);
+        if (smp.length) workoutSamples[m.id] = smp;
+      }),
+    );
+  }
   return assembleFullBackup({
     exportedMs: Date.now(),
     rev: REV,
@@ -68,17 +72,19 @@ export async function buildFullBackup(): Promise<FullBackup> {
     workoutSamples,
     liftSettings: liftSettings(),
     appSettings: getSettings(),
+    includeSecrets,
   });
 }
 
 let inflightBackup: Promise<BackupStatus> | null = null;
 
-/** Writes both `armory-fit-latest.json` and today's dated snapshot to `Documents/ArmoryFit Backup`. */
+/** Writes `armory-fit-latest.json` (with 1 Hz samples) and compact daily `armory-fit-YYYY-MM-DD.json` to `Documents/ArmoryFit Backup`. */
 export async function runBackupNow(): Promise<BackupStatus> {
   if (inflightBackup) return inflightBackup;
   inflightBackup = (async () => {
-    const data = await buildFullBackup();
-    const json = JSON.stringify(data);
+    const data = await buildFullBackup({ includeSamples: true, includeSecrets: true });
+    const latestJson = JSON.stringify(data);
+    const dailyJson = JSON.stringify({ ...data, workoutSamples: {} });
     const today = localDate();
     const st: BackupStatus = {
       atMs: data.exportedMs,
@@ -90,8 +96,8 @@ export async function runBackupNow(): Promise<BackupStatus> {
     };
     if (isNative()) {
       const [latestRes, dailyRes] = await Promise.all([
-        writeNativeBackupFile('armory-fit-latest.json', json),
-        writeNativeBackupFile(`armory-fit-${today}.json`, json),
+        writeNativeBackupFile('armory-fit-latest.json', latestJson),
+        writeNativeBackupFile(`armory-fit-${today}.json`, dailyJson),
       ]);
       if (!latestRes.saved && !dailyRes.saved) {
         st.error = latestRes.error || dailyRes.error || 'Could not write to Documents/ArmoryFit Backup';
@@ -107,17 +113,23 @@ export async function runBackupNow(): Promise<BackupStatus> {
   return inflightBackup;
 }
 
-/** Shares/downloads the complete v2 backup file (useful on web or manual archive sharing). */
+/** Shares/downloads the complete backup file (useful on web or manual archive sharing). */
 export async function shareFullBackup(): Promise<FullBackup> {
-  const data = await buildFullBackup();
+  const data = await buildFullBackup({ includeSamples: true, includeSecrets: true });
   const blob = new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' });
   await shareImage(blob, `armory-fit-${localDate()}.json`, 'Armory Fit full backup');
   return data;
 }
 
-/** Restores either a v2 full Armory Fit backup or a legacy v1 armory-lifts backup. */
+/** Restores either a v2/v3 full Armory Fit backup or a legacy v1 armory-lifts backup. */
 export async function restoreFromJson(raw: string): Promise<RestoreResult> {
   const b = parseBackupJson(raw);
+  if (isNative()) {
+    try {
+      const pre = await buildFullBackup({ includeSamples: false, includeSecrets: true });
+      await writeNativeBackupFile(`pre-restore-${Date.now()}.json`, JSON.stringify(pre));
+    } catch { /* best-effort safety snapshot */ }
+  }
   const res = await lifts.importAll(
     b.app === 'armory-fit-backup'
       ? { app: 'armory-lifts', v: 1, exportedMs: b.exportedMs, sessions: b.sessions, routines: b.routines, exercises: b.exercises, videos: b.videos }
@@ -139,8 +151,11 @@ export async function restoreFromJson(raw: string): Promise<RestoreResult> {
     updateLiftSettings(b.liftSettings);
   }
   if (b.appSettings && typeof b.appSettings === 'object') {
-    const { apiKey: _ignored, ...safe } = b.appSettings as Partial<Settings>;
-    updateSettings({ ...safe, apiKey: getSettings().apiKey });
+    const incoming = b.appSettings as Partial<Settings>;
+    const { apiKey: rawKey, queue: rawQueue, ...rest } = incoming;
+    const nextKey = typeof rawKey === 'string' && rawKey.trim() ? rawKey.trim() : getSettings().apiKey;
+    const nextQueue = rawQueue && typeof rawQueue === 'object' ? { ...defaultQueueState(), ...rawQueue } : getSettings().queue;
+    updateSettings({ ...rest, queue: nextQueue, apiKey: nextKey });
   }
   void calendar.refresh();
   return { kind: 'v2', lifts: res.sessions, cardio: cardioCount, routines: res.routines, exercises: res.exercises };
@@ -187,16 +202,22 @@ export function ensureDailyBackup(): void {
 
 let autoWired = false;
 let lastLiftSig = '';
-let lastQueueSig = '';
+let lastSettingsSig = '';
 
-/** Watches finished sessions, routines, and daily opens so DriveSync always has a fresh snapshot. */
+/** Watches finished sessions, routines, exercise rows, and settings so DriveSync always has a fresh snapshot. */
 export function initAutoBackup(): void {
   if (autoWired || !isNative()) return;
   autoWired = true;
   void lifts.ready.then(() => {
-    const liftSig = (): string => `${lifts.finished().length}:${lifts.routines.size}:${lifts.rows.size}`;
+    const liftSig = (): string => {
+      const doneSig = lifts
+        .finished()
+        .map((s) => `${s.id}:${s.endMs ?? s.startMs}:${s.exs.reduce((n, e) => n + e.sets.filter((x) => x.done).length, 0)}`)
+        .join(',');
+      return `${doneSig}|${JSON.stringify([...lifts.routines.values()])}|${JSON.stringify([...lifts.rows.values()])}`;
+    };
     lastLiftSig = liftSig();
-    lastQueueSig = JSON.stringify(getSettings().queue);
+    lastSettingsSig = JSON.stringify(getSettings());
     ensureDailyBackup();
 
     lifts.changed.on(() => {
@@ -207,11 +228,14 @@ export function initAutoBackup(): void {
       }
     });
     settingsChanged.on((s) => {
-      const nextQ = JSON.stringify(s.queue);
-      if (nextQ !== lastQueueSig) {
-        lastQueueSig = nextQ;
+      const nextS = JSON.stringify(s);
+      if (nextS !== lastSettingsSig) {
+        lastSettingsSig = nextS;
         scheduleAutoBackup();
       }
+    });
+    liftSettingsChanged.on(() => {
+      scheduleAutoBackup();
     });
     metaSaved.on(() => {
       scheduleAutoBackup();

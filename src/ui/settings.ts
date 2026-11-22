@@ -109,9 +109,9 @@ export function settingsScreen(root: HTMLElement): () => void {
     <h2 class="sec">INTERVALS.ICU</h2>
     <section class="card">
       <label class="field">Athlete ID<input id="aid" value="${s.athleteId}" autocapitalize="off" autocomplete="off" spellcheck="false"></label>
-      <label class="field">API key<input id="key" type="password" value="${s.apiKey}" placeholder="Pre-configured" autocomplete="off" spellcheck="false"></label>
+      <label class="field">API key<input id="key" type="password" value="${s.apiKey}" placeholder="Paste Intervals.icu API key" autocomplete="off" spellcheck="false"></label>
       <div class="row"><button class="btn sm" id="test">Test connection</button><span id="testout" class="hint"></span></div>
-      <p class="hint">Pre-configured for your account on this device (Intervals → Settings → Developer Settings).</p>
+      <p class="hint">Saved on this device and included in your private DriveSync backup (Intervals → Settings → Developer Settings).</p>
     </section>
 
     <h2 class="sec">ROLLING PROGRAM · PHASE 1</h2>

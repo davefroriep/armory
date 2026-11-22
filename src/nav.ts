@@ -1,3 +1,18 @@
+let backInterceptor: (() => boolean) | null = null;
+
+/** Registers a native Back handler (returns true when Back was handled). */
+export function setBackInterceptor(fn: (() => boolean) | null): void {
+  backInterceptor = fn;
+}
+
+export function clearBackInterceptor(fn: () => boolean): void {
+  if (backInterceptor === fn) backInterceptor = null;
+}
+
+export function consumeBackInterceptor(): boolean {
+  return backInterceptor ? backInterceptor() : false;
+}
+
 /**
  * Pure hierarchical parent-route resolver so Android hardware back / edge-swipe always walks up
  * toward the main menu (`#/`) rather than jumping randomly through past tab history.

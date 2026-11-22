@@ -61,8 +61,18 @@ export function buildExercise(
         { rx, sets: nSets, base1RmKg: opts.base1RmKg, unit: opts.unit },
       )
     : null;
+  const isPrescribedRamp = !!rx?.setsRx?.length || (() => {
+    const ps = resolved?.prescribedSets?.filter((p) => (p.kind ?? 'n') !== 'w') ?? [];
+    if (ps.length <= 1) return false;
+    const weights = new Set(ps.map((p) => (p.wKg != null ? Math.round(p.wKg * 10) : null)));
+    const reps = new Set(ps.map((p) => p.r));
+    return weights.size > 1 || reps.size > 1;
+  })();
   const sets = resolved?.prescribedSets?.length
-    ? resolved.prescribedSets.map((ps) => newSet(ps.kind ?? 'n', ps.wKg, ps.r, true))
+    ? resolved.prescribedSets.map((ps) => ({
+        ...newSet(ps.kind ?? 'n', ps.wKg, ps.r, true),
+        ...(isPrescribedRamp ? { rxLock: true } : {}),
+      }))
     : Array.from({ length: Math.max(1, nSets) }, () => newSet());
   const se: SessionEx = { uid: uid(), exId, sets, ...(ss ? { ss } : {}), ...(slot != null ? { slot } : {}), ...(rx ? { rx } : {}) };
   prefill(se, prev);
@@ -74,14 +84,14 @@ export function buildExercise(
 
 /**
  * Boostcamp-style forward fill: values entered (or accepted) in set `from` flow into the later sets that
- * are still untouched suggestions. Warm-ups neither push nor receive.
+ * are still untouched suggestions. Warm-ups and rx-locked ramp sets neither push nor receive.
  */
 export function forward(se: SessionEx, from: number, fields: { w?: boolean; r?: boolean }): void {
   const src = se.sets[from];
   if (!src || src.kind === 'w') return;
   for (let j = from + 1; j < se.sets.length; j++) {
     const t = se.sets[j];
-    if (t.done || t.kind === 'w') continue;
+    if (t.done || t.kind === 'w' || t.rxLock) continue;
     if (fields.w && (t.wAuto || t.w == null)) { t.w = src.w; t.wAuto = src.w != null; }
     if (fields.r && (t.rAuto || t.r == null)) { t.r = src.r; t.rAuto = src.r != null; }
   }
@@ -91,6 +101,7 @@ export function editWeight(se: SessionEx, idx: number, w: number | null): void {
   const s = se.sets[idx];
   s.w = w;
   s.wAuto = false;
+  delete s.rxLock;
   forward(se, idx, { w: true });
 }
 
@@ -98,6 +109,7 @@ export function editReps(se: SessionEx, idx: number, r: number | null): void {
   const s = se.sets[idx];
   s.r = r;
   s.rAuto = false;
+  delete s.rxLock;
   forward(se, idx, { r: true });
 }
 
@@ -156,10 +168,20 @@ export function swapExercise(se: SessionEx, exId: string, prev: SessionEx | null
   const n = se.sets.length;
   se.exId = exId;
   se.sets = Array.from({ length: n }, () => newSet());
+  delete se.rx;
   delete se.note;
   delete se.rest;
   delete se.restAuto;
   prefill(se, prev);
+}
+
+/** Removes an exercise card cleanly, clearing any orphaned `ss` flag on the preceding card when dropping the end of a superset. */
+export function removeExerciseAt(exs: SessionEx[], idx: number): SessionEx | null {
+  if (idx < 0 || idx >= exs.length) return null;
+  if (!exs[idx].ss && idx > 0 && exs[idx - 1].ss) delete exs[idx - 1].ss;
+  const [removed] = exs.splice(idx, 1);
+  if (exs.length) delete exs[exs.length - 1].ss;
+  return removed ?? null;
 }
 
 export const hasLogged = (se: SessionEx): boolean => se.sets.some((s) => s.done);
@@ -298,8 +320,9 @@ export function pruneUnlogged(s: LiftSession): number {
     e.sets = keep;
   }
   delete s.skipped;
-  s.exs = s.exs.filter((e) => e.sets.length > 0);
-  // a superset flag on the new last exercise would dangle
+  for (let i = s.exs.length - 1; i >= 0; i--) {
+    if (s.exs[i].sets.length === 0) removeExerciseAt(s.exs, i);
+  }
   if (s.exs.length) delete s.exs[s.exs.length - 1].ss;
   return dropped;
 }

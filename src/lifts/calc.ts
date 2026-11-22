@@ -79,15 +79,18 @@ export function exerciseSessions(sessions: LiftSession[], exId: string): ExSessi
   return out.sort((a, b) => a.s.startMs - b.s.startMs);
 }
 
-/** The most recent finished performance before `beforeMs` (for the PREVIOUS column and auto-fill). */
+/** The most recent finished performance before `beforeMs` (prefers sessions with logged working sets). */
 export function previousPerformance(sessions: Iterable<LiftSession>, exId: string, beforeMs = Infinity, excludeId?: string): SessionEx | null {
-  let best: ExSession | null = null;
+  let bestWorking: ExSession | null = null;
+  let bestAny: ExSession | null = null;
   for (const s of sessions) {
     if (s.status !== 'done' || s.id === excludeId || s.startMs >= beforeMs) continue;
-    const e = s.exs.find((x) => x.exId === exId && x.sets.some((z) => z.done));
-    if (e && (!best || s.startMs > best.s.startMs)) best = { s, e };
+    const eWork = s.exs.find((x) => x.exId === exId && x.sets.some(isWorking));
+    if (eWork && (!bestWorking || s.startMs > bestWorking.s.startMs)) bestWorking = { s, e: eWork };
+    const eAny = s.exs.find((x) => x.exId === exId && x.sets.some((z) => z.done));
+    if (eAny && (!bestAny || s.startMs > bestAny.s.startMs)) bestAny = { s, e: eAny };
   }
-  return best ? best.e : null;
+  return bestWorking?.e ?? bestAny?.e ?? null;
 }
 
 // ---------- rep records ----------
@@ -153,6 +156,61 @@ export function computePRs(sessions: LiftSession[], exOf: ExOf): Map<string, PRH
         if (hadHistory.has(e.exId) && set.r <= PR_MAX_REPS && kg > b[n] + 0.005 && (kg > 0 || ex?.type === 'bodyweight')) hits.set(set.id, { n: set.r, kg });
         for (let i = 1; i <= n; i++) if (kg > b[i]) b[i] = kg;
       }
+    }
+  }
+  return hits;
+}
+
+/** Precomputes historical per-exercise 1RM..40RM best loads across finished sessions for O(active sets) PR checks. */
+export function computePRBaseline(sessions: LiftSession[], exOf: ExOf): Map<string, number[]> {
+  const bests = new Map<string, number[]>();
+  for (const s of [...sessions].sort((a, b) => a.startMs - b.startMs)) {
+    if (s.status !== 'done') continue;
+    for (const e of s.exs) {
+      const ex = exOf(e.exId);
+      if (ex?.type === 'time') continue;
+      let b = bests.get(e.exId);
+      if (!b) {
+        b = Array(PR_MAX_REPS + 1).fill(-1);
+        bests.set(e.exId, b);
+      }
+      for (const set of e.sets) {
+        if (!isWorking(set) || !set.r || set.r < 1) continue;
+        const kg = set.w ?? 0;
+        const n = Math.min(set.r, PR_MAX_REPS);
+        for (let i = 1; i <= n; i++) if (kg > b[i]) b[i] = kg;
+      }
+    }
+  }
+  return bests;
+}
+
+/** Scores one session against a precomputed historical baseline without mutating the baseline. */
+export function computeSessionPRs(
+  session: LiftSession,
+  baseline: Map<string, number[]>,
+  exOf: ExOf,
+): Map<string, PRHit> {
+  const hits = new Map<string, PRHit>();
+  const hadHistory = new Set(baseline.keys());
+  const localBests = new Map<string, number[]>();
+  for (const e of session.exs) {
+    const ex = exOf(e.exId);
+    if (ex?.type === 'time') continue;
+    let b = localBests.get(e.exId);
+    if (!b) {
+      const base = baseline.get(e.exId);
+      b = base ? [...base] : Array(PR_MAX_REPS + 1).fill(-1);
+      localBests.set(e.exId, b);
+    }
+    for (const set of e.sets) {
+      if (!isWorking(set) || !set.r || set.r < 1) continue;
+      const kg = set.w ?? 0;
+      const n = Math.min(set.r, PR_MAX_REPS);
+      if (hadHistory.has(e.exId) && set.r <= PR_MAX_REPS && kg > b[n] + 0.005 && (kg > 0 || ex?.type === 'bodyweight')) {
+        hits.set(set.id, { n: set.r, kg });
+      }
+      for (let i = 1; i <= n; i++) if (kg > b[i]) b[i] = kg;
     }
   }
   return hits;

@@ -10,6 +10,8 @@ export interface GateContext {
   mode: RecoveryMode;
   /** Seconds of "get ready" after the gate opens before the next block starts. */
   lead: number;
+  /** Optional minimum sustained ms below `hrLimit` before opening an HR-gated recovery block. */
+  debounceMs?: number;
 }
 
 /**
@@ -26,6 +28,8 @@ export class WorkoutEngine {
   private resumedAt = 0;
   /** segment index -> real length (s) once a gated / skipped block has ended. */
   private released = new Map<number, number>();
+  private gateLowSince: number | null = null;
+  private gateLowIdx = -1;
 
   constructor(public program: Program) {}
 
@@ -37,6 +41,8 @@ export class WorkoutEngine {
     this.accMs = 0;
     this.resumedAt = now;
     this.released.clear();
+    this.gateLowSince = null;
+    this.gateLowIdx = -1;
     this.state = 'running';
   }
 
@@ -52,11 +58,28 @@ export class WorkoutEngine {
     this.state = 'running';
   }
 
+  /** Serializes released/skipped segment lengths for crash-resume persistence. */
+  exportReleased(): Record<number, number> {
+    const out: Record<number, number> = {};
+    for (const [k, v] of this.released.entries()) out[k] = v;
+    return out;
+  }
+
   /** Hydrates the engine in paused state from previously recorded elapsed seconds (crash resume). */
-  hydratePaused(elapsedSec: number): void {
+  hydratePaused(elapsedSec: number, released?: Record<number, number>): void {
     this.accMs = Math.max(0, elapsedSec * 1000);
     this.resumedAt = 0;
     this.released.clear();
+    this.gateLowSince = null;
+    this.gateLowIdx = -1;
+    if (released) {
+      for (const [k, v] of Object.entries(released)) {
+        const idx = Number(k);
+        if (Number.isInteger(idx) && idx >= 0 && typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+          this.released.set(idx, v);
+        }
+      }
+    }
     this.state = 'paused';
   }
 
@@ -126,7 +149,23 @@ export class WorkoutEngine {
     const open = gateOpen({
       gate, nominal: this.program.segments[loc.index].seconds, into: loc.into, hr: ctx.hr, hrLimit: ctx.hrLimit, mode: ctx.mode,
     });
-    if (!open) return null;
+    if (!open) {
+      if (loc.index === this.gateLowIdx) this.gateLowSince = null;
+      return null;
+    }
+    const debounceMs = ctx.debounceMs ?? 0;
+    const inHrWindow = ctx.mode === 'gated' && ctx.hr != null && loc.into >= gate.minSec && loc.into < gate.maxSec;
+    if (inHrWindow && debounceMs > 0) {
+      if (loc.index !== this.gateLowIdx) {
+        this.gateLowIdx = loc.index;
+        this.gateLowSince = now;
+      } else {
+        this.gateLowSince ??= now;
+      }
+      if (now - this.gateLowSince < debounceMs) return null;
+    }
+    this.gateLowSince = null;
+    this.gateLowIdx = -1;
     this.released.set(loc.index, loc.into + Math.max(0, ctx.lead));
     return loc.index;
   }

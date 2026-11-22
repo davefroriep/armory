@@ -165,6 +165,24 @@ export const relDay = (ms: number): string => {
 export function mount(build: () => (() => void) | void): () => void {
   let cleanup: (() => void) | void;
   let dead = false;
-  void Promise.all([lifts.ready, active.init()]).then(() => { if (!dead) cleanup = build(); });
+  void Promise.all([lifts.ready, active.init()])
+    .then(() => {
+      if (!dead) cleanup = build();
+    })
+    .catch((err) => {
+      console.error('[mount]', err);
+      if (dead) return;
+      const app = document.getElementById('app');
+      if (app) {
+        app.innerHTML = `<main class="page"><section class="card warn">
+          <h3>Could not open local database</h3>
+          <p>${esc((err as Error)?.message || 'Storage initialization failed.')}</p>
+          <div class="row">
+            <button class="btn primary sm" type="button" onclick="location.reload()">Reload</button>
+            <a class="btn sm" href="#/settings">Open Settings / Restore</a>
+          </div>
+        </section></main>`;
+      }
+    });
   return () => { dead = true; cleanup?.(); };
 }

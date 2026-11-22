@@ -973,3 +973,21 @@ describe('wallboard snapshot & routing', () => {
     expect(voiceTokenMatchPct('armory skip rest', 'Armory next exercise')).toBeLessThan(60);
   });
 });
+
+describe('Wave 2 Wallboard & Voice bounds hardening', () => {
+  it('compiles WALLBOARD_HTML inline script cleanly and includes the stale stream watchdog', () => {
+    const match = WALLBOARD_HTML.match(/<script>([\s\S]*?)<\/script>/);
+    expect(match).not.toBeNull();
+    expect(() => new Function(match![1])).not.toThrow();
+    expect(WALLBOARD_HTML).toContain('staleBanner');
+    expect(WALLBOARD_HTML).toContain('PHONE PAUSED');
+  });
+
+  it('rejects extreme out-of-range numeric voice arguments and noisy armed-mode tails', () => {
+    expect(parseVoiceTranscript('armory 5000 for 8')).toBeNull();
+    expect(parseVoiceTranscript('armory 225 for 999')).toBeNull();
+    expect(parseVoiceTranscript('armory 9999 seconds')).toBeNull();
+    expect(parseVoiceTranscript('armory add 999 seconds')).toBeNull();
+    expect(parseVoiceTranscript('check out that song', { armed: true })).toBeNull();
+  });
+});

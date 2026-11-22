@@ -3,7 +3,7 @@ import { DEFAULTS } from '../src/store/settings';
 import { assembleFullBackup, parseBackupJson } from '../src/store/backupCodec';
 
 describe('Armory Fit v2 full backup & restore parser', () => {
-  it('assembles a complete v2 backup with cardio samples, lift sessions, and queue while stripping apiKey', () => {
+  it('assembles a complete v2 backup with cardio samples, lift sessions, and queue while preserving apiKey by default', () => {
     const out = assembleFullBackup({
       exportedMs: 1_763_300_000_000,
       rev: 'v0.36',
@@ -73,8 +73,31 @@ describe('Armory Fit v2 full backup & restore parser', () => {
 
     expect(out.app).toBe('armory-fit-backup');
     expect(out.v).toBe(2);
-    expect('apiKey' in out.appSettings).toBe(false);
+    expect(out.schema).toBe(3);
+    expect('apiKey' in out.appSettings).toBe(true);
     expect(out.appSettings.ftp).toBe(190);
+
+    const withSecret = assembleFullBackup({
+      exportedMs: out.exportedMs,
+      liftBackup: { app: 'armory-lifts', v: 1, exportedMs: out.exportedMs, sessions: out.sessions, routines: out.routines, exercises: out.exercises, videos: out.videos },
+      workoutsMeta: out.workoutsMeta,
+      workoutSamples: out.workoutSamples,
+      liftSettings: out.liftSettings,
+      appSettings: { ...out.appSettings, apiKey: 'test-key-xyz' } as any,
+    });
+    expect(withSecret.appSettings.apiKey).toBe('test-key-xyz');
+
+    const stripped = assembleFullBackup({
+      exportedMs: out.exportedMs,
+      liftBackup: { app: 'armory-lifts', v: 1, exportedMs: out.exportedMs, sessions: out.sessions, routines: out.routines, exercises: out.exercises, videos: out.videos },
+      workoutsMeta: out.workoutsMeta,
+      workoutSamples: out.workoutSamples,
+      liftSettings: out.liftSettings,
+      appSettings: { ...out.appSettings, apiKey: 'test-key-xyz' } as any,
+      includeSecrets: false,
+    });
+    expect('apiKey' in stripped.appSettings).toBe(false);
+    expect(parseBackupJson(JSON.stringify({ ...out, v: 3 })).v).toBe(3);
     expect(out.sessions[0].skipped).toEqual([{ exId: 'pull-up', plannedSets: 3, doneSets: 0 }]);
     expect(out.workoutsMeta).toHaveLength(1);
     expect(out.workoutSamples['cb-1']).toHaveLength(1);

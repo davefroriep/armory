@@ -35,13 +35,18 @@ export function cardioWorkoutScreen(root: HTMLElement, args: string[]): () => vo
 
       const avgCad = samples.length ? Math.round(samples.reduce((a, x) => a + x.cad, 0) / samples.length) : 0;
       const distMi = samples.length ? (samples[samples.length - 1].dist / 1609.344) : 0;
+      const avgW = Math.round(m.avgW);
+      const maxW = Math.round(m.maxW);
+      const avgHr = Math.round(m.avgHr);
+      const maxHr = Math.round(m.maxHr);
+      const kj = Math.round(m.kj);
       const statCards: [string, string][] = [
         ['TIME', hms(m.seconds)],
-        m.avgW > 0 ? ['AVG W', `${m.avgW} W`] : ['CADENCE', avgCad ? `${avgCad} rpm` : '--'],
-        m.maxW > 0 ? ['MAX W', `${m.maxW} W`] : ['WORK', m.kj > 0 ? `${m.kj} kJ` : '--'],
-        m.avgHr > 0 ? ['AVG HR', `${m.avgHr}`] : ['MAX HR', m.maxHr ? `${m.maxHr}` : '--'],
+        avgW > 0 ? ['AVG W', `${avgW} W`] : ['CADENCE', avgCad ? `${avgCad} rpm` : '--'],
+        maxW > 0 ? ['MAX W', `${maxW} W`] : ['WORK', kj > 0 ? `${kj} kJ` : '--'],
+        avgHr > 0 ? ['AVG HR', `${avgHr}`] : ['MAX HR', maxHr ? `${maxHr}` : '--'],
       ];
-      if (m.avgW > 0 && m.kj > 0) statCards.push(['WORK', `${m.kj} kJ`]);
+      if (avgW > 0 && kj > 0) statCards.push(['WORK', `${kj} kJ`]);
       if (distMi >= 0.05) statCards.push(['DIST', `${distMi.toFixed(2)} mi`]);
 
       const syncHtml = m.upload === 'done'

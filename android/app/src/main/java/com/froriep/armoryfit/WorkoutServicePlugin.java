@@ -22,6 +22,7 @@ import android.provider.MediaStore;
 import android.provider.OpenableColumns;
 import android.provider.Settings;
 import android.util.Base64;
+import android.util.Log;
 import android.util.Size;
 import android.view.WindowManager;
 
@@ -51,10 +52,13 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.TimeZone;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /** JS bridge: WorkoutService lifecycle, rest-timer tray/overlay, wallboard HTTP/SSE, voice recognition + video linking. */
 @CapacitorPlugin(
@@ -920,7 +924,58 @@ public class WorkoutServicePlugin extends Plugin {
         call.resolve();
     }
 
-    /** Writes a JSON backup file into shared Documents/ArmoryFit Backup/ for DriveSync. */
+    private static final Pattern DAILY_BACKUP_NAME = Pattern.compile("^armory-fit-(\\d{4}-\\d{2}-\\d{2})\\.json$");
+
+    /** Deletes daily snapshot files older than 14 days (preserving the 1st of each month, latest, and pre-restore snapshots). */
+    private static void pruneOldDailyBackups(Context c, String relPath) {
+        try {
+            SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd", Locale.US);
+            Calendar cal = Calendar.getInstance();
+            cal.add(Calendar.DAY_OF_YEAR, -14);
+            String cutoffYmd = fmt.format(cal.getTime());
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentResolver cr = c.getContentResolver();
+                Uri collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                String sel = MediaStore.MediaColumns.RELATIVE_PATH + "=? OR "
+                        + MediaStore.MediaColumns.RELATIVE_PATH + "=?";
+                String[] args = new String[] {relPath, relPath + "/"};
+                try (Cursor cur = cr.query(collection, new String[] {MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME}, sel, args, null)) {
+                    while (cur != null && cur.moveToNext()) {
+                        long id = cur.getLong(0);
+                        String name = cur.getString(1);
+                        if (name == null) continue;
+                        Matcher m = DAILY_BACKUP_NAME.matcher(name);
+                        if (!m.matches()) continue;
+                        String ymd = m.group(1);
+                        if (ymd != null && ymd.compareTo(cutoffYmd) < 0 && !ymd.endsWith("-01")) {
+                            try {
+                                cr.delete(ContentUris.withAppendedId(collection, id), null, null);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }
+                }
+            } else {
+                File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "ArmoryFit Backup");
+                File[] files = dir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        Matcher m = DAILY_BACKUP_NAME.matcher(f.getName());
+                        if (!m.matches()) continue;
+                        String ymd = m.group(1);
+                        if (ymd != null && ymd.compareTo(cutoffYmd) < 0 && !ymd.endsWith("-01")) {
+                            f.delete();
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w("ArmoryBackup", "pruneOldDailyBackups failed", e);
+        }
+    }
+
+    /** Writes a JSON backup file into shared Documents/ArmoryFit Backup/ for DriveSync atomically. */
     @PluginMethod
     public void writeBackupFile(PluginCall call) {
         String rawName = call.getString("fileName", "armory-fit-latest.json");
@@ -932,6 +987,7 @@ public class WorkoutServicePlugin extends Plugin {
         new Thread(() -> {
             JSObject ret = new JSObject();
             String relPath = Environment.DIRECTORY_DOCUMENTS + "/ArmoryFit Backup";
+            boolean wrote = false;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ContentResolver cr = c.getContentResolver();
                 Uri collection = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
@@ -949,20 +1005,37 @@ public class WorkoutServicePlugin extends Plugin {
                 }
 
                 Uri target = existing;
-                boolean wrote = false;
                 if (target != null) {
-                    try (OutputStream os = cr.openOutputStream(target, "wt")) {
-                        if (os != null) {
-                            os.write(bytes);
-                            os.flush();
-                            wrote = true;
+                    ContentValues pendingCv = new ContentValues();
+                    pendingCv.put(MediaStore.MediaColumns.IS_PENDING, 1);
+                    ContentValues doneCv = new ContentValues();
+                    doneCv.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    try {
+                        try {
+                            cr.update(target, pendingCv, null, null);
+                        } catch (Exception ignored) {
+                        }
+                        try (OutputStream os = cr.openOutputStream(target, "wt")) {
+                            if (os != null) {
+                                os.write(bytes);
+                                os.flush();
+                                wrote = true;
+                            }
                         }
                     } catch (Exception ignored) {
+                        wrote = false;
                         try {
                             cr.delete(target, null, null);
                         } catch (Exception ignored2) {
                         }
                         target = null;
+                    } finally {
+                        if (target != null && wrote) {
+                            try {
+                                cr.update(target, doneCv, null, null);
+                            } catch (Exception ignored) {
+                            }
+                        }
                     }
                 }
                 if (!wrote) {
@@ -970,6 +1043,7 @@ public class WorkoutServicePlugin extends Plugin {
                     cv.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
                     cv.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
                     cv.put(MediaStore.MediaColumns.RELATIVE_PATH, relPath + "/");
+                    cv.put(MediaStore.MediaColumns.IS_PENDING, 1);
                     try {
                         target = cr.insert(collection, cv);
                         if (target != null) {
@@ -980,29 +1054,50 @@ public class WorkoutServicePlugin extends Plugin {
                                     wrote = true;
                                 }
                             }
+                            if (wrote) {
+                                ContentValues doneCv = new ContentValues();
+                                doneCv.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                                cr.update(target, doneCv, null, null);
+                            } else {
+                                cr.delete(target, null, null);
+                            }
                         }
                     } catch (Exception e) {
                         ret.put("error", e.getMessage());
+                        if (target != null) {
+                            try {
+                                cr.delete(target, null, null);
+                            } catch (Exception ignored2) {
+                            }
+                        }
                     }
                 }
                 ret.put("saved", wrote);
                 ret.put("path", relPath + "/" + fileName);
             } else {
-                boolean wrote = false;
                 File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "ArmoryFit Backup");
+                File tmp = new File(dir, fileName + ".tmp");
+                File out = new File(dir, fileName);
                 try {
                     if (!dir.exists()) dir.mkdirs();
-                    File out = new File(dir, fileName);
-                    try (FileOutputStream fos = new FileOutputStream(out, false)) {
+                    try (FileOutputStream fos = new FileOutputStream(tmp, false)) {
                         fos.write(bytes);
                         fos.flush();
-                        wrote = true;
+                        fos.getFD().sync();
                     }
+                    if (out.exists() && !out.delete()) {
+                        Log.w("ArmoryBackup", "Could not remove old backup file before rename: " + out);
+                    }
+                    wrote = tmp.renameTo(out);
                     ret.put("path", out.getAbsolutePath());
                 } catch (Exception e) {
                     ret.put("error", e.getMessage());
+                    if (tmp.exists()) tmp.delete();
                 }
                 ret.put("saved", wrote);
+            }
+            if (wrote && DAILY_BACKUP_NAME.matcher(fileName).matches()) {
+                pruneOldDailyBackups(c, relPath);
             }
             call.resolve(ret);
         }).start();

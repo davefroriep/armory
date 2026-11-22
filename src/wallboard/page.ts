@@ -191,6 +191,9 @@ export const WALLBOARD_HTML = `<!doctype html>
   .sb-item span { font-size:clamp(13px,1.5vw,19px); color:var(--mut); }
   .ptt { position:fixed; right:16px; bottom:16px; border:1px solid var(--line); background:var(--card2); color:var(--txt); padding:10px 16px; border-radius:999px; font-weight:700; cursor:pointer; opacity:.85; }
   .ptt.on { background:rgba(34,211,238,.25); border-color:var(--cyan); color:#fff; }
+  .stale-banner { display:none; position:fixed; top:14px; right:18px; z-index:45; padding:7px 14px; border-radius:999px; background:rgba(245,158,11,.22); border:1.5px solid var(--amber); color:#fef3c7; font-size:clamp(12px,1.25vw,16px); font-weight:800; letter-spacing:.04em; box-shadow:0 4px 18px rgba(0,0,0,.45); }
+  body.stale .stale-banner { display:inline-flex; align-items:center; gap:8px; }
+  body.stale .hr-bpm, body.stale .target-num, body.stale .s-logged { opacity:.55; }
   .wb-replay { position:fixed; inset:0; z-index:50; background:#030712; display:flex; flex-direction:column; }
   .wb-replay[hidden] { display:none !important; }
   #wbRepVid { width:100%; height:100%; object-fit:contain; display:block; background:#000; }
@@ -247,6 +250,7 @@ export const WALLBOARD_HTML = `<!doctype html>
 <div class="wrap" id="app">
   <div class="top"><div class="brand"><b>ARMORY FIT</b><span class="pill">Connecting…</span></div><div class="top-mid"></div><div class="top-r"><div class="clk" id="clk">--:--</div></div></div>
 </div>
+<div class="stale-banner" id="staleBanner"></div>
 <div class="wb-replay" id="wbReplay" hidden>
   <video id="wbRepVid" playsinline muted></video>
   <div class="wb-rep-top">
@@ -265,6 +269,8 @@ const mmss = (sec) => {
   return h ? h + ':' + String(m).padStart(2,'0') + ':' + String(r).padStart(2,'0') : m + ':' + String(r).padStart(2,'0');
 };
 let lastJson = '';
+let lastRxMs = Date.now();
+let lastState = null;
 let activeReplayKey = '';
 let dismissedReplayKey = '';
 let replayLoopsLeft = 0;
@@ -361,8 +367,15 @@ function syncReplay(st, hr, hrColor) {
   }
 }
 
+function markFresh() {
+  lastRxMs = Date.now();
+  document.body.classList.remove('stale');
+}
+
 function render(st) {
   if (!st) return;
+  lastState = st;
+  markFresh();
   const app = document.getElementById('app');
   const nowStr = new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
   const modePill = st.mode === 'lift'
@@ -549,6 +562,7 @@ async function pollOnce() {
   try {
     const r = await fetch(wbUrl('/state') + '?t=' + Date.now(), { cache:'no-store' });
     if (r.ok) {
+      markFresh();
       const txt = await r.text();
       if (txt !== lastJson) { lastJson = txt; render(JSON.parse(txt)); }
     }
@@ -562,6 +576,7 @@ if (location.protocol !== 'about:' && location.protocol !== 'blob:') {
     try {
       const es = new EventSource(wbUrl('/events'));
       es.onmessage = (e) => {
+        markFresh();
         if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         if (e.data && e.data !== lastJson) {
           lastJson = e.data;
@@ -586,11 +601,18 @@ document.addEventListener('click', keepAwake);
 setInterval(() => {
   const t = new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
   document.querySelectorAll('.clk, .standby-big').forEach((el) => { el.textContent = t; });
-}, 15000);
+  const stale = !!(lastState && lastState.mode !== 'standby' && Date.now() - lastRxMs > 12000);
+  document.body.classList.toggle('stale', stale);
+  if (stale) {
+    const sbEl = document.getElementById('staleBanner');
+    const agoT = new Date(lastRxMs).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+    if (sbEl) sbEl.textContent = 'PHONE PAUSED · last update ' + agoT;
+  }
+}, 5000);
 
 // Optional LAN browser speech relay (available in Chrome on OptiPlex/tablets; hidden on Silk/devices without Web Speech)
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-if (SR && location.protocol.startsWith('http') && !/; wv\)|AFT/i.test(navigator.userAgent)) {
+if (SR && location.protocol.startsWith('http') && !/; wv[)]|AFT/i.test(navigator.userAgent)) {
   const btn = document.getElementById('ptt');
   btn.hidden = false;
   let rec = null;

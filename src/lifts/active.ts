@@ -293,8 +293,9 @@ class ActiveWorkout {
     this.restChanged.emit();
   }
 
-  /** A set was just logged: start the rest timer unless disabled for this card (e.g. mid-superset or Auto off). */
-  afterSetLogged(s: LiftSession, i: number): void {
+  /** A set was just logged: start the rest timer unless warm-up or disabled for this card (e.g. mid-superset or Auto off). */
+  afterSetLogged(s: LiftSession, i: number, setIdx?: number): void {
+    if (setIdx != null && s.exs[i]?.sets[setIdx]?.kind === 'w') return;
     if (!this.restAutoFor(s, i)) {
       if (midSuperset(s.exs, i) ? this.rest : this.rest?.fired) this.clearRest();
       return;

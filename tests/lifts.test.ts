@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ALERT_SAMPLE_RATE, ALERT_SPECS, encodeWav, synthesizeBellPcm } from '../src/audio/audio';
 import { parentHash } from '../src/nav';
 import {
-  MAX_RM, PR_MAX_REPS, computePRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
+  MAX_RM, PR_MAX_REPS, computePRBaseline, computePRs, computeSessionPRs, e1rm, e1rmTrend, exerciseSessions, muscleSets, previousPerformance, repBests, sessionStats,
   setVolumeKg, weekStart, addWeeks, DAY_MS,
 } from '../src/lifts/calc';
 import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
@@ -11,7 +11,7 @@ import {
   addSet, buildExercise, canLog, collectUnfinishedItems, camsForExercise, defaultCamsForExercise, DEFAULT_FALLBACK_CAM,
   driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec, hasSessionActivity, inferredCamForExercise,
   isSessionPaused, isSessionStarted, labels, midSuperset, newSet, normalizeCamList, pauseSessionClock,
-  preferredCamForExercise, prevSetFor, pruneUnlogged, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
+  preferredCamForExercise, prevSetFor, pruneUnlogged, removeExerciseAt, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
   startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import {
@@ -71,11 +71,11 @@ describe('exercise library', () => {
 });
 
 describe('units', () => {
-  it('round-trips pounds without float noise and provides custom +/-5/+/-10 weight steps', () => {
+  it('round-trips pounds without float noise and provides custom +/-2.5/+/-5/+/-10 weight steps', () => {
     for (const v of [45, 135, 137.5, 225, 315, 2.5]) expect(toDisplay(fromDisplay(v, 'lb'), 'lb')).toBe(v);
     expect(fmtNum(toDisplay(lb(135), 'lb'))).toBe('135');
     expect(toDisplay(100, 'kg')).toBe(100);
-    expect(stepsFor('lb')).toEqual([-10, -5, 5, 10]);
+    expect(stepsFor('lb')).toEqual([-10, -5, -2.5, 2.5, 5, 10]);
     expect(stepsFor('kg')).toEqual([-5, -2.5, 2.5, 5]);
   });
 });
@@ -884,5 +884,100 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
     expect(rows.get('barbell-bench-press')!.camPref).toBeUndefined();
     expect(rows.get('custom-move')!.cams).toEqual(['Smith Wide']);
     expect(rows.get('rear-delt-fly')!.cams).toEqual(['Rack Cam']);
+  });
+});
+
+describe('Wave 2 lifting logic & PR parity', () => {
+  it('protects prescribed ramp sets with rxLock, unlocks only the edited set, and clears rx on swapExercise', () => {
+    const se = buildExercise('barbell-bench-press', 3, null, false, undefined, {
+      rx: {
+        setsRx: [
+          { loadLb: 135, reps: 8 },
+          { loadLb: 155, reps: 6 },
+          { loadLb: 175, reps: 4 },
+        ],
+      },
+      unit: 'lb',
+    });
+    expect(se.sets.every((s) => s.rxLock === true)).toBe(true);
+    editWeight(se, 0, fromDisplay(145, 'lb'));
+    expect(se.sets[0].rxLock).toBeUndefined();
+    expect(Math.round(toDisplay(se.sets[1].w!, 'lb'))).toBe(155);
+    expect(Math.round(toDisplay(se.sets[2].w!, 'lb'))).toBe(175);
+    expect(se.sets[1].rxLock).toBe(true);
+
+    swapExercise(se, 'dumbbell-bench-press', null);
+    expect(se.rx).toBeUndefined();
+    expect(se.sets.every((s) => !s.rxLock)).toBe(true);
+  });
+
+  it('clears orphaned superset flags in removeExerciseAt and pruneUnlogged', () => {
+    const exA = buildExercise('barbell-bench-press', 2, null, true);
+    const exB = buildExercise('smith-machine-row', 2, null, false);
+    const exs = [exA, exB];
+    removeExerciseAt(exs, 1);
+    expect(exs).toHaveLength(1);
+    expect(exs[0].ss).toBeUndefined();
+
+    const s: LiftSession = {
+      id: 'sess-ss',
+      name: 'Upper',
+      routineId: null,
+      eventId: null,
+      startMs: 1000,
+      endMs: null,
+      status: 'active',
+      rpe: null,
+      bwKg: null,
+      exs: [
+        { uid: 'u1', exId: 'barbell-bench-press', ss: true, sets: [{ ...newSet('n', lb(185), 8), done: true }] },
+        { uid: 'u2', exId: 'smith-machine-row', sets: [newSet('n', lb(135), 10)] },
+      ],
+    };
+    pruneUnlogged(s);
+    expect(s.exs).toHaveLength(1);
+    expect(s.exs[0].ss).toBeUndefined();
+  });
+
+  it('previousPerformance prefers finished sessions with logged working sets over warmup-only sessions', () => {
+    const olderWorking: LiftSession = {
+      id: 's1', name: 'Push', routineId: null, eventId: null, startMs: 1000, endMs: 2000, status: 'done', rpe: 8, bwKg: null,
+      exs: [{ uid: 'e1', exId: 'barbell-bench-press', sets: [{ ...newSet('n', lb(185), 8), done: true }] }],
+    };
+    const newerWarmupOnly: LiftSession = {
+      id: 's2', name: 'Push', routineId: null, eventId: null, startMs: 3000, endMs: 4000, status: 'done', rpe: 6, bwKg: null,
+      exs: [{ uid: 'e2', exId: 'barbell-bench-press', sets: [{ ...newSet('w', lb(95), 8), done: true }] }],
+    };
+    const prev = previousPerformance([olderWorking, newerWarmupOnly], 'barbell-bench-press');
+    expect(prev?.uid).toBe('e1');
+  });
+
+  it('computeSessionPRs + computePRBaseline matches computePRs for the latest session', () => {
+    const exOf = (id: string) => LIBRARY_BY_ID.get(id);
+    const s1: LiftSession = {
+      id: 's1', name: 'Upper 1', routineId: null, eventId: null, startMs: 1000, endMs: 2000, status: 'done', rpe: 8, bwKg: null,
+      exs: [{
+        uid: 'e1', exId: 'barbell-bench-press',
+        sets: [
+          { ...newSet('w', lb(135), 8), id: 'w1', done: true },
+          { ...newSet('n', lb(185), 8), id: 'a1', done: true },
+        ],
+      }],
+    };
+    const s2: LiftSession = {
+      id: 's2', name: 'Upper 2', routineId: null, eventId: null, startMs: 5000, endMs: 6000, status: 'done', rpe: 8, bwKg: null,
+      exs: [{
+        uid: 'e2', exId: 'barbell-bench-press',
+        sets: [
+          { ...newSet('n', lb(195), 8), id: 'b1', done: true },
+          { ...newSet('n', lb(180), 8), id: 'b2', done: true },
+        ],
+      }],
+    };
+    const full = computePRs([s1, s2], exOf);
+    const base = computePRBaseline([s1], exOf);
+    const fast = computeSessionPRs(s2, base, exOf);
+    expect([...fast.keys()]).toEqual(['b1']);
+    expect([...fast.entries()]).toEqual([...full.entries()].filter(([id]) => id.startsWith('b')));
   });
 });

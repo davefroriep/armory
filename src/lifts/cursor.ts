@@ -1,4 +1,4 @@
-import { addSet, labels, supersetGroups } from './logic';
+import { addSet, labels, removeExerciseAt, supersetGroups } from './logic';
 import type { Exercise, LiftSet, SessionEx } from './types';
 
 export interface CursorRef {
@@ -317,8 +317,7 @@ export function applyDeleteEmptySets(exs: SessionEx[], cursor: CursorRef | null)
   if (kept.length > 0) {
     se.sets = kept;
   } else {
-    exs.splice(cur.exIdx, 1);
-    if (exs.length) delete exs[exs.length - 1].ss;
+    removeExerciseAt(exs, cur.exIdx);
   }
   return {
     changed: true,

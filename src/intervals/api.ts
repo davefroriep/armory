@@ -28,15 +28,26 @@ function auth(): HeadersInit {
 
 async function call(path: string, init: RequestInit = {}): Promise<Response> {
   if (!hasKey()) throw new IntervalsError('No Intervals.icu API key set (Settings)');
+  const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), 20_000) : null;
   let res: Response;
   try {
-    res = await fetch(BASE + path, { ...init, headers: { ...auth(), ...(init.headers ?? {}) } });
-  } catch {
+    res = await fetch(BASE + path, {
+      ...init,
+      headers: { ...auth(), ...(init.headers ?? {}) },
+      ...(ctrl && !init.signal ? { signal: ctrl.signal } : {}),
+    });
+  } catch (e) {
+    if ((e as Error)?.name === 'AbortError') throw new IntervalsError('Request timed out');
     throw new IntervalsError('Network error (offline?)');
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   if (!res.ok) {
+    const retryAfter = res.status === 429 ? res.headers.get('Retry-After') : null;
     const txt = (await res.text().catch(() => '')).slice(0, 120);
-    throw new IntervalsError(`Intervals.icu HTTP ${res.status}${txt ? ': ' + txt : ''}`, res.status);
+    const raNote = retryAfter ? ` (retry after ${retryAfter}s)` : '';
+    throw new IntervalsError(`Intervals.icu HTTP ${res.status}${raNote}${txt ? ': ' + txt : ''}`, res.status);
   }
   return res;
 }

@@ -1,15 +1,15 @@
 import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
-import { computePRs } from '../../lifts/calc';
+import { computePRBaseline, computeSessionPRs } from '../../lifts/calc';
 import { advanceCursorAfterLog, jumpToExerciseCursor, resolveTargetSet } from '../../lifts/cursor';
 import {
   addSet, buildExercise, camsForExercise, canLog, collectUnfinishedItems, DEFAULT_CAM_OPTIONS, DEFAULT_FALLBACK_CAM,
   deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
-  prevSetFor, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
+  prevSetFor, removeExerciseAt, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
-import { resolvePrescription } from '../../lifts/prescriptions';
+import { prescriptionFor, resolvePrescription } from '../../lifts/prescriptions';
 import { PHASE1_PLAN } from '../../domain/plan';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
@@ -62,10 +62,9 @@ function build(root: HTMLElement, id?: string): () => void {
     if (!prevCache.has(se.exId)) prevCache.set(se.exId, lifts.previous(se.exId, s.startMs, s.id));
     return prevCache.get(se.exId)!;
   };
+  const prBaseline = edit ? null : computePRBaseline(lifts.finished().filter((x) => x.id !== s.id), exOf);
   const recomputePRs = (): void => {
-    hits = edit
-      ? lifts.prs()
-      : computePRs([...lifts.finished().filter((x) => x.id !== s.id), { ...s, status: 'done' as const, startMs: Date.now() + 1 }], exOf);
+    hits = edit ? lifts.prs() : computeSessionPRs(s, prBaseline!, exOf);
   };
   const save = (): void => { if (dead || finishing || (!edit && !lifts.sessions.has(s.id))) return; dirty = true; lifts.saveSession(s); };
   const setBuddyMode = (next: boolean): void => {
@@ -442,7 +441,31 @@ function build(root: HTMLElement, id?: string): () => void {
   });
 
   // ---------- dock (steppers & rep presets above the keyboard) ----------
-  const REP_PRESETS = [8, 10, 12, 15];
+  const repPresetsFor = (se: SessionEx, ex: Exercise): number[] => {
+    const nums = new Set<number>();
+    const rawRx = se.rx?.reps != null ? String(se.rx.reps) : prescriptionFor(ex).repTarget;
+    const rxNums = (rawRx.match(/\d+/g) ?? []).map(Number).filter((n) => n >= 1 && n <= 60);
+    const lo = rxNums[0] ?? 8;
+    const hi = rxNums[rxNums.length - 1] ?? lo;
+    const padLo = lo <= 6 ? 1 : 2;
+    const padHi = hi >= 12 ? 3 : 2;
+    nums.add(Math.max(1, lo - padLo));
+    nums.add(lo);
+    if (hi > lo) {
+      nums.add(hi);
+      nums.add(hi + padHi);
+    } else {
+      nums.add(lo + 2);
+      nums.add(lo + 4);
+    }
+    const prevLastR = prevOf(se)?.sets.filter((x) => x.done && x.kind !== 'w').slice(-1)[0]?.r;
+    if (prevLastR && prevLastR >= 1 && prevLastR <= 60 && nums.size < 4) nums.add(prevLastR);
+    for (const fb of [6, 8, 10, 12, 15]) {
+      if (nums.size >= 4) break;
+      nums.add(fb);
+    }
+    return [...nums].sort((a, b) => a - b).slice(0, 4);
+  };
   let focused: HTMLInputElement | null = null;
   let scrollT1: ReturnType<typeof setTimeout> | null = null;
   let scrollT2: ReturnType<typeof setTimeout> | null = null;
@@ -474,16 +497,21 @@ function build(root: HTMLElement, id?: string): () => void {
   const showDock = (inp: HTMLInputElement): void => {
     focused = inp;
     const isW = inp.classList.contains('sw');
-    const isTime = !isW && exOf(rowOf(inp).se.exId).type === 'time';
+    const { se } = rowOf(inp);
+    const ex = exOf(se.exId);
+    const isTime = !isW && ex.type === 'time';
     const d = dock();
     if (isW || isTime) {
       const steps = isW ? stepsFor() : [-15, -5, 5, 15];
       d.classList.remove('reps');
+      d.classList.toggle('compact', isW && steps.length > 4);
       d.innerHTML = `${steps.map((v) => `<button class="dk" data-step="${v}">${v > 0 ? '+' : '−'}${fmtNum(Math.abs(v))}</button>`).join('')}<button class="dk log" data-dock="log">LOG ✓</button>`;
     } else {
+      d.classList.remove('compact');
       d.classList.add('reps');
       const curV = Number(inp.value);
-      d.innerHTML = `${REP_PRESETS.map((p) => `<button class="dk pre${curV === p ? ' on' : ''}" data-rep="${p}">${p}</button>`).join('')}<button class="dk pm" data-step="-1">−1</button><button class="dk pm" data-step="1">+1</button><button class="dk log" data-dock="log">LOG ✓</button>`;
+      const presets = repPresetsFor(se, ex);
+      d.innerHTML = `${presets.map((p) => `<button class="dk pre${curV === p ? ' on' : ''}" data-rep="${p}">${p}</button>`).join('')}<button class="dk pm" data-step="-1">−1</button><button class="dk pm" data-step="1">+1</button><button class="dk log" data-dock="log">LOG ✓</button>`;
     }
     d.hidden = false;
     document.body.classList.add('dock-open');
@@ -492,7 +520,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (scrollT1) { clearTimeout(scrollT1); scrollT1 = null; }
     if (scrollT2) { clearTimeout(scrollT2); scrollT2 = null; }
     dock().hidden = true;
-    dock().classList.remove('reps');
+    dock().classList.remove('reps', 'compact');
     document.body.classList.remove('dock-open');
     focused = null;
   };
@@ -624,17 +652,36 @@ function build(root: HTMLElement, id?: string): () => void {
       }
       recomputePRs();
       if (!edit) {
-        active.afterSetLogged(s, idx);
+        active.afterSetLogged(s, idx, i);
         paintClock();
       }
       commitBuzz(false);
       maybeCamOnLog(false, wasArmed, armedCams);
     } else {
       recomputePRs();
-      if (!r && was && !edit) {
-        paintClock();
-        voice.setCursor({ exUid: se.uid, setId: set.id });
-        void active.resetIfNoneLogged(s).then((reset) => { if (reset && !dead) paintClock(); });
+      if (!r && was) {
+        if (!edit) {
+          paintClock();
+          voice.setCursor({ exUid: se.uid, setId: set.id });
+          void active.resetIfNoneLogged(s).then((reset) => { if (reset && !dead) paintClock(); });
+        }
+        toast('Set unchecked', {
+          undo: () => {
+            if (dead || set.done) return;
+            const restored = toggleDone(se, i, ex);
+            if (restored) {
+              if (!edit) {
+                active.ensureStarted(s);
+                voice.setCursor(advanceCursorAfterLog(s.exs, { exIdx: idx, setIdx: i }));
+                paintClock();
+              }
+              recomputePRs();
+              syncCard(card);
+              paintTarget();
+              save();
+            }
+          },
+        });
       }
     }
     syncCard(card);
@@ -688,8 +735,7 @@ function build(root: HTMLElement, id?: string): () => void {
       location.hash = `#/strength/exercise/${se.exId}`;
     } else if (k === 'remove') {
       const snap = snapshot();
-      s.exs.splice(idx, 1);
-      if (s.exs.length) delete s.exs[s.exs.length - 1].ss;
+      removeExerciseAt(s.exs, idx);
       save(); paint();
       toast(`${ex.name} removed`, { undo: () => restore(snap) });
     }

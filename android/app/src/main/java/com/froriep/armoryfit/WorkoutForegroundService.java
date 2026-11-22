@@ -1,8 +1,10 @@
 package com.froriep.armoryfit;
 
+import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.Handler;
@@ -10,8 +12,10 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.util.Log;
 
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 
 /**
  * Keeps BLE, heart rate and the rest timer alive when Armory Fit is minimized or the screen is off.
@@ -28,6 +32,10 @@ public class WorkoutForegroundService extends Service {
     static final String ACTION_REST_SKIP = "com.froriep.armoryfit.REST_SKIP";
     static final String ACTION_APP_VISIBILITY = "com.froriep.armoryfit.APP_VISIBILITY";
 
+    private static final String TAG = "ArmoryWorkoutSvc";
+    private static final long STALE_WATCHDOG_MS = 15L * 60L * 1000L;
+    private static final long WATCHDOG_POLL_MS = 5L * 60L * 1000L;
+
     static volatile boolean appVisible = true;
     static volatile boolean running = false;
 
@@ -36,6 +44,7 @@ public class WorkoutForegroundService extends Service {
     private RestOverlay overlay;
 
     private boolean workoutActive = false;
+    private long lastActivityElapsedMs = 0L;
     private String workoutTitle = "Armory Fit";
     private String workoutText = "Workout active";
     private long workoutStartEpochMs = 0L;
@@ -77,6 +86,21 @@ public class WorkoutForegroundService extends Service {
         }
     };
 
+    private final Runnable watchdogRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!workoutActive && !restActive) return;
+            long idleMs = SystemClock.elapsedRealtime() - lastActivityElapsedMs;
+            if (workoutActive && !restActive && !appVisible && lastActivityElapsedMs > 0L && idleMs > STALE_WATCHDOG_MS) {
+                Log.w(TAG, "Stopping abandoned workout service after " + (idleMs / 1000L) + "s idle");
+                workoutActive = false;
+                stopServiceCleanly();
+                return;
+            }
+            handler.postDelayed(this, WATCHDOG_POLL_MS);
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -97,13 +121,13 @@ public class WorkoutForegroundService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        WorkoutNotif.ensureChannel(this);
         String action = intent != null ? intent.getAction() : ACTION_START_WORKOUT;
         if (action == null) action = ACTION_START_WORKOUT;
 
         switch (action) {
             case ACTION_START_WORKOUT: {
                 workoutActive = true;
+                touchActivity();
                 String t = intent != null ? intent.getStringExtra("title") : null;
                 String x = intent != null ? intent.getStringExtra("text") : null;
                 long sm = intent != null ? intent.getLongExtra("startMs", 0L) : 0L;
@@ -112,9 +136,11 @@ public class WorkoutForegroundService extends Service {
                 if (sm > 0L) workoutStartEpochMs = sm;
                 ensureWakeLock();
                 promoteForeground();
+                scheduleWatchdog();
                 break;
             }
             case ACTION_UPDATE_WORKOUT: {
+                touchActivity();
                 String t = intent != null ? intent.getStringExtra("title") : null;
                 String x = intent != null ? intent.getStringExtra("text") : null;
                 long sm = intent != null ? intent.getLongExtra("startMs", 0L) : 0L;
@@ -133,12 +159,12 @@ public class WorkoutForegroundService extends Service {
                 workoutActive = false;
                 workoutStartEpochMs = 0L;
                 if (!restActive) {
-                    stopForeground(true);
-                    stopSelf();
+                    stopServiceCleanly();
                 }
                 break;
             }
             case ACTION_REST_SET: {
+                touchActivity();
                 long remMs = intent != null ? intent.getLongExtra("remainingMs", 90_000L) : 90_000L;
                 restTotalSec = Math.max(5, intent != null ? intent.getIntExtra("totalSec", 90) : 90);
                 restLabel = intent != null && intent.getStringExtra("label") != null ? intent.getStringExtra("label") : "";
@@ -150,12 +176,14 @@ public class WorkoutForegroundService extends Service {
                 restFired = remMs <= 0L;
                 ensureWakeLock();
                 promoteForeground();
+                scheduleWatchdog();
                 scheduleRestAlarm(remMs);
                 notifySafe(WorkoutNotif.buildRest(this, restLabel, workoutText, restEndEpochMs, remMs, restFired, false));
                 syncOverlayLoop();
                 break;
             }
             case ACTION_REST_ADJUST: {
+                touchActivity();
                 int delta = intent != null ? intent.getIntExtra("deltaSec", 0) : 0;
                 if (restActive && delta != 0) adjustRest(delta, true);
                 break;
@@ -230,15 +258,45 @@ public class WorkoutForegroundService extends Service {
         }
     }
 
+    private void touchActivity() {
+        lastActivityElapsedMs = SystemClock.elapsedRealtime();
+    }
+
+    private void scheduleWatchdog() {
+        handler.removeCallbacks(watchdogRunnable);
+        if (workoutActive || restActive) {
+            handler.postDelayed(watchdogRunnable, WATCHDOG_POLL_MS);
+        }
+    }
+
+    private void stopServiceCleanly() {
+        handler.removeCallbacks(watchdogRunnable);
+        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        wakeLock = null;
+        stopForeground(true);
+        stopSelf();
+    }
+
     private void promoteForeground() {
         long rem = restEndElapsedMs - SystemClock.elapsedRealtime();
         android.app.Notification n = restActive
                 ? WorkoutNotif.buildRest(this, restLabel, workoutText, restEndEpochMs, rem, restFired, false)
                 : WorkoutNotif.build(this, workoutTitle, workoutText, workoutStartEpochMs);
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(WorkoutNotif.ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
-        } else {
-            startForeground(WorkoutNotif.ID, n);
+        try {
+            boolean hasBt = Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                    || ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                            == PackageManager.PERMISSION_GRANTED;
+            if (Build.VERSION.SDK_INT >= 29 && hasBt) {
+                startForeground(WorkoutNotif.ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+            } else {
+                startForeground(WorkoutNotif.ID, n);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "promoteForeground failed", e);
+            notifySafe(n);
+            workoutActive = false;
+            restActive = false;
+            stopSelf();
         }
     }
 
@@ -265,9 +323,11 @@ public class WorkoutForegroundService extends Service {
     public void onDestroy() {
         running = false;
         restActive = false;
+        workoutActive = false;
         WorkoutMetronome.stop();
         handler.removeCallbacks(fireRestRunnable);
         handler.removeCallbacks(overlayTickRunnable);
+        handler.removeCallbacks(watchdogRunnable);
         if (overlay != null) overlay.hide();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         wakeLock = null;

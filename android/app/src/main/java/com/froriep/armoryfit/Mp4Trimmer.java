@@ -57,14 +57,17 @@ final class Mp4Trimmer {
                 .build();
 
         EditedMediaItem editedItem = new EditedMediaItem.Builder(mediaItem).build();
+        boolean needsToneMap = isHdrOrNonH264(appCtx, srcUri, srcFile);
 
         Exception firstErr = null;
-        try {
-            runMedia3Transform(appCtx, editedItem, dstFile, true);
-            if (dstFile.exists() && dstFile.length() > 0) return;
-        } catch (Exception e) {
-            firstErr = e;
-            if (dstFile.exists()) dstFile.delete();
+        if (needsToneMap) {
+            try {
+                runMedia3Transform(appCtx, editedItem, dstFile, true);
+                if (dstFile.exists() && dstFile.length() > 0) return;
+            } catch (Exception e) {
+                firstErr = e;
+                if (dstFile.exists()) dstFile.delete();
+            }
         }
 
         try {
@@ -82,6 +85,32 @@ final class Mp4Trimmer {
         }
 
         streamCopyTrim(appCtx, srcUri, srcFile, safeStartMs, safeEndMs, dstFile);
+    }
+
+    @OptIn(markerClass = UnstableApi.class)
+    private static boolean isHdrOrNonH264(Context c, Uri srcUri, File srcFile) {
+        MediaExtractor ex = new MediaExtractor();
+        try {
+            if (srcFile != null) ex.setDataSource(srcFile.getAbsolutePath());
+            else ex.setDataSource(c, srcUri, null);
+            for (int i = 0; i < ex.getTrackCount(); i++) {
+                MediaFormat fmt = ex.getTrackFormat(i);
+                String mime = fmt.getString(MediaFormat.KEY_MIME);
+                if (mime == null || !mime.startsWith("video/")) continue;
+                if (!MimeTypes.VIDEO_H264.equalsIgnoreCase(mime)) return true;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && fmt.containsKey(MediaFormat.KEY_COLOR_TRANSFER)) {
+                    int tr = fmt.getInteger(MediaFormat.KEY_COLOR_TRANSFER);
+                    if (tr == MediaFormat.COLOR_TRANSFER_ST2084 || tr == MediaFormat.COLOR_TRANSFER_HLG) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try { ex.release(); } catch (Exception ignored) {}
+        }
+        return false;
     }
 
     @OptIn(markerClass = UnstableApi.class)
@@ -145,7 +174,14 @@ final class Mp4Trimmer {
         boolean finished = latch.await(120, TimeUnit.SECONDS);
         if (!finished) {
             Transformer tx = txRef.get();
-            if (tx != null) mainHandler.post(tx::cancel);
+            if (tx != null) {
+                CountDownLatch cancelLatch = new CountDownLatch(1);
+                mainHandler.post(() -> {
+                    try { tx.cancel(); } catch (Exception ignored) {}
+                    cancelLatch.countDown();
+                });
+                cancelLatch.await(2, TimeUnit.SECONDS);
+            }
             throw new IOException("Video trim timed out");
         }
         Exception err = errRef.get();
@@ -168,6 +204,7 @@ final class Mp4Trimmer {
         MediaExtractor extractor = new MediaExtractor();
         MediaMuxer muxer = null;
         boolean muxerStarted = false;
+        boolean loopDone = false;
         try {
             if (srcFile != null) extractor.setDataSource(srcFile.getAbsolutePath());
             else extractor.setDataSource(c, srcUri, null);
@@ -225,7 +262,16 @@ final class Mp4Trimmer {
 
             while (true) {
                 info.offset = 0;
-                int sampleSize = extractor.readSampleData(buf, 0);
+                int sampleSize;
+                while (true) {
+                    try {
+                        sampleSize = extractor.readSampleData(buf, 0);
+                        break;
+                    } catch (IllegalArgumentException tooSmall) {
+                        if (buf.capacity() >= 8 * 1024 * 1024) throw tooSmall;
+                        buf = ByteBuffer.allocate(Math.min(8 * 1024 * 1024, buf.capacity() * 2));
+                    }
+                }
                 if (sampleSize < 0) break;
 
                 int track = extractor.getSampleTrackIndex();
@@ -267,16 +313,25 @@ final class Mp4Trimmer {
             if (writtenSamples == 0) {
                 throw new IOException("No samples within trim range");
             }
+            loopDone = true;
         } finally {
+            Exception stopErr = null;
             try {
                 if (muxer != null) {
                     if (muxerStarted) {
-                        try { muxer.stop(); } catch (Exception ignored) {}
+                        try {
+                            muxer.stop();
+                        } catch (Exception e) {
+                            stopErr = e;
+                        }
                     }
                     muxer.release();
                 }
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                if (stopErr == null) stopErr = e;
+            }
             try { extractor.release(); } catch (Exception ignored) {}
+            if (loopDone && stopErr != null) throw stopErr;
         }
     }
 }
