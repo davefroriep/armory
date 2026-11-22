@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+import urllib.parse
 
 import cv2
 import numpy as np
@@ -2551,6 +2552,182 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertTrue(multi_res.get_json()["ok"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_denon_ip_control_auto_provisioner_and_safety_guards(self) -> None:
+        ha_cfg = ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15")
+        denon_cli = ha.DenonAvrClient(lambda: ha_cfg, http_get=lambda _u, _t: (200, b""), sleep_fn=lambda _s: None)
+
+        # 1. Dedicated radio form (Off in Standby -> Always On) with read-before-write + verify + cache noop
+        tmp1 = Path(tempfile.mkdtemp(prefix="denon_ipctrl_1_"))
+        try:
+            mode_state = {"val": "STANDBY"}
+            get_calls: list[str] = []
+            post_calls: list[tuple[str, bytes]] = []
+
+            def fake_get_1(url: str, _to: float) -> tuple[int, bytes]:
+                get_calls.append(url)
+                if url.endswith("/SETUP/l_menu.asp"):
+                    return 200, b'<a href="/SETUP/NETWORK/d_ipcontrol.asp">IP Control</a>'
+                if url.endswith("/SETUP/NETWORK/d_ipcontrol.asp"):
+                    chk_a = " checked" if mode_state["val"] == "ALWAYS" else ""
+                    chk_s = " checked" if mode_state["val"] == "STANDBY" else ""
+                    html_doc = (
+                        '<FORM name="ipcontrol" action="s_ipcontrol.asp" method="post">'
+                        '<INPUT type="hidden" name="tokenId" value="42">'
+                        f'<INPUT type="radio" name="radioIpControl" value="ALWAYS"{chk_a}>Always On'
+                        f'<INPUT type="radio" name="radioIpControl" value="STANDBY"{chk_s}>Off In Standby'
+                        '</FORM>'
+                    )
+                    return 200, html_doc.encode("ascii")
+                return 404, b""
+
+            def fake_post_1(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                post_calls.append((url, body))
+                parsed = urllib.parse.parse_qs(body.decode("ascii"))
+                mode_state["val"] = parsed["radioIpControl"][0]
+                return 200, b""
+
+            ctrl1 = dc.GymDisplayController(
+                denon_client=denon_cli,
+                http_get=fake_get_1,
+                http_post=fake_post_1,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+                state_dir=tmp1,
+            )
+            res1 = ctrl1.ensure_denon_ip_control_always_on()
+            self.assertTrue(res1["ok"])
+            self.assertEqual(res1["state"], "verified_always_on")
+            self.assertTrue(res1["changed"])
+            self.assertEqual(len(post_calls), 1)
+            self.assertTrue(post_calls[0][0].endswith("/SETUP/NETWORK/s_ipcontrol.asp"))
+            post_qs = urllib.parse.parse_qs(post_calls[0][1].decode("ascii"))
+            self.assertEqual(post_qs["tokenId"], ["42"])
+            self.assertEqual(post_qs["radioIpControl"], ["ALWAYS"])
+            self.assertTrue((tmp1 / "denon_ip_control_state.json").is_file())
+            self.assertTrue((tmp1 / "denon_network_dump.json").is_file())
+            self.assertEqual(ctrl1.status_dict()["denonIpControl"]["state"], "verified_always_on")
+
+            # Subsequent non-forced call is instant cached no-op (zero extra HTTP calls)
+            prev_gets = len(get_calls)
+            res1_cached = ctrl1.ensure_denon_ip_control_always_on()
+            self.assertEqual(res1_cached["state"], "verified_always_on")
+            self.assertEqual(len(get_calls), prev_gets)
+            self.assertEqual(len(post_calls), 1)
+
+            # 2. Reload controller from same state_dir when already Always On -> zero POSTs
+            post_calls.clear()
+            ctrl1_reloaded = dc.GymDisplayController(
+                denon_client=denon_cli,
+                http_get=fake_get_1,
+                http_post=fake_post_1,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+                state_dir=tmp1,
+            )
+            res_already = ctrl1_reloaded.ensure_denon_ip_control_always_on(force=True)
+            self.assertTrue(res_already["ok"])
+            self.assertEqual(res_already["state"], "verified_always_on")
+            self.assertFalse(res_already["changed"])
+            self.assertEqual(post_calls, [])
+        finally:
+            shutil.rmtree(tmp1, ignore_errors=True)
+
+        # 3. Safety Guard 1: reject combined DHCP / IP address form (zero POSTs, saves dump, needs_review)
+        tmp2 = Path(tempfile.mkdtemp(prefix="denon_ipctrl_2_"))
+        try:
+            unsafe_posts: list[str] = []
+
+            def fake_get_unsafe(url: str, _to: float) -> tuple[int, bytes]:
+                if url.endswith("/SETUP/NETWORK/d_network.asp"):
+                    html_doc = (
+                        '<FORM name="net" action="s_network.asp">'
+                        '<INPUT type="radio" name="radioDhcp" value="ON" checked>DHCP On'
+                        '<INPUT type="text" name="txtIpAddress" value="192.168.1.15">'
+                        '<INPUT type="radio" name="radioIpControl" value="ALWAYS">Always On'
+                        '<INPUT type="radio" name="radioIpControl" value="STANDBY" checked>Off In Standby'
+                        '</FORM>'
+                    )
+                    return 200, html_doc.encode("ascii")
+                return 404, b""
+
+            ctrl2 = dc.GymDisplayController(
+                denon_client=denon_cli,
+                http_get=fake_get_unsafe,
+                http_post=lambda u, _b, _h, _t: (unsafe_posts.append(u), (200, b""))[1],
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+                state_dir=tmp2,
+            )
+            res2 = ctrl2.ensure_denon_ip_control_always_on()
+            self.assertFalse(res2["ok"])
+            self.assertEqual(res2["state"], "needs_review")
+            self.assertEqual(unsafe_posts, [])
+            self.assertTrue((tmp2 / "denon_network_dump.json").is_file())
+        finally:
+            shutil.rmtree(tmp2, ignore_errors=True)
+
+        # 4. <SELECT> form variant works cleanly & 5. Unreachable Denon stays pending
+        tmp3 = Path(tempfile.mkdtemp(prefix="denon_ipctrl_3_"))
+        try:
+            sel_state = {"val": "0"}
+            sel_posts: list[bytes] = []
+
+            def fake_get_select(url: str, _to: float) -> tuple[int, bytes]:
+                if url.endswith("/SETUP/NETWORK/d_netcontrol.asp"):
+                    s0 = " selected" if sel_state["val"] == "0" else ""
+                    s1 = " selected" if sel_state["val"] == "1" else ""
+                    html_doc = (
+                        '<FORM name="nc">'
+                        '<SELECT name="listNetControl">'
+                        f'<OPTION value="0"{s0}>Off In Standby</OPTION>'
+                        f'<OPTION value="1"{s1}>Always On</OPTION>'
+                        '</SELECT></FORM>'
+                    )
+                    return 200, html_doc.encode("ascii")
+                return 404, b""
+
+            def fake_post_select(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                self.assertTrue(url.endswith("/SETUP/NETWORK/s_netcontrol.asp"))
+                sel_posts.append(body)
+                sel_state["val"] = urllib.parse.parse_qs(body.decode("ascii"))["listNetControl"][0]
+                return 200, b""
+
+            ctrl3 = dc.GymDisplayController(
+                denon_client=denon_cli,
+                http_get=fake_get_select,
+                http_post=fake_post_select,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+                state_dir=tmp3,
+            )
+            res3 = ctrl3.ensure_denon_ip_control_always_on()
+            self.assertTrue(res3["ok"])
+            self.assertEqual(res3["state"], "verified_always_on")
+            self.assertEqual(len(sel_posts), 1)
+        finally:
+            shutil.rmtree(tmp3, ignore_errors=True)
+
+        tmp4 = Path(tempfile.mkdtemp(prefix="denon_ipctrl_4_"))
+        try:
+            def fake_get_down(_url: str, _to: float) -> tuple[int, bytes]:
+                raise TimeoutError("timed out")
+
+            ctrl4 = dc.GymDisplayController(
+                denon_client=denon_cli,
+                http_get=fake_get_down,
+                http_post=lambda _u, _b, _h, _t: (200, b""),
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+                state_dir=tmp4,
+            )
+            res4 = ctrl4.ensure_denon_ip_control_always_on()
+            self.assertFalse(res4["ok"])
+            self.assertEqual(res4["state"], "pending")
+            self.assertFalse(res4.get("reachable", True))
+            self.assertEqual(ctrl4.get_denon_ip_control_state()["state"], "pending")
+        finally:
+            shutil.rmtree(tmp4, ignore_errors=True)
 
     def test_room_audio_recorder_silent_clips_and_mux_endpoints(self) -> None:
         ffmpeg = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")

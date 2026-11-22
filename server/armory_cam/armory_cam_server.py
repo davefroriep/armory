@@ -2365,6 +2365,7 @@ class ArmoryCamService:
             sleep_wallboard_fn=self._sleep_wallboard_sync,
             wol_sender=send_wol_magic_packet if self._voice_autostart else None,
             allow_network=self._voice_autostart,
+            state_dir=self.root,
         )
         self.shows = ShowDirector(
             root_dir=self.root,
@@ -2766,6 +2767,58 @@ class ArmoryCamService:
             self.room_audio.start()
             if self._voice_autostart:
                 self.voice.start()
+                denon_t = threading.Thread(
+                    target=self._denon_ip_control_watch_loop,
+                    name="denon-ip-control-watch",
+                    daemon=True,
+                )
+                denon_t.start()
+                self._worker_threads.append(denon_t)
+
+    def _denon_ip_control_watch_loop(self) -> None:
+        """One-shot watcher: when Denon comes online, verify or safely enable IP Control = Always On."""
+        if self.displays.get_denon_ip_control_state().get("state") in ("verified_always_on", "needs_review"):
+            return
+        delay_sec = 5.0
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(delay_sec):
+                return
+            delay_sec = 30.0
+            if self.displays.get_denon_ip_control_state().get("state") in ("verified_always_on", "needs_review"):
+                return
+            if not self.displays.is_denon_tcp_reachable(timeout=0.8):
+                continue
+            if self._stop_event.wait(2.0):
+                return
+            try:
+                res = self.displays.ensure_denon_ip_control_always_on()
+            except Exception as exc:
+                self.log.debug("Denon IP Control watcher error: %s", exc)
+                delay_sec = 60.0
+                continue
+            state = res.get("state")
+            if state == "verified_always_on":
+                self.log.info("Denon AVR-3313CI IP Control verified Always On: %s", res)
+                if self.ntfy_topic:
+                    send_ntfy_alert(
+                        self.ntfy_topic,
+                        "Denon IP Control Enabled",
+                        "Denon AVR-3313CI IP Control is now verified Always On. Voice 'Open the gym' can wake the Denon!",
+                        tags="white_check_mark,loud_sound",
+                    )
+                return
+            if state == "needs_review":
+                self.log.info("Denon network web pages captured for review: %s", res)
+                if self.ntfy_topic:
+                    send_ntfy_alert(
+                        self.ntfy_topic,
+                        "Denon Network Setup Captured",
+                        "Denon came online and its Network web pages were saved safely to denon_network_dump.json "
+                        "(nothing modified). Tell Antigravity to inspect it, or set Setup > Network > IP Control > Always On on the Denon remote.",
+                        tags="information_source,loud_sound",
+                    )
+                return
+            delay_sec = 60.0
 
     def stop_background(self) -> None:
         self._stop_event.set()

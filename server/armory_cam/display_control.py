@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import concurrent.futures
 from dataclasses import dataclass, field
+import html as html_lib
+import json
+from pathlib import Path
 import re
 import shlex
 import socket
@@ -283,6 +286,151 @@ def _parse_denon_video_form(html: str) -> dict[str, str]:
     return fields
 
 
+_IP_CTRL_UNSAFE_FIELD_RE = re.compile(
+    r"(?:dhcp|ipaddr|ip_addr|subnet|netmask|gateway|dns|proxy|ssid|pass|wep|wpa|macaddr)",
+    re.I,
+)
+_IP_CTRL_KEYWORD_RE = re.compile(
+    r"(?:ip\s*control|network\s*(?:control|standby)|net\s*control|ipcontrol|netcontrol|standby)",
+    re.I,
+)
+
+
+def _strip_html_label(raw: str, max_len: int = 120) -> str:
+    txt = html_lib.unescape(re.sub(r"<[^>]+>", " ", raw or ""))
+    return re.sub(r"\s+", " ", txt).strip()[:max_len]
+
+
+def find_denon_ip_control_form(html: str) -> dict[str, Any] | None:
+    """Detect a safe standalone Denon IP Control / Network Standby form without DHCP/IP fields."""
+    if not html or "<form" not in html.lower():
+        return None
+
+    for fm in re.finditer(r"<FORM\b([^>]*)>(.*?)</FORM>", html, re.I | re.S):
+        form_attrs, raw_body = fm.group(1), fm.group(2)
+        act_m = re.search(r'\baction=["\']([^"\']*)["\']|\baction=([^\s>]+)', form_attrs, re.I)
+        action_str = (act_m.group(1) if (act_m and act_m.group(1) is not None) else (act_m.group(2) if act_m else "")) or ""
+        clean_body = re.sub(r"<!--.*?-->", " ", raw_body, flags=re.S)
+
+        fields: dict[str, str] = {}
+        all_names: list[str] = []
+        text_inputs = 0
+        radios: dict[str, list[tuple[str, str, bool]]] = {}
+        selects: dict[str, list[tuple[str, str, bool]]] = {}
+
+        for im in re.finditer(r"<INPUT\b([^>]*)>", clean_body, re.I):
+            attrs = im.group(1)
+            tp_m = re.search(r'\btype=["\']?([^"\'\s>]+)', attrs, re.I)
+            nm_m = re.search(r'\bname=["\']?([^"\'\s>]+)', attrs, re.I)
+            vl_m = re.search(r'\bvalue=["\']([^"\']*)["\']', attrs, re.I) or re.search(r"\bvalue=([^\s>]+)", attrs, re.I)
+            if not nm_m:
+                continue
+            t = (tp_m.group(1) if tp_m else "text").lower()
+            if t in ("submit", "button", "reset", "image"):
+                continue
+            name = nm_m.group(1)
+            val = html_lib.unescape(vl_m.group(1)) if vl_m else ""
+            is_checked = bool(re.search(r"\bchecked\b", attrs, re.I))
+            all_names.append(name)
+            if t == "text":
+                text_inputs += 1
+            if t in ("hidden", "text"):
+                fields[name] = val
+            elif t == "checkbox":
+                if is_checked:
+                    fields[name] = val or "on"
+            elif t == "radio":
+                if is_checked:
+                    fields[name] = val
+                tail = clean_body[im.end():]
+                stop_m = re.search(r"<(?:input|select)\b|</(?:tr|p|li|form)\b", tail, re.I)
+                snippet = tail[: stop_m.start()] if stop_m else tail[:240]
+                radios.setdefault(name, []).append((val, _strip_html_label(snippet), is_checked))
+
+        for sm in re.finditer(r"<SELECT\b([^>]*)>(.*?)</SELECT>", clean_body, re.I | re.S):
+            s_attrs, s_body = sm.group(1), sm.group(2)
+            nm_m = re.search(r'\bname=["\']?([^"\'\s>]+)', s_attrs, re.I)
+            if not nm_m:
+                continue
+            name = nm_m.group(1)
+            all_names.append(name)
+            opts: list[tuple[str, str, bool]] = []
+            for om in re.finditer(r"<OPTION\b([^>]*)>(.*?)(?=<OPTION\b|$)", s_body, re.I | re.S):
+                o_attrs, o_raw_txt = om.group(1), om.group(2)
+                lbl = _strip_html_label(o_raw_txt)
+                vl_m = re.search(r'\bvalue=["\']([^"\']*)["\']', o_attrs, re.I) or re.search(r"\bvalue=([^\s>]+)", o_attrs, re.I)
+                val = html_lib.unescape(vl_m.group(1)) if vl_m else lbl
+                is_sel = bool(re.search(r"\bselected\b", o_attrs, re.I))
+                if is_sel:
+                    fields[name] = val
+                opts.append((val, lbl, is_sel))
+            if opts:
+                if name not in fields:
+                    fields[name] = opts[0][0]
+                selects[name] = opts
+
+        # Safety Guard 1: never submit a form with IP/DHCP/Wi-Fi settings or IPv4 octets
+        if text_inputs >= 4 or any(_IP_CTRL_UNSAFE_FIELD_RE.search(nm) for nm in all_names):
+            continue
+
+        # Safety Guard 2: require IP/Network Control context and distinct Always On / Standby Off pair
+        form_text = _strip_html_label(clean_body, max_len=4000)
+        form_has_kw = bool(_IP_CTRL_KEYWORD_RE.search(form_text))
+        candidates = sorted(
+            [*radios.items(), *selects.items()],
+            key=lambda kv: (0 if _IP_CTRL_KEYWORD_RE.search(kv[0]) else 1),
+        )
+        for ctrl_name, options in candidates:
+            if not (form_has_kw or _IP_CTRL_KEYWORD_RE.search(ctrl_name)):
+                continue
+            always_on_val: str | None = None
+            for val, lbl, _cur in options:
+                if (
+                    re.search(r"\balways\s*_?\s*on\b", lbl, re.I)
+                    or re.search(r"\balways\s*_?\s*on\b", val, re.I)
+                    or val.strip().upper() in ("ALWAYS", "ALWAYS_ON", "ALWAYSON")
+                ):
+                    always_on_val = val
+                    break
+            if always_on_val is None and any(
+                re.search(r"off\s*in\s*standby|\bstandby\b", lbl, re.I) or re.search(r"standby", val, re.I)
+                for val, lbl, _cur in options
+            ):
+                for val, lbl, _cur in options:
+                    if re.match(r"^on$", lbl.strip(), re.I) or val.strip().upper() == "ON":
+                        always_on_val = val
+                        break
+            if always_on_val is None:
+                continue
+
+            standby_off_val: str | None = None
+            for val, lbl, _cur in options:
+                if val == always_on_val:
+                    continue
+                if re.search(r"standby|\boff\b", lbl, re.I) or re.search(r"standby|\boff\b", val, re.I):
+                    standby_off_val = val
+                    break
+            if standby_off_val is None:
+                continue
+
+            current_val = fields.get(ctrl_name, "")
+            if not current_val:
+                for val, _lbl, is_cur in options:
+                    if is_cur:
+                        current_val = val
+                        break
+            return {
+                "action": action_str,
+                "fieldName": ctrl_name,
+                "alwaysOnValue": always_on_val,
+                "standbyOffValue": standby_off_val,
+                "currentValue": current_val,
+                "alreadyAlwaysOn": current_val == always_on_val,
+                "fields": fields,
+            }
+    return None
+
+
 def parse_roku_device_info(xml_text: str) -> dict[str, Any]:
     """Parse Roku ECP `/query/device-info` XML into structured metadata."""
     text = (xml_text or "").strip()
@@ -530,6 +678,7 @@ class GymDisplayController:
         http_post: Callable[[str, bytes, dict[str, str] | None, float], tuple[int, bytes]] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         allow_network: bool = True,
+        state_dir: Path | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self.cfg = config or GymDisplaysConfig()
@@ -545,6 +694,292 @@ class GymDisplayController:
         self.last_primary_probe: dict[str, Any] = {}
         self.last_cube_probe: dict[str, Any] = {}
         self.last_spin_info: dict[str, Any] = {}
+        self._state_dir = Path(state_dir) if state_dir is not None else None
+        self._ip_ctrl_state_path = (self._state_dir / "denon_ip_control_state.json") if self._state_dir else None
+        self._ip_ctrl_dump_path = (self._state_dir / "denon_network_dump.json") if self._state_dir else None
+        self._denon_ip_ctrl_state: dict[str, Any] = self._load_denon_ip_control_state()
+
+    def _load_denon_ip_control_state(self) -> dict[str, Any]:
+        if self._ip_ctrl_state_path is not None and self._ip_ctrl_state_path.is_file():
+            try:
+                raw = json.loads(self._ip_ctrl_state_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict) and raw.get("state"):
+                    return raw
+            except Exception:
+                pass
+        return {"state": "pending"}
+
+    def get_denon_ip_control_state(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._denon_ip_ctrl_state)
+
+    def _save_denon_ip_control_state(self, data: dict[str, Any]) -> None:
+        snap = dict(data)
+        with self._lock:
+            self._denon_ip_ctrl_state = snap
+            path = self._ip_ctrl_state_path
+        if path is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(snap, indent=2), encoding="utf-8")
+            tmp.replace(path)
+
+    def _save_denon_network_dump(self, captured_pages: dict[str, str]) -> None:
+        if self._ip_ctrl_dump_path is None or not captured_pages:
+            return
+        payload = {
+            "savedAtMs": int(time.time() * 1000),
+            "pages": captured_pages,
+        }
+        self._ip_ctrl_dump_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._ip_ctrl_dump_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self._ip_ctrl_dump_path)
+
+    def is_denon_tcp_reachable(self, timeout: float = 0.8) -> bool:
+        """Fast TCP check to see whether the Denon AVR web interface is currently awake."""
+        if self.denon is None:
+            return False
+        dcfg = self.denon._get_cfg()
+        if not getattr(dcfg, "denon_enabled", False):
+            return False
+        raw_host = str(getattr(dcfg, "denon_host", "") or "").strip()
+        if not raw_host:
+            return False
+        if self._http_get is not None:
+            return True
+        if not self._allow_network:
+            return False
+        port = int(getattr(dcfg, "denon_port", 80) or 80)
+        host = raw_host
+        if ":" in raw_host and not raw_host.startswith("["):
+            h_part, _, p_part = raw_host.rpartition(":")
+            if p_part.isdigit():
+                host = h_part
+                port = int(p_part)
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    def ensure_denon_ip_control_always_on(self, *, force: bool = False) -> dict[str, Any]:
+        """Crawl Denon `/SETUP/NETWORK/`, verify or set IP Control = Always On, else safely dump HTML."""
+        if not force:
+            cur = self.get_denon_ip_control_state()
+            if cur.get("state") == "verified_always_on":
+                return {**cur, "ok": True}
+
+        if self.denon is None:
+            return {"ok": False, "state": "pending", "error": "Denon client unavailable"}
+        dcfg = self.denon._get_cfg()
+        base = self.denon._base_url(dcfg)
+        if not getattr(dcfg, "denon_enabled", False) or not base:
+            return {"ok": False, "state": "pending", "error": "Denon disabled or unconfigured"}
+
+        base_netloc = urllib.parse.urlparse(base).netloc.lower()
+        seed_paths = (
+            "/SETUP/NETWORK/IPCONTROL/d_ipcontrol.asp",
+            "/SETUP/NETWORK/d_ipcontrol.asp",
+            "/SETUP/NETWORK/NETCONTROL/d_netcontrol.asp",
+            "/SETUP/NETWORK/d_netcontrol.asp",
+            "/SETUP/NETWORK/d_network.asp",
+            "/SETUP/NETWORK/f_network.asp",
+            "/SETUP/NETWORK/l_network.asp",
+            "/SETUP/l_menu.asp",
+            "/SETUP/l_setup.asp",
+            "/SETUP/f_setup.asp",
+        )
+        queue: list[str] = [urllib.parse.urljoin(base + "/", p) for p in seed_paths]
+        seen: set[str] = set()
+        captured_pages: dict[str, str] = {}
+        reachable_any = False
+
+        while queue and len(seen) < 20:
+            url = queue.pop(0)
+            if url in seen:
+                continue
+            seen.add(url)
+            try:
+                code, raw = self._do_get(url, 3.0)
+            except Exception:
+                continue
+            if code < 500:
+                reachable_any = True
+            if not (200 <= code < 300):
+                continue
+            html_txt = raw.decode("utf-8", errors="ignore")
+            path_key = urllib.parse.urlparse(url).path or url
+            captured_pages[path_key] = html_txt[:32000]
+
+            for link_m in re.finditer(
+                r'(?:href|src)\s*=\s*["\']([^"\']+)["\']|["\']([^"\']*\.(?:asp|html?)(?:\?[^"\']*)?)["\']',
+                html_txt,
+                re.I,
+            ):
+                cand = (link_m.group(1) or link_m.group(2) or "").strip()
+                if not cand or cand.startswith(("#", "javascript:", "mailto:")):
+                    continue
+                joined = urllib.parse.urljoin(url, cand).split("#", 1)[0]
+                parsed_j = urllib.parse.urlparse(joined)
+                if parsed_j.netloc.lower() != base_netloc or joined in seen:
+                    continue
+                upper_p = parsed_j.path.upper()
+                fname_low = parsed_j.path.rsplit("/", 1)[-1].lower()
+                if fname_low.startswith("s_"):
+                    continue
+                if (
+                    any(tok in upper_p for tok in ("NETWORK", "IPCONTROL", "NETCONTROL", "STANDBY"))
+                    or upper_p.startswith(("/SETUP/L_", "/SETUP/F_"))
+                ):
+                    queue.append(joined)
+
+        if not reachable_any:
+            return {
+                "ok": False,
+                "state": "pending",
+                "reachable": False,
+                "error": "Denon unreachable (in standby)",
+            }
+
+        self._save_denon_network_dump(captured_pages)
+
+        for path_key, page_html in captured_pages.items():
+            page_url = urllib.parse.urljoin(base + "/", path_key)
+            match = find_denon_ip_control_form(page_html)
+            if not match:
+                continue
+
+            if match["alreadyAlwaysOn"]:
+                res = {
+                    "ok": True,
+                    "state": "verified_always_on",
+                    "changed": False,
+                    "page": page_url,
+                    "field": match["fieldName"],
+                    "value": match["alwaysOnValue"],
+                    "updatedAtMs": int(time.time() * 1000),
+                }
+                self._save_denon_ip_control_state(res)
+                return res
+
+            action_rel = str(match.get("action") or "").strip()
+            if action_rel:
+                post_url = urllib.parse.urljoin(page_url, action_rel)
+            else:
+                parsed_p = urllib.parse.urlparse(page_url)
+                parts = parsed_p.path.rsplit("/", 1)
+                fname = parts[-1]
+                if not fname.lower().startswith("d_"):
+                    res = {
+                        "ok": False,
+                        "state": "needs_review",
+                        "changed": False,
+                        "page": page_url,
+                        "dumpPath": str(self._ip_ctrl_dump_path or ""),
+                        "error": f"No safe POST target for {path_key}",
+                        "updatedAtMs": int(time.time() * 1000),
+                    }
+                    self._save_denon_ip_control_state(res)
+                    return res
+                new_fname = ("s_" if fname.startswith("d_") else "S_") + fname[2:]
+                new_path = f"{parts[0]}/{new_fname}" if len(parts) == 2 else new_fname
+                post_url = urllib.parse.urlunparse(parsed_p._replace(path=new_path))
+
+            post_fields = dict(match["fields"])
+            post_fields[match["fieldName"]] = match["alwaysOnValue"]
+            encoded = urllib.parse.urlencode(post_fields).encode("ascii")
+            try:
+                pcode, _ = self._do_post(
+                    post_url,
+                    encoded,
+                    {"Content-Type": "application/x-www-form-urlencoded"},
+                    3.5,
+                )
+            except Exception as exc:
+                res = {
+                    "ok": False,
+                    "state": "needs_review",
+                    "changed": False,
+                    "page": page_url,
+                    "postUrl": post_url,
+                    "dumpPath": str(self._ip_ctrl_dump_path or ""),
+                    "error": f"Denon POST failed: {exc}",
+                    "updatedAtMs": int(time.time() * 1000),
+                }
+                self._save_denon_ip_control_state(res)
+                return res
+
+            if pcode >= 400:
+                res = {
+                    "ok": False,
+                    "state": "needs_review",
+                    "changed": False,
+                    "page": page_url,
+                    "postUrl": post_url,
+                    "dumpPath": str(self._ip_ctrl_dump_path or ""),
+                    "error": f"Denon POST returned HTTP {pcode}",
+                    "updatedAtMs": int(time.time() * 1000),
+                }
+                self._save_denon_ip_control_state(res)
+                return res
+
+            self._sleep(1.0)
+            try:
+                vcode, vraw = self._do_get(page_url, 3.0)
+            except Exception as exc:
+                res = {
+                    "ok": False,
+                    "state": "needs_review",
+                    "changed": False,
+                    "page": page_url,
+                    "postUrl": post_url,
+                    "dumpPath": str(self._ip_ctrl_dump_path or ""),
+                    "error": f"Denon verify GET failed: {exc}",
+                    "updatedAtMs": int(time.time() * 1000),
+                }
+                self._save_denon_ip_control_state(res)
+                return res
+
+            v_match = find_denon_ip_control_form(vraw.decode("utf-8", errors="ignore")) if vcode < 400 else None
+            if v_match and v_match["alreadyAlwaysOn"]:
+                res = {
+                    "ok": True,
+                    "state": "verified_always_on",
+                    "changed": True,
+                    "page": page_url,
+                    "postUrl": post_url,
+                    "field": v_match["fieldName"],
+                    "value": v_match["alwaysOnValue"],
+                    "updatedAtMs": int(time.time() * 1000),
+                }
+                self._save_denon_ip_control_state(res)
+                return res
+
+            res = {
+                "ok": False,
+                "state": "needs_review",
+                "changed": False,
+                "page": page_url,
+                "postUrl": post_url,
+                "dumpPath": str(self._ip_ctrl_dump_path or ""),
+                "error": "POST succeeded but re-read did not confirm Always On",
+                "updatedAtMs": int(time.time() * 1000),
+            }
+            self._save_denon_ip_control_state(res)
+            return res
+
+        res = {
+            "ok": False,
+            "state": "needs_review",
+            "changed": False,
+            "capturedPages": sorted(captured_pages.keys()),
+            "dumpPath": str(self._ip_ctrl_dump_path or ""),
+            "message": "Denon web pages captured; no safe standalone IP Control form matched (zero settings modified)",
+            "updatedAtMs": int(time.time() * 1000),
+        }
+        self._save_denon_ip_control_state(res)
+        return res
 
     def get_config(self) -> GymDisplaysConfig:
         with self._lock:
@@ -1208,6 +1643,8 @@ class GymDisplayController:
             return {**self.set_denon_monitor_out("1"), "target": "avr", "action": "monitor1"}
         if action == "monitor_auto":
             return {**self.set_denon_monitor_out("AUTO"), "target": "avr", "action": "monitor_auto"}
+        if action == "ip_control_on":
+            return {**self.ensure_denon_ip_control_always_on(force=True), "target": "avr", "action": "ip_control_on"}
         return {"ok": False, "target": "avr", "action": action, "error": f"Unsupported AVR action: {action}"}
 
     def execute_many(self, targets: Sequence[str], action: str, *, skip_unconfigured_spin: bool = False) -> dict[str, Any]:
@@ -1364,4 +1801,5 @@ class GymDisplayController:
                 "probe": self.last_cube_probe,
             },
             "spin": spin_info,
+            "denonIpControl": self.get_denon_ip_control_state(),
         }
