@@ -3070,6 +3070,36 @@ class ArmoryCamTests(unittest.TestCase):
         self.assertGreater(adb.pending_sleep_at_ms or 0, now_ms)
         self.assertEqual(adb._sleep_retry_count, 1)
 
+    def test_run_server_preserves_none_root_dir(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_run_srv_"))
+        orig_sys_hook = sys.excepthook
+        orig_thr_hook = threading.excepthook
+        try:
+            fake_svc = mock.MagicMock()
+            fake_svc.port = 8766
+            fake_svc.root = tmp
+            fake_svc.ffmpeg = "ffmpeg"
+            fake_srv = mock.MagicMock()
+            with (
+                mock.patch.object(ac, "default_root_dir", return_value=tmp),
+                mock.patch.object(ac.logging.handlers, "RotatingFileHandler", return_value=mock.MagicMock()),
+                mock.patch.object(ac.logging, "basicConfig"),
+                mock.patch.object(ac, "ArmoryCamService", return_value=fake_svc) as m_svc,
+                mock.patch.object(ac, "create_app", return_value=mock.MagicMock()),
+                mock.patch.object(ac, "make_server", return_value=fake_srv),
+            ):
+                ac.run_server(root_dir=None)
+            m_svc.assert_called_once_with(root_dir=None)
+            fake_svc.start_background.assert_called_once()
+            fake_srv.serve_forever.assert_called_once()
+            fake_svc.stop_background.assert_called_once()
+        finally:
+            sys.excepthook = orig_sys_hook
+            threading.excepthook = orig_thr_hook
+            for h in list(ac.logging.getLogger().handlers):
+                h.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class ShowDirectorTests(unittest.TestCase):
     def test_voice_triggers_prompt_and_local_interception(self) -> None:

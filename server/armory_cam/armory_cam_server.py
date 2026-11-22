@@ -13192,7 +13192,7 @@ def run_server(root_dir: Path | None = None, port_override: int | None = None) -
     sys.excepthook = _log_sys_exc
     threading.excepthook = _log_thread_exc
 
-    svc = ArmoryCamService(root_dir=eff_root)
+    svc = ArmoryCamService(root_dir=root_dir)
     port = port_override or svc.port
     app = create_app(svc)
     svc.start_background()
