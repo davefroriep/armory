@@ -399,6 +399,31 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertIsNotNone(res_idle)
             self.assertTrue(any("KEYCODE_SLEEP" in " ".join(c) for c in cmds))
             self.assertFalse(adb.tv_awake_requested)
+            self.assertEqual(adb.last_wake_ms, 0)
+
+            # 8. Regression: stale earlier workout must NOT sleep a fresh wake/open_gym after 2s
+            cmds.clear()
+            svc.wallboard.update_state({"mode": "lift", "title": "Old Workout"}, workout_active=True)
+            with svc.wallboard.cond:
+                svc.wallboard.last_active_push_ms = now_ms - 700_000
+            svc.voice.set_wallboard_active(True)
+            wake_open = svc._wake_wallboard_sync(force=True)
+            self.assertTrue(wake_open["ok"])
+            self.assertTrue(adb.tv_awake_requested)
+            self.assertFalse(svc.wallboard.workout_active)
+            self.assertEqual(svc.wallboard.mode, "standby")
+            self.assertEqual(svc.wallboard.last_active_push_ms, 0)
+            self.assertFalse(svc.voice.wallboard_active)
+            # Even if workout_active were True with stale push, check_timers respects fresh last_wake_ms
+            adb.last_wake_ms = now_ms
+            res_after_wake = adb.check_timers(
+                svc.wallboard_cfg,
+                last_active_push_ms=now_ms - 700_000,
+                workout_active=True,
+                now_ms=now_ms + 2_000,
+            )
+            self.assertIsNone(res_after_wake)
+            self.assertTrue(adb.tv_awake_requested)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -2271,7 +2296,7 @@ class ArmoryCamTests(unittest.TestCase):
         for phrase in ("Armory 225 for 8", "Armory check", "Armory skip rest", "Armory replay", "Armory add 10 pounds"):
             self.assertIsNone(dc.parse_display_voice_command(phrase), msg=phrase)
 
-        self.assertEqual(dc.parse_display_voice_command("Armory, open the gym"), {"target": "open_gym", "targets": ["open_gym"], "action": "run", "speech": "Opening the gym"})
+        self.assertEqual(dc.parse_display_voice_command("Armory, open the gym"), {"target": "open_gym", "targets": ["open_gym"], "action": "run", "speech": "", "silent": True})
         self.assertEqual(dc.parse_display_voice_command("Armory, close the gym"), {"target": "close_gym", "targets": ["close_gym"], "action": "run", "speech": "", "silent": True})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV"), {"target": "tv", "targets": ["tv"], "action": "on", "speech": "TV on"})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on SmartSpin TV"), {"target": "spin", "targets": ["spin"], "action": "on", "speech": "SmartSpin TV on"})
@@ -2482,6 +2507,7 @@ class ArmoryCamTests(unittest.TestCase):
 
             dash = client.get("/").get_data(as_text=True)
             self.assertIn("Gym Displays &amp; Discrete Power Control", dash)
+            self.assertIn("vxRoomCmdReadback", dash)
             self.assertIn("dpPrimHost", dash)
             self.assertIn("dpSpinHost", dash)
             self.assertIn("dpMusicUrl", dash)
@@ -2499,13 +2525,29 @@ class ArmoryCamTests(unittest.TestCase):
             self.assertTrue(disp_evt["localHandled"])
             self.assertIn("SmartSpin TV on", disp_evt["ackText"])
 
-            # Close gym handled locally, silently (zero TTS confirmation)
+            # Open gym & Close gym handled locally, silently (zero TTS confirmation)
             spoken_msgs.clear()
             svc.voice.set_context(active=True, readback=True)
+            open_evt = svc.voice.inject_transcript("Armory, open the gym")
+            self.assertTrue(open_evt["localHandled"])
+            self.assertIn("Gym opened", open_evt["ackText"])
+            self.assertEqual(spoken_msgs, [])
+
             close_evt = svc.voice.inject_transcript("Armory, close the gym")
             self.assertTrue(close_evt["localHandled"])
             self.assertEqual(close_evt["ackText"], "✓ Gym closed")
             self.assertEqual(spoken_msgs, [])
+
+            # roomCommandReadback=False silences room/TV voice replies while workout readback stays enabled
+            cfg_rc = client.post("/api/voice/config", json={"roomCommandReadback": False})
+            self.assertEqual(cfg_rc.status_code, 200)
+            self.assertFalse(cfg_rc.get_json()["config"]["roomCommandReadback"])
+            self.assertFalse(client.get("/api/voice/status").get_json()["roomCommandReadback"])
+            spoken_msgs.clear()
+            quiet_tv = svc.voice.inject_transcript("Armory, turn on SmartSpin TV")
+            self.assertTrue(quiet_tv["localHandled"])
+            self.assertEqual(spoken_msgs, [])
+            client.post("/api/voice/config", json={"roomCommandReadback": True})
 
             # Compound voice command handled locally
             wb_calls.clear()

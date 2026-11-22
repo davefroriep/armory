@@ -2164,6 +2164,7 @@ class FireTvAdbController:
                     self.pending_sleep_at_ms = None
                     self.pending_sleep_reason = ""
                     self.tv_awake_requested = False
+                    self.last_wake_ms = 0
                     self._sleep_retry_count = 0
                     self.adb_state = "unconfigured"
                     self.last_action = f"sleep skipped ({reason or 'unconfigured'})"
@@ -2190,6 +2191,7 @@ class FireTvAdbController:
                         self.pending_sleep_at_ms = None
                         self.pending_sleep_reason = ""
                         self.tv_awake_requested = False
+                        self.last_wake_ms = 0
                         self._sleep_retry_count = 0
                 return {"ok": False, "configured": True, "state": st, "serial": ser, "message": msg}
             try:
@@ -2210,6 +2212,7 @@ class FireTvAdbController:
                 self.pending_sleep_at_ms = None
                 self.pending_sleep_reason = ""
                 self.tv_awake_requested = False
+                self.last_wake_ms = 0
                 self._sleep_retry_count = 0
                 self.adb_state = "asleep"
                 self.last_action = f"sleep ({reason or 'manual'})"
@@ -2242,9 +2245,10 @@ class FireTvAdbController:
                     self.pending_sleep_reason = ""
             elif (
                 self.tv_awake_requested
+                and workout_active
                 and cfg.idle_sleep_sec > 0
                 and last_active_push_ms > 0
-                and (cur_ms - last_active_push_ms) >= cfg.idle_sleep_sec * 1000
+                and (cur_ms - max(last_active_push_ms, self.last_wake_ms)) >= cfg.idle_sleep_sec * 1000
             ):
                 reason_to_sleep = "idle_timeout"
         if reason_to_sleep:
@@ -2450,6 +2454,23 @@ class WallboardRelay:
             self.last_active_push_ms = now_ms
             if source_url and source_url.strip():
                 self.source_url = source_url.strip().rstrip("/")
+
+    def clear_stale_active(self, idle_sleep_sec: int, now_ms: int | None = None) -> bool:
+        cur_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        stale_ms = max(60, int(idle_sleep_sec or DEFAULT_IDLE_SLEEP_SEC)) * 1000
+        with self.cond:
+            if not self.workout_active:
+                return False
+            if self.last_active_push_ms > 0 and (cur_ms - self.last_active_push_ms) < stale_ms:
+                return False
+            standby_payload = self.standby_state_dict(cur_ms)
+            self.latest_json = json.dumps(standby_payload, separators=(",", ":")).replace("\r", " ").replace("\n", " ")
+            self.workout_active = False
+            self.mode = "standby"
+            self.last_active_push_ms = 0
+            self.seq += 1
+            self.cond.notify_all()
+            return True
 
     def status_dict(self) -> dict[str, Any]:
         with self.cond:
@@ -3333,7 +3354,10 @@ class ArmoryCamService:
                 with self.wallboard.cond:
                     last_active_ms = self.wallboard.last_active_push_ms
                     workout_active = self.wallboard.workout_active
-                self.adb.check_timers(wb_cfg, last_active_ms, workout_active)
+                res = self.adb.check_timers(wb_cfg, last_active_ms, workout_active)
+                if isinstance(res, dict) and res.get("ok") and not res.get("skipped"):
+                    if self.wallboard.clear_stale_active(wb_cfg.idle_sleep_sec):
+                        self.voice.set_wallboard_active(False)
             except Exception as exc:
                 self.log.debug("ADB timer loop error: %s", exc)
             self._stop_event.wait(2.0)
@@ -5926,6 +5950,8 @@ class ArmoryCamService:
         with self.lock:
             cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
             url = self.effective_wallboard_url()
+        if self.wallboard.clear_stale_active(cfg.idle_sleep_sec):
+            self.voice.set_wallboard_active(False)
         return self.adb.wake_and_launch(cfg, url, force=force)
 
     def _sleep_wallboard_sync(self) -> dict[str, Any]:
@@ -7112,6 +7138,13 @@ DASHBOARD_HTML = """<!doctype html>
               <select id="vxSetCommitMode">
                 <option value="voice">Voice (+10% Speed — Default)</option>
                 <option value="chime">Commit Chime Only (Fast Bing)</option>
+              </select>
+            </div>
+            <div>
+              <label>Room / Gym Command Voice Reply</label>
+              <select id="vxRoomCmdReadback">
+                <option value="1">Yes (TVs, Lights, Music)</option>
+                <option value="0">No (Silent — Workout Readback Only)</option>
               </select>
             </div>
             <div>
@@ -9097,6 +9130,7 @@ async function saveVoiceConfig(triggerBtn) {
     listenMode: $('vxMode').value || 'workout',
     deviceMatch: $('vxDevice').value || 'PowerConf S330',
     speakerReadback: $('vxReadback').value === '1',
+    roomCommandReadback: $('vxRoomCmdReadback') ? ($('vxRoomCmdReadback').value === '1') : true,
     setCommitMode: $('vxSetCommitMode').value || 'voice',
     ttsVoice: $('vxTtsVoice').value || 'kokoro:am_michael',
     modelSize: $('vxModel').value || 'base.en',
@@ -9585,6 +9619,7 @@ async function init() {
   $('vxEnabled').value = vx.enabled === false ? '0' : '1';
   $('vxMode').value = vx.listenMode === 'always' ? 'always' : 'workout';
   $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
+  if ($('vxRoomCmdReadback')) $('vxRoomCmdReadback').value = vx.roomCommandReadback === false ? '0' : '1';
   $('vxSetCommitMode').value = vx.setCommitMode === 'chime' ? 'chime' : 'voice';
   $('vxTtsVoice').value = vx.ttsVoice || 'kokoro:am_michael';
   $('vxModel').value = vx.modelSize || 'base.en';

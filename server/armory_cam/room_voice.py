@@ -292,6 +292,7 @@ class RoomVoiceConfig:
     model_size: str = "base.en"   # empirically benchmarked <= 1.2s on i7-4790
     wake_word: str = "armory"
     speaker_readback: bool = True
+    room_command_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
     set_commit_mode: str = "voice"  # "voice" | "chime"
     vad_threshold: float = 0.42
@@ -309,6 +310,7 @@ class RoomVoiceConfig:
             "modelSize": self.model_size,
             "wakeWord": self.wake_word,
             "speakerReadback": bool(self.speaker_readback),
+            "roomCommandReadback": bool(self.room_command_readback),
             "ttsVoice": self.tts_voice,
             "setCommitMode": self.set_commit_mode,
             "vadThreshold": round(float(self.vad_threshold), 2),
@@ -340,6 +342,7 @@ class RoomVoiceConfig:
             model_size=model_size,
             wake_word=wake,
             speaker_readback=bool(raw.get("speakerReadback", True)),
+            room_command_readback=bool(raw.get("roomCommandReadback", True)),
             tts_voice=tts_voice,
             set_commit_mode=set_commit_mode,
             vad_threshold=_clamp(float(raw.get("vadThreshold", 0.42) or 0.42), 0.15, 0.90),
@@ -1928,6 +1931,7 @@ class RoomVoiceService:
                 "hostApi": self._stream_host_api or (in_dev["hostApi"] if in_dev else ""),
                 "speaker": out_dev["name"] if out_dev else self.cfg.speaker_match,
                 "speakerReadback": bool(self.cfg.speaker_readback),
+                "roomCommandReadback": bool(self.cfg.room_command_readback),
                 "ttsVoice": self.cfg.tts_voice,
                 "ttsDevice": getattr(self._tts, "kokoro_device", ""),
                 "setCommitMode": self.cfg.set_commit_mode,
@@ -1984,7 +1988,7 @@ class RoomVoiceService:
                     "ackText": ack_txt,
                 }
                 self.recent_transcripts.appendleft(entry)
-                do_readback = bool(self.cfg.speaker_readback and self.context_readback)
+                do_readback = bool(self.cfg.speaker_readback and self.context_readback and self.cfg.room_command_readback)
             if do_readback and speech_txt:
                 self.speak_confirmation(speech_txt)
             return entry
