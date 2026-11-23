@@ -6199,8 +6199,28 @@ DASHBOARD_HTML = """<!doctype html>
   .mbar-th{position:absolute;top:0;bottom:0;width:2px;background:var(--amber)}
   label{display:block;font-size:12px;color:var(--mut);margin:8px 0 4px}
   input[type=text],input[type=password],input[type=number],select,textarea{width:100%;padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:#0c1118;color:var(--fg);font:inherit}
-  .show-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px;margin-top:10px}
+  .show-grid{display:flex;flex-direction:column;gap:8px;margin-top:8px}
   .show-item{background:#0c1118;border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px}
+  .show-acc{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .show-acc[open]{border-color:rgba(46,160,255,.45)}
+  .card.show-acc,.dev-drop-box.show-acc,.show-item.show-acc{padding:0;gap:0}
+  .dev-drop-box.show-acc{margin-bottom:14px}
+  .show-acc>summary.show-acc-sum{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;cursor:pointer;user-select:none;flex-wrap:wrap}
+  .show-acc>summary.show-acc-sum::-webkit-details-marker{display:none}
+  .show-acc>summary.show-acc-sum:hover{background:rgba(255,255,255,.03)}
+  .show-acc-left{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}
+  .show-chev{display:inline-flex;align-items:center;justify-content:center;width:16px;color:var(--mut);font-size:12px;transition:transform .14s ease;flex-shrink:0}
+  .show-acc[open]>summary .show-chev{transform:rotate(90deg);color:var(--blue)}
+  .show-acc-title{font-weight:900;font-size:14px;line-height:1.25}
+  .show-acc-sub{font-size:11px;color:var(--mut);line-height:1.35}
+  .show-acc-acts{display:inline-flex;align-items:center;gap:6px;flex-shrink:0;flex-wrap:wrap}
+  .show-acc-body{padding:10px 12px 12px;border-top:1px solid rgba(255,255,255,.07);display:flex;flex-direction:column;gap:10px}
+  .sh-sub{background:#090d14;border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:0;overflow:hidden}
+  .sh-sub>summary{list-style:none;padding:7px 10px;cursor:pointer;font-size:12px;font-weight:800;color:#9cc7f5;user-select:none;display:flex;align-items:center;gap:6px}
+  .sh-sub>summary::-webkit-details-marker{display:none}
+  .sh-sub>summary:hover{background:rgba(255,255,255,.03)}
+  .sh-sub[open]>summary{border-bottom:1px solid rgba(255,255,255,.06)}
+  .sh-sub-body{padding:8px 10px 10px;display:flex;flex-direction:column;gap:8px}
   .show-head{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap}
   .show-trigs{font-size:11px;color:var(--mut);line-height:1.5}
   .show-audio{width:100%;height:34px;border-radius:8px;background:#131a22}
@@ -6221,7 +6241,7 @@ DASHBOARD_HTML = """<!doctype html>
   .dev-caption{text-align:center;font-weight:900;font-size:15px;color:#f8fafc;background:rgba(0,0,0,.62);border:1px solid rgba(255,255,255,.15);padding:8px 12px;border-radius:8px;z-index:2}
   .dev-log{font:11px/1.4 ui-monospace,Consolas,monospace;color:#7cc4ff;max-height:74px;overflow:auto;background:rgba(0,0,0,.45);padding:6px 8px;border-radius:6px;z-index:2}
   .tag-bar{display:flex;flex-wrap:wrap;gap:5px;align-items:center;margin-top:6px}
-  .tag-chip{background:#16202c;border:1px solid #2b3d54;color:#9cc7f5;border-radius:7px;padding:3px 8px;font:700 11px/1.3 ui-monospace,Consolas,monospace;cursor:pointer}
+  .tag-chip{background:#16202c;border:1px solid #2b3d54;color:#9cc7f5;border-radius:7px;padding:4px 9px;font:700 11px/1.3 ui-monospace,Consolas,monospace;cursor:pointer}
   .tag-chip:hover{background:#1d2b3c;border-color:#7cc4ff;color:#fff}
   .cue-list{display:flex;flex-direction:column;gap:8px;margin-top:6px}
   .cue-row{background:#0e151f;border:1px solid #213044;border-radius:9px;padding:8px;display:flex;flex-direction:column;gap:6px}
@@ -6287,6 +6307,8 @@ DASHBOARD_HTML = """<!doctype html>
     .topbar{position:static;padding:10px 14px}
     .page-wrap{padding:14px 14px 32px}
     .ov-split{grid-template-columns:1fr}
+    .show-acc>summary.show-acc-sum{padding:9px 10px}
+    .tag-chip{padding:6px 9px;font-size:11.5px}
   }
 </style>
 </head>
@@ -6454,7 +6476,7 @@ DASHBOARD_HTML = """<!doctype html>
             <h2><span>Shortcuts &amp; Tools</span></h2>
             <div class="ctrl-row" style="margin-top:0">
               <button class="btn sec" type="button" onclick="navigatePage('cameras'); $('openEditorTop') && $('openEditorTop').click()">⤢ Full-Screen Crop &amp; Mask</button>
-              <button class="btn sec" type="button" onclick="navigatePage('shows')">🎬 Ryder Intro Simulator</button>
+              <button class="btn sec" type="button" onclick="navigatePage('shows'); if ($('devRyderBox')) $('devRyderBox').open = true;">🎬 Ryder Intro Simulator</button>
               <button class="btn sec" type="button" onclick="navigatePage('gym')">📺 Configure Displays / IP</button>
               <button class="btn sec" type="button" onclick="navigatePage('audio')">🎙️ Test S330 Mic / Denon</button>
               <button class="btn sec" type="button" id="ovBackupCfgBtn">💾 Back up OptiPlex Configs</button>
@@ -6603,23 +6625,32 @@ DASHBOARD_HTML = """<!doctype html>
           <div>
             <h1>Walk-Ins &amp; PR Drop-Ins (Show Lab)</h1>
             <div id="shMsg" class="page-sub">
-              Iterating on the <b>Ryder Dev Drop</b> below leaves your other 5 shows untouched. Studio voices auto-cache by segment so timing/FX tweaks use zero cloud quota.
+              All shows start collapsed — tap any show to edit scripts, hype/speed tags, voice &amp; timing, or fire right from its header. Studio voices auto-cache so speed/pause tweaks use zero cloud quota.
             </div>
           </div>
           <div class="ctrl-row" style="margin-top:0">
+            <button class="btn sec sm" id="shExpandAllBtn" type="button">Expand All</button>
+            <button class="btn sec sm" id="shCollapseAllBtn" type="button">Collapse All</button>
             <button class="btn red sm" id="shStopAllBtn" type="button">⏹ Stop Active Show</button>
             <span id="shBadge" class="pill">IDLE</span>
           </div>
         </div>
 
-        <div id="devRyderBox" class="dev-drop-box">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-            <div>
-              <span class="pill live" style="margin-right:6px">DEV DROP</span>
-              <strong style="font-size:15px">Ryder Curry Armory Debut — Full FX &amp; 3-Screen Simulator</strong>
-              <span id="devKokoroPill" class="pill ok" style="margin-left:6px">Checking Voices…</span>
-              <span id="devStagePill" class="pill" style="margin-left:6px">Checking MP4 &amp; Screens…</span>
-            </div>
+        <details id="devRyderBox" class="dev-drop-box show-acc">
+          <summary class="show-acc-sum">
+            <span class="show-acc-left">
+              <span class="show-chev">▸</span>
+              <span class="pill live">DEV DROP</span>
+              <span class="show-acc-title">Ryder Curry Armory Debut</span>
+              <span id="devKokoroPill" class="pill ok">Checking Voices…</span>
+              <span id="devStagePill" class="pill">Checking MP4 &amp; Screens…</span>
+            </span>
+            <span class="show-acc-acts">
+              <button class="btn sm ok" type="button" title="Simulate Ryder show locally" onclick="event.preventDefault(); event.stopPropagation(); $('devRyderBox').open = true; startLocalRyderSim(null)">🎬 Sim</button>
+              <button class="btn sm" type="button" title="Fire Ryder live on screens + Denon" onclick="event.preventDefault(); event.stopPropagation(); if ($('devFireLiveBtn')) $('devFireLiveBtn').click()">🔥 Fire</button>
+            </span>
+          </summary>
+          <div class="show-acc-body">
             <div class="ctrl-row" style="margin-top:0">
               <button class="btn sm ok" id="devSimFullBtn" type="button">🎬 Simulate Full Show (Local)</button>
               <button class="btn sm sec" id="devSimJumpBtn" type="button">⏩ Jump to 1:16 (Test 1:20 Overlay)</button>
@@ -6630,186 +6661,214 @@ DASHBOARD_HTML = """<!doctype html>
                 <input id="devRyExcludeMainTv" type="checkbox" style="width:auto;margin:0"> Exclude Main TV (Coding)
               </label>
             </div>
-          </div>
 
-          <div id="devStage" class="dev-stage">
-            <div class="fx-hud">
-              <span id="devLightsHud" class="fx-tag">LIGHTS: STANDBY</span>
-              <span id="devFogHud" class="fx-tag">FOG: OFF</span>
-              <span id="devFlashHud" class="fx-tag">FLASH: READY</span>
-              <span id="devDenonHud" class="fx-tag">DENON: STANDBY</span>
-              <span id="devSimClock" class="fx-tag">0:00</span>
+            <div id="devStage" class="dev-stage">
+              <div class="fx-hud">
+                <span id="devLightsHud" class="fx-tag">LIGHTS: STANDBY</span>
+                <span id="devFogHud" class="fx-tag">FOG: OFF</span>
+                <span id="devFlashHud" class="fx-tag">FLASH: READY</span>
+                <span id="devDenonHud" class="fx-tag">DENON: STANDBY</span>
+                <span id="devSimClock" class="fx-tag">0:00</span>
+              </div>
+              <div class="dev-yt-wrap" id="devYtWrap">
+                <video id="devRyVideo" controls playsinline preload="metadata" style="width:100%;height:100%;background:#000;border-radius:8px"></video>
+                <div id="devVidFlash" style="pointer-events:none;position:absolute;inset:0;background:#fff;opacity:0;border-radius:8px;transition:opacity 0.05s linear;z-index:4"></div>
+              </div>
+              <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;z-index:2">
+                <span id="devScrubClock" class="pill" style="font-family:ui-monospace,Consolas,monospace;font-size:12px">MP4 0:00.0 · Intro 0:00.0</span>
+                <button class="btn sm sec" type="button" data-scrub="-5">-5s</button>
+                <button class="btn sm sec" type="button" data-scrub="-1">-1s</button>
+                <button class="btn sm sec" type="button" data-scrub="-0.1">-0.1s</button>
+                <button class="btn sm ok" id="devScrubPlayBtn" type="button">▶/⏸</button>
+                <button class="btn sm sec" type="button" data-scrub="0.1">+0.1s</button>
+                <button class="btn sm sec" type="button" data-scrub="1">+1s</button>
+                <button class="btn sm sec" type="button" data-scrub="5">+5s</button>
+              </div>
+              <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch the pre-baked 1080p MP4 + synchronized TV stage cues.</div>
+              <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
             </div>
-            <div class="dev-yt-wrap" id="devYtWrap">
-              <video id="devRyVideo" controls playsinline preload="metadata" style="width:100%;height:100%;background:#000;border-radius:8px"></video>
-              <div id="devVidFlash" style="pointer-events:none;position:absolute;inset:0;background:#fff;opacity:0;border-radius:8px;transition:opacity 0.05s linear;z-index:4"></div>
-            </div>
-            <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;z-index:2">
-              <span id="devScrubClock" class="pill" style="font-family:ui-monospace,Consolas,monospace;font-size:12px">MP4 0:00.0 · Intro 0:00.0</span>
-              <button class="btn sm sec" type="button" data-scrub="-5">-5s</button>
-              <button class="btn sm sec" type="button" data-scrub="-1">-1s</button>
-              <button class="btn sm sec" type="button" data-scrub="-0.1">-0.1s</button>
-              <button class="btn sm ok" id="devScrubPlayBtn" type="button">▶/⏸</button>
-              <button class="btn sm sec" type="button" data-scrub="0.1">+0.1s</button>
-              <button class="btn sm sec" type="button" data-scrub="1">+1s</button>
-              <button class="btn sm sec" type="button" data-scrub="5">+5s</button>
-            </div>
-            <div id="devCaption" class="dev-caption">Click <b>Simulate Full Show</b> (or say <code>&ldquo;Armory, Ryder is here&rdquo;</code>) to watch the pre-baked 1080p MP4 + synchronized TV stage cues.</div>
-            <div id="devLog" class="dev-log">[Show Lab] Ready.</div>
-          </div>
 
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;margin-top:10px">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px">
+              <div>
+                <label>Audition Intro (Thunder + Announcer + Crowd)</label>
+                <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
+                <div class="ctrl-row" style="margin-top:4px">
+                  <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice</button>
+                  <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+                    <input id="devRyTestFxChk" type="checkbox" style="width:auto;margin:0"> + Thunder &amp; Crowd
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label>Audition Speech Box (Dry / Fast Test)</label>
+                <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
+                <div class="ctrl-row" style="margin-top:4px">
+                  <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1st Speech Box</button>
+                </div>
+              </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px">
+              <div><label>Studio Voice Engine</label><select id="devRyVoice"></select></div>
+              <div><label>Intro Voice Start (s)</label><input id="devRyIntroStart" type="number" min="0" max="15" step="0.1" value="2.3"></div>
+              <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.06"></div>
+              <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
+              <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
+              <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
+            </div>
             <div>
-              <label>Audition Intro (Thunder + Announcer + Crowd)</label>
-              <audio class="show-audio" id="shAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/preview.wav"></audio>
-              <div class="ctrl-row" style="margin-top:4px">
-                <button class="btn sm ok" id="devRyTestIntroBtn" type="button">▶ Test Intro Voice</button>
-                <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-                  <input id="devRyTestFxChk" type="checkbox" style="width:auto;margin:0"> + Thunder &amp; Crowd
-                </label>
-              </div>
+              <label>Voice Acting Style / Direction (used by Gemini 2.5 Flash TTS &amp; OpenAI gpt-4o-mini-tts)</label>
+              <input id="devRyStyle" type="text" placeholder="Electric HBO championship boxing ring announcer in a packed arena...">
             </div>
             <div>
-              <label>Audition Speech Box (Dry / Fast Test)</label>
-              <audio class="show-audio" id="shOvAudio_ryder_walkin" controls preload="none" src="/api/shows/ryder_walkin/overlay.wav"></audio>
-              <div class="ctrl-row" style="margin-top:4px">
-                <button class="btn sm ok" id="devRyTestOvBtn" type="button">▶ Test 1st Speech Box</button>
+              <label>Main HBO Intro Script (starts at Intro Voice Start; supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label>
+              <textarea id="devRyIntroTxt" rows="3"></textarea>
+            </div>
+            <div class="tag-bar" id="devRyTagBar">
+              <span style="font-size:11px;color:var(--mut);font-weight:700">Hype &amp; Speed:</span>
+              <button class="tag-chip" type="button" data-tag=" [excited] ">⚡ Hype [excited]</button>
+              <button class="tag-chip" type="button" data-tag=" [shouting] ">🔥 Shout [shouting]</button>
+              <button class="tag-chip" type="button" data-tag=" [dramatic] ">🎭 [dramatic]</button>
+              <button class="tag-chip" type="button" data-tag=" [rushed] ">💨 [rushed]</button>
+              <button class="tag-chip" type="button" data-wrap="speed:+10%">⏩ Faster +10%</button>
+              <button class="tag-chip" type="button" data-wrap="speed:+20%">⏩ Faster +20%</button>
+              <button class="tag-chip" type="button" data-wrap="speed:-10%">🐢 Slower -10%</button>
+              <button class="tag-chip" type="button" data-wrap="vol:+3dB">🔊 Louder +3dB</button>
+              <button class="tag-chip" type="button" data-tag=" [pause:100ms] ">⏱ +0.1s</button>
+              <button class="tag-chip" type="button" data-tag=" [pause:350ms] ">⏱ +0.35s</button>
+              <button class="tag-chip" type="button" data-tag=" [pause:750ms] ">⏱ +0.75s</button>
+            </div>
+            <div style="border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+                <span style="font-weight:800;font-size:12px;color:#7cc4ff">Timed Speech Boxes (Intro or Entrance Video · 📍 Stamp from Scrubber)</span>
+                <button class="btn sm sec" id="devRyAddSpeechBtn" type="button">+ Add Speech Box</button>
               </div>
+              <div id="devRySpeechList" class="cue-list"></div>
             </div>
-          </div>
-
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-top:8px">
-            <div><label>Studio Voice Engine</label><select id="devRyVoice"></select></div>
-            <div><label>Intro Voice Start (s)</label><input id="devRyIntroStart" type="number" min="0" max="15" step="0.1" value="2.3"></div>
-            <div><label>Hall Reverb (0.00–0.25)</label><input id="devRyRev" type="number" min="0" max="0.25" step="0.02" value="0.06"></div>
-            <div><label>Voice Gain Boost (dB)</label><input id="devRyBoost" type="number" min="-4" max="6" step="0.5" value="2.0"></div>
-            <div><label>Fog Burst (s)</label><input id="devRyFog" type="number" min="1" max="60" step="1" value="30"></div>
-            <div><label>Pulse Strobe (s / int / on)</label><input id="devRyPulse" type="text" value="20 / 2.0 / 0.25" readonly style="opacity:.75"></div>
-          </div>
-          <div style="margin-top:6px">
-            <label>Voice Acting Style / Direction (used by Gemini 2.5 Flash TTS &amp; OpenAI gpt-4o-mini-tts)</label>
-            <input id="devRyStyle" type="text" placeholder="Electric HBO championship boxing ring announcer in a packed arena...">
-          </div>
-          <div style="margin-top:6px">
-            <label>Main HBO Intro Script (starts at Intro Voice Start; supports inline <code>[pause:100ms]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[shouting]</code>)</label>
-            <textarea id="devRyIntroTxt" rows="3"></textarea>
-          </div>
-          <div class="tag-bar" id="devRyTagBar">
-            <span style="font-size:11px;color:var(--mut);font-weight:700">Insert Inline Tag:</span>
-            <button class="tag-chip" type="button" data-tag=" [pause:100ms] ">+[pause:100ms]</button>
-            <button class="tag-chip" type="button" data-tag=" [pause:350ms] ">+[pause:350ms]</button>
-            <button class="tag-chip" type="button" data-tag=" [pause:750ms] ">+[pause:750ms]</button>
-            <button class="tag-chip" type="button" data-wrap="speed:+10%">+[speed:+10%]</button>
-            <button class="tag-chip" type="button" data-wrap="speed:-10%">+[speed:-10%]</button>
-            <button class="tag-chip" type="button" data-wrap="vol:+3dB">+[vol:+3dB]</button>
-            <button class="tag-chip" type="button" data-tag=" [shouting] ">+[shouting] (EL v3)</button>
-            <button class="tag-chip" type="button" data-tag=" [excited] ">+[excited] (EL v3)</button>
-          </div>
-          <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-              <span style="font-weight:800;font-size:12px;color:#7cc4ff">Timed Speech Boxes (Intro or Entrance Video · 📍 Stamp from Scrubber)</span>
-              <button class="btn sm sec" id="devRyAddSpeechBtn" type="button">+ Add Speech Box</button>
-            </div>
-            <div id="devRySpeechList" class="cue-list"></div>
-          </div>
-          <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
-              <span style="font-weight:800;font-size:12px;color:#fde047">Timed FX / Screen Flash Cues (Zero MP4 Rebuild Required)</span>
-              <button class="btn sm sec" id="devRyAddFxBtn" type="button">+ Add FX Cue</button>
-            </div>
-            <div id="devRyFxCueList" class="cue-list"></div>
-          </div>
-          <div class="ctrl-row" style="margin-top:10px">
-            <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Bake Into Show MP4</button>
-            <button class="btn sm ok" id="devRySaveQuickBtn" type="button">Save Timings / FX Only (No MP4 Rebuild)</button>
-            <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
-            <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
-            <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
-          </div>
-          <details style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
-            <summary style="cursor:pointer;font-weight:800;font-size:12px;color:#7cc4ff">Studio Voice API Keys (ElevenLabs · Gemini 2.5 Flash · OpenAI) &amp; Custom Voice Upload</summary>
-            <div style="font-size:11px;color:var(--mut);margin-top:6px">
-              Gemini Free Tier allows <code>10</code> requests/day (<code>...</code> pauses coalesce to 1 call &amp; segments auto-cache on disk); ElevenLabs Free gives <code>10,000</code> chars/mo; Kokoro Local is unlimited offline.
-            </div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:6px">
-              <div><label>ElevenLabs API Key <span id="ttsElHint" style="color:#86efac"></span></label><input id="ttsElKey" type="password" autocomplete="off" placeholder="sk_... (elevenlabs.io free tier 10k/mo)"></div>
-              <div><label>ElevenLabs Model</label><select id="ttsElModel"><option value="eleven_v3">eleven_v3 (Most Expressive + [shouting])</option><option value="eleven_multilingual_v2">eleven_multilingual_v2 (Ultra-Stable)</option></select></div>
-              <div><label>Google Gemini AI Studio Key <span id="ttsGemHint" style="color:#86efac"></span></label><input id="ttsGemKey" type="password" autocomplete="off" placeholder="AIza... (aistudio.google.com free)"></div>
-              <div><label>OpenAI API Key <span id="ttsOaiHint" style="color:#86efac"></span></label><input id="ttsOaiKey" type="password" autocomplete="off" placeholder="sk-... (gpt-4o-mini-tts)"></div>
-            </div>
-            <div class="ctrl-row" style="margin-top:8px">
-              <button class="btn sm" id="ttsSaveKeysBtn" type="button">Save API Keys &amp; Refresh Voices</button>
-              <span id="ttsKeysOut" style="color:var(--mut);font-size:12px"></span>
-            </div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px;margin-top:8px;border-top:1px dashed rgba(255,255,255,.08);padding-top:8px">
-              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                <label style="margin:0;font-size:12px">Custom Intro Voice (.mp3/.wav): <input id="devRyIntroVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
-                <button class="btn sm sec" id="devRyIntroVoiceClr" type="button" hidden>Revert to TTS</button>
+            <div style="border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+                <span style="font-weight:800;font-size:12px;color:#fde047">Timed FX / Screen Flash Cues (Zero MP4 Rebuild Required)</span>
+                <button class="btn sm sec" id="devRyAddFxBtn" type="button">+ Add FX Cue</button>
               </div>
-              <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                <label style="margin:0;font-size:12px">Custom 1:20 Overlay (.mp3/.wav): <input id="devRyOvVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
-                <button class="btn sm sec" id="devRyOvVoiceClr" type="button" hidden>Revert to TTS</button>
-              </div>
+              <div id="devRyFxCueList" class="cue-list"></div>
             </div>
-          </details>
-        </div>
+            <div class="ctrl-row" style="margin-top:0">
+              <button class="btn sm" id="devRySaveBtn" type="button">Save &amp; Bake Into Show MP4</button>
+              <button class="btn sm ok" id="devRySaveQuickBtn" type="button">Save Timings / FX Only (No MP4 Rebuild)</button>
+              <button class="btn sm sec" id="devRyFetchVidBtn" type="button">↻ Fetch YouTube Source &amp; Rebuild MP4</button>
+              <label style="margin:0;font-size:12px">Swap Entrance Video (.mp4): <input id="devRyVidFile" type="file" accept=".mp4,.mkv,.mov,.webm"></label>
+              <span id="shOut_ryder_walkin" style="color:var(--mut);font-size:12px"></span>
+            </div>
+            <details class="sh-sub">
+              <summary>🎙 Custom Intro / Overlay Voice Uploads (.mp3/.wav)</summary>
+              <div class="sh-sub-body">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:8px">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <label style="margin:0;font-size:12px">Custom Intro Voice (.mp3/.wav): <input id="devRyIntroVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
+                    <button class="btn sm sec" id="devRyIntroVoiceClr" type="button" hidden>Revert to TTS</button>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <label style="margin:0;font-size:12px">Custom 1:20 Overlay (.mp3/.wav): <input id="devRyOvVoiceFile" type="file" accept=".mp3,.wav,.m4a,.ogg"></label>
+                    <button class="btn sm sec" id="devRyOvVoiceClr" type="button" hidden>Revert to TTS</button>
+                  </div>
+                </div>
+              </div>
+            </details>
+          </div>
+        </details>
 
         <div class="card">
-          <h2><span>Global PR Drop-In &amp; Walk-In Shows</span></h2>
+          <h2><span>Global PR Drop-In &amp; Walk-In Shows</span><span id="shCountPill" class="pill">Loading…</span></h2>
           <div id="shGrid" class="show-grid">
             <div style="color:var(--mut);font-size:12px">Loading shows…</div>
           </div>
         </div>
 
-        <div class="card">
-          <h2><span>Smart FX Hooks (House Lights Rack &amp; Smith + Fog Machine)</span></h2>
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">
-            <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
-            <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-            <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-            <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
-            <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-            <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-            <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
-            <div><label>Smart Fogger v3.1 IP / Host</label><input id="fxTheaterHost" type="text" placeholder="smart-fogger.local or 192.168.1.xxx"></div>
-            <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
-            <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
-          </div>
-          <details style="margin-top:8px">
-            <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Single-Relay Legacy Fallback (optional)</summary>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-top:6px">
-              <div><label>Legacy House Lights IP</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
-              <div><label>Legacy Lights OFF URL</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-              <div><label>Legacy Lights ON URL</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+        <details id="ttsKeysCard" class="card show-acc" style="margin-top:14px">
+          <summary class="show-acc-sum">
+            <span class="show-acc-left">
+              <span class="show-chev">▸</span>
+              <strong>Studio Voice API Keys</strong>
+              <span class="show-acc-sub">ElevenLabs · Gemini 2.5 · OpenAI</span>
+            </span>
+            <span class="show-acc-acts">
+              <span id="ttsKeysPill" class="pill">Checking…</span>
+            </span>
+          </summary>
+          <div class="show-acc-body">
+            <div style="font-size:11px;color:var(--mut)">
+              Gemini Free Tier allows <code>10</code> requests/day (<code>...</code> pauses coalesce to 1 call &amp; segments auto-cache on disk); ElevenLabs Free gives <code>10,000</code> chars/mo; Kokoro Local is unlimited offline.
             </div>
-          </details>
-          <div class="ctrl-row" style="margin-top:10px;flex-wrap:wrap;gap:6px">
-            <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
-            <button class="btn sm ok" id="fxRackOnBtn" type="button">Rack ON</button>
-            <button class="btn sm sec" id="fxRackOffBtn" type="button">Rack OFF</button>
-            <button class="btn sm ok" id="fxSmithOnBtn" type="button">Smith ON</button>
-            <button class="btn sm sec" id="fxSmithOffBtn" type="button">Smith OFF</button>
-            <button class="btn sm ok" id="fxAllOnBtn" type="button">All Lights ON</button>
-            <button class="btn sm sec" id="fxAllOffBtn" type="button">All Lights OFF</button>
-            <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Both Flash</button>
-            <button class="btn sec sm" id="fxTestAltFlashBtn" type="button">Test 4x Alternate Rack ↔ Smith</button>
-            <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
-            <select id="fxTheaterTestScene" style="width:auto;min-width:155px">
-              <option value="jenna">jenna (Missy UV/Gold)</option>
-              <option value="avenleigh">avenleigh (Pink VIP)</option>
-              <option value="vip_gold">vip_gold (Velvet Rope)</option>
-              <option value="vip_prism">vip_prism (Modern Prism)</option>
-              <option value="thunder">thunder (Storm)</option>
-              <option value="fireworks">fireworks (PR Pyro)</option>
-              <option value="bench_hype">bench_hype (Forge Red)</option>
-              <option value="walkin">walkin (Crimson)</option>
-              <option value="pr">pr (PR Blast)</option>
-            </select>
-            <button class="btn sec sm" id="fxTestTheaterBtn" type="button">Test Theater Scene</button>
-            <button class="btn sec sm" id="fxStopTheaterBtn" type="button">Stop Theater FX</button>
-            <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px">
+              <div><label>ElevenLabs API Key <span id="ttsElHint" style="color:#86efac"></span></label><input id="ttsElKey" type="password" autocomplete="off" placeholder="sk_... (elevenlabs.io free tier 10k/mo)"></div>
+              <div><label>ElevenLabs Model</label><select id="ttsElModel"><option value="eleven_v3">eleven_v3 (Most Expressive + [shouting])</option><option value="eleven_multilingual_v2">eleven_multilingual_v2 (Ultra-Stable)</option></select></div>
+              <div><label>Google Gemini AI Studio Key <span id="ttsGemHint" style="color:#86efac"></span></label><input id="ttsGemKey" type="password" autocomplete="off" placeholder="AIza... (aistudio.google.com free)"></div>
+              <div><label>OpenAI API Key <span id="ttsOaiHint" style="color:#86efac"></span></label><input id="ttsOaiKey" type="password" autocomplete="off" placeholder="sk-... (gpt-4o-mini-tts)"></div>
+            </div>
+            <div class="ctrl-row" style="margin-top:0">
+              <button class="btn sm" id="ttsSaveKeysBtn" type="button">Save API Keys &amp; Refresh Voices</button>
+              <span id="ttsKeysOut" style="color:var(--mut);font-size:12px"></span>
+            </div>
           </div>
-        </div>
+        </details>
+
+        <details id="fxHooksCard" class="card show-acc" style="margin-top:14px">
+          <summary class="show-acc-sum">
+            <span class="show-acc-left">
+              <span class="show-chev">▸</span>
+              <strong>Smart FX Hooks</strong>
+              <span class="show-acc-sub">House Lights (Rack &amp; Smith) · Fog · Theater LEDs</span>
+            </span>
+          </summary>
+          <div class="show-acc-body">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">
+              <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
+              <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+              <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+              <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
+              <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+              <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+              <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
+              <div><label>Smart Fogger v3.1 IP / Host</label><input id="fxTheaterHost" type="text" placeholder="smart-fogger.local or 192.168.1.xxx"></div>
+              <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
+              <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
+            </div>
+            <details style="margin-top:0">
+              <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Single-Relay Legacy Fallback (optional)</summary>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-top:6px">
+                <div><label>Legacy House Lights IP</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
+                <div><label>Legacy Lights OFF URL</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+                <div><label>Legacy Lights ON URL</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+              </div>
+            </details>
+            <div class="ctrl-row" style="margin-top:0;flex-wrap:wrap;gap:6px">
+              <button class="btn sm" id="fxSaveBtn" type="button">Save FX Hooks</button>
+              <button class="btn sm ok" id="fxRackOnBtn" type="button">Rack ON</button>
+              <button class="btn sm sec" id="fxRackOffBtn" type="button">Rack OFF</button>
+              <button class="btn sm ok" id="fxSmithOnBtn" type="button">Smith ON</button>
+              <button class="btn sm sec" id="fxSmithOffBtn" type="button">Smith OFF</button>
+              <button class="btn sm ok" id="fxAllOnBtn" type="button">All Lights ON</button>
+              <button class="btn sm sec" id="fxAllOffBtn" type="button">All Lights OFF</button>
+              <button class="btn sec sm" id="fxTestFlashBtn" type="button">Test 2x Both Flash</button>
+              <button class="btn sec sm" id="fxTestAltFlashBtn" type="button">Test 4x Alternate Rack ↔ Smith</button>
+              <button class="btn sec sm" id="fxTestFogBtn" type="button">Test Fog Trigger</button>
+              <select id="fxTheaterTestScene" style="width:auto;min-width:155px">
+                <option value="jenna">jenna (Missy UV/Gold)</option>
+                <option value="avenleigh">avenleigh (Pink VIP)</option>
+                <option value="vip_gold">vip_gold (Velvet Rope)</option>
+                <option value="vip_prism">vip_prism (Modern Prism)</option>
+                <option value="thunder">thunder (Storm)</option>
+                <option value="fireworks">fireworks (PR Pyro)</option>
+                <option value="bench_hype">bench_hype (Forge Red)</option>
+                <option value="walkin">walkin (Crimson)</option>
+                <option value="pr">pr (PR Blast)</option>
+              </select>
+              <button class="btn sec sm" id="fxTestTheaterBtn" type="button">Test Theater Scene</button>
+              <button class="btn sec sm" id="fxStopTheaterBtn" type="button">Stop Theater FX</button>
+              <span id="fxOut" style="color:var(--mut);font-size:12px"></span>
+            </div>
+          </div>
+        </details>
       </section>
 
       <!-- PAGE 5: GYM & DISPLAYS -->
@@ -9883,6 +9942,10 @@ $('dpFindRokuBtn').onclick = async () => {
 
 let devRyderSpec = null;
 let devRyVoicesCache = [];
+const openShowIds = new Set();
+const openShowSubIds = new Set();
+const closedShowSubIds = new Set();
+const showAuditionBlobUrls = {};
 let rySimState = { running: false, timers: [], iv: null, ytPlayer: null, introEl: null, ovEl: null, fogLeft: 0, cueFlags: null, flashTimer: null };
 let ryScrubRaf = null;
 
@@ -10256,6 +10319,156 @@ function populateTtsProviders(p) {
   if ($('ttsGemHint')) $('ttsGemHint').textContent = p.hasGeminiKey ? `(Saved ${p.geminiHint})` : '';
   if ($('ttsOaiHint')) $('ttsOaiHint').textContent = p.hasOpenaiKey ? `(Saved ${p.openaiHint})` : '';
   if ($('ttsElModel') && p.elevenlabsModel) $('ttsElModel').value = p.elevenlabsModel;
+  const kp = $('ttsKeysPill');
+  if (kp) {
+    const active = [];
+    if (p.hasElevenlabsKey) active.push('EL');
+    if (p.hasGeminiKey) active.push('GEM');
+    if (p.hasOpenaiKey) active.push('OAI');
+    kp.textContent = active.length ? active.join(' · ') : 'Local Kokoro Only';
+    kp.className = active.length ? 'pill ok' : 'pill';
+  }
+}
+
+const TOP_VOICES = new Set([
+  'elevenlabs:nPczCjzI2devNBz1zQrb',
+  'gemini:Fenrir',
+  'elevenlabs:N2lVS1w4EtoT3dr4eOWO',
+  'edge:en-US-BrianMultilingualNeural',
+  'kokoro:onyx_fenrir_epic',
+  'kokoro:am_onyx',
+]);
+
+function buildGroupedVoiceOptionsHtml(voices, selectedId) {
+  const list = Array.isArray(voices) ? voices : [];
+  if (!list.length) {
+    return selectedId ? `<option value="${escHtml(selectedId)}" selected>${escHtml(selectedId)}</option>` : '';
+  }
+  const groups = [
+    ['elevenlabs', 'ElevenLabs Studio (Hyper-Realistic)'],
+    ['gemini', 'Google Gemini 2.5 Flash TTS (Free AI Studio Key)'],
+    ['openai', 'OpenAI gpt-4o-mini-tts (Directed)'],
+    ['kokoro', 'Local Offline (Kokoro-82M FP32)'],
+    ['edge', 'Free Cloud (Microsoft Edge HD)'],
+  ];
+  let html = '';
+  groups.forEach(([eng, glabel]) => {
+    const items = list.filter(v => v.engine === eng);
+    if (!items.length) return;
+    html += `<optgroup label="${escHtml(glabel)}">`;
+    items.forEach(v => {
+      const prefix = TOP_VOICES.has(v.id) ? '★ ' : '';
+      const suffix = (v.requiresKey && !v.available) ? ' (needs API key)' : '';
+      const sel = v.id === selectedId ? ' selected' : '';
+      html += `<option value="${escHtml(v.id)}"${sel}>${escHtml(prefix + v.label + suffix)}</option>`;
+    });
+    html += '</optgroup>';
+  });
+  if (!html) {
+    html = list.map(v => {
+      const sel = v.id === selectedId ? ' selected' : '';
+      return `<option value="${escHtml(v.id)}"${sel}>${escHtml((TOP_VOICES.has(v.id) ? '★ ' : '') + v.label)}</option>`;
+    }).join('');
+  }
+  return html;
+}
+
+function buildInlineTagBarHtml(targetId) {
+  const tid = escHtml(targetId || '');
+  return `
+    <div class="tag-bar sh-tag-bar" data-target="${tid}">
+      <span style="font-size:11px;color:var(--mut);font-weight:700">Hype &amp; Speed:</span>
+      <button class="tag-chip" type="button" data-tag=" [excited] ">⚡ Hype [excited]</button>
+      <button class="tag-chip" type="button" data-tag=" [shouting] ">🔥 Shout [shouting]</button>
+      <button class="tag-chip" type="button" data-tag=" [dramatic] ">🎭 [dramatic]</button>
+      <button class="tag-chip" type="button" data-tag=" [rushed] ">💨 [rushed]</button>
+      <button class="tag-chip" type="button" data-wrap="speed:+10%">⏩ Faster +10%</button>
+      <button class="tag-chip" type="button" data-wrap="speed:+20%">⏩ Faster +20%</button>
+      <button class="tag-chip" type="button" data-wrap="speed:-10%">🐢 Slower -10%</button>
+      <button class="tag-chip" type="button" data-wrap="vol:+3dB">🔊 Louder +3dB</button>
+      <button class="tag-chip" type="button" data-tag=" [pause:100ms] ">⏱ +0.1s</button>
+      <button class="tag-chip" type="button" data-tag=" [pause:350ms] ">⏱ +0.35s</button>
+      <button class="tag-chip" type="button" data-tag=" [pause:750ms] ">⏱ +0.75s</button>
+    </div>`;
+}
+
+function applyInlineTagToTextarea(ta, btn) {
+  if (!ta || !btn) return;
+  const val = String(ta.value || '');
+  const s0 = ta.selectionStart != null ? ta.selectionStart : val.length;
+  const s1 = ta.selectionEnd != null ? ta.selectionEnd : val.length;
+  const focused = ta.dataset.userFocused === '1';
+  const trimLen = val.trimEnd().length;
+  const tagRaw = btn.getAttribute('data-tag');
+  const wrapTag = btn.getAttribute('data-wrap');
+  let nextVal = val;
+  let caretPos = s0;
+
+  if (tagRaw) {
+    const cleanTag = tagRaw.trim();
+    const isEnergy = /^\\[(excited|shouting|dramatic|rushed)\\]$/i.test(cleanTag);
+    if (!focused && isEnergy) {
+      const rest = val.trimStart();
+      const ins = rest ? `${cleanTag} ${rest}` : `${cleanTag} `;
+      nextVal = ins;
+      caretPos = cleanTag.length + 1;
+    } else {
+      const pos = s0;
+      const before = val.slice(0, pos);
+      const after = val.slice(pos);
+      const lead = (before && !/\\s$/.test(before)) ? ' ' : '';
+      const trail = (!after || /^\\s/.test(after)) ? (after ? '' : ' ') : ' ';
+      const ins = `${lead}${cleanTag}${trail}`;
+      nextVal = before + ins + after;
+      caretPos = before.length + ins.length;
+    }
+  } else if (wrapTag) {
+    if (s1 > s0) {
+      const sel = val.slice(s0, s1);
+      const closeTag = wrapTag.split(':')[0];
+      const ins = `[${wrapTag}]${sel}[/${closeTag}]`;
+      nextVal = val.slice(0, s0) + ins + val.slice(s1);
+      caretPos = s0 + ins.length;
+    } else {
+      const isMid = focused && s0 > 0 && s0 < trimLen;
+      if (!isMid) {
+        const rest = val.trimStart();
+        const prefix = `[${wrapTag}] `;
+        nextVal = prefix + rest;
+        caretPos = prefix.length;
+      } else {
+        const before = val.slice(0, s0);
+        const after = val.slice(s0);
+        const lead = (before && !/\\s$/.test(before)) ? ' ' : '';
+        const trail = (after && !/^\\s/.test(after)) ? ' ' : '';
+        const ins = `${lead}[${wrapTag}]${trail}`;
+        nextVal = before + ins + after;
+        caretPos = before.length + ins.length;
+      }
+    }
+  }
+
+  ta.value = nextVal;
+  ta.dataset.userFocused = '1';
+  ta.focus();
+  ta.selectionStart = ta.selectionEnd = caretPos;
+}
+
+function onShowAccToggle(id, isOpen) {
+  if (!id) return;
+  if (isOpen) openShowIds.add(id);
+  else openShowIds.delete(id);
+}
+
+function onShowSubToggle(key, isOpen) {
+  if (!key) return;
+  if (isOpen) {
+    openShowSubIds.add(key);
+    closedShowSubIds.delete(key);
+  } else {
+    openShowSubIds.delete(key);
+    closedShowSubIds.add(key);
+  }
 }
 
 function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProviders) {
@@ -10285,34 +10498,7 @@ function populateRyderDevPanel(ry, voices, kokoroReady, stageClients, ttsProvide
   const vSel = $('devRyVoice');
   if (Array.isArray(voices) && voices.length) devRyVoicesCache = voices;
   if (vSel && Array.isArray(voices) && voices.length) {
-    const TOP_VOICES = new Set([
-      'elevenlabs:nPczCjzI2devNBz1zQrb',
-      'gemini:Fenrir',
-      'elevenlabs:N2lVS1w4EtoT3dr4eOWO',
-      'edge:en-US-BrianMultilingualNeural',
-      'kokoro:onyx_fenrir_epic',
-      'kokoro:am_onyx',
-    ]);
-    const groups = [
-      ['elevenlabs', 'ElevenLabs Studio (Hyper-Realistic)'],
-      ['gemini', 'Google Gemini 2.5 Flash TTS (Free AI Studio Key)'],
-      ['openai', 'OpenAI gpt-4o-mini-tts (Directed)'],
-      ['kokoro', 'Local Offline (Kokoro-82M FP32)'],
-      ['edge', 'Free Cloud (Microsoft Edge HD)'],
-    ];
-    let html = '';
-    groups.forEach(([eng, glabel]) => {
-      const items = voices.filter(v => v.engine === eng);
-      if (!items.length) return;
-      html += `<optgroup label="${escHtml(glabel)}">`;
-      items.forEach(v => {
-        const prefix = TOP_VOICES.has(v.id) ? '★ ' : '';
-        const suffix = (v.requiresKey && !v.available) ? ' (needs API key)' : '';
-        html += `<option value="${escHtml(v.id)}">${escHtml(prefix + v.label + suffix)}</option>`;
-      });
-      html += '</optgroup>';
-    });
-    vSel.innerHTML = html || voices.map(v => `<option value="${escHtml(v.id)}">${escHtml((TOP_VOICES.has(v.id) ? '★ ' : '') + v.label)}</option>`).join('');
+    vSel.innerHTML = buildGroupedVoiceOptionsHtml(voices, (ry && ry.announcerVoice) || 'kokoro:onyx_fenrir_epic');
   }
   if (!ry) return;
   devRyderSpec = ry;
@@ -10513,13 +10699,20 @@ function renderShows(data) {
   const ryder = allShows.find(s => s.id === 'ryder_walkin');
   populateRyderDevPanel(ryder, data.voices || [], Boolean(data.kokoroReady), data.stageClients || {}, data.ttsProviders || null);
   const others = allShows.filter(s => s.id !== 'ryder_walkin');
+  if ($('shCountPill')) $('shCountPill').textContent = `${others.length} show${others.length === 1 ? '' : 's'}`;
   if (!others.length) {
     grid.innerHTML = '<div style="color:var(--mut);font-size:12px">No other shows configured.</div>';
     return;
   }
+  const voicesList = (Array.isArray(data.voices) && data.voices.length) ? data.voices : devRyVoicesCache;
   grid.innerHTML = others.map(s => {
     const id = escHtml(s.id);
-    const trigs = (s.triggers || []).map(t => `<code>"Armory, ${escHtml(t)}"</code>`).join(' ');
+    const isOpen = openShowIds.has(s.id);
+    const trigsList = Array.isArray(s.triggers) ? s.triggers : [];
+    const trigs = trigsList.map(t => `<code>"Armory, ${escHtml(t)}"</code>`).join(' ');
+    const trigHint = trigsList.length
+      ? `<code>"Armory, ${escHtml(trigsList[0])}"</code>${trigsList.length > 1 ? ` <span class="show-acc-sub">+${trigsList.length - 1} more</span>` : ''}`
+      : '';
     const srcTag = s.sourceUploaded ? `<span class="pill ok">CUSTOM: ${escHtml(s.sourceFile)}</span>` : '<span class="pill">DEMO TRACK</span>';
     const vidPill = (s.showVideoReady && s.hasSourceVideo) ? '<span class="pill ok">3-SCREEN MP4 READY</span>' : '';
     const durTag = s.previewReady ? `${s.previewDurationSec}s ready` : 'Not built';
@@ -10535,53 +10728,88 @@ function renderShows(data) {
       ['fireworks', 'fireworks (Pyro Sky)'],
       ['bench_hype', 'bench_hype (Forge Red)'],
     ].map(([val, lbl]) => `<option value="${val}" ${(s.theaterScene || '') === val ? 'selected' : ''}>${lbl}</option>`).join('');
-    const videoEl = (s.showVideoReady && s.hasSourceVideo)
-      ? `<video controls preload="none" src="/api/shows/${id}/show.mp4" style="width:100%;max-height:220px;border-radius:8px;background:#000"></video>`
+    const voiceOpts = buildGroupedVoiceOptionsHtml(voicesList, s.announcerVoice || 'kokoro:onyx_fenrir_epic');
+    const vidSubKey = `${s.id}:video`;
+    const cfgSubKey = `${s.id}:cfg`;
+    const vidSubOpen = openShowSubIds.has(vidSubKey);
+    const cfgSubOpen = openShowSubIds.has(cfgSubKey) || (s.kind === 'pr_drop' && !closedShowSubIds.has(cfgSubKey));
+    const videoSection = (s.showVideoReady && s.hasSourceVideo)
+      ? `<details class="sh-sub" ${vidSubOpen ? 'open' : ''} ontoggle="onShowSubToggle('${vidSubKey}', this.open)">
+          <summary>🎬 3-Screen Entrance Video</summary>
+          <div class="sh-sub-body">
+            <video controls preload="none" src="/api/shows/${id}/show.mp4" style="width:100%;max-height:220px;border-radius:8px;background:#000"></video>
+          </div>
+        </details>`
+      : '';
+    const scriptSection = s.kind !== 'pr_drop'
+      ? `<div>
+          <label>Announcer Script (supports <code>[excited]</code>, <code>[shouting]</code>, <code>[speed:+10%]</code>, <code>[vol:+3dB]</code>, <code>[pause:350ms]</code>)</label>
+          <textarea id="shAnn_${id}" rows="3">${escHtml(s.announcerText || '')}</textarea>
+          ${buildInlineTagBarHtml('shAnn_' + id)}
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px">
+          <div><label>Studio Voice Engine</label><select id="shVoice_${id}">${voiceOpts}</select></div>
+          <div><label>Voice Acting Style / Direction</label><input id="shStyle_${id}" type="text" value="${escHtml(s.voiceStyle || '')}" placeholder="Electric hype announcer..."></div>
+        </div>`
       : '';
     return `
-      <div class="show-item" data-showid="${id}">
-        <div class="show-head">
-          <div>
-            <div style="font-weight:900;font-size:14px">${escHtml(s.name)}</div>
-            <div class="show-trigs">${trigs}</div>
+      <details class="show-item show-acc" data-showid="${id}" ${isOpen ? 'open' : ''} ontoggle="onShowAccToggle('${id}', this.open)">
+        <summary class="show-acc-sum">
+          <span class="show-acc-left">
+            <span class="show-chev">▸</span>
+            <span class="show-acc-title">${escHtml(s.name)}</span>
+            ${trigHint}
+            ${vidPill}${srcTag}<span class="pill live">${durTag}</span>
+          </span>
+          <span class="show-acc-acts">
+            <button class="btn sm ok" type="button" title="Preview locally" onclick="event.preventDefault(); event.stopPropagation(); previewShow('${id}')">▶</button>
+            <button class="btn sm" type="button" title="Fire live (Denon ${s.denonVol})" onclick="event.preventDefault(); event.stopPropagation(); fireShow('${id}')">🔥 Fire</button>
+          </span>
+        </summary>
+        <div class="show-acc-body">
+          <audio class="show-audio" id="shAudio_${id}" controls preload="none" src="/api/shows/${id}/preview.wav"></audio>
+          <div class="show-trigs">${trigs}</div>
+          <div class="ctrl-row" style="margin-top:0">
+            <button class="btn sm ok" type="button" onclick="previewShow('${id}')">▶ Preview Mix</button>
+            <button class="btn sm" type="button" onclick="fireShow('${id}')">🔥 Fire Live (Denon ${s.denonVol})</button>
+            <button class="btn sm sec" type="button" onclick="rebuildShow('${id}')">↻ Rebuild</button>
+            ${s.kind !== 'pr_drop' ? `<button class="btn sm ok" type="button" onclick="auditionShowVoice('${id}', this)">🎙 Test Voice</button>` : ''}
           </div>
-          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${vidPill}${srcTag}<span class="pill live">${durTag}</span></div>
+          ${scriptSection}
+          <div class="ctrl-row" style="margin-top:0">
+            <button class="btn sm" type="button" onclick="saveShowConfig('${id}', this)">Save &amp; Rebuild Mix</button>
+            <span id="shOut_${id}" style="color:var(--mut);font-size:11px"></span>
+          </div>
+          ${videoSection}
+          <details class="sh-sub" ${cfgSubOpen ? 'open' : ''} ontoggle="onShowSubToggle('${cfgSubKey}', this.open)">
+            <summary>⚙ Audio, Timing, LED Scene &amp; Song Upload</summary>
+            <div class="sh-sub-body">
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:6px">
+                <div><label>Denon Vol</label><input id="shVol_${id}" type="number" min="30" max="75" value="${s.denonVol}"></div>
+                <div><label>Cube Mode</label><select id="shMode_${id}">
+                  <option value="duck" ${s.cubeMode==='duck'?'selected':''}>duck</option>
+                  <option value="takeover" ${s.cubeMode==='takeover'?'selected':''}>takeover</option>
+                  <option value="overlay" ${s.cubeMode==='overlay'?'selected':''}>overlay</option>
+                </select></div>
+                <div><label>Theater LED Scene</label><select id="shTheater_${id}">${theaterOpts}</select></div>
+                <div><label>Start (s)</label><input id="shStart_${id}" type="number" min="0" step="0.25" value="${s.songStartSec}"></div>
+                <div><label>Dur (s)</label><input id="shDur_${id}" type="number" min="0" max="65" step="0.5" value="${s.songDurationSec}"></div>
+                <div><label>Fade (s)</label><input id="shFade_${id}" type="number" min="0.3" max="10" step="0.2" value="${s.fadeOutSec}"></div>
+                <div><label>Flashes (0–6)</label><input id="shFlash_${id}" type="number" min="0" max="6" step="1" value="${s.lightsFlashCount || 0}"></div>
+              </div>
+              <div class="ctrl-row" style="margin-top:0">
+                <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
+                  <input id="shCheer_${id}" type="checkbox" ${s.addCheer ? 'checked' : ''} style="width:auto;margin:0"> Add Crowd Cheer
+                </label>
+              </div>
+              <div class="ctrl-row" style="margin-top:0">
+                <label style="margin:0;flex:1;min-width:170px">Swap Song (.mp3/.wav): <input id="shFile_${id}" type="file" accept=".mp3,.wav,.m4a,.ogg" onchange="uploadShowSong('${id}', this)"></label>
+                ${s.sourceUploaded ? `<button class="btn sm sec" type="button" onclick="clearShowSong('${id}')">Revert Demo</button>` : ''}
+              </div>
+            </div>
+          </details>
         </div>
-        <audio class="show-audio" id="shAudio_${id}" controls preload="none" src="/api/shows/${id}/preview.wav"></audio>
-        ${videoEl}
-        <div class="ctrl-row" style="margin-top:0">
-          <button class="btn sm ok" type="button" onclick="previewShow('${id}')">▶ Preview Locally</button>
-          <button class="btn sm" type="button" onclick="fireShow('${id}')">🔥 Fire Live (Denon ${s.denonVol})</button>
-          <button class="btn sm sec" type="button" onclick="rebuildShow('${id}')">↻ Rebuild</button>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:6px">
-          <div><label>Denon Vol</label><input id="shVol_${id}" type="number" min="30" max="75" value="${s.denonVol}"></div>
-          <div><label>Cube Mode</label><select id="shMode_${id}">
-            <option value="duck" ${s.cubeMode==='duck'?'selected':''}>duck</option>
-            <option value="takeover" ${s.cubeMode==='takeover'?'selected':''}>takeover</option>
-            <option value="overlay" ${s.cubeMode==='overlay'?'selected':''}>overlay</option>
-          </select></div>
-          <div><label>Theater LED Scene</label><select id="shTheater_${id}">${theaterOpts}</select></div>
-          <div><label>Start (s)</label><input id="shStart_${id}" type="number" min="0" step="0.25" value="${s.songStartSec}"></div>
-          <div><label>Dur (s)</label><input id="shDur_${id}" type="number" min="0" max="65" step="0.5" value="${s.songDurationSec}"></div>
-          <div><label>Fade (s)</label><input id="shFade_${id}" type="number" min="0.3" max="10" step="0.2" value="${s.fadeOutSec}"></div>
-          <div><label>Flashes (0–6)</label><input id="shFlash_${id}" type="number" min="0" max="6" step="1" value="${s.lightsFlashCount || 0}"></div>
-        </div>
-        <div class="ctrl-row" style="margin-top:0">
-          <label style="margin:0;font-size:11px;display:inline-flex;align-items:center;gap:4px;cursor:pointer">
-            <input id="shCheer_${id}" type="checkbox" ${s.addCheer ? 'checked' : ''} style="width:auto;margin:0"> Add Crowd Cheer
-          </label>
-        </div>
-        ${s.kind !== 'pr_drop' ? `<div><label>Announcer Script</label><textarea id="shAnn_${id}" rows="2">${escHtml(s.announcerText || '')}</textarea></div>` : ''}
-        <div class="ctrl-row" style="margin-top:2px">
-          <label style="margin:0;flex:1;min-width:170px">Swap Song (.mp3/.wav): <input id="shFile_${id}" type="file" accept=".mp3,.wav,.m4a,.ogg" onchange="uploadShowSong('${id}', this)"></label>
-          ${s.sourceUploaded ? `<button class="btn sm sec" type="button" onclick="clearShowSong('${id}')">Revert Demo</button>` : ''}
-        </div>
-        <div class="ctrl-row" style="margin-top:2px">
-          <button class="btn sm sec" type="button" onclick="saveShowConfig('${id}', this)">Save &amp; Rebuild Mix</button>
-          <span id="shOut_${id}" style="color:var(--mut);font-size:11px"></span>
-        </div>
-      </div>`;
+      </details>`;
   }).join('');
 }
 
@@ -10639,6 +10867,63 @@ async function rebuildShow(id) {
   }
 }
 
+async function auditionShowVoice(id, btn) {
+  const ta = $('shAnn_' + id);
+  const text = (ta && ta.value.trim()) || '';
+  const outEl = $('shOut_' + id);
+  const audioEl = $('shAudio_' + id);
+  if (!text) {
+    if (outEl) outEl.textContent = '✗ Enter announcer script first';
+    return;
+  }
+  const spec = (latestShowsList || []).find(x => x.id === id) || {};
+  const chosenVoice = ($('shVoice_' + id) && $('shVoice_' + id).value) || spec.announcerVoice || 'kokoro:onyx_fenrir_epic';
+  const voiceStyle = ($('shStyle_' + id) && $('shStyle_' + id).value.trim()) || '';
+  if (btn) btn.disabled = true;
+  if (outEl) outEl.textContent = 'Auditioning voice (mix untouched)…';
+  try {
+    const resp = await fetch('/api/shows/audition-voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        slot: 'intro',
+        text,
+        voice: chosenVoice,
+        voiceStyle,
+        voiceReverbWet: spec.voiceReverbWet != null ? Number(spec.voiceReverbWet) : 0.09,
+        voiceBoostDb: spec.voiceBoostDb != null ? Number(spec.voiceBoostDb) : 2.0,
+        withFx: false,
+      }),
+    });
+    if (!resp.ok) {
+      let errMsg = `HTTP ${resp.status}`;
+      try {
+        const j = await resp.json();
+        if (j && j.error) errMsg = j.error;
+      } catch {}
+      if (outEl) outEl.textContent = `✗ ${errMsg}`;
+      return;
+    }
+    const durHdr = resp.headers.get('X-Armory-Duration-Sec') || '?';
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    if (showAuditionBlobUrls[id]) {
+      try { URL.revokeObjectURL(showAuditionBlobUrls[id]); } catch {}
+    }
+    showAuditionBlobUrls[id] = url;
+    if (audioEl) {
+      audioEl.src = url;
+      audioEl.load();
+      audioEl.play().catch(() => {});
+    }
+    if (outEl) outEl.textContent = `✓ Playing voice audition (${durHdr}s — mix untouched)`;
+  } catch (e) {
+    if (outEl) outEl.textContent = `✗ Audition failed: ${(e && e.message) || 'error'}`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function saveShowConfig(id, btn) {
   const body = {
     denonVol: Number($('shVol_' + id).value || 70),
@@ -10651,6 +10936,8 @@ async function saveShowConfig(id, btn) {
   if ($('shTheater_' + id)) body.theaterScene = $('shTheater_' + id).value || '';
   if ($('shCheer_' + id)) body.addCheer = Boolean($('shCheer_' + id).checked);
   if ($('shAnn_' + id)) body.announcerText = $('shAnn_' + id).value.trim();
+  if ($('shVoice_' + id) && $('shVoice_' + id).value) body.announcerVoice = $('shVoice_' + id).value;
+  if ($('shStyle_' + id)) body.voiceStyle = $('shStyle_' + id).value.trim();
   if ($('shYt_' + id)) body.youtubeUrl = $('shYt_' + id).value.trim();
   if ($('shOut_' + id)) $('shOut_' + id).textContent = 'Saving & rendering…';
   try {
@@ -10783,30 +11070,50 @@ if ($('devScrubPlayBtn')) $('devScrubPlayBtn').onclick = () => {
 let activeRyTextarea = null;
 if ($('devRyderBox')) {
   $('devRyderBox').addEventListener('focusin', (ev) => {
-    if (ev.target && ev.target.tagName === 'TEXTAREA') activeRyTextarea = ev.target;
+    if (ev.target && ev.target.tagName === 'TEXTAREA') {
+      activeRyTextarea = ev.target;
+      ev.target.dataset.userFocused = '1';
+    }
   });
 }
 if ($('devRyTagBar')) $('devRyTagBar').addEventListener('click', (ev) => {
   const btn = ev.target && ev.target.closest ? ev.target.closest('button[data-tag],button[data-wrap]') : null;
   if (!btn) return;
   const ta = activeRyTextarea || $('devRyIntroTxt');
-  if (!ta) return;
-  const s0 = ta.selectionStart != null ? ta.selectionStart : ta.value.length;
-  const s1 = ta.selectionEnd != null ? ta.selectionEnd : ta.value.length;
-  const tagTxt = btn.getAttribute('data-tag');
-  const wrapTag = btn.getAttribute('data-wrap');
-  let ins = '';
-  if (tagTxt) {
-    ins = tagTxt;
-  } else if (wrapTag) {
-    const sel = ta.value.slice(s0, s1) || 'word';
-    const closeTag = wrapTag.split(':')[0];
-    ins = `[${wrapTag}]${sel}[/${closeTag}]`;
-  }
-  ta.value = ta.value.slice(0, s0) + ins + ta.value.slice(s1);
-  ta.focus();
-  ta.selectionStart = ta.selectionEnd = s0 + ins.length;
+  applyInlineTagToTextarea(ta, btn);
 });
+if ($('shGrid')) {
+  $('shGrid').addEventListener('focusin', (ev) => {
+    if (ev.target && ev.target.tagName === 'TEXTAREA') ev.target.dataset.userFocused = '1';
+  });
+  $('shGrid').addEventListener('click', (ev) => {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('.sh-tag-bar button[data-tag], .sh-tag-bar button[data-wrap]') : null;
+    if (!btn) return;
+    const bar = btn.closest('.sh-tag-bar');
+    const tid = bar && bar.getAttribute('data-target');
+    const ta = tid ? $(tid) : null;
+    applyInlineTagToTextarea(ta, btn);
+  });
+}
+if ($('shExpandAllBtn')) $('shExpandAllBtn').onclick = () => {
+  if ($('devRyderBox')) $('devRyderBox').open = true;
+  if ($('ttsKeysCard')) $('ttsKeysCard').open = true;
+  if ($('fxHooksCard')) $('fxHooksCard').open = true;
+  document.querySelectorAll('#shGrid details.show-acc').forEach(el => {
+    el.open = true;
+    const sid = el.getAttribute('data-showid');
+    if (sid) openShowIds.add(sid);
+  });
+};
+if ($('shCollapseAllBtn')) $('shCollapseAllBtn').onclick = () => {
+  if ($('devRyderBox')) $('devRyderBox').open = false;
+  if ($('ttsKeysCard')) $('ttsKeysCard').open = false;
+  if ($('fxHooksCard')) $('fxHooksCard').open = false;
+  openShowIds.clear();
+  document.querySelectorAll('#shGrid details.show-acc').forEach(el => {
+    el.open = false;
+  });
+};
 if ($('devRyAddSpeechBtn')) $('devRyAddSpeechBtn').onclick = () => addRySpeechRow(null);
 if ($('devRyAddFxBtn')) $('devRyAddFxBtn').onclick = () => addRyFxRow(null);
 

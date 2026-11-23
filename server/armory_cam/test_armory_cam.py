@@ -5100,6 +5100,69 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_show_lab_collapsible_cards_and_walkin_inline_tag_controls(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_show_lab_acc_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.shows.allow_network = False
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash = client.get("/").get_data(as_text=True)
+            # 1. Top-level Show Lab accordions start closed (no `open` attribute on launch)
+            for tag_prefix in (
+                '<details id="devRyderBox" class="dev-drop-box show-acc">',
+                '<details id="ttsKeysCard" class="card show-acc"',
+                '<details id="fxHooksCard" class="card show-acc"',
+            ):
+                self.assertIn(tag_prefix, dash)
+                idx = dash.index(tag_prefix)
+                close_gt = dash.index(">", idx)
+                self.assertNotIn(" open", dash[idx:close_gt].lower())
+
+            # 2. Expand/Collapse controls + shared inline hype/speed/voice helpers present
+            for tok in (
+                "shExpandAllBtn",
+                "shCollapseAllBtn",
+                "buildInlineTagBarHtml",
+                "applyInlineTagToTextarea",
+                "auditionShowVoice",
+                "shVoice_",
+                "shStyle_",
+                "speed:+10%",
+                "speed:+20%",
+                "speed:-10%",
+                "[excited]",
+                "[shouting]",
+                "vol:+3dB",
+                "onShowAccToggle",
+            ):
+                self.assertIn(tok, dash, msg=f"Missing Show Lab token: {tok}")
+
+            # 3. Updating script, voice & voiceStyle on any walk-in persists cleanly
+            payload = {
+                "announcerText": "[speed:+10%] [excited] Clear the floor! [shouting] JENNA!!",
+                "announcerVoice": "kokoro:am_onyx",
+                "voiceStyle": "High energy rockstar hype",
+            }
+            resp = client.post("/api/shows/jenna_walkin/config", json=payload)
+            self.assertEqual(resp.status_code, 200)
+            body = resp.get_json()
+            self.assertTrue(body["ok"], msg=str(body))
+            self.assertEqual(body["show"]["announcerText"], payload["announcerText"])
+            self.assertEqual(body["show"]["announcerVoice"], payload["announcerVoice"])
+            self.assertEqual(body["show"]["voiceStyle"], payload["voiceStyle"])
+
+            reloaded = sd.ShowDirector(root_dir=tmp, allow_network=False)
+            jenna = reloaded.get_show("jenna_walkin")
+            assert jenna is not None
+            self.assertEqual(jenna.announcer_text, payload["announcerText"])
+            self.assertEqual(jenna.announcer_voice, payload["announcerVoice"])
+            self.assertEqual(jenna.voice_style, payload["voiceStyle"])
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
