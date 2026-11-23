@@ -79,6 +79,11 @@ DEFAULT_ADB_PORT = 5555
 DEFAULT_IDLE_SLEEP_SEC = 600
 DEFAULT_SCRUB_THUMB_W = 280
 DEFAULT_SCRUB_THUMB_Q = 58
+MOTION_PRE_ROLL_SEC = 12
+MOTION_POST_ROLL_SEC = 18
+MOTION_RESCAN_VERSION = 2
+MAX_STREAM_CONCURRENT = 4
+TAPE_GAP_MS = 15_000
 MIN_CROP_SPAN = 0.15
 MIN_EXCL_SPAN = 0.04
 MAX_EXCLUSIONS = 6
@@ -1117,6 +1122,7 @@ def build_ffmpeg_vf(
     tilt: float = 0.0,
     defish: bool = False,
     src_size: tuple[int, int] = (WYZE_V3_REF_W, WYZE_V3_REF_H),
+    fast_defish: bool = False,
 ) -> str | None:
     """Build ordered FFmpeg `-vf` chain (rotate -> v360 PTZ or tilt+crop -> optional fps/scale)."""
     parts: list[str] = []
@@ -1134,10 +1140,11 @@ def build_ffmpeg_vf(
         sw = max(16, int(src_size[0] or WYZE_V3_REF_W))
         sh = max(16, int(src_size[1] or WYZE_V3_REF_H))
         p = compute_v360_params(sw, sh, crop=norm_crop, rotate=rot, tilt=tlt)
+        interp_mode = "linear" if fast_defish else "cubic"
         parts.append(
             f"v360=input=fisheye:ih_fov={p['ih_fov']:.4f}:iv_fov={p['iv_fov']:.4f}:output=flat:"
             f"w={p['out_w']}:h={p['out_h']}:h_fov={p['hfov_deg']:.2f}:v_fov={p['vfov_deg']:.2f}:"
-            f"yaw={p['yaw_deg']:.2f}:pitch={p['pitch_deg']:.2f}:roll={p['roll_deg']:.2f}:interp=cubic"
+            f"yaw={p['yaw_deg']:.2f}:pitch={p['pitch_deg']:.2f}:roll={p['roll_deg']:.2f}:interp={interp_mode}"
         )
     else:
         if tlt != 0.0:
@@ -1298,17 +1305,21 @@ def compute_motion_energy_from_frames(
     frames: list[np.ndarray],
     roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
     exclusions: Sequence[Any] = (),
+    prev_frame: np.ndarray | None = None,
 ) -> float:
-    """Compute lightweight motion score (0..100) across sampled BGR frames inside normalized ROI minus exclusion quads."""
-    if len(frames) < 2:
+    """Compute motion score v2 (0..100) across sampled BGR frames + optional prev_frame inside ROI minus exclusion quads."""
+    all_frames = ([prev_frame] + list(frames)) if prev_frame is not None else list(frames)
+    if len(all_frames) < 2:
         return 0.0
     x0, y0, x1, y1 = normalize_crop(roi)
     excl_list = normalize_exclusions(list(exclusions)) if exclusions else []
 
     prep: list[np.ndarray] = []
     include_mask: np.ndarray | None = None
-    for frm in frames:
-        small = cv2.resize(frm, (160, 90), interpolation=cv2.INTER_AREA)
+    for frm in all_frames:
+        if frm is None or frm.size == 0:
+            continue
+        small = cv2.resize(frm, (240, 135), interpolation=cv2.INTER_AREA)
         h, w = small.shape[:2]
         cx0, cx1 = int(round(x0 * w)), int(round(x1 * w))
         cy0, cy1 = int(round(y0 * h)), int(round(y1 * h))
@@ -1330,18 +1341,27 @@ def compute_motion_energy_from_frames(
                 cv2.fillPoly(mask_u8, [pts], 0, shift=shift)
             include_mask = mask_u8.astype(bool)
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        prep.append(cv2.GaussianBlur(gray, (5, 5), 0))
+        prep.append(cv2.GaussianBlur(gray, (3, 3), 0))
 
+    if len(prep) < 2:
+        return 0.0
     if include_mask is not None and not np.any(include_mask):
         return 0.0
 
+    pairs: list[tuple[int, int]] = [(i, i + 1) for i in range(len(prep) - 1)]
+    seg_start = 1 if prev_frame is not None else 0
+    if len(prep) - seg_start >= 3:
+        pairs.append((seg_start, len(prep) - 1))
+
     best = 0.0
-    for i in range(len(prep) - 1):
-        diff = cv2.absdiff(prep[i], prep[i + 1])
+    for idx_a, idx_b in pairs:
+        diff = cv2.absdiff(prep[idx_a], prep[idx_b])
         vals = diff[include_mask] if include_mask is not None else diff
         mean_diff = float(np.mean(vals))
-        active_pct = float(np.mean(vals > 14)) * 100.0
-        score = round(0.6 * mean_diff + 0.25 * active_pct, 3)
+        active10 = float(np.mean(vals > 10)) * 100.0
+        p98 = float(np.percentile(vals, 98))
+        p98_bonus = max(0.0, p98 - 6.0) * 0.12
+        score = round(0.65 * mean_diff + 0.35 * active10 + p98_bonus, 3)
         if score > best:
             best = score
     return min(100.0, best)
@@ -1586,6 +1606,8 @@ class SegmentInfo:
     end_ms: int
     energy: float
     camera: str
+    kind: str = ""
+    session_id: str = ""
 
 
 @dataclass
@@ -2587,6 +2609,7 @@ class ArmoryCamService:
             self.ntfy_topic = ""
         self.cameras: list[CameraConfig] = []
         self.bump_alert_ntfy: bool = True
+        self.motion_record_247: bool = True
         self._bump_strikes: dict[str, int] = {}
         self._bump_last_ntfy: dict[str, float] = {}
         self._bump_last_check: dict[str, float] = {}
@@ -2601,6 +2624,16 @@ class ArmoryCamService:
         self.seen_files: set[str] = set()
         self.latest_energy: dict[str, float] = {}
         self.cam_connected: dict[str, bool] = {}
+        self._last_seg_frame: dict[tuple[str, int, float], tuple[int, np.ndarray]] = {}
+        self._motion_archive_until_ms: int = 0
+        self._motion_soft_streak: dict[str, int] = {}
+        self._copied_session_keys: dict[str, set[tuple[str, str]]] = {}
+        self._scan_lock = threading.Lock()
+        self._scan_active: set[str] = set()
+        self._scan_progress: dict[str, tuple[int, int]] = {}
+        self._stream_lock = threading.Lock()
+        self._stream_procs: dict[str, tuple[subprocess.Popen[bytes], float]] = {}
+        self._interactive_busy_until: float = 0.0
         self._thumb_lock = threading.Lock()
         self._thumb_mem: OrderedDict[str, bytes] = OrderedDict()
         self._preview_locks_guard = threading.Lock()
@@ -2768,6 +2801,7 @@ class ArmoryCamService:
             if "driveBackupDir" in raw:
                 self.drive_backup_dir = str(raw.get("driveBackupDir") or "").strip()
             self.bump_alert_ntfy = bool(raw.get("bumpAlertNtfy", True))
+            self.motion_record_247 = bool(raw.get("motionRecord247", True))
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
             self.voice_cfg = RoomVoiceConfig.from_dict(raw.get("voice"))
             self.voice.update_config(self.voice_cfg.to_dict())
@@ -2789,6 +2823,7 @@ class ArmoryCamService:
             "preRollSec": self.pre_roll_sec,
             "driveBackupDir": self.drive_backup_dir,
             "bumpAlertNtfy": self.bump_alert_ntfy,
+            "motionRecord247": self.motion_record_247,
             "cameras": [c.to_dict() for c in self.cameras],
             "wallboard": self.wallboard_cfg.to_dict(),
             "voice": self.voice_cfg.to_dict(),
@@ -2985,6 +3020,8 @@ class ArmoryCamService:
                 self.drive_backup_dir = next_dir
             if "bumpAlertNtfy" in raw:
                 self.bump_alert_ntfy = bool(raw.get("bumpAlertNtfy"))
+            if "motionRecord247" in raw:
+                self.motion_record_247 = bool(raw.get("motionRecord247"))
             if isinstance(raw.get("wallboard"), dict):
                 merged = {**self.wallboard_cfg.to_dict(), **raw["wallboard"]}
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
@@ -3144,6 +3181,14 @@ class ArmoryCamService:
         self.voice.stop()
         self.room_audio.stop()
         self.live_hub.stop_all()
+        with self._stream_lock:
+            s_procs = [p for p, _ in self._stream_procs.values()]
+            self._stream_procs.clear()
+        for sp in s_procs:
+            try:
+                sp.terminate()
+            except Exception:
+                pass
         with self.lock:
             procs = list(self._procs.values())
             self._procs.clear()
@@ -3370,11 +3415,9 @@ class ArmoryCamService:
             try:
                 with self.lock:
                     phys_cams = self._physical_cameras()
-                    rec_active = bool(self.recording and not self.paused)
-                need_energy = rec_active or ((time.monotonic() - self._last_camera_ui_mono) < 15.0)
                 for cam in phys_cams:
                     try:
-                        self._ingest_closed_segments(cam, now, compute_energy=need_energy)
+                        self._ingest_closed_segments(cam, now, compute_energy=True)
                     except Exception as exc:
                         self.log.exception("[%s] Segment ingest error: %s", cam.name, exc)
                 if now - last_bump > 30.0:
@@ -3457,23 +3500,34 @@ class ArmoryCamService:
             view_results: list[tuple[CameraConfig, SegmentInfo]] = []
             for v in views:
                 if raw_frames:
-                    tkey = (normalize_rotate(v.rotate), normalize_tilt(v.tilt))
+                    rot_v = normalize_rotate(v.rotate)
+                    tilt_v = normalize_tilt(v.tilt)
+                    tkey = (rot_v, tilt_v)
                     if tkey not in rot_cache:
                         rot_cache[tkey] = (
                             [
-                                apply_frame_transform(frm, rotate=tkey[0], tilt=tkey[1], apply_crop=False)
+                                apply_frame_transform(frm, rotate=rot_v, tilt=tilt_v, apply_crop=False)
                                 for frm in raw_frames
                             ]
                             if tkey != (0, 0.0)
                             else raw_frames
                         )
+                    tframes = rot_cache[tkey]
+                    prev_entry = self._last_seg_frame.get((v.slug, rot_v, tilt_v))
+                    prev_frm = (
+                        prev_entry[1]
+                        if prev_entry is not None and 0 < (start_ms - prev_entry[0]) <= 6000
+                        else None
+                    )
                     energy = (
                         compute_motion_energy_from_frames(
-                            rot_cache[tkey], roi=v.effective_roi(), exclusions=v.exclusions
+                            tframes, roi=v.effective_roi(), exclusions=v.exclusions, prev_frame=prev_frm
                         )
-                        if rot_cache[tkey]
+                        if tframes
                         else 0.0
                     )
+                    if tframes:
+                        self._last_seg_frame[(v.slug, rot_v, tilt_v)] = (start_ms + dur_ms, tframes[-1])
                 else:
                     energy = 0.0
                 info = SegmentInfo(
@@ -3494,12 +3548,67 @@ class ArmoryCamService:
                     bucket.append(info)
                     if len(bucket) > 600:
                         del bucket[:-600]
-                    if self.recording and not self.paused and self.active_session_id:
+                if self.recording and not self.paused and self.active_session_id:
+                    for v, info in view_results:
                         self._copy_segment_to_session(self.active_session_id, v, info)
+                elif self.motion_record_247 and compute_energy and view_results:
+                    triggered = False
+                    for v, info in view_results:
+                        soft_th = max(1.0, float(v.motion_threshold) * 0.65)
+                        hard_th = max(1.8, float(v.motion_threshold) * 0.95)
+                        if info.energy >= soft_th:
+                            self._motion_soft_streak[v.slug] = self._motion_soft_streak.get(v.slug, 0) + 1
+                        else:
+                            self._motion_soft_streak[v.slug] = 0
+                        if info.energy >= hard_th or self._motion_soft_streak.get(v.slug, 0) >= 2:
+                            triggered = True
+                    seg_s0 = view_results[0][1].start_ms
+                    seg_e0 = view_results[0][1].end_ms
+                    if triggered:
+                        motion_sid = f"motion_{datetime.fromtimestamp(seg_s0 / 1000.0).strftime('%Y-%m-%d')}"
+                        self._ensure_motion_session_meta(motion_sid, seg_s0)
+                        was_idle = seg_s0 > self._motion_archive_until_ms
+                        self._motion_archive_until_ms = max(
+                            self._motion_archive_until_ms, seg_e0 + MOTION_POST_ROLL_SEC * 1000
+                        )
+                        if was_idle:
+                            pre_cutoff = seg_s0 - (MOTION_PRE_ROLL_SEC * 1000)
+                            for c_all in self.cameras:
+                                if not c_all.enabled:
+                                    continue
+                                for r_seg in self.ring_segments.get(c_all.slug, []):
+                                    if r_seg.end_ms >= pre_cutoff and r_seg.start_ms <= seg_e0:
+                                        self._copy_segment_to_session(motion_sid, c_all, r_seg)
+                    if seg_s0 <= self._motion_archive_until_ms:
+                        motion_sid = f"motion_{datetime.fromtimestamp(seg_s0 / 1000.0).strftime('%Y-%m-%d')}"
+                        self._ensure_motion_session_meta(motion_sid, seg_s0)
+                        for v, info in view_results:
+                            self._copy_segment_to_session(motion_sid, v, info)
+
+    def _ensure_motion_session_meta(self, motion_sid: str, started_ms: int) -> None:
+        sdir = self.tapes_root / safe_slug(motion_sid, "motion")
+        sdir.mkdir(parents=True, exist_ok=True)
+        meta_path = sdir / "session.json"
+        if not meta_path.is_file():
+            try:
+                meta_path.write_text(
+                    json.dumps(
+                        {
+                            "sessionId": motion_sid,
+                            "name": "24/7 Motion",
+                            "kind": "motion",
+                            "startedMs": int(started_ms),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
 
     def _copy_segment_to_session(self, session_id: str, cam: CameraConfig, info: SegmentInfo) -> None:
+        clean_id = safe_slug(session_id, "session")
         media_slug = self._source_slug_for(cam)
-        sdir = self.tapes_root / safe_slug(session_id, "session") / media_slug
+        sdir = self.tapes_root / clean_id / media_slug
         sdir.mkdir(parents=True, exist_ok=True)
         dst = sdir / info.path.name
         if not dst.exists() and info.path.exists():
@@ -3510,7 +3619,24 @@ class ArmoryCamService:
                     shutil.copy2(info.path, dst)
                 except OSError:
                     return
-        motion_file = self.tapes_root / safe_slug(session_id, "session") / "motion.jsonl"
+        motion_file = self.tapes_root / clean_id / "motion.jsonl"
+        seen_set = self._copied_session_keys.get(clean_id)
+        if seen_set is None:
+            seen_set = set()
+            if motion_file.is_file():
+                try:
+                    for line in motion_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if not line.strip():
+                            continue
+                        obj = json.loads(line)
+                        seen_set.add((str(obj.get("slug") or obj.get("camera") or ""), str(obj.get("file") or "")))
+                except Exception:
+                    pass
+            self._copied_session_keys[clean_id] = seen_set
+        dedup_key = (cam.slug, info.path.name)
+        if dedup_key in seen_set:
+            return
+        seen_set.add(dedup_key)
         sample = {
             "camera": cam.name,
             "slug": cam.slug,
@@ -3518,6 +3644,7 @@ class ArmoryCamService:
             "startMs": info.start_ms,
             "endMs": info.end_ms,
             "energy": info.energy,
+            "v": MOTION_RESCAN_VERSION,
         }
         try:
             with motion_file.open("a", encoding="utf-8") as fh:
@@ -3704,7 +3831,14 @@ class ArmoryCamService:
             sdir = self.tapes_root / clean_id
             sdir.mkdir(parents=True, exist_ok=True)
             (sdir / "session.json").write_text(
-                json.dumps({"sessionId": session_id, "name": name, "startedMs": int(time.time() * 1000)}),
+                json.dumps(
+                    {
+                        "sessionId": session_id,
+                        "name": name,
+                        "kind": "workout",
+                        "startedMs": int(time.time() * 1000),
+                    }
+                ),
                 encoding="utf-8",
             )
             pre_cutoff = int(time.time() * 1000) - (self.pre_roll_sec * 1000)
@@ -3736,40 +3870,466 @@ class ArmoryCamService:
             if discard and target:
                 shutil.rmtree(self.tapes_root / target, ignore_errors=True)
 
-    def session_samples(self, session_id: str | None = None) -> list[dict[str, Any]]:
-        samples: list[dict[str, Any]] = []
-        seen_keys: set[tuple[str, str]] = set()
-        if session_id:
-            clean_id = safe_slug(session_id)
-            motion_file = self.tapes_root / clean_id / "motion.jsonl"
-            if motion_file.exists():
-                for line in motion_file.read_text(encoding="utf-8").splitlines():
+    @staticmethod
+    def _normalize_source_filter(raw: str | None) -> str:
+        val = str(raw or "").strip().lower()
+        if val in ("workout", "workouts", "w"):
+            return "workout"
+        if val in ("motion", "247", "nonworkout", "m"):
+            return "motion"
+        return "all"
+
+    def _tape_meta(self, clean_id: str) -> dict[str, Any]:
+        sdir = self.tapes_root / clean_id
+        default_kind = "motion" if clean_id.startswith("motion_") else "workout"
+        meta_file = sdir / "session.json"
+        if meta_file.is_file():
+            try:
+                obj = json.loads(meta_file.read_text(encoding="utf-8"))
+                if isinstance(obj, dict):
+                    kind = "motion" if (obj.get("kind") == "motion" or clean_id.startswith("motion_")) else "workout"
+                    name = str(obj.get("name") or "").strip()
+                    if not name:
+                        name = "24/7 Motion" if kind == "motion" else clean_id
+                    return {
+                        "sessionId": str(obj.get("sessionId") or clean_id),
+                        "name": name,
+                        "kind": kind,
+                        "startedMs": int(obj.get("startedMs") or 0),
+                    }
+            except Exception:
+                pass
+        return {
+            "sessionId": clean_id,
+            "name": "24/7 Motion" if default_kind == "motion" else clean_id,
+            "kind": default_kind,
+            "startedMs": 0,
+        }
+
+    def _tape_first_ts_ms(self, clean_id: str) -> int | None:
+        sdir = self.tapes_root / clean_id
+        if not sdir.is_dir():
+            return None
+        best: int | None = None
+        try:
+            for cam_ent in os.scandir(sdir):
+                if not cam_ent.is_dir():
+                    continue
+                with os.scandir(cam_ent.path) as it:
+                    for f_ent in it:
+                        nm = f_ent.name
+                        if not (nm.startswith("seg_") and nm.endswith(".ts")):
+                            continue
+                        ms = parse_segment_start_ms(nm)
+                        if ms is not None and (best is None or ms < best):
+                            best = ms
+        except OSError:
+            pass
+        return best
+
+    def _resolve_session_entries(self, session_id: str | None, source_filter: str = "all") -> list[tuple[str, str]]:
+        raw = str(session_id or "").strip()
+        if not raw:
+            return []
+        sf = self._normalize_source_filter(source_filter)
+        if raw.startswith("__day__:"):
+            day_str = raw[len("__day__:") :].strip()[:10]
+            if not day_str:
+                return []
+            day_compact = day_str.replace("-", "")
+            matched: list[tuple[int, str, str, bool]] = []
+            if self.tapes_root.is_dir():
+                try:
+                    with os.scandir(self.tapes_root) as root_it:
+                        entries = list(root_it)
+                except OSError:
+                    entries = []
+                for ent in entries:
+                    if not ent.is_dir():
+                        continue
+                    cid = ent.name
+                    meta = self._tape_meta(cid)
+                    kind = meta["kind"]
+                    if sf != "all" and kind != sf:
+                        continue
+                    belongs = cid == f"motion_{day_str}"
+                    first_ms: int | None = None
+                    ts_set: set[int] = set()
+                    try:
+                        with os.scandir(ent.path) as sub_it:
+                            subs = list(sub_it)
+                        for sub in subs:
+                            if not sub.is_dir():
+                                continue
+                            with os.scandir(sub.path) as it:
+                                for f_ent in it:
+                                    nm = f_ent.name
+                                    if not (nm.startswith("seg_") and nm.endswith(".ts")):
+                                        continue
+                                    ms = parse_segment_start_ms(nm)
+                                    if ms is not None:
+                                        ts_set.add(ms)
+                                        if first_ms is None or ms < first_ms:
+                                            first_ms = ms
+                                    if nm.startswith(f"seg_{day_compact}_"):
+                                        belongs = True
+                                    if belongs and len(ts_set) >= 2 and first_ms is not None:
+                                        break
+                            if belongs and len(ts_set) >= 2 and first_ms is not None:
+                                break
+                    except OSError:
+                        continue
+                    if not belongs and meta.get("startedMs"):
+                        try:
+                            if datetime.fromtimestamp(meta["startedMs"] / 1000.0).strftime("%Y-%m-%d") == day_str:
+                                belongs = True
+                        except Exception:
+                            pass
+                    if belongs and first_ms is not None:
+                        matched.append((first_ms, cid, kind, len(ts_set) <= 1))
+            non_stubs = [m for m in matched if not m[3]]
+            kept = non_stubs if non_stubs else matched
+            kept.sort(key=lambda item: item[0])
+            return [(cid, kind) for _, cid, kind, _ in kept]
+
+        clean_id = safe_slug(raw, "session")
+        meta = self._tape_meta(clean_id)
+        if sf != "all" and meta["kind"] != sf:
+            return []
+        return [(clean_id, meta["kind"])]
+
+    def _load_motion_v2(self, clean_id: str) -> dict[str, Any]:
+        p = self.tapes_root / clean_id / "motion_v2.json"
+        if not p.is_file():
+            return {}
+        try:
+            obj = json.loads(p.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) and obj.get("version") == MOTION_RESCAN_VERSION else {}
+        except Exception:
+            return {}
+
+    def _save_motion_v2(self, clean_id: str, payload: dict[str, Any]) -> None:
+        sdir = self.tapes_root / clean_id
+        if not sdir.is_dir():
+            return
+        p = sdir / "motion_v2.json"
+        tmp = sdir / f".motion_v2.{threading.get_ident()}.tmp"
+        try:
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(p)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+
+    def _read_first_ts_frame(self, seg_path: Path, max_w: int = 480) -> np.ndarray | None:
+        cap = cv2.VideoCapture(str(seg_path))
+        if not cap.isOpened():
+            return None
+        try:
+            for _ in range(4):
+                ok, frm = cap.read()
+                if ok and frm is not None:
+                    if max_w > 0 and frm.shape[1] > max_w:
+                        h2 = max(2, int(round(frm.shape[0] * (float(max_w) / float(frm.shape[1])))))
+                        return cv2.resize(frm, (max_w, h2), interpolation=cv2.INTER_AREA)
+                    return frm
+            return None
+        finally:
+            cap.release()
+
+    def _rescan_session_motion(self, clean_id: str, force: bool = False) -> bool:
+        sdir = self.tapes_root / clean_id
+        if not sdir.is_dir():
+            return False
+        with self._scan_lock:
+            if clean_id in self._scan_active:
+                return False
+            self._scan_active.add(clean_id)
+        try:
+            with self.lock:
+                cams = [c for c in self.cameras if c.enabled]
+            v2_doc = self._load_motion_v2(clean_id)
+            views_doc: dict[str, Any] = dict(v2_doc.get("views") or {}) if isinstance(v2_doc, dict) else {}
+
+            # Map existing motion.jsonl scores so intra-segment rapid motion is preserved via max(v1, v2)
+            v1_scores: dict[tuple[str, str], float] = {}
+            mf = sdir / "motion.jsonl"
+            if mf.is_file():
+                for line in mf.read_text(encoding="utf-8", errors="ignore").splitlines():
                     if not line.strip():
                         continue
                     try:
                         obj = json.loads(line)
-                        k = (str(obj.get("camera", "")), str(obj.get("file", "")))
-                        if k not in seen_keys:
-                            seen_keys.add(k)
-                            samples.append(obj)
-                    except json.JSONDecodeError:
+                        fn = str(obj.get("file") or "")
+                        eng = float(obj.get("energy", 0.0))
+                        sl = str(obj.get("slug") or "")
+                        cn = str(obj.get("camera") or "").lower()
+                        if sl:
+                            v1_scores[(sl, fn)] = max(v1_scores.get((sl, fn), 0.0), eng)
+                        if cn:
+                            v1_scores[(cn, fn)] = max(v1_scores.get((cn, fn), 0.0), eng)
+                    except Exception:
                         continue
+
+            by_source: dict[str, list[CameraConfig]] = {}
+            for c in cams:
+                src_slug = self._source_slug_for(c)
+                if (sdir / src_slug).is_dir():
+                    by_source.setdefault(src_slug, []).append(c)
+                elif (sdir / c.slug).is_dir():
+                    by_source.setdefault(c.slug, []).append(c)
+
+            if not by_source:
+                return False
+
+            work_sources: list[tuple[str, list[Path], list[CameraConfig]]] = []
+            total_segs = 0
+            for src_slug, src_views in by_source.items():
+                segs = sorted((sdir / src_slug).glob("seg_*.ts"))
+                if not segs:
+                    continue
+                need_views: list[CameraConfig] = []
+                for v in src_views:
+                    ck = self._crop_cache_key(v)
+                    existing = views_doc.get(v.slug)
+                    if force or not isinstance(existing, dict) or existing.get("cropKey") != ck:
+                        need_views.append(v)
+                        continue
+                    sc_map = existing.get("scores") or {}
+                    covered = sum(1 for sp in segs if sp.name in sc_map)
+                    if covered < int(len(segs) * 0.85):
+                        need_views.append(v)
+                if need_views:
+                    work_sources.append((src_slug, segs, need_views))
+                    total_segs += len(segs)
+
+            if not work_sources:
+                return False
+
+            done_segs = 0
+            with self._scan_lock:
+                self._scan_progress[clean_id] = (0, max(1, total_segs))
+
+            for src_slug, segs, need_views in work_sources:
+                first_frames: list[np.ndarray | None] = []
+                chunk_size = 8
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    for off in range(0, len(segs), chunk_size):
+                        # Yield CPU immediately while streaming, or during any scrub/seek for auto-backfill
+                        while not self._stop_event.is_set() and (
+                            bool(self._stream_procs)
+                            or (not force and time.monotonic() < self._interactive_busy_until)
+                        ):
+                            self._stop_event.wait(0.25)
+                        if self._stop_event.is_set():
+                            return False
+                        batch = segs[off : off + chunk_size]
+                        for frm in pool.map(self._read_first_ts_frame, batch):
+                            first_frames.append(frm)
+                            done_segs += 1
+                            if done_segs % 25 == 0 or done_segs == total_segs:
+                                with self._scan_lock:
+                                    self._scan_progress[clean_id] = (done_segs, max(1, total_segs))
+
+                seg_times = [parse_segment_start_ms(sp.name) or 0 for sp in segs]
+                rot_cache: dict[tuple[int, float], list[np.ndarray | None]] = {}
+                for v in need_views:
+                    rot_v = normalize_rotate(v.rotate)
+                    tilt_v = normalize_tilt(v.tilt)
+                    tkey = (rot_v, tilt_v)
+                    if tkey not in rot_cache:
+                        if tkey == (0, 0.0):
+                            rot_cache[tkey] = first_frames
+                        else:
+                            rot_cache[tkey] = [
+                                apply_frame_transform(f, rotate=rot_v, tilt=tilt_v, apply_crop=False)
+                                if f is not None
+                                else None
+                                for f in first_frames
+                            ]
+                    tframes = rot_cache[tkey]
+                    roi_v = v.effective_roi()
+                    excl_v = v.exclusions
+                    scores: dict[str, float] = {}
+                    for i, sp in enumerate(segs):
+                        cur_f = tframes[i]
+                        prev_f = (
+                            tframes[i - 1]
+                            if i > 0 and 0 < (seg_times[i] - seg_times[i - 1]) <= 8000
+                            else None
+                        )
+                        inter_e = 0.0
+                        if prev_f is not None and cur_f is not None:
+                            inter_e = compute_motion_energy_from_frames(
+                                [prev_f, cur_f], roi=roi_v, exclusions=excl_v
+                            )
+                        elif cur_f is not None:
+                            # Isolated segment or start of a run: inspect within-segment frames
+                            _, intra_raw = extract_ts_sampled_frames(sp)
+                            if len(intra_raw) >= 2:
+                                intra_t = (
+                                    [
+                                        apply_frame_transform(f, rotate=rot_v, tilt=tilt_v, apply_crop=False)
+                                        for f in intra_raw
+                                    ]
+                                    if tkey != (0, 0.0)
+                                    else intra_raw
+                                )
+                                inter_e = compute_motion_energy_from_frames(
+                                    intra_t, roi=roi_v, exclusions=excl_v
+                                )
+                        old_v1 = max(
+                            v1_scores.get((v.slug, sp.name), 0.0),
+                            v1_scores.get((v.name.lower(), sp.name), 0.0),
+                        )
+                        scores[sp.name] = round(max(old_v1, inter_e), 2)
+                    views_doc[v.slug] = {"cropKey": self._crop_cache_key(v), "scores": scores}
+
+            self._save_motion_v2(clean_id, {"version": MOTION_RESCAN_VERSION, "views": views_doc})
+            return True
+        finally:
+            with self._scan_lock:
+                self._scan_active.discard(clean_id)
+                self._scan_progress.pop(clean_id, None)
+
+    def _trigger_session_rescan_async(self, clean_id: str, force: bool = False) -> bool:
+        sdir = self.tapes_root / clean_id
+        if not sdir.is_dir():
+            return False
+        with self._scan_lock:
+            if clean_id in self._scan_active:
+                return False
+
+        def _worker() -> None:
+            try:
+                self._rescan_session_motion(clean_id, force=force)
+            except Exception as exc:
+                self.log.debug("Background motion v2 scan error (%s): %s", clean_id, exc)
+
+        threading.Thread(target=_worker, name=f"motion-scan-{clean_id[:16]}", daemon=True).start()
+        return True
+
+    def rescan_tapes(self, session_id: str, force: bool = True, source_filter: str = "all") -> dict[str, Any]:
+        entries = self._resolve_session_entries(session_id, source_filter)
+        started = 0
+        scanning = 0
+        for cid, _kind in entries:
+            with self._scan_lock:
+                if cid in self._scan_active:
+                    scanning += 1
+                    continue
+            if self._trigger_session_rescan_async(cid, force=force):
+                started += 1
+        return {
+            "ok": True,
+            "started": started,
+            "scanning": started + scanning,
+            "scanStatus": "scanning" if (started + scanning) > 0 else "ready",
+        }
+
+    def session_samples(self, session_id: str | None = None, source_filter: str = "all") -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        seen_keys: set[tuple[str, str]] = set()
         with self.lock:
-            for cam in self.cameras:
-                for info in self.ring_segments.get(cam.slug, []):
-                    k = (info.camera, info.path.name)
-                    if k not in seen_keys:
-                        seen_keys.add(k)
+            active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
+            cams_by_slug = {c.slug: c for c in self.cameras}
+            cams_by_name = {c.name.lower(): c for c in self.cameras}
+
+        if session_id:
+            entries = self._resolve_session_entries(session_id, source_filter)
+            include_ring = False
+            for clean_id, kind in entries:
+                kind_ch = "m" if kind == "motion" else "w"
+                if clean_id == active_slug:
+                    include_ring = True
+                v2_doc = self._load_motion_v2(clean_id)
+                v2_views = v2_doc.get("views") if isinstance(v2_doc.get("views"), dict) else {}
+                v2_score_by_slug: dict[str, dict[str, float]] = {}
+                for v_slug, v_entry in v2_views.items():
+                    if not isinstance(v_entry, dict):
+                        continue
+                    cfg_cam = cams_by_slug.get(v_slug)
+                    if cfg_cam and v_entry.get("cropKey") and v_entry.get("cropKey") != self._crop_cache_key(cfg_cam):
+                        continue
+                    sc = v_entry.get("scores")
+                    if isinstance(sc, dict):
+                        v2_score_by_slug[v_slug] = sc
+
+                motion_file = self.tapes_root / clean_id / "motion.jsonl"
+                seen_in_session: set[tuple[str, str]] = set()
+                if motion_file.exists():
+                    for line in motion_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            fn = str(obj.get("file", ""))
+                            cam_name = str(obj.get("camera", ""))
+                            slug = str(obj.get("slug") or "")
+                            if not slug and cam_name.lower() in cams_by_name:
+                                slug = cams_by_name[cam_name.lower()].slug
+                            k = (cam_name, fn)
+                            v2_e = float(v2_score_by_slug.get(slug, {}).get(fn, 0.0))
+                            eng = max(float(obj.get("energy", 0.0)), v2_e)
+                            seen_in_session.add((slug or cam_name.lower(), fn))
+                            if k not in seen_keys:
+                                seen_keys.add(k)
+                                samples.append(
+                                    {
+                                        **obj,
+                                        "slug": slug or obj.get("slug", ""),
+                                        "energy": round(eng, 3),
+                                        "kind": kind_ch,
+                                        "sid": clean_id,
+                                    }
+                                )
+                        except json.JSONDecodeError:
+                            continue
+
+                # Emit samples for virtual/new views present in motion_v2.json that weren't in motion.jsonl
+                for v_slug, sc_map in v2_score_by_slug.items():
+                    cfg_cam = cams_by_slug.get(v_slug)
+                    cam_name = cfg_cam.name if cfg_cam else v_slug
+                    for fn, raw_e in sc_map.items():
+                        if (v_slug, fn) in seen_in_session or (cam_name, fn) in seen_keys:
+                            continue
+                        s_ms = parse_segment_start_ms(fn)
+                        if s_ms is None:
+                            continue
+                        seen_keys.add((cam_name, fn))
                         samples.append(
                             {
-                                "camera": info.camera,
-                                "slug": cam.slug,
-                                "file": info.path.name,
-                                "startMs": info.start_ms,
-                                "endMs": info.end_ms,
-                                "energy": info.energy,
+                                "camera": cam_name,
+                                "slug": v_slug,
+                                "file": fn,
+                                "startMs": s_ms,
+                                "endMs": s_ms + 3000,
+                                "energy": round(float(raw_e), 3),
+                                "kind": kind_ch,
+                                "sid": clean_id,
                             }
                         )
+        else:
+            include_ring = True
+
+        if include_ring:
+            with self.lock:
+                for cam in self.cameras:
+                    for info in self.ring_segments.get(cam.slug, []):
+                        k = (info.camera, info.path.name)
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            samples.append(
+                                {
+                                    "camera": info.camera,
+                                    "slug": cam.slug,
+                                    "file": info.path.name,
+                                    "startMs": info.start_ms,
+                                    "endMs": info.end_ms,
+                                    "energy": info.energy,
+                                    "kind": "l",
+                                    "sid": "",
+                                }
+                            )
         samples.sort(key=lambda x: int(x["startMs"]))
         return samples
 
@@ -3832,70 +4392,132 @@ class ArmoryCamService:
                             end_ms=next_start,
                             energy=seg.energy,
                             camera=seg.camera,
+                            kind=seg.kind,
+                            session_id=seg.session_id,
                         )
                     )
                     continue
             out.append(seg)
         return out
 
-    def find_segments(self, camera_name: str, session_id: str, start_ms: int, end_ms: int) -> list[SegmentInfo]:
+    def _motion_scores_for_session(
+        self,
+        clean_id: str,
+        slug: str,
+        canon_name: str,
+        cam: CameraConfig | None,
+    ) -> dict[str, tuple[int, int, float]]:
+        motion_map: dict[str, tuple[int, int, float]] = {}
+        motion_file = self.tapes_root / clean_id / "motion.jsonl"
+        if motion_file.exists():
+            for line in motion_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get("slug") == slug or str(obj.get("camera") or "").lower() == canon_name.lower():
+                        fn = str(obj["file"])
+                        prev = motion_map.get(fn)
+                        eng = float(obj.get("energy", 0.0))
+                        if prev is None or eng > prev[2]:
+                            motion_map[fn] = (int(obj["startMs"]), int(obj["endMs"]), eng)
+                except Exception:
+                    continue
+
+        v2_doc = self._load_motion_v2(clean_id)
+        v2_views = v2_doc.get("views") if isinstance(v2_doc.get("views"), dict) else {}
+        v2_entry = v2_views.get(slug) if isinstance(v2_views, dict) else None
+        if isinstance(v2_entry, dict):
+            ck_ok = (cam is None) or (not v2_entry.get("cropKey")) or (v2_entry.get("cropKey") == self._crop_cache_key(cam))
+            if ck_ok and isinstance(v2_entry.get("scores"), dict):
+                for fn, raw_e in v2_entry["scores"].items():
+                    e_v2 = float(raw_e or 0.0)
+                    prev = motion_map.get(fn)
+                    if prev is not None:
+                        if e_v2 > prev[2]:
+                            motion_map[fn] = (prev[0], prev[1], e_v2)
+                    else:
+                        s_ms = parse_segment_start_ms(fn)
+                        if s_ms is not None:
+                            motion_map[fn] = (s_ms, s_ms + 3000, e_v2)
+        return motion_map
+
+    def find_segments(
+        self,
+        camera_name: str,
+        session_id: str,
+        start_ms: int,
+        end_ms: int,
+        source_filter: str = "all",
+    ) -> list[SegmentInfo]:
         cam = self._find_camera(camera_name)
         slug = cam.slug if cam else safe_slug(camera_name.lower(), "rack_cam")
         media_slug = self._source_slug_for(cam) if cam else slug
         canon_name = cam.name if cam else camera_name
-        clean_id = safe_slug(session_id, "session") if session_id else ""
 
-        by_name: dict[str, SegmentInfo] = {}
+        by_key: dict[str, SegmentInfo] = {}
         inferred_names: set[str] = set()
-        motion_map: dict[str, tuple[int, int, float]] = {}
-        if clean_id:
-            motion_file = self.tapes_root / clean_id / "motion.jsonl"
-            if motion_file.exists():
-                for line in motion_file.read_text(encoding="utf-8").splitlines():
-                    try:
-                        obj = json.loads(line)
-                        if obj.get("slug") == slug or obj.get("camera") == canon_name:
-                            motion_map[str(obj["file"])] = (
-                                int(obj["startMs"]),
-                                int(obj["endMs"]),
-                                float(obj.get("energy", 0.0)),
-                            )
-                    except Exception:
-                        continue
+        with self.lock:
+            active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
 
+        entries = self._resolve_session_entries(session_id, source_filter)
+        entry_ids = {cid for cid, _ in entries}
+        any_dir_exists = any((self.tapes_root / cid).is_dir() for cid, _ in entries)
+
+        for clean_id, kind in entries:
+            kind_ch = "m" if kind == "motion" else "w"
+            motion_map = self._motion_scores_for_session(clean_id, slug, canon_name, cam)
             tape_dirs = [self.tapes_root / clean_id / media_slug]
             if slug != media_slug:
                 tape_dirs.append(self.tapes_root / clean_id / slug)
             for tape_cam_dir in tape_dirs:
                 if tape_cam_dir.exists():
                     for p in sorted(tape_cam_dir.glob("seg_*.ts")):
-                        if p.name in by_name:
+                        prev = by_key.get(p.name)
+                        if prev is not None and prev.kind == "w":
                             continue
                         m = motion_map.get(p.name)
                         s_ms = m[0] if m else (parse_segment_start_ms(p.name) or 0)
                         e_ms = m[1] if m else (s_ms + 3000)
                         eng = m[2] if m else 0.0
-                        by_name[p.name] = SegmentInfo(path=p, start_ms=s_ms, end_ms=e_ms, energy=eng, camera=canon_name)
+                        by_key[p.name] = SegmentInfo(
+                            path=p,
+                            start_ms=s_ms,
+                            end_ms=e_ms,
+                            energy=eng,
+                            camera=canon_name,
+                            kind=kind_ch,
+                            session_id=clean_id,
+                        )
                         if not m:
                             inferred_names.add(p.name)
 
-        with self.lock:
-            for info in self.ring_segments.get(slug, []):
-                if info.path.exists() and info.path.name not in by_name:
-                    by_name[info.path.name] = info
-            if media_slug != slug:
-                for info in self.ring_segments.get(media_slug, []):
-                    if info.path.exists() and info.path.name not in by_name:
-                        by_name[info.path.name] = SegmentInfo(
-                            path=info.path,
-                            start_ms=info.start_ms,
-                            end_ms=info.end_ms,
-                            energy=0.0,
-                            camera=canon_name,
-                        )
+        include_ring = (
+            (not session_id)
+            or (active_slug in entry_ids)
+            or (not by_key and not str(session_id or "").startswith("__day__:") and not any_dir_exists)
+        )
+        if include_ring:
+            with self.lock:
+                for info in self.ring_segments.get(slug, []):
+                    if info.path.exists() and info.path.name not in by_key:
+                        by_key[info.path.name] = replace(info, kind="l", session_id="")
+                if media_slug != slug:
+                    for info in self.ring_segments.get(media_slug, []):
+                        if info.path.exists() and info.path.name not in by_key:
+                            by_key[info.path.name] = SegmentInfo(
+                                path=info.path,
+                                start_ms=info.start_ms,
+                                end_ms=info.end_ms,
+                                energy=0.0,
+                                camera=canon_name,
+                                kind="l",
+                                session_id="",
+                            )
 
-        inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_name))
-        ordered = self._reconcile_inferred_segments(sorted(by_name.values(), key=lambda s: s.start_ms), inferred_names)
+            inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_key))
+
+        ordered = self._reconcile_inferred_segments(sorted(by_key.values(), key=lambda s: s.start_ms), inferred_names)
         return [s for s in ordered if s.end_ms >= start_ms - 2500 and s.start_ms <= end_ms + 2500]
 
     def _find_camera(self, name_or_slug: str | None) -> CameraConfig | None:
@@ -3920,48 +4542,69 @@ class ArmoryCamService:
                 return c
         return None
 
-    def _list_camera_segments(self, camera_name: str, session_id: str) -> list[SegmentInfo]:
+    def _list_camera_segments(
+        self,
+        camera_name: str,
+        session_id: str,
+        source_filter: str = "all",
+    ) -> list[SegmentInfo]:
         cam = self._find_camera(camera_name)
         slug = cam.slug if cam else safe_slug(camera_name.lower(), "rack_cam")
         media_slug = self._source_slug_for(cam) if cam else slug
         canon_name = cam.name if cam else camera_name
-        clean_id = safe_slug(session_id, "session") if session_id else ""
         by_name: dict[str, SegmentInfo] = {}
         inferred_names: set[str] = set()
 
         with self.lock:
             active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
 
-        if clean_id:
+        entries = self._resolve_session_entries(session_id, source_filter)
+        entry_ids = {cid for cid, _ in entries}
+        any_dir_exists = any((self.tapes_root / cid).is_dir() for cid, _ in entries)
+
+        for clean_id, kind in entries:
+            kind_ch = "m" if kind == "motion" else "w"
+            motion_map = self._motion_scores_for_session(clean_id, slug, canon_name, cam)
             tape_dirs = [self.tapes_root / clean_id / media_slug]
             if slug != media_slug:
                 tape_dirs.append(self.tapes_root / clean_id / slug)
             for tape_cam_dir in tape_dirs:
                 if tape_cam_dir.exists():
                     for p in sorted(tape_cam_dir.glob("seg_*.ts")):
-                        if p.name in by_name:
+                        prev = by_name.get(p.name)
+                        if prev is not None and prev.kind == "w":
                             continue
-                        s_ms = parse_segment_start_ms(p.name)
+                        m = motion_map.get(p.name)
+                        s_ms = m[0] if m else parse_segment_start_ms(p.name)
                         if s_ms is None:
                             try:
                                 s_ms = int(p.stat().st_mtime * 1000) - 3000
                             except OSError:
                                 continue
+                        e_ms = m[1] if m else (s_ms + 3000)
+                        eng = m[2] if m else 0.0
                         by_name[p.name] = SegmentInfo(
                             path=p,
                             start_ms=s_ms,
-                            end_ms=s_ms + 3000,
-                            energy=0.0,
+                            end_ms=e_ms,
+                            energy=eng,
                             camera=canon_name,
+                            kind=kind_ch,
+                            session_id=clean_id,
                         )
-                        inferred_names.add(p.name)
+                        if not m:
+                            inferred_names.add(p.name)
 
-        include_ring = (not clean_id) or (clean_id == active_slug) or (not by_name)
+        include_ring = (
+            (not session_id)
+            or (active_slug in entry_ids)
+            or (not by_name and not str(session_id or "").startswith("__day__:") and not any_dir_exists)
+        )
         if include_ring:
             with self.lock:
                 for info in self.ring_segments.get(slug, []):
                     if info.path.exists() and info.path.name not in by_name:
-                        by_name[info.path.name] = info
+                        by_name[info.path.name] = replace(info, kind="l", session_id="")
                 if media_slug != slug:
                     for info in self.ring_segments.get(media_slug, []):
                         if info.path.exists() and info.path.name not in by_name:
@@ -3971,16 +4614,147 @@ class ArmoryCamService:
                                 end_ms=info.end_ms,
                                 energy=0.0,
                                 camera=canon_name,
+                                kind="l",
+                                session_id="",
                             )
 
             inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_name))
         return self._reconcile_inferred_segments(sorted(by_name.values(), key=lambda s: s.start_ms), inferred_names)
 
-    def tape_timeline(self, camera_name: str, session_id: str, buckets: int = 80) -> dict[str, Any]:
+    @staticmethod
+    def _build_runs(segs: list[SegmentInfo], gap_ms: int = TAPE_GAP_MS) -> list[dict[str, Any]]:
+        if not segs:
+            return []
+        runs: list[dict[str, Any]] = []
+        cur_s = int(segs[0].start_ms)
+        cur_e = int(segs[0].end_ms)
+        cur_cnt = 1
+        cur_max_e = float(segs[0].energy)
+        cur_kinds: set[str] = {segs[0].kind or "w"}
+        cur_sid = segs[0].session_id
+        for s in segs[1:]:
+            s0 = int(s.start_ms)
+            s1 = int(s.end_ms)
+            if s0 - cur_e > gap_ms:
+                runs.append(
+                    {
+                        "startMs": cur_s,
+                        "endMs": cur_e,
+                        "durationSec": max(2, int(round((cur_e - cur_s) / 1000.0))),
+                        "segmentCount": cur_cnt,
+                        "maxEnergy": round(cur_max_e, 2),
+                        "kind": "mixed" if len(cur_kinds) > 1 else next(iter(cur_kinds)),
+                        "sid": cur_sid,
+                    }
+                )
+                cur_s, cur_e, cur_cnt, cur_max_e = s0, s1, 1, float(s.energy)
+                cur_kinds = {s.kind or "w"}
+                cur_sid = s.session_id
+            else:
+                cur_e = max(cur_e, s1)
+                cur_cnt += 1
+                if float(s.energy) > cur_max_e:
+                    cur_max_e = float(s.energy)
+                cur_kinds.add(s.kind or "w")
+        runs.append(
+            {
+                "startMs": cur_s,
+                "endMs": cur_e,
+                "durationSec": max(2, int(round((cur_e - cur_s) / 1000.0))),
+                "segmentCount": cur_cnt,
+                "maxEnergy": round(cur_max_e, 2),
+                "kind": "mixed" if len(cur_kinds) > 1 else next(iter(cur_kinds)),
+                "sid": cur_sid,
+            }
+        )
+        return runs
+
+    @staticmethod
+    def _build_runs_from_timestamps(ts_list: list[int], gap_ms: int = TAPE_GAP_MS) -> list[dict[str, Any]]:
+        if not ts_list:
+            return []
+        ordered = sorted(set(ts_list))
+        runs: list[dict[str, Any]] = []
+        r0 = ordered[0]
+        r1 = r0 + 2500
+        cnt = 1
+        for ts in ordered[1:]:
+            if ts - r1 > gap_ms:
+                runs.append(
+                    {
+                        "startMs": r0,
+                        "endMs": r1,
+                        "durationSec": max(2, int(round((r1 - r0) / 1000.0))),
+                        "segmentCount": cnt,
+                    }
+                )
+                r0, r1, cnt = ts, ts + 2500, 1
+            else:
+                r1 = max(r1, ts + 2500)
+                cnt += 1
+        runs.append(
+            {
+                "startMs": r0,
+                "endMs": r1,
+                "durationSec": max(2, int(round((r1 - r0) / 1000.0))),
+                "segmentCount": cnt,
+            }
+        )
+        return runs
+
+    def _check_session_scan_needed(self, entries: list[tuple[str, str]], cam: CameraConfig | None) -> tuple[str, int]:
+        if not entries or cam is None:
+            return "ready", 100
+        ck = self._crop_cache_key(cam)
+        src_slug = self._source_slug_for(cam)
+        scanning_any = False
+        done_sum = 0
+        tot_sum = 0
+        for cid, _ in entries:
+            with self._scan_lock:
+                if cid in self._scan_active:
+                    scanning_any = True
+                    d, t = self._scan_progress.get(cid, (0, 1))
+                    done_sum += d
+                    tot_sum += t
+                    continue
+            sdir = self.tapes_root / cid
+            phys_dir = sdir / src_slug
+            if not phys_dir.is_dir():
+                phys_dir = sdir / cam.slug
+            if not phys_dir.is_dir():
+                continue
+            seg_names = [f.name for f in phys_dir.glob("seg_*.ts")]
+            if len(seg_names) < 2:
+                continue
+            v2_doc = self._load_motion_v2(cid)
+            v2_entry = (v2_doc.get("views") or {}).get(cam.slug) if isinstance(v2_doc.get("views"), dict) else None
+            needs_scan = True
+            if isinstance(v2_entry, dict) and v2_entry.get("cropKey") == ck:
+                sc_map = v2_entry.get("scores") or {}
+                covered = sum(1 for nm in seg_names if nm in sc_map)
+                if covered >= int(len(seg_names) * 0.85):
+                    needs_scan = False
+            if needs_scan:
+                self._trigger_session_rescan_async(cid, force=False)
+                scanning_any = True
+                tot_sum += len(seg_names)
+        if scanning_any:
+            pct = int(round((done_sum / max(1, tot_sum)) * 100))
+            return "scanning", max(1, min(99, pct))
+        return "ready", 100
+
+    def tape_timeline(
+        self,
+        camera_name: str,
+        session_id: str,
+        buckets: int = 80,
+        source_filter: str = "all",
+    ) -> dict[str, Any]:
         cam = self._find_camera(camera_name)
         canon = cam.name if cam else (camera_name or "Rack Cam")
         thresh = float(cam.motion_threshold if cam else DEFAULT_MOTION_THRESHOLD)
-        segs = self._list_camera_segments(canon, session_id)
+        segs = self._list_camera_segments(canon, session_id, source_filter=source_filter)
         if not segs:
             return {
                 "ok": True,
@@ -3988,11 +4762,23 @@ class ArmoryCamService:
                 "minMs": 0,
                 "maxMs": 0,
                 "segmentCount": 0,
+                "recordedSec": 0,
                 "threshold": round(thresh, 2),
+                "runs": [],
+                "samples": [],
+                "allCamSamples": [],
+                "cameraNames": [],
+                "cameraActivity": {},
+                "hasAudio": False,
+                "scanStatus": "ready",
+                "scanPct": 100,
                 "activity": [],
                 "bursts": [],
                 "bursts30": [],
             }
+
+        entries = self._resolve_session_entries(session_id, source_filter) if session_id else []
+        scan_status, scan_pct = self._check_session_scan_needed(entries, cam)
 
         min_ms = int(segs[0].start_ms)
         max_ms = max(min_ms + 2000, max(int(s.end_ms) for s in segs))
@@ -4007,23 +4793,61 @@ class ArmoryCamService:
             for bi in range(bi0, bi1 + 1):
                 bucket_has_video[bi] = True
 
+        all_samples = self.session_samples(session_id, source_filter=source_filter)
         cam_samples: list[dict[str, Any]] = []
         cam_l = canon.lower()
         slug_l = cam.slug.lower() if cam else ""
-        for s in self.session_samples(session_id):
+        sample_by_file: dict[str, float] = {}
+        with self.lock:
+            enabled_cams = [c for c in self.cameras if c.enabled]
+        cam_names = [c.name for c in enabled_cams]
+        if canon not in cam_names:
+            cam_names.insert(0, canon)
+        cam_idx_by_l = {c.name.lower(): idx for idx, c in enumerate(enabled_cams)}
+        slug_idx_by_l = {c.slug.lower(): idx for idx, c in enumerate(enabled_cams)}
+        cam_thresh_by_idx = {idx: float(c.motion_threshold) for idx, c in enumerate(enabled_cams)}
+        cam_act: dict[str, dict[str, Any]] = {cn: {"activeSegs": 0, "maxE": 0.0} for cn in cam_names}
+        all_cam_bins: dict[int, tuple[int, int, float, int, str]] = {}
+
+        for s in all_samples:
             sc = str(s.get("camera", "")).strip().lower()
             ss = str(s.get("slug", "")).strip().lower()
+            e = float(s.get("energy", 0.0))
+            c_idx = slug_idx_by_l.get(ss) if ss in slug_idx_by_l else cam_idx_by_l.get(sc)
+            if c_idx is not None:
+                cn = enabled_cams[c_idx].name
+                stat = cam_act[cn]
+                if e >= max(1.0, cam_thresh_by_idx[c_idx] * 0.7):
+                    stat["activeSegs"] += 1
+                if e > stat["maxE"]:
+                    stat["maxE"] = round(e, 2)
+                s0 = int(s["startMs"])
+                s1 = int(s["endMs"])
+                k_bin = s0 // 2000
+                cur_best = all_cam_bins.get(k_bin)
+                k_ch = str(s.get("kind") or "w")
+                if cur_best is None or e > cur_best[2]:
+                    all_cam_bins[k_bin] = (s0, max(1000, s1 - s0), round(e, 2), c_idx, k_ch)
+
             if sc != cam_l and (not slug_l or ss != slug_l):
                 continue
             cam_samples.append(s)
+            fn = str(s.get("file") or "")
+            if fn and e > sample_by_file.get(fn, -1.0):
+                sample_by_file[fn] = e
             mid = (int(s["startMs"]) + int(s["endMs"])) // 2
             bi = min(n_buckets - 1, max(0, int(((mid - min_ms) / span) * n_buckets)))
-            e = float(s.get("energy", 0.0))
             if e > bucket_max[bi]:
                 bucket_max[bi] = e
 
+        # Sync SegmentInfo energy with best sample energy
+        enriched_segs: list[SegmentInfo] = []
+        for s in segs:
+            best_e = max(float(s.energy), sample_by_file.get(s.path.name, 0.0))
+            enriched_segs.append(replace(s, energy=best_e))
+
         if not cam_samples:
-            for s in segs:
+            for s in enriched_segs:
                 e = float(s.energy)
                 cam_samples.append(
                     {
@@ -4038,6 +4862,22 @@ class ArmoryCamService:
                 bi = min(n_buckets - 1, max(0, int(((mid - min_ms) / span) * n_buckets)))
                 if e > bucket_max[bi]:
                     bucket_max[bi] = e
+
+        runs = self._build_runs(enriched_segs)
+        recorded_sec = sum(int(r["durationSec"]) for r in runs)
+        compact_samples = [
+            [
+                int(s.start_ms),
+                max(1000, int(s.end_ms - s.start_ms)),
+                round(float(s.energy), 2),
+                s.kind or "w",
+            ]
+            for s in enriched_segs
+        ]
+        all_cam_samples = [
+            [row[0], row[1], row[2], row[3], row[4]]
+            for _, row in sorted(all_cam_bins.items(), key=lambda kv: kv[0])
+        ]
 
         activity = [
             {
@@ -4077,15 +4917,25 @@ class ArmoryCamService:
             "camera": canon,
             "minMs": min_ms,
             "maxMs": max_ms,
-            "segmentCount": len(segs),
+            "segmentCount": len(enriched_segs),
+            "recordedSec": recorded_sec,
             "threshold": round(thresh, 2),
+            "runs": runs,
+            "samples": compact_samples,
+            "allCamSamples": all_cam_samples,
+            "cameraNames": cam_names,
+            "cameraActivity": cam_act,
+            "hasAudio": self.room_audio.has_audio(min_ms, max_ms),
+            "scanStatus": scan_status,
+            "scanPct": scan_pct,
             "activity": activity,
             "bursts": bursts,
             "bursts30": bursts30,
         }
 
-    def list_tapes(self) -> dict[str, Any]:
-        """List rolling workout tapes grouped by local calendar day + the live pre-roll ring buffer."""
+    def list_tapes(self, source_filter: str = "all") -> dict[str, Any]:
+        """List rolling workout & 24/7 motion tapes grouped by local calendar day + live pre-roll ring buffer."""
+        sf = self._normalize_source_filter(source_filter)
         with self.lock:
             cams = list(self.cameras)
             active_slug = safe_slug(self.active_session_id, "session") if self.active_session_id else ""
@@ -4106,11 +4956,16 @@ class ArmoryCamService:
                 if not s_ent.is_dir():
                     continue
                 sid = s_ent.name
+                meta = self._tape_meta(sid)
+                kind = meta["kind"]
+                if sf != "all" and kind != sf:
+                    continue
                 min_ms: int | None = None
                 max_ms: int | None = None
                 seg_count = 0
                 total_bytes = 0
                 phys_slugs: set[str] = set()
+                ts_set: set[int] = set()
                 try:
                     sub_entries = list(os.scandir(s_ent.path))
                 except OSError:
@@ -4135,6 +4990,7 @@ class ArmoryCamService:
                                     sz = 0
                                 if s_ms is None:
                                     continue
+                                ts_set.add(s_ms)
                                 e_ms = s_ms + 2500
                                 min_ms = s_ms if (min_ms is None or s_ms < min_ms) else min_ms
                                 max_ms = e_ms if (max_ms is None or e_ms > max_ms) else max_ms
@@ -4148,16 +5004,25 @@ class ArmoryCamService:
 
                 if seg_count == 0 or min_ms is None or max_ms is None:
                     continue
+                runs = self._build_runs_from_timestamps(sorted(ts_set))
+                recorded_sec = sum(int(r["durationSec"]) for r in runs) if runs else max(2, int(round((max_ms - min_ms) / 1000.0)))
+                span_sec = max(2, int(round((max_ms - min_ms) / 1000.0)))
                 dt = datetime.fromtimestamp(min_ms / 1000.0)
                 tapes.append(
                     {
                         "sessionId": sid,
+                        "name": meta["name"],
+                        "kind": kind,
                         "isLive": False,
                         "isActive": sid == active_slug,
+                        "isStub": len(ts_set) <= 1,
                         "date": dt.strftime("%Y-%m-%d"),
                         "startMs": min_ms,
                         "endMs": max_ms,
-                        "durationSec": max(2, int(round((max_ms - min_ms) / 1000.0))),
+                        "durationSec": recorded_sec,
+                        "recordedSec": recorded_sec,
+                        "spanSec": span_sec,
+                        "runs": runs,
                         "segmentCount": seg_count,
                         "sizeMb": round(total_bytes / (1024.0 * 1024.0), 1),
                         "cameras": _views_for_sources(phys_slugs),
@@ -4167,27 +5032,41 @@ class ArmoryCamService:
 
         tapes.sort(key=lambda t: t["startMs"], reverse=True)
 
-        # Build days summary (newest date first)
-        days_map: dict[str, dict[str, Any]] = {}
+        # Group by date; filter out 1-chunk stubs on any day that already has real recordings
+        tapes_by_day: dict[str, list[dict[str, Any]]] = {}
         for t in tapes:
-            dkey = t["date"]
-            bucket = days_map.get(dkey)
-            if bucket is None:
-                dt = datetime.strptime(dkey, "%Y-%m-%d")
-                bucket = {
+            tapes_by_day.setdefault(t["date"], []).append(t)
+
+        days: list[dict[str, Any]] = []
+        for dkey in sorted(tapes_by_day.keys(), reverse=True):
+            day_tapes = tapes_by_day[dkey]
+            non_stubs = [t for t in day_tapes if not t.get("isStub")]
+            kept = non_stubs if non_stubs else day_tapes
+            dt = datetime.strptime(dkey, "%Y-%m-%d")
+            w_tapes = [t for t in kept if t["kind"] == "workout"]
+            m_tapes = [t for t in kept if t["kind"] == "motion"]
+            rec_sec = sum(int(t["recordedSec"]) for t in kept)
+            w_names = []
+            for wt in w_tapes:
+                nm = str(wt.get("name") or "").strip()
+                if nm and nm != wt["sessionId"] and nm not in w_names:
+                    w_names.append(nm)
+            days.append(
+                {
                     "date": dkey,
                     "label": f"{dt.strftime('%a %b')} {dt.day}",
-                    "tapeCount": 0,
-                    "totalDurationSec": 0,
-                    "totalMb": 0.0,
-                    "tapes": [],
+                    "tapeCount": len(kept),
+                    "totalDurationSec": rec_sec,
+                    "recordedSec": rec_sec,
+                    "workoutSec": sum(int(t["recordedSec"]) for t in w_tapes),
+                    "motionSec": sum(int(t["recordedSec"]) for t in m_tapes),
+                    "workoutCount": len(w_tapes),
+                    "motionCount": len(m_tapes),
+                    "workoutNames": w_names,
+                    "totalMb": round(sum(float(t["sizeMb"]) for t in kept), 1),
+                    "tapes": kept,
                 }
-                days_map[dkey] = bucket
-            bucket["tapes"].append(t)
-            bucket["tapeCount"] += 1
-            bucket["totalDurationSec"] += int(t["durationSec"])
-            bucket["totalMb"] = round(float(bucket["totalMb"]) + float(t["sizeMb"]), 1)
-        days = sorted(days_map.values(), key=lambda d: d["date"], reverse=True)
+            )
 
         # Live rolling ring entry (always present when physical ring has segments)
         live_min: int | None = None
@@ -4331,7 +5210,7 @@ class ArmoryCamService:
         predecoded_frame: np.ndarray | None = None,
     ) -> bytes | None:
         tw = max(180, min(720, int(max_w)))
-        if cam is None or tw != DEFAULT_SCRUB_THUMB_W:
+        if cam is None or tw > DEFAULT_SCRUB_THUMB_W:
             return self._render_segment_thumb_jpeg(
                 seg_path, cam, max_w=tw, quality=quality, predecoded_frame=predecoded_frame
             )
@@ -4376,9 +5255,12 @@ class ArmoryCamService:
         session_id: str,
         ts_ms: int,
         max_w: int = 480,
+        max_gap_ms: int | None = None,
+        source_filter: str = "all",
     ) -> bytes | None:
+        self._interactive_busy_until = max(self._interactive_busy_until, time.monotonic() + 3.0)
         cam = self._find_camera(camera_name)
-        segs = self._list_camera_segments(camera_name, session_id)
+        segs = self._list_camera_segments(camera_name, session_id, source_filter=source_filter)
         if not segs:
             return None
 
@@ -4392,6 +5274,14 @@ class ArmoryCamService:
         if not cands:
             cands.append(segs[0])
         best = min(cands, key=lambda s: abs(((s.start_ms + s.end_ms) // 2) - ts_ms))
+
+        if max_gap_ms is not None:
+            if best.start_ms <= ts_ms <= best.end_ms:
+                dist = 0
+            else:
+                dist = min(abs(ts_ms - best.start_ms), abs(ts_ms - best.end_ms))
+            if dist > int(max_gap_ms):
+                return None
 
         if cam and int(max_w) <= DEFAULT_SCRUB_THUMB_W:
             cached = self._get_or_create_seg_thumb(cam, best.path, max_w=DEFAULT_SCRUB_THUMB_W)
@@ -4446,10 +5336,11 @@ class ArmoryCamService:
         end_ms: int | None = None,
         count: int = 80,
         max_w: int = DEFAULT_SCRUB_THUMB_W,
+        source_filter: str = "all",
     ) -> dict[str, Any]:
         cam = self._find_camera(camera_name)
         canon = cam.name if cam else (camera_name or "Rack Cam")
-        segs = self._list_camera_segments(canon, session_id)
+        segs = self._list_camera_segments(canon, session_id, source_filter=source_filter)
         if not segs:
             return {
                 "ok": True,
@@ -4700,13 +5591,21 @@ class ArmoryCamService:
         *,
         include_audio: bool = False,
         audio_path: Path | None = None,
+        fast_defish: bool = False,
     ) -> bool:
         if not segs:
             return False
         out_path.parent.mkdir(parents=True, exist_ok=True)
         src_size = self._probe_segment_dims(segs[0].path) if (cam_cfg and cam_cfg.defish) else (WYZE_V3_REF_W, WYZE_V3_REF_H)
         vf = (
-            build_ffmpeg_vf(cam_cfg.crop, cam_cfg.rotate, tilt=cam_cfg.tilt, defish=cam_cfg.defish, src_size=src_size)
+            build_ffmpeg_vf(
+                cam_cfg.crop,
+                cam_cfg.rotate,
+                tilt=cam_cfg.tilt,
+                defish=cam_cfg.defish,
+                src_size=src_size,
+                fast_defish=fast_defish,
+            )
             if cam_cfg
             else None
         )
@@ -4831,19 +5730,203 @@ class ArmoryCamService:
                 avail.append(cam.name)
         return avail
 
+    def stop_stream(self, stream_id: str = "") -> int:
+        killed = 0
+        with self._stream_lock:
+            keys = [stream_id] if (stream_id and stream_id in self._stream_procs) else ([] if stream_id else list(self._stream_procs.keys()))
+            targets = [self._stream_procs.pop(k)[0] for k in keys]
+        for proc in targets:
+            killed += 1
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        return killed
+
+    def stream_tape_fmp4(
+        self,
+        camera_name: str,
+        session_id: str,
+        start_ms: int,
+        *,
+        source_filter: str = "all",
+        max_sec: int = 600,
+        stream_id: str = "",
+    ) -> tuple[int, int, Any] | None:
+        """Open a low-latency (~330ms TTFF) fragmented MP4 FFmpeg stream across a contiguous tape run."""
+        self._interactive_busy_until = max(self._interactive_busy_until, time.monotonic() + 5.0)
+        cam_cfg = self._find_camera(camera_name)
+        canon = cam_cfg.name if cam_cfg else (camera_name or "Rack Cam")
+        segs = self._list_camera_segments(canon, session_id, source_filter=source_filter)
+        if not segs:
+            return None
+
+        req_ms = int(start_ms)
+        start_idx = -1
+        for i, s in enumerate(segs):
+            if s.end_ms > req_ms - 500:
+                if s.start_ms <= req_ms + 10_000:
+                    start_idx = i
+                break
+        if start_idx < 0:
+            return None
+
+        run_segs: list[SegmentInfo] = [segs[start_idx]]
+        max_end_ms = max(req_ms, int(run_segs[0].start_ms)) + max(15, min(1800, int(max_sec))) * 1000
+        for s in segs[start_idx + 1 :]:
+            if s.start_ms - run_segs[-1].end_ms > 12_000:
+                break
+            if s.start_ms >= max_end_ms or len(run_segs) >= 300:
+                break
+            run_segs.append(s)
+
+        actual_start_ms = max(req_ms, int(run_segs[0].start_ms))
+        run_end_ms = int(run_segs[-1].end_ms)
+        ss_sec = max(0.0, (actual_start_ms - int(run_segs[0].start_ms)) / 1000.0)
+
+        src_size = self._probe_segment_dims(run_segs[0].path) if (cam_cfg and cam_cfg.defish) else (WYZE_V3_REF_W, WYZE_V3_REF_H)
+        vf = (
+            build_ffmpeg_vf(
+                cam_cfg.crop,
+                cam_cfg.rotate,
+                tilt=cam_cfg.tilt,
+                defish=cam_cfg.defish,
+                src_size=src_size,
+                fast_defish=True,
+            )
+            if cam_cfg
+            else None
+        )
+
+        tag = uuid.uuid4().hex[:10]
+        s_key = stream_id.strip() or f"anon_{tag}"
+        concat_path = self.previews_root / f".stream_{tag}.txt"
+        concat_lines = [
+            "file '{}'".format(s.path.resolve().as_posix().replace("'", r"'\''"))
+            for s in run_segs
+        ]
+        concat_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+        cmd = [
+            self.ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            *(["-ss", f"{ss_sec:.3f}"] if ss_sec >= 0.08 else []),
+            *(["-vf", vf] if vf else []),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-g",
+            "15",
+            "-keyint_min",
+            "15",
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+            "-crf",
+            "25",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-f",
+            "mp4",
+            "-frag_duration",
+            "500000",
+            "-movflags",
+            "frag_keyframe+empty_moov+default_base_moof",
+            "pipe:1",
+        ]
+
+        to_kill: list[subprocess.Popen[bytes]] = []
+        with self._stream_lock:
+            old = self._stream_procs.pop(s_key, None)
+            if old is not None:
+                to_kill.append(old[0])
+            while len(self._stream_procs) >= MAX_STREAM_CONCURRENT:
+                oldest_k = min(self._stream_procs.items(), key=lambda kv: kv[1][1])[0]
+                to_kill.append(self._stream_procs.pop(oldest_k)[0])
+        for old_p in to_kill:
+            try:
+                old_p.terminate()
+            except Exception:
+                pass
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                **_subprocess_no_window_kwargs(),
+            )
+            _assign_child_to_job(proc)
+        except Exception:
+            concat_path.unlink(missing_ok=True)
+            return None
+
+        with self._stream_lock:
+            self._stream_procs[s_key] = (proc, time.monotonic())
+
+        def _gen():
+            try:
+                assert proc.stdout is not None
+                while True:
+                    chunk = proc.stdout.read(32_768)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                with self._stream_lock:
+                    cur = self._stream_procs.get(s_key)
+                    if cur is not None and cur[0] is proc:
+                        self._stream_procs.pop(s_key, None)
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait(timeout=1.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                concat_path.unlink(missing_ok=True)
+
+        return actual_start_ms, run_end_ms, _gen
+
     def cut_preview(
         self,
         session_id: str,
         start_ms: int,
         end_ms: int,
         camera_name: str,
+        source_filter: str = "all",
     ) -> dict[str, Any] | None:
         cam_cfg = self._find_camera_exact(camera_name)
         if not cam_cfg:
             return None
         s_ms = int(start_ms)
         e_ms = min(s_ms + 180_000, max(s_ms + 1000, int(end_ms)))
-        segs = self.find_segments(cam_cfg.name, session_id, s_ms, e_ms)
+        segs = self.find_segments(cam_cfg.name, session_id, s_ms, e_ms, source_filter=source_filter)
         if not any(s.end_ms > s_ms and s.start_ms < e_ms for s in segs):
             return None
 
@@ -4866,7 +5949,7 @@ class ArmoryCamService:
                     pass
                 cached = True
             else:
-                ok = self._encode_segments_mp4(segs, cam_cfg, s_ms, e_ms, out_path)
+                ok = self._encode_segments_mp4(segs, cam_cfg, s_ms, e_ms, out_path, fast_defish=True)
                 if not ok:
                     return None
                 cached = False
@@ -4894,11 +5977,12 @@ class ArmoryCamService:
         camera_override: str | None = None,
         *,
         include_audio: bool = False,
+        source_filter: str = "all",
     ) -> dict[str, Any] | None:
         if end_ms <= start_ms:
             end_ms = start_ms + 5000
 
-        samples = self.session_samples(session_id)
+        samples = self.session_samples(session_id, source_filter=source_filter)
         fallback_cam = next(
             (c.name for c in self.cameras if c.enabled and c.name == "Rack Cam"),
             next((c.name for c in self.cameras if c.enabled), "Rack Cam"),
@@ -4921,12 +6005,12 @@ class ArmoryCamService:
             proc = self._procs.get(media_slug_probe)
             is_capturing = bool(proc is not None and proc.poll() is None)
 
-        segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
+        segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms, source_filter=source_filter)
         if is_capturing and int(end_ms) >= call_now_ms - 5000:
             wait_target_ms = min(int(end_ms), call_now_ms)
             deadline = time.monotonic() + 4.2
             while time.monotonic() < deadline:
-                segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms)
+                segs = self.find_segments(chosen_cam, session_id, start_ms, end_ms, source_filter=source_filter)
                 ready = False
                 if segs:
                     last_seg = segs[-1]
@@ -4945,7 +6029,7 @@ class ArmoryCamService:
         if not segs and not camera_override:
             for alt in self.cameras:
                 if alt.name != chosen_cam:
-                    alt_segs = self.find_segments(alt.name, session_id, start_ms, end_ms)
+                    alt_segs = self.find_segments(alt.name, session_id, start_ms, end_ms, source_filter=source_filter)
                     if alt_segs:
                         chosen_cam = alt.name
                         segs = alt_segs
@@ -5025,6 +6109,7 @@ class ArmoryCamService:
         cameras: Sequence[str],
         *,
         include_audio: bool = False,
+        source_filter: str = "all",
     ) -> list[dict[str, Any]]:
         clean: list[str] = []
         seen: set[str] = set()
@@ -5041,19 +6126,23 @@ class ArmoryCamService:
                 end_ms=end_ms,
                 camera_override=(clean[0] if clean else None),
                 include_audio=include_audio,
+                source_filter=source_filter,
             )
             return [single] if single else []
 
         with ThreadPoolExecutor(max_workers=min(4, len(clean))) as pool:
             futs = [
                 pool.submit(
-                    self.cut_clip,
-                    session_id,
-                    ex_name,
-                    start_ms,
-                    end_ms,
+                    lambda c_nm: self.cut_clip(
+                        session_id,
+                        ex_name,
+                        start_ms,
+                        end_ms,
+                        c_nm,
+                        include_audio=include_audio,
+                        source_filter=source_filter,
+                    ),
                     cam_name,
-                    include_audio=include_audio,
                 )
                 for cam_name in clean
             ]
@@ -5916,6 +7005,7 @@ class ArmoryCamService:
             rec = self.recording
             paused = self.paused
             bump_alert_ntfy = self.bump_alert_ntfy
+            motion_record_247 = self.motion_record_247
             last_poll_ok_ms = self._last_poll_ok_ms
 
         wb_status = {
@@ -5935,6 +7025,7 @@ class ArmoryCamService:
             "recording": rec,
             "paused": paused,
             "bumpAlertNtfy": bump_alert_ntfy,
+            "motionRecord247": motion_record_247,
             "disk": self.disk_stats(),
             "calibration": self.calibration_status(),
             "preview": self.preview_drive_info(),
@@ -6102,7 +7193,7 @@ DASHBOARD_HTML = """<!doctype html>
   .topbar-title{font-size:17px;font-weight:900;letter-spacing:.01em;margin:0}
   .topbar-meta{font-size:12px;color:var(--mut);margin-left:4px;font-variant-numeric:tabular-nums}
   .topbar-actions{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-  .page-wrap{width:100%;max-width:1240px;margin:0 auto;padding:18px 22px 36px}
+  .page-wrap{width:100%;max-width:1360px;margin:0 auto;padding:18px 22px 36px}
   .page{display:none}
   .page.active{display:block}
   .page-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
@@ -6131,25 +7222,77 @@ DASHBOARD_HTML = """<!doctype html>
   .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px}
   .card + .card{margin-top:14px}
   .card h2{margin:0 0 10px;font-size:16px;font-weight:900;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
-  .ts-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:6px 0 8px}
-  .ts-pill{border:1px solid var(--line);background:var(--inset);color:var(--mut);border-radius:9px;padding:5px 10px;font:700 12px/1.2 inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:border-color .12s ease,background-color .12s ease,color .12s ease}
+  .ts-head-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .ts-seg-ctrl{display:inline-flex;align-items:center;gap:2px;background:var(--inset);border:1px solid var(--line);border-radius:10px;padding:3px}
+  .ts-seg-btn{border:0;background:transparent;color:var(--mut);border-radius:7px;padding:4px 10px;font:800 11.5px/1.2 inherit;cursor:pointer;white-space:nowrap;transition:background-color .12s ease,color .12s ease}
+  .ts-seg-btn:hover{color:var(--fg)}
+  .ts-seg-btn.on{background:rgba(46,160,255,.22);color:#eaf4ff;box-shadow:inset 0 0 0 1px rgba(46,160,255,.45)}
+  .ts-strip{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:5px 0 8px}
+  .ts-pill{border:1px solid var(--line);background:var(--inset);color:var(--mut);border-radius:9px;padding:5px 10px;font:700 12px/1.25 inherit;cursor:pointer;display:inline-flex;align-items:center;gap:6px;transition:border-color .12s ease,background-color .12s ease,color .12s ease}
   .ts-pill:hover{border-color:#3a5270;color:var(--fg)}
   .ts-pill.on{background:rgba(46,160,255,.18);border-color:var(--blue);color:#fff}
-  .ts-stage{position:relative;width:100%;aspect-ratio:16/9;max-height:480px;background:#04070b;border-radius:12px;border:1px solid var(--line);overflow:hidden;display:flex;align-items:center;justify-content:center;margin-top:8px}
-  .ts-stage img,.ts-stage video{width:100%;height:100%;object-fit:contain;display:block;background:#000}
-  .ts-hud{position:absolute;left:10px;top:10px;z-index:4;background:rgba(7,10,15,.84);border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:4px 10px;font:700 12px/1.3 ui-monospace,Consolas,monospace;color:#e2e8f0;font-variant-numeric:tabular-nums;pointer-events:none}
-  .ts-stage-tools{position:absolute;right:10px;top:10px;z-index:5;display:flex;align-items:center;gap:6px}
-  .ts-stage-tools select{width:auto;padding:4px 8px;font-size:12px;font-weight:700;background:rgba(9,13,19,.88)}
-  .ts-rail-wrap{position:relative;margin-top:10px;background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:8px 10px 6px}
-  #tsTimelineCanvas{width:100%;height:78px;display:block;cursor:crosshair;touch-action:none;border-radius:6px}
-  .ts-hover-tip{position:absolute;top:-26px;transform:translateX(-50%);background:#0f172a;border:1px solid var(--blue);color:#f8fafc;border-radius:6px;padding:2px 7px;font:700 11px/1.3 ui-monospace,Consolas,monospace;pointer-events:none;white-space:nowrap;z-index:6}
+  .ts-pill-tag{font-size:10px;font-weight:900;padding:1px 5px;border-radius:5px;letter-spacing:.02em}
+  .ts-pill-tag.w{background:rgba(34,197,94,.18);color:#86efac}
+  .ts-pill-tag.m{background:rgba(168,85,247,.20);color:#d8b4fe}
+  .ts-workspace{display:grid;grid-template-columns:minmax(0,1fr) 338px;gap:14px;align-items:start;margin-top:8px}
+  .ts-player-col{min-width:0;display:flex;flex-direction:column;gap:8px}
+  .ts-stage{position:relative;width:100%;aspect-ratio:16/9;max-height:clamp(280px,39vh,395px);background:#04070b;border-radius:12px;border:1px solid var(--line);overflow:hidden;display:flex;align-items:center;justify-content:center;cursor:pointer;user-select:none}
+  .ts-stage:fullscreen{max-height:none;border-radius:0;border:0}
+  .ts-stage img,.ts-stage video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;display:block;background:#000}
+  .ts-stage img{z-index:1}
+  .ts-stage video{z-index:2}
+  .ts-hud{position:absolute;left:10px;top:10px;z-index:5;background:rgba(7,10,15,.84);border:1px solid rgba(255,255,255,.14);border-radius:8px;padding:4px 10px;font:700 12px/1.3 ui-monospace,Consolas,monospace;color:#e2e8f0;font-variant-numeric:tabular-nums;pointer-events:none}
+  .ts-stage-tools{position:absolute;right:10px;top:10px;z-index:6;display:flex;align-items:center;gap:6px}
+  .ts-stage-tools .btn{background:rgba(9,13,19,.86)}
+  .ts-buffering{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:7;background:rgba(7,10,15,.86);border:1px solid rgba(46,160,255,.45);border-radius:11px;padding:8px 14px;display:inline-flex;align-items:center;gap:9px;font:700 12.5px/1.2 inherit;color:#eaf4ff;pointer-events:none;box-shadow:0 8px 24px rgba(0,0,0,.6)}
+  .ts-spin{width:15px;height:15px;border:2px solid rgba(124,196,255,.25);border-top-color:#38bdf8;border-radius:50%;animation:tsSpin .75s linear infinite}
+  @keyframes tsSpin{to{transform:rotate(360deg)}}
+  .ts-gap-overlay{position:absolute;inset:0;z-index:6;background:radial-gradient(circle at center,rgba(15,23,42,.92),rgba(4,7,11,.96));display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:20px;text-align:center}
+  .ts-gap-title{font:900 16px/1.25 inherit;color:#f8fafc}
+  .ts-gap-sub{font:600 12.5px/1.4 ui-monospace,Consolas,monospace;color:var(--mut)}
+  .ts-skip-toast{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);z-index:7;background:rgba(15,23,42,.90);border:1px solid rgba(168,85,247,.55);color:#f3e8ff;padding:5px 12px;border-radius:999px;font:800 11.5px/1.2 inherit;pointer-events:none;box-shadow:0 6px 18px rgba(0,0,0,.5)}
+  .ts-rail-wrap{position:relative;background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:8px 10px 7px}
+  .ts-rail-bar{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:7px}
+  .ts-run-strip{display:flex;align-items:center;gap:4px;flex-wrap:wrap}
+  .ts-run-btn{border:1px solid #25364c;background:#121b27;color:#cbd5e1;border-radius:7px;padding:2px 7px;font:700 11px/1.25 ui-monospace,Consolas,monospace;cursor:pointer}
+  .ts-run-btn:hover{border-color:var(--blue);color:#fff}
+  .ts-run-btn.on{background:rgba(46,160,255,.20);border-color:var(--blue);color:#eaf4ff}
+  #tsTimelineCanvas{width:100%;height:86px;display:block;cursor:crosshair;touch-action:none;border-radius:6px}
+  .ts-hover-pop{position:absolute;bottom:calc(100% + 8px);transform:translateX(-50%);width:204px;background:#0a1019;border:1px solid var(--blue);border-radius:10px;padding:5px;box-shadow:0 10px 28px rgba(0,0,0,.78);pointer-events:none;z-index:25}
+  .ts-hover-pop img{width:192px;height:108px;object-fit:cover;border-radius:6px;display:block;background:#04070b}
+  .ts-hover-nogap{width:192px;height:66px;border-radius:6px;background:#0f172a;display:flex;align-items:center;justify-content:center;color:var(--mut);font:800 11px/1.2 inherit;border:1px dashed #334155}
+  .ts-hover-meta{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-top:4px;font:700 11px/1.2 ui-monospace,Consolas,monospace;color:#f8fafc;padding:0 2px}
   .ts-rail-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-top:6px;font:600 11px/1.3 ui-monospace,Consolas,monospace;color:var(--mut);flex-wrap:wrap}
-  .ts-legend{display:inline-flex;gap:12px;align-items:center;flex-wrap:wrap;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .ts-legend{display:inline-flex;gap:11px;align-items:center;flex-wrap:wrap;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
   .ts-sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
-  .ts-bursts{display:flex;flex-wrap:wrap;gap:6px;max-height:116px;overflow:auto;margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
-  .ts-burst-btn{background:#121b27;border:1px solid #25364c;color:#cbd5e1;border-radius:8px;padding:4px 9px;font:700 11px/1.2 ui-monospace,Consolas,monospace;cursor:pointer}
-  .ts-burst-btn:hover{border-color:var(--green);color:#fff}
-  .ts-burst-btn.on{background:rgba(34,197,94,.20);border-color:var(--green);color:#86efac}
+  .ts-transport{display:flex;flex-wrap:wrap;align-items:center;gap:6px;background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:7px 9px}
+  .ts-transport select{width:auto;padding:4px 8px;font-size:12px;font-weight:800}
+  .ts-play-main{min-width:96px;font-size:12.5px}
+  .ts-clip-bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px;background:var(--inset);border:1px solid var(--line);border-radius:11px;padding:7px 9px}
+  .ts-sidebar{background:var(--inset);border:1px solid var(--line);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px;max-height:760px;position:sticky;top:64px}
+  .ts-side-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .ts-side-title{font:900 13.5px/1.2 inherit;color:#f1f5f9;display:flex;align-items:center;gap:6px}
+  .ts-filter-box{background:#0e1520;border:1px solid var(--line);border-radius:9px;padding:8px;display:flex;flex-direction:column;gap:7px}
+  .ts-filter-row{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11.5px;color:var(--mut)}
+  .ts-filter-row input[type=range]{flex:1;accent-color:var(--blue)}
+  .ts-bursts{display:flex;flex-direction:column;gap:6px;overflow-y:auto;padding-right:2px;flex:1;min-height:180px;max-height:560px}
+  .ts-ev-card{display:grid;grid-template-columns:96px minmax(0,1fr);gap:8px;align-items:center;background:#101824;border:1px solid #223246;border-radius:9px;padding:6px;cursor:pointer;text-align:left;transition:border-color .12s ease,background-color .12s ease}
+  .ts-ev-card:hover{border-color:var(--blue);background:#152030}
+  .ts-ev-card.on{border-color:var(--green);background:rgba(34,197,94,.12)}
+  .ts-ev-thumb{width:96px;height:54px;border-radius:6px;background:#05080d;object-fit:cover;display:block}
+  .ts-ev-meta{min-width:0;display:flex;flex-direction:column;gap:3px}
+  .ts-ev-top{display:flex;align-items:center;justify-content:space-between;gap:4px;font:800 12px/1.2 ui-monospace,Consolas,monospace;color:#f1f5f9}
+  .ts-ev-sub{display:flex;align-items:center;gap:4px;flex-wrap:wrap;font-size:10.5px;color:var(--mut)}
+  .ts-ev-bar{height:4px;border-radius:999px;background:#1b2838;overflow:hidden}
+  .ts-ev-bar>span{display:block;height:100%;border-radius:999px}
+  .ts-ev-foot{display:flex;align-items:center;justify-content:space-between;gap:4px}
+  .ts-ev-clip{border:1px solid #2d4057;background:#162231;color:#cbd5e1;border-radius:5px;padding:1px 6px;font:800 10px/1.3 inherit;cursor:pointer}
+  .ts-ev-clip:hover{border-color:var(--amber);color:#fde68a}
+  @media (max-width:1100px){
+    .ts-workspace{grid-template-columns:1fr}
+    .ts-sidebar{position:static;max-height:none}
+    .ts-bursts{max-height:380px}
+  }
   .cam-head-l{display:flex;align-items:center;gap:8px;min-width:0;flex:1;flex-wrap:wrap}
   .cam-head-r{display:flex;align-items:center;gap:6px;flex-shrink:0}
   .cam-name-inp{width:170px;max-width:100%;padding:4px 8px!important;font-weight:800!important;font-size:14px!important;border-radius:8px!important}
@@ -6512,6 +7655,10 @@ DASHBOARD_HTML = """<!doctype html>
             <input id="bumpAlertNtfy" type="checkbox" style="width:auto;margin:0">
             <span>Camera Bump Alert (ntfy push if a camera gets bumped)</span>
           </label>
+          <label style="display:flex;align-items:center;gap:8px;margin-top:8px;text-transform:none;font-size:13px;color:var(--fg)">
+            <input id="motionRecord247" type="checkbox" style="width:auto;margin:0">
+            <span>24/7 Motion Recording (auto-archive gym activity outside workouts with 12s pre-roll &amp; 18s post-roll)</span>
+          </label>
           <div class="ctrl-row" style="margin-top:10px">
             <button class="btn" id="saveBtn" type="button">Save Camera Config &amp; Apply</button>
             <span id="saveMsg" style="color:var(--mut);font-size:12px"></span>
@@ -6523,10 +7670,15 @@ DASHBOARD_HTML = """<!doctype html>
       <section class="page" data-page="footage">
         <div class="page-head">
           <div>
-            <h1>14-Day Footage &amp; Saved Clips</h1>
-            <div class="page-sub">Scrub any recorded workout session or the live pre-roll buffer with green activity spikes and instant clip export.</div>
+            <h1>14-Day NVR Scrubber &amp; Saved Clips</h1>
+            <div class="page-sub">Continuous fMP4 playback on one master timeline with Workout &amp; 24/7 Motion filtering, instant thumbnail scrub, and 0ms sensitivity controls.</div>
           </div>
-          <div class="ctrl-row" style="margin-top:0">
+          <div class="ts-head-tools">
+            <div class="ts-seg-ctrl" role="group" aria-label="Source filter">
+              <button class="ts-seg-btn on" type="button" data-tssrc="all">All</button>
+              <button class="ts-seg-btn" type="button" data-tssrc="workout">Workouts</button>
+              <button class="ts-seg-btn" type="button" data-tssrc="motion">24/7 Motion</button>
+            </div>
             <button class="btn sec sm" id="tsRefreshBtn" type="button">↻ Refresh Tapes</button>
           </div>
         </div>
@@ -6534,79 +7686,161 @@ DASHBOARD_HTML = """<!doctype html>
         <div class="card" id="tapeScrubCard">
           <h2>
             <span>14-Day Activity Tape Scrubber</span>
-            <span id="tsStatusPill" class="pill live">READY</span>
+            <span style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">
+              <span id="tsScanPill" class="pill live" hidden>Scanning v2…</span>
+              <span id="tsStatusPill" class="pill live">READY</span>
+            </span>
           </h2>
           <div class="eyebrow">Day</div>
           <div id="tsDayStrip" class="ts-strip"></div>
           <div id="tsSessionRow" hidden>
-            <div class="eyebrow" style="margin-top:4px">Workout Session</div>
+            <div class="eyebrow" style="margin-top:4px">View / Session</div>
             <div id="tsSessionStrip" class="ts-strip"></div>
           </div>
           <div class="eyebrow" style="margin-top:4px">Camera Angle</div>
           <div id="tsCamStrip" class="ts-strip"></div>
 
-          <div class="ts-stage">
-            <div id="tsTimeHud" class="ts-hud">Select a session to scrub</div>
-            <div class="ts-stage-tools">
-              <button class="btn sm sec" id="tsBackToScrubBtn" type="button" hidden>← Scrub Frame</button>
-              <select id="tsSpeedSel" aria-label="Playback speed">
-                <option value="0.25">0.25× Slow</option>
-                <option value="0.5">0.5× Half</option>
-                <option value="1" selected>1× Normal</option>
-                <option value="2">2× Fast</option>
-              </select>
+          <div class="ts-workspace">
+            <div class="ts-player-col">
+              <div class="ts-stage" id="tsStage">
+                <div id="tsTimeHud" class="ts-hud">Select a session to scrub</div>
+                <div class="ts-stage-tools" onclick="event.stopPropagation()">
+                  <span id="tsPlayBadge" class="pill live" hidden>PLAYING</span>
+                  <button class="btn sm sec" id="tsFsBtn" type="button" title="Fullscreen (F)">⤢</button>
+                </div>
+                <img id="tsFrameImg" alt="" hidden>
+                <video id="tsVideo" muted playsinline hidden></video>
+                <audio id="tsAudio" hidden></audio>
+                <div id="tsBuffering" class="ts-buffering" hidden>
+                  <span class="ts-spin"></span>
+                  <span id="tsBufferLbl">Starting fMP4 stream…</span>
+                </div>
+                <div id="tsGapOverlay" class="ts-gap-overlay" hidden onclick="event.stopPropagation()">
+                  <div class="ts-gap-title" id="tsGapTitle">No recording at this time</div>
+                  <div class="ts-gap-sub" id="tsGapSub">Empty timeline gap</div>
+                  <button class="btn sm" id="tsJumpNextRunBtn" type="button">Jump to Next Footage →</button>
+                </div>
+                <div id="tsSkipToast" class="ts-skip-toast" hidden></div>
+              </div>
+
+              <div class="ts-rail-wrap" id="tsRailWrap">
+                <div class="ts-rail-bar">
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <div class="ts-seg-ctrl" role="group" aria-label="Gap mode">
+                      <button class="ts-seg-btn" type="button" id="tsGapCollapseBtn" data-tsgap="collapse">Collapse Gaps</button>
+                      <button class="ts-seg-btn on" type="button" id="tsGapRealBtn" data-tsgap="real">Real Clock</button>
+                    </div>
+                    <div class="ts-seg-ctrl" role="group" aria-label="Timeline zoom">
+                      <button class="ts-seg-btn on" type="button" data-tszoom="fit">Fit</button>
+                      <button class="ts-seg-btn" type="button" data-tszoom="1800">30m</button>
+                      <button class="ts-seg-btn" type="button" data-tszoom="600">10m</button>
+                      <button class="ts-seg-btn" type="button" data-tszoom="180">3m</button>
+                      <button class="ts-seg-btn" type="button" data-tszoom="60">1m</button>
+                    </div>
+                    <button class="btn sec sm" id="tsPanLeftBtn" type="button" hidden title="Pan earlier">◀</button>
+                    <button class="btn sec sm" id="tsPanRightBtn" type="button" hidden title="Pan later">▶</button>
+                  </div>
+                  <div id="tsRunStrip" class="ts-run-strip"></div>
+                </div>
+
+                <div id="tsHoverPop" class="ts-hover-pop" hidden>
+                  <img id="tsHoverImg" alt="" hidden>
+                  <div id="tsHoverGap" class="ts-hover-nogap" hidden>No recording (gap)</div>
+                  <div class="ts-hover-meta">
+                    <span id="tsHoverTime">--:--:--</span>
+                    <span id="tsHoverScore">0.0</span>
+                  </div>
+                </div>
+                <canvas id="tsTimelineCanvas" width="1000" height="86"></canvas>
+                <div class="ts-rail-foot">
+                  <span id="tsStartLbl">--:--</span>
+                  <span class="ts-legend">
+                    <span><span class="ts-sw" style="background:#22c55e"></span>Workout</span>
+                    <span><span class="ts-sw" style="background:#a855f7"></span>24/7 Motion</span>
+                    <span><span class="ts-sw" style="background:#38bdf8"></span>Peak</span>
+                    <span><span class="ts-sw" style="background:#f59e0b"></span>In–Out [ ]</span>
+                  </span>
+                  <span id="tsCurLbl" style="color:#eaf4ff">--:--:--</span>
+                  <span id="tsEndLbl">--:--</span>
+                </div>
+              </div>
+
+              <div class="ts-transport">
+                <button class="btn sec sm" id="tsPrevBurstBtn" type="button" title="Previous motion event (,)">⏮ Prev</button>
+                <button class="btn sec sm" type="button" data-tsstep="-10">-10s</button>
+                <button class="btn sec sm" type="button" data-tsstep="-2">-2s</button>
+                <button class="btn ok sm ts-play-main" id="tsPlayBtn" type="button" title="Play / Pause continuous stream (Space)">▶ Play</button>
+                <button class="btn sec sm" type="button" data-tsstep="2">+2s</button>
+                <button class="btn sec sm" type="button" data-tsstep="10">+10s</button>
+                <button class="btn sec sm" id="tsNextBurstBtn" type="button" title="Next motion event (.)">Next ⏭</button>
+                <select id="tsSpeedSel" aria-label="Playback speed" title="Playback speed">
+                  <option value="0.25">0.25×</option>
+                  <option value="0.5">0.5×</option>
+                  <option value="1" selected>1×</option>
+                  <option value="1.5">1.5×</option>
+                  <option value="2">2×</option>
+                  <option value="4">4×</option>
+                </select>
+                <button class="btn sec sm" id="tsMotionOnlyBtn" type="button" title="Auto-skip quiet rest zones during playback (M)">⚡ Motion Only</button>
+                <button class="btn sec sm" id="tsAudioBtn" type="button" title="Toggle synced S330 room audio">🔇 Audio</button>
+              </div>
+
+              <div class="ts-clip-bar">
+                <button class="btn sec sm" id="tsSetInBtn" type="button">Set In [</button>
+                <button class="btn sec sm" id="tsSetOutBtn" type="button">Set Out ]</button>
+                <button class="btn sec sm" id="tsClearRangeBtn" type="button">Clear</button>
+                <span id="tsRangeInfo" style="font-size:11px;color:var(--mut);font-family:ui-monospace,Consolas,monospace">No range</span>
+                <input id="tsClipLabel" type="text" placeholder="Clip name (e.g. Squat 315x3)" style="flex:1;min-width:165px;padding:5px 9px;font-size:12px">
+                <label style="margin:0;font-size:12px;display:inline-flex;align-items:center;gap:5px;cursor:pointer;white-space:nowrap">
+                  <input id="tsIncludeAudio" type="checkbox" style="width:auto;margin:0"> S330 Audio
+                </label>
+                <button class="btn sm" id="tsSaveClipBtn" type="button">💾 Save Clip to Drive</button>
+                <span id="tsOut" style="font-size:12px;color:var(--mut)"></span>
+              </div>
             </div>
-            <img id="tsFrameImg" alt="Scrub frame">
-            <video id="tsVideo" controls playsinline hidden></video>
-          </div>
 
-          <div class="ts-rail-wrap">
-            <div id="tsHoverTip" class="ts-hover-tip" hidden></div>
-            <canvas id="tsTimelineCanvas" width="1000" height="78"></canvas>
-            <div class="ts-rail-foot">
-              <span id="tsStartLbl">--:--</span>
-              <span class="ts-legend">
-                <span><span class="ts-sw" style="background:#22c55e"></span>Activity (Motion)</span>
-                <span><span class="ts-sw" style="background:#263649"></span>Quiet / Rest</span>
-                <span><span class="ts-sw" style="background:#f59e0b"></span>In–Out Range</span>
-              </span>
-              <span id="tsCurLbl" style="color:#eaf4ff">--:--:--</span>
-              <span id="tsEndLbl">--:--</span>
-            </div>
-          </div>
-
-          <div class="ctrl-row" style="margin-top:10px">
-            <button class="btn sec sm" id="tsPrevBurstBtn" type="button">⏮ Prev Activity</button>
-            <button class="btn sec sm" type="button" data-tsstep="-30">-30s</button>
-            <button class="btn sec sm" type="button" data-tsstep="-10">-10s</button>
-            <button class="btn sec sm" type="button" data-tsstep="-2">-2s</button>
-            <button class="btn ok sm" id="tsPlayBtn" type="button">▶ Play Window</button>
-            <button class="btn sec sm" type="button" data-tsstep="2">+2s</button>
-            <button class="btn sec sm" type="button" data-tsstep="10">+10s</button>
-            <button class="btn sec sm" type="button" data-tsstep="30">+30s</button>
-            <button class="btn sec sm" id="tsNextBurstBtn" type="button">Next Activity ⏭</button>
-            <select id="tsWinSec" style="width:auto;padding:4px 8px;font-size:12px">
-              <option value="15">15s window</option>
-              <option value="30" selected>30s window</option>
-              <option value="60">60s window</option>
-              <option value="120">120s window</option>
-            </select>
-          </div>
-
-          <div class="ctrl-row" style="margin-top:8px">
-            <button class="btn sec sm" id="tsSetInBtn" type="button">Set In [</button>
-            <button class="btn sec sm" id="tsSetOutBtn" type="button">Set Out ]</button>
-            <button class="btn sec sm" id="tsClearRangeBtn" type="button">Clear Range</button>
-            <input id="tsClipLabel" type="text" placeholder="Clip name (e.g. Squat 315x3)" style="width:210px;padding:5px 9px;font-size:12px">
-            <label style="margin:0;font-size:12px;display:inline-flex;align-items:center;gap:5px;cursor:pointer">
-              <input id="tsIncludeAudio" type="checkbox" style="width:auto;margin:0"> Include S330 Audio
-            </label>
-            <button class="btn sm" id="tsSaveClipBtn" type="button">💾 Save Clip to Drive</button>
-            <span id="tsOut" style="font-size:12px;color:var(--mut)"></span>
-          </div>
-
-          <div id="tsBurstList" class="ts-bursts">
-            <span style="font-size:12px;color:var(--mut)">Select a day/session above to see detected activity windows.</span>
+            <aside class="ts-sidebar">
+              <div class="ts-side-head">
+                <div class="ts-side-title">
+                  <span>Motion Events</span>
+                  <span id="tsEvCountPill" class="pill ok">0</span>
+                </div>
+                <button class="btn sec sm" id="tsRescanBtn" type="button" title="Re-analyze recordings with Motion Engine v2">↻ Re-scan</button>
+              </div>
+              <div class="ts-filter-box">
+                <div class="ts-filter-row">
+                  <span>Sensitivity</span>
+                  <input id="tsSensSlider" type="range" min="0.6" max="8.0" step="0.1" value="1.5">
+                  <b id="tsSensVal" style="color:#eaf4ff;min-width:28px;text-align:right;font-family:ui-monospace,Consolas,monospace">1.5</b>
+                </div>
+                <div class="ts-filter-row">
+                  <div class="ts-seg-ctrl" role="group" aria-label="Sensitivity presets">
+                    <button class="ts-seg-btn" type="button" data-tssens="0.9">Fine 0.9</button>
+                    <button class="ts-seg-btn on" type="button" data-tssens="1.5">Balanced 1.5</button>
+                    <button class="ts-seg-btn" type="button" data-tssens="5.0">Heavy 5.0</button>
+                  </div>
+                </div>
+                <div class="ts-filter-row">
+                  <span>Min Dur</span>
+                  <div class="ts-seg-ctrl" role="group" aria-label="Min duration">
+                    <button class="ts-seg-btn" type="button" data-tsmindur="2">2s+</button>
+                    <button class="ts-seg-btn on" type="button" data-tsmindur="5">5s+</button>
+                    <button class="ts-seg-btn" type="button" data-tsmindur="12">12s+</button>
+                    <button class="ts-seg-btn" type="button" data-tsmindur="25">25s+</button>
+                  </div>
+                </div>
+                <div class="ts-filter-row">
+                  <span>Scope</span>
+                  <div class="ts-seg-ctrl" role="group" aria-label="Camera scope">
+                    <button class="ts-seg-btn on" type="button" data-tsscope="cam">This Cam</button>
+                    <button class="ts-seg-btn" type="button" data-tsscope="all">All Cams</button>
+                  </div>
+                </div>
+              </div>
+              <div id="tsBurstList" class="ts-bursts">
+                <span style="font-size:12px;color:var(--mut)">Select a day/session above to inspect motion events.</span>
+              </div>
+            </aside>
           </div>
         </div>
 
@@ -7373,6 +8607,7 @@ let latestShowsList = [];
 
 const tsState = {
   loaded: false,
+  sourceFilter: 'all',
   days: [],
   live: null,
   selectedDayKey: '',
@@ -7381,15 +8616,51 @@ const tsState = {
   camera: 'Rack Cam',
   cameras: [],
   timeline: null,
+  trackSegs: [],
+  collapseGaps: false,
+  manualGapModeKey: '',
+  zoomMode: 'fit',
+  viewStartFrac: 0,
+  viewEndFrac: 1,
   curMs: 0,
   inMs: null,
   outMs: null,
-  playingVideo: false,
-  dragging: false,
-  hoverRatio: null,
+  playing: false,
+  buffering: false,
+  playGen: 0,
+  streamId: 'web_' + Math.random().toString(36).slice(2, 10),
+  streamStartMs: 0,
+  streamEndMs: 0,
+  speed: 1,
+  motionOnly: false,
+  quietSinceMs: 0,
+  skipCooldownUntil: 0,
+  skipToastTimer: null,
+  audioOn: false,
+  audioChunkStart: 0,
+  audioChunkEnd: 0,
+  rafId: 0,
+  dragMode: '',
+  wasPlayingOnDrag: false,
+  panStartX: 0,
+  panStartFrac0: 0,
+  hoverFrac: null,
+  hoverMs: null,
+  sensitivity: 1.5,
+  minDurSec: 5,
+  allCamsEvents: false,
+  events: [],
+  packCache: new Map(),
+  activePack: [],
+  packAbort: null,
+  packTimer: null,
   frameTimer: null,
   frameAbort: null,
   frameObjUrl: '',
+  scanPollTimer: null,
+  evObserver: null,
+  tapesAbort: null,
+  tapesReqSeq: 0,
 };
 
 const mmState = {
@@ -9082,6 +10353,7 @@ async function saveConfig(triggerBtn = null) {
     preRollSec: Number($('preRoll').value) || 120,
     driveBackupDir: $('driveDir').value.trim(),
     bumpAlertNtfy: $('bumpAlertNtfy') ? $('bumpAlertNtfy').checked : (cfg.bumpAlertNtfy !== false),
+    motionRecord247: $('motionRecord247') ? $('motionRecord247').checked : (cfg.motionRecord247 !== false),
     cameras,
     wallboard,
   };
@@ -9096,6 +10368,7 @@ async function saveConfig(triggerBtn = null) {
     cfg.cameras = cameras;
     cfg.wallboard = wallboard;
     cfg.bumpAlertNtfy = body.bumpAlertNtfy;
+    cfg.motionRecord247 = body.motionRecord247;
     syncRawFeeds();
     markDirty(false);
     pollStatus();
@@ -9680,6 +10953,7 @@ async function init() {
   $('preRoll').value = cfg.preRollSec;
   $('driveDir').value = cfg.driveBackupDir || '';
   if ($('bumpAlertNtfy')) $('bumpAlertNtfy').checked = (cfg.bumpAlertNtfy !== false);
+  if ($('motionRecord247')) $('motionRecord247').checked = (cfg.motionRecord247 !== false);
   const wb = cfg.wallboard || {};
   $('wbHost').value = wb.fireTvHost || '';
   $('wbMac').value = wb.fireTvMac || '';
@@ -9757,7 +11031,7 @@ async function init() {
 ['retDays', 'preRoll', 'driveDir', 'wbHost', 'wbMac', 'wbPort', 'wbIdleMin'].forEach(id => {
   $(id).addEventListener('input', () => markDirty());
 });
-['wbClient', 'wbWake', 'wbSleep', 'bumpAlertNtfy'].forEach(id => {
+['wbClient', 'wbWake', 'wbSleep', 'bumpAlertNtfy', 'motionRecord247'].forEach(id => {
   if ($(id)) $(id).addEventListener('change', () => markDirty());
 });
 
@@ -11397,7 +12671,12 @@ function pageFromHash() {
 }
 
 function navigatePage(pageId, pushHash = true) {
+  const prevPage = activePage;
   const next = Object.prototype.hasOwnProperty.call(PAGE_TITLES, pageId) ? pageId : 'overview';
+  if (prevPage === 'footage' && next !== 'footage') {
+    stopTapePlayback(false);
+    stopTapeScanPoll();
+  }
   activePage = next;
   document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
     btn.classList.toggle('on', btn.dataset.nav === next);
@@ -11440,6 +12719,13 @@ function wireNavigation() {
   window.addEventListener('resize', () => {
     if (activePage === 'footage') drawTapeTimeline();
   });
+  window.addEventListener('beforeunload', () => {
+    if (tsState.playing && navigator.sendBeacon) {
+      try {
+        navigator.sendBeacon('/api/tape/stream/stop', new Blob([JSON.stringify({ streamId: tsState.streamId })], { type: 'application/json' }));
+      } catch {}
+    }
+  });
   document.addEventListener('keydown', (ev) => {
     if (mmState.open) return;
     const tag = (ev.target && ev.target.tagName) || '';
@@ -11456,6 +12742,10 @@ function wireNavigation() {
       else if (ev.key === ' ') { ev.preventDefault(); playTapeWindow(); }
       else if (ev.key === '[') { setScrubInOut('in'); }
       else if (ev.key === ']') { setScrubInOut('out'); }
+      else if (ev.key === ',') { ev.preventDefault(); jumpActivityBurst(-1); }
+      else if (ev.key === '.') { ev.preventDefault(); jumpActivityBurst(1); }
+      else if (ev.key === 'm' || ev.key === 'M') { ev.preventDefault(); toggleMotionOnly(); }
+      else if (ev.key === 'f' || ev.key === 'F') { ev.preventDefault(); toggleStageFullscreen(); }
     }
   });
   if ($('topStopShowBtn')) $('topStopShowBtn').onclick = () => { stopLocalRyderSim(); stopShow(); };
@@ -11557,7 +12847,7 @@ function syncOverview() {
   const days = tsState.days || [];
   const totalTapes = days.reduce((acc, d) => acc + (d.tapeCount || 0), 0);
   if ($('ovKpiDiskSub') && tsState.loaded) {
-    $('ovKpiDiskSub').textContent = `${totalTapes} workout tape(s) across ${days.length} day(s)`;
+    $('ovKpiDiskSub').textContent = `${totalTapes} tape(s) across ${days.length} day(s)`;
   }
   if ($('ovFootageSummary')) {
     if (!tsState.loaded) {
@@ -11565,7 +12855,9 @@ function syncOverview() {
     } else {
       const latestDay = days[0];
       const liveTxt = tsState.live ? `Live buffer: <b>${fmtDurShort(tsState.live.durationSec)}</b>` : 'Live ring idle';
-      const dayTxt = latestDay ? `Latest day: <b>${escHtml(latestDay.label)}</b> (${latestDay.tapeCount} session(s), ${fmtDurShort(latestDay.totalDurationSec)})` : 'No saved sessions yet';
+      const dayTxt = latestDay
+        ? `Latest day: <b>${escHtml(latestDay.label)}</b> (${latestDay.tapeCount} tape(s), ${fmtDurShort(latestDay.recordedSec || latestDay.totalDurationSec)})`
+        : 'No saved sessions yet';
       $('ovFootageSummary').innerHTML = `${dayTxt} · ${liveTxt}`;
     }
   }
@@ -11579,9 +12871,26 @@ function syncOverview() {
   }
 }
 
+function stopTapeScanPoll() {
+  if (tsState.scanPollTimer) {
+    clearTimeout(tsState.scanPollTimer);
+    tsState.scanPollTimer = null;
+  }
+}
+
 async function loadTapes() {
+  const seq = ++tsState.tapesReqSeq;
+  if (tsState.tapesAbort) {
+    try { tsState.tapesAbort.abort(); } catch {}
+  }
+  tsState.tapesAbort = new AbortController();
   try {
-    const r = await fetch('/api/tapes', { cache: 'no-store' }).then(x => x.json());
+    const q = new URLSearchParams({ source: tsState.sourceFilter || 'all' });
+    const r = await fetch(`/api/tapes?${q.toString()}`, {
+      cache: 'no-store',
+      signal: tsState.tapesAbort.signal,
+    }).then(x => x.json());
+    if (seq !== tsState.tapesReqSeq) return;
     tsState.loaded = true;
     tsState.days = Array.isArray(r.days) ? r.days : [];
     tsState.live = r.live || null;
@@ -11595,8 +12904,12 @@ async function loadTapes() {
       ensureScrubberTimeline();
     }
     syncOverview();
-  } catch (e) {
-    if ($('tsStatusPill')) { $('tsStatusPill').textContent = 'ERR'; $('tsStatusPill').className = 'pill err'; }
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+    if (seq === tsState.tapesReqSeq && $('tsStatusPill')) {
+      $('tsStatusPill').textContent = 'ERR';
+      $('tsStatusPill').className = 'pill err';
+    }
   }
 }
 
@@ -11615,18 +12928,39 @@ function renderTapeDayStrip() {
   const pills = [];
   if (tsState.live) {
     const on = tsState.selectedDayKey === 'live' ? ' on' : '';
-    pills.push(`<button class="ts-pill${on}" type="button" data-tsday="live"><span class="dot live"></span>Live Buffer (${fmtDurShort(tsState.live.durationSec)})</button>`);
+    pills.push(`<button class="ts-pill${on}" type="button" data-tsday="live"><span class="dot live"></span>Live Buffer · ${fmtDurShort(tsState.live.durationSec)}</button>`);
   }
   tsState.days.forEach(d => {
     const on = tsState.selectedDayKey === d.date ? ' on' : '';
     const hasActive = (d.tapes || []).some(t => t.isActive);
     const dot = hasActive ? '<span class="dot ok"></span>' : '';
-    pills.push(`<button class="ts-pill${on}" type="button" data-tsday="${escHtml(d.date)}">${dot}${escHtml(d.label)} · ${fmtDurShort(d.totalDurationSec)}</button>`);
+    const recSec = d.recordedSec != null ? d.recordedSec : d.totalDurationSec;
+    const wNames = Array.isArray(d.workoutNames) && d.workoutNames.length ? d.workoutNames.slice(0, 2).join(', ') : '';
+    const wTag = wNames ? `<span class="ts-pill-tag w">${escHtml(wNames)}</span>` : '';
+    const mTag = (d.motionSec > 0) ? `<span class="ts-pill-tag m">24/7 ${fmtDurShort(d.motionSec)}</span>` : '';
+    pills.push(`<button class="ts-pill${on}" type="button" data-tsday="${escHtml(d.date)}">${dot}<span>${escHtml(d.label)}</span>${wTag}<span style="color:var(--mut)">${fmtDurShort(recSec)}</span>${mTag}</button>`);
   });
-  strip.innerHTML = pills.length ? pills.join('') : '<span style="color:var(--mut);font-size:12px">No rolling tapes yet.</span>';
+  if (!pills.length) {
+    const hint = tsState.sourceFilter === 'motion'
+      ? 'No 24/7 motion archives yet — movement outside workouts records automatically when enabled.'
+      : 'No rolling tapes yet.';
+    strip.innerHTML = `<span style="color:var(--mut);font-size:12px">${hint}</span>`;
+  } else {
+    strip.innerHTML = pills.join('');
+  }
   strip.querySelectorAll('[data-tsday]').forEach(b => {
-    b.onclick = () => selectTapeDay(b.dataset.tsday, false);
+    b.onclick = () => selectTapeDay(b.dataset.tsday, true);
   });
+}
+
+function unionCamerasForTapes(tapes) {
+  const seen = [];
+  (tapes || []).forEach(t => {
+    (t.cameras || []).forEach(c => {
+      if (c && !seen.includes(c)) seen.push(c);
+    });
+  });
+  return seen.length ? seen : ['Rack Cam', 'Smith Cam'];
 }
 
 function selectTapeDay(dayKey, forceReload = false) {
@@ -11640,62 +12974,101 @@ function selectTapeDay(dayKey, forceReload = false) {
   const day = tsState.days.find(d => d.date === dayKey);
   if (!day || !(day.tapes || []).length) {
     if ($('tsSessionRow')) $('tsSessionRow').hidden = true;
+    tsState.timeline = null;
+    tsState.events = [];
+    stopTapePlayback(false);
+    renderTapeEvents();
+    drawTapeTimeline();
+    if ($('tsStatusPill')) { $('tsStatusPill').textContent = 'EMPTY'; $('tsStatusPill').className = 'pill warn'; }
     return;
   }
+  const tapes = day.tapes;
+  const wholeId = `__day__:${day.date}`;
+  const dayCams = unionCamerasForTapes(tapes);
   const sessRow = $('tsSessionRow');
   const sessStrip = $('tsSessionStrip');
-  const tapes = day.tapes;
+  const validIds = new Set([wholeId, ...tapes.map(t => t.sessionId)]);
+  let chosenSid = (!tsState.isLive && validIds.has(tsState.sessionId)) ? tsState.sessionId : (tapes.length > 1 ? wholeId : tapes[0].sessionId);
+
   if (sessRow && sessStrip) {
     if (tapes.length > 1) {
       sessRow.hidden = false;
-      if (!tapes.some(t => t.sessionId === tsState.sessionId && !tsState.isLive)) {
-        tsState.sessionId = tapes[0].sessionId;
-      }
-      sessStrip.innerHTML = tapes.map(t => {
-        const on = (!tsState.isLive && t.sessionId === tsState.sessionId) ? ' on' : '';
+      const wholeOn = (!tsState.isLive && chosenSid === wholeId) ? ' on' : '';
+      const recSec = day.recordedSec != null ? day.recordedSec : day.totalDurationSec;
+      const parts = [
+        `<button class="ts-pill${wholeOn}" type="button" data-tssess="${escHtml(wholeId)}"><span>Whole Day</span><span style="color:var(--mut)">${fmtDurShort(recSec)}</span></button>`,
+      ];
+      tapes.forEach(t => {
+        const on = (!tsState.isLive && t.sessionId === chosenSid) ? ' on' : '';
         const dot = t.isActive ? '<span class="dot ok"></span>' : '';
-        return `<button class="ts-pill${on}" type="button" data-tssess="${escHtml(t.sessionId)}">${dot}${fmtClock(t.startMs, false)} · ${fmtDurShort(t.durationSec)} (${t.sizeMb} MB)</button>`;
-      }).join('');
+        const kTag = t.kind === 'motion'
+          ? '<span class="ts-pill-tag m">24/7</span>'
+          : '<span class="ts-pill-tag w">Workout</span>';
+        const title = (t.name && t.name !== t.sessionId) ? t.name : fmtClock(t.startMs, false);
+        const tDur = t.recordedSec != null ? t.recordedSec : t.durationSec;
+        parts.push(`<button class="ts-pill${on}" type="button" data-tssess="${escHtml(t.sessionId)}">${dot}${kTag}<span>${escHtml(title)}</span><span style="color:var(--mut)">${fmtDurShort(tDur)}</span></button>`);
+      });
+      sessStrip.innerHTML = parts.join('');
       sessStrip.querySelectorAll('[data-tssess]').forEach(b => {
         b.onclick = () => {
-          const hit = tapes.find(x => x.sessionId === b.dataset.tssess);
-          if (hit) {
-            selectTapeSession(hit.sessionId, hit.cameras || [], false, true);
-            sessStrip.querySelectorAll('[data-tssess]').forEach(x => x.classList.toggle('on', x.dataset.tssess === hit.sessionId));
-          }
+          const sid = b.dataset.tssess;
+          const hit = tapes.find(x => x.sessionId === sid);
+          const cams = sid === wholeId ? dayCams : ((hit && hit.cameras) || dayCams);
+          sessStrip.querySelectorAll('[data-tssess]').forEach(x => x.classList.toggle('on', x.dataset.tssess === sid));
+          selectTapeSession(sid, cams, false, true);
         };
       });
     } else {
       sessRow.hidden = true;
+      chosenSid = tapes[0].sessionId;
     }
   }
-  const chosen = tapes.find(t => !tsState.isLive && t.sessionId === tsState.sessionId) || tapes[0];
-  selectTapeSession(chosen.sessionId, chosen.cameras || [], false, forceReload);
+  const hit = tapes.find(t => t.sessionId === chosenSid);
+  const cams = chosenSid === wholeId ? dayCams : ((hit && hit.cameras) || dayCams);
+  selectTapeSession(chosenSid, cams, false, forceReload);
 }
 
 function selectTapeSession(sessionId, cameras, isLive, resetRange = true) {
   const changed = tsState.sessionId !== sessionId || tsState.isLive !== isLive || resetRange;
+  if (changed) {
+    stopTapePlayback(false);
+    stopTapeScanPoll();
+    tsState.packCache.clear();
+    tsState.activePack = [];
+    tsState.zoomMode = 'fit';
+    tsState.viewStartFrac = 0;
+    tsState.viewEndFrac = 1;
+    tsState.inMs = null;
+    tsState.outMs = null;
+    tsState.curMs = 0;
+    syncZoomButtons();
+  }
   tsState.sessionId = sessionId;
   tsState.isLive = Boolean(isLive);
   tsState.cameras = (cameras && cameras.length) ? cameras : ['Rack Cam', 'Smith Cam'];
   if (!tsState.cameras.includes(tsState.camera)) {
     tsState.camera = tsState.cameras[0];
   }
-  if (changed) {
-    tsState.inMs = null;
-    tsState.outMs = null;
-    tsState.curMs = 0;
-  }
   renderTapeCamStrip();
+  updateRangeInfo();
   loadTapeTimeline(!changed);
 }
 
 function renderTapeCamStrip() {
   const strip = $('tsCamStrip');
   if (!strip) return;
+  const tl = tsState.timeline;
+  const actMap = (tl && tl.cameraActivity) ? tl.cameraActivity : {};
   strip.innerHTML = tsState.cameras.map(cam => {
     const on = cam === tsState.camera ? ' on' : '';
-    return `<button class="ts-pill${on}" type="button" data-tscam="${escHtml(cam)}">${escHtml(cam)}</button>`;
+    const stat = actMap[cam];
+    let badge = '';
+    if (stat && stat.activeSegs > 0) {
+      badge = `<span class="ts-pill-tag w">${stat.activeSegs}</span>`;
+    } else if (stat) {
+      badge = `<span style="font-size:10px;color:#64748b">quiet</span>`;
+    }
+    return `<button class="ts-pill${on}" type="button" data-tscam="${escHtml(cam)}">${escHtml(cam)}${badge}</button>`;
   }).join('');
   strip.querySelectorAll('[data-tscam]').forEach(b => {
     b.onclick = () => selectTapeCamera(b.dataset.tscam);
@@ -11704,39 +13077,354 @@ function renderTapeCamStrip() {
 
 function selectTapeCamera(camName) {
   if (!camName || tsState.camera === camName) return;
+  const wasPlaying = tsState.playing;
+  const keepMs = tsState.curMs;
+  stopTapePlayback(false);
   tsState.camera = camName;
   renderTapeCamStrip();
-  loadTapeTimeline(true);
+  loadTapeTimeline(true, { resumePlay: wasPlaying, targetMs: keepMs, userPickedCam: true });
 }
 
-async function loadTapeTimeline(preservePlayhead = false) {
-  if ($('tsStatusPill')) { $('tsStatusPill').textContent = 'LOADING…'; $('tsStatusPill').className = 'pill live'; }
+function rebuildTrackMap() {
+  const tl = tsState.timeline;
+  tsState.trackSegs = [];
+  if (!tl || !tl.segmentCount) return;
+  const minMs = Number(tl.minMs || 0);
+  const maxMs = Math.max(minMs + 2000, Number(tl.maxMs || 0));
+  const spanMs = Math.max(1000, maxMs - minMs);
+  const runs = (Array.isArray(tl.runs) && tl.runs.length)
+    ? tl.runs.map((r, i) => ({
+        idx: i,
+        startMs: Number(r.startMs),
+        endMs: Math.max(Number(r.startMs) + 1000, Number(r.endMs)),
+        durationSec: Number(r.durationSec || Math.round((Number(r.endMs) - Number(r.startMs)) / 1000)),
+        kind: r.kind || 'workout',
+      }))
+    : [{ idx: 0, startMs: minMs, endMs: maxMs, durationSec: Math.round(spanMs / 1000), kind: 'workout' }];
+
+  const recordedMs = runs.reduce((acc, r) => acc + Math.max(1000, r.endMs - r.startMs), 0);
+  const viewKey = `${tsState.selectedDayKey}|${tsState.sessionId}|${tsState.sourceFilter}`;
+  if (tsState.manualGapModeKey !== viewKey) {
+    tsState.collapseGaps = (runs.length > 1 && recordedMs / spanMs < 0.85);
+  }
+  if (runs.length <= 1) {
+    tsState.collapseGaps = false;
+  }
+  syncGapModeButtons(runs.length > 1);
+
+  if (!tsState.collapseGaps || runs.length <= 1) {
+    tsState.trackSegs = [{ kind: 'run', idx: 0, startMs: minMs, endMs: maxMs, f0: 0, f1: 1 }];
+  } else {
+    const seamFrac = Math.min(0.015, 0.16 / (runs.length - 1));
+    const usable = Math.max(0.5, 1 - seamFrac * (runs.length - 1));
+    const totalRunMs = Math.max(1000, recordedMs);
+    let f = 0;
+    for (let i = 0; i < runs.length; i++) {
+      const r = runs[i];
+      const rSpan = Math.max(1000, r.endMs - r.startMs);
+      const rW = (rSpan / totalRunMs) * usable;
+      const f1 = (i === runs.length - 1) ? 1 : (f + rW);
+      tsState.trackSegs.push({ kind: 'run', idx: i, startMs: r.startMs, endMs: r.endMs, f0: f, f1 });
+      f = f1;
+      if (i < runs.length - 1) {
+        const gf1 = f + seamFrac;
+        tsState.trackSegs.push({ kind: 'gap', idx: i, startMs: r.endMs, endMs: runs[i + 1].startMs, f0: f, f1: gf1 });
+        f = gf1;
+      }
+    }
+  }
+  renderRunStrip(runs);
+}
+
+function renderRunStrip(runs) {
+  const strip = $('tsRunStrip');
+  if (!strip) return;
+  if (!runs || runs.length <= 1) {
+    strip.innerHTML = '';
+    return;
+  }
+  const shown = runs.slice(0, 7);
+  strip.innerHTML = shown.map((r, i) => {
+    const active = tsState.curMs >= r.startMs - 1500 && tsState.curMs <= r.endMs + 1500 ? ' on' : '';
+    return `<button class="ts-run-btn${active}" type="button" data-tsrun="${i}" title="${fmtClock(r.startMs)} – ${fmtClock(r.endMs)}">${fmtClock(r.startMs, false)} (${fmtDurShort(r.durationSec)})</button>`;
+  }).join('') + (runs.length > 7 ? `<span style="font-size:10.5px;color:var(--mut)">+${runs.length - 7}</span>` : '');
+  strip.querySelectorAll('[data-tsrun]').forEach(btn => {
+    btn.onclick = () => {
+      const r = runs[Number(btn.dataset.tsrun)];
+      if (!r) return;
+      if (tsState.playing) startTapePlayback(r.startMs);
+      else scrubToMs(r.startMs, true);
+    };
+  });
+}
+
+function msToTrackFrac(ms) {
+  const segs = tsState.trackSegs;
+  if (!segs || !segs.length) return 0;
+  if (ms <= segs[0].startMs) return 0;
+  const last = segs[segs.length - 1];
+  if (ms >= last.endMs) return 1;
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (ms <= s.endMs || i === segs.length - 1) {
+      const span = Math.max(1, s.endMs - s.startMs);
+      const t = clamp((ms - s.startMs) / span, 0, 1);
+      return s.f0 + t * (s.f1 - s.f0);
+    }
+  }
+  return 1;
+}
+
+function trackFracToMs(frac, snapGap = false) {
+  const segs = tsState.trackSegs;
+  const tl = tsState.timeline;
+  if (!segs || !segs.length || !tl) return tl ? Number(tl.minMs || 0) : 0;
+  const f = clamp(frac, 0, 1);
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (f <= s.f1 || i === segs.length - 1) {
+      if (snapGap && s.kind === 'gap' && tsState.collapseGaps) {
+        return segs[Math.min(segs.length - 1, i + 1)].startMs;
+      }
+      const fSpan = Math.max(1e-6, s.f1 - s.f0);
+      const t = clamp((f - s.f0) / fSpan, 0, 1);
+      return Math.round(s.startMs + t * (s.endMs - s.startMs));
+    }
+  }
+  return Number(tl.maxMs || 0);
+}
+
+function findRunAt(ms) {
+  const tl = tsState.timeline;
+  const runs = (tl && Array.isArray(tl.runs) && tl.runs.length)
+    ? tl.runs
+    : (tl && tl.segmentCount ? [{ startMs: tl.minMs, endMs: tl.maxMs }] : []);
+  for (let i = 0; i < runs.length; i++) {
+    if (ms >= runs[i].startMs - 1500 && ms <= runs[i].endMs + 1500) {
+      return { run: runs[i], index: i, runs };
+    }
+  }
+  return { run: null, index: -1, runs };
+}
+
+function findGapAt(ms) {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return null;
+  const runs = (Array.isArray(tl.runs) && tl.runs.length) ? tl.runs : [{ startMs: tl.minMs, endMs: tl.maxMs }];
+  const info = findRunAt(ms);
+  if (info.run) return null;
+  const nextRun = runs.find(r => r.startMs > ms) || null;
+  let prevRun = null;
+  for (let i = runs.length - 1; i >= 0; i--) {
+    if (runs[i].endMs < ms) { prevRun = runs[i]; break; }
+  }
+  return {
+    startMs: prevRun ? prevRun.endMs : tl.minMs,
+    endMs: nextRun ? nextRun.startMs : tl.maxMs,
+    prevRun,
+    nextRun,
+    fallbackRun: nextRun || runs[0],
+  };
+}
+
+function syncGapModeButtons(hasGaps) {
+  if ($('tsGapCollapseBtn')) {
+    $('tsGapCollapseBtn').classList.toggle('on', Boolean(tsState.collapseGaps));
+    $('tsGapCollapseBtn').disabled = !hasGaps;
+    $('tsGapCollapseBtn').title = hasGaps ? 'Hide empty multi-hour gaps on timeline' : 'Single continuous run (no gaps)';
+  }
+  if ($('tsGapRealBtn')) {
+    $('tsGapRealBtn').classList.toggle('on', !tsState.collapseGaps);
+  }
+}
+
+function syncZoomButtons() {
+  document.querySelectorAll('[data-tszoom]').forEach(b => {
+    b.classList.toggle('on', b.dataset.tszoom === tsState.zoomMode);
+  });
+  const zoomed = (tsState.viewEndFrac - tsState.viewStartFrac) < 0.995;
+  if ($('tsPanLeftBtn')) $('tsPanLeftBtn').hidden = !zoomed;
+  if ($('tsPanRightBtn')) $('tsPanRightBtn').hidden = !zoomed;
+}
+
+function setGapMode(mode) {
+  const tl = tsState.timeline;
+  if (!tl) return;
+  const viewKey = `${tsState.selectedDayKey}|${tsState.sessionId}|${tsState.sourceFilter}`;
+  tsState.manualGapModeKey = viewKey;
+  tsState.collapseGaps = (mode === 'collapse');
+  rebuildTrackMap();
+  setZoomMode(tsState.zoomMode);
+  drawTapeTimeline();
+}
+
+function setZoomMode(mode) {
+  tsState.zoomMode = String(mode || 'fit');
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount || tsState.zoomMode === 'fit') {
+    tsState.zoomMode = 'fit';
+    tsState.viewStartFrac = 0;
+    tsState.viewEndFrac = 1;
+  } else {
+    const zoomMs = Math.max(15_000, Number(tsState.zoomMode) * 1000);
+    const effMs = tsState.collapseGaps
+      ? Math.max(1000, Number(tl.recordedSec || 0) * 1000 || (tl.maxMs - tl.minMs))
+      : Math.max(1000, Number(tl.maxMs || 0) - Number(tl.minMs || 0));
+    const spanFrac = clamp(zoomMs / effMs, 0.012, 1);
+    if (spanFrac >= 0.99) {
+      tsState.zoomMode = 'fit';
+      tsState.viewStartFrac = 0;
+      tsState.viewEndFrac = 1;
+    } else {
+      const centerFrac = msToTrackFrac(tsState.curMs || tl.minMs);
+      let s = centerFrac - spanFrac * 0.35;
+      let e = s + spanFrac;
+      if (s < 0) { s = 0; e = spanFrac; }
+      if (e > 1) { e = 1; s = Math.max(0, 1 - spanFrac); }
+      tsState.viewStartFrac = s;
+      tsState.viewEndFrac = e;
+    }
+  }
+  syncZoomButtons();
+  drawTapeTimeline();
+  preloadViewportPack();
+}
+
+function panViewport(dir) {
+  const span = tsState.viewEndFrac - tsState.viewStartFrac;
+  if (span >= 0.995) return;
+  const shift = span * 0.45 * (dir > 0 ? 1 : -1);
+  let s = clamp(tsState.viewStartFrac + shift, 0, 1 - span);
+  tsState.viewStartFrac = s;
+  tsState.viewEndFrac = s + span;
+  drawTapeTimeline();
+  preloadViewportPack();
+}
+
+function zoomAtCanvasFrac(cursorFracOnTrack, zoomIn) {
+  const curSpan = tsState.viewEndFrac - tsState.viewStartFrac;
+  const nextSpan = clamp(curSpan * (zoomIn ? 0.65 : 1.45), 0.012, 1);
+  if (nextSpan >= 0.99) {
+    setZoomMode('fit');
+    return;
+  }
+  const rel = clamp((cursorFracOnTrack - tsState.viewStartFrac) / Math.max(1e-6, curSpan), 0, 1);
+  let s = cursorFracOnTrack - rel * nextSpan;
+  let e = s + nextSpan;
+  if (s < 0) { s = 0; e = nextSpan; }
+  if (e > 1) { e = 1; s = Math.max(0, 1 - nextSpan); }
+  tsState.zoomMode = 'custom';
+  tsState.viewStartFrac = s;
+  tsState.viewEndFrac = e;
+  syncZoomButtons();
+  drawTapeTimeline();
+  if (tsState.packTimer) clearTimeout(tsState.packTimer);
+  tsState.packTimer = setTimeout(preloadViewportPack, 220);
+}
+
+async function loadTapeTimeline(preservePlayhead = false, opts = {}) {
+  if (!opts.silent && $('tsStatusPill')) {
+    $('tsStatusPill').textContent = 'LOADING…';
+    $('tsStatusPill').className = 'pill live';
+  }
   try {
     const q = new URLSearchParams({
       sessionId: tsState.sessionId || '',
       camera: tsState.camera || 'Rack Cam',
+      source: tsState.sourceFilter || 'all',
       buckets: '240',
     });
     const tl = await fetch(`/api/tape/timeline?${q.toString()}`, { cache: 'no-store' }).then(x => x.json());
     tsState.timeline = tl;
     const nSegs = tl.segmentCount || 0;
-    const bursts = Array.isArray(tl.bursts) ? tl.bursts : [];
+    const recSec = Number(tl.recordedSec || 0);
+    reclusterEventsOnly(false);
+
+    // If auto-opened on a quiet camera while another camera has recorded motion, switch straight to the active angle
+    if (!opts.userPickedCam && !opts.scanRefresh && !opts.silent && !tsState.isLive && nSegs > 0 && tsState.events.length === 0) {
+      const actMap = tl.cameraActivity || {};
+      let bestCam = '';
+      let bestScore = 0;
+      (tsState.cameras || []).forEach(cName => {
+        if (cName === tsState.camera) return;
+        const st = actMap[cName];
+        const segs = st ? Number(st.activeSegs || 0) : 0;
+        if (segs > bestScore) {
+          bestScore = segs;
+          bestCam = cName;
+        }
+      });
+      if (bestCam && bestScore > 0) {
+        tsState.camera = bestCam;
+        renderTapeCamStrip();
+        return loadTapeTimeline(false, { ...opts, userPickedCam: true });
+      }
+    }
+
     if ($('tsStatusPill')) {
-      $('tsStatusPill').textContent = nSegs ? `${nSegs} chunks · ${bursts.length} activity` : 'EMPTY';
+      $('tsStatusPill').textContent = nSegs ? `${fmtDurShort(recSec)} · ${tsState.events.length} events` : 'EMPTY';
       $('tsStatusPill').className = 'pill ' + (nSegs ? 'ok' : 'warn');
     }
+    if ($('tsScanPill')) {
+      if (tl.scanStatus === 'scanning') {
+        $('tsScanPill').hidden = false;
+        $('tsScanPill').textContent = `Scanning v2 · ${tl.scanPct || 0}%`;
+        $('tsScanPill').className = 'pill live';
+      } else {
+        $('tsScanPill').hidden = true;
+      }
+    }
+    if ($('tsAudioBtn')) {
+      const hasAud = Boolean(tl.hasAudio);
+      $('tsAudioBtn').disabled = !hasAud;
+      if (!hasAud && tsState.audioOn) {
+        tsState.audioOn = false;
+        $('tsAudioBtn').textContent = '🔇 No Audio';
+      } else if (!hasAud) {
+        $('tsAudioBtn').textContent = '🔇 No Audio';
+      } else {
+        $('tsAudioBtn').textContent = tsState.audioOn ? '🔊 Audio ON' : '🔇 Audio';
+        $('tsAudioBtn').classList.toggle('on', tsState.audioOn);
+      }
+    }
+    renderTapeCamStrip();
+    rebuildTrackMap();
+    renderTapeEvents();
+
     if ($('tsStartLbl')) $('tsStartLbl').textContent = fmtClock(tl.minMs);
     if ($('tsEndLbl')) $('tsEndLbl').textContent = fmtClock(tl.maxMs);
+
+    if (opts.scanRefresh) {
+      drawTapeTimeline();
+      if (tl.scanStatus === 'scanning' && activePage === 'footage') scheduleTapeScanPoll();
+      return;
+    }
+
     if (nSegs > 0) {
-      let targetMs = tsState.curMs;
+      let targetMs = (opts.targetMs != null) ? Number(opts.targetMs) : tsState.curMs;
       if (!preservePlayhead || targetMs < tl.minMs || targetMs > tl.maxMs) {
-        if (!tsState.isLive && bursts.length) targetMs = bursts[0].startMs;
-        else targetMs = Math.max(tl.minMs, tl.maxMs - 10000);
+        if (!tsState.isLive && tsState.events.length) {
+          targetMs = Math.max(tl.minMs, tsState.events[0].startMs - 1500);
+        } else if (!tsState.isLive && Array.isArray(tl.runs) && tl.runs.length) {
+          targetMs = tl.runs[0].startMs;
+        } else {
+          targetMs = Math.max(tl.minMs, tl.maxMs - 10000);
+        }
       }
-      renderTapeBursts();
-      scrubToMs(targetMs, true);
+      if (findGapAt(targetMs)) {
+        const g = findGapAt(targetMs);
+        if (g && g.fallbackRun) targetMs = g.fallbackRun.startMs;
+      }
+      if (tsState.packTimer) clearTimeout(tsState.packTimer);
+      if (opts.resumePlay) {
+        startTapePlayback(targetMs);
+      } else {
+        scrubToMs(targetMs, true);
+        tsState.packTimer = setTimeout(() => { if (!tsState.playing) preloadViewportPack(); }, 350);
+      }
+      if (tl.scanStatus === 'scanning' && activePage === 'footage') scheduleTapeScanPoll();
     } else {
-      renderTapeBursts();
+      hideGapOverlay();
       drawTapeTimeline();
     }
   } catch {
@@ -11744,37 +13432,225 @@ async function loadTapeTimeline(preservePlayhead = false) {
   }
 }
 
-function renderTapeBursts() {
-  const box = $('tsBurstList');
+function scheduleTapeScanPoll() {
+  stopTapeScanPoll();
+  tsState.scanPollTimer = setTimeout(() => {
+    if (activePage !== 'footage') return;
+    loadTapeTimeline(true, { silent: true, scanRefresh: true });
+  }, 2400);
+}
+
+function clusterSampleRows(rows, isAllCams, minDurOverrideSec = null) {
   const tl = tsState.timeline;
-  if (!box) return;
-  const bursts = (tl && Array.isArray(tl.bursts)) ? tl.bursts : [];
-  if (!bursts.length) {
-    box.innerHTML = '<span style="font-size:12px;color:var(--mut)">No motion bursts ≥8s detected in this camera window — drag the timeline to scrub any moment.</span>';
+  if (!tl || !Array.isArray(rows) || !rows.length) return [];
+  const sens = Number(tsState.sensitivity || 1.5);
+  const minDurMs = Math.max(1000, Number(minDurOverrideSec != null ? minDurOverrideSec : (tsState.minDurSec || 5)) * 1000);
+  const mergeGapMs = 4000;
+  const camNames = Array.isArray(tl.cameraNames) ? tl.cameraNames : [];
+  const raw = [];
+  let cur = null;
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const s0 = Number(row[0]);
+    const dur = Math.max(1000, Number(row[1] || 2000));
+    const s1 = s0 + dur;
+    const e = Number(row[2] || 0);
+    if (e < sens) continue;
+    const camName = isAllCams ? (camNames[Number(row[3])] || tsState.camera) : tsState.camera;
+    const kind = isAllCams ? (row[4] || 'w') : (row[3] || 'w');
+    const mid = Math.round((s0 + s1) / 2);
+
+    if (cur && (s0 - cur.endMs) <= mergeGapMs && (!isAllCams || cur.camera === camName)) {
+      if (s1 > cur.endMs) cur.endMs = s1;
+      cur.segCount += 1;
+      if (e > cur.peakEnergy) {
+        cur.peakEnergy = e;
+        cur.peakMs = mid;
+      }
+      if (kind === 'm' && cur.kind !== 'w') cur.kind = 'm';
+    } else {
+      if (cur) raw.push(cur);
+      cur = {
+        startMs: s0,
+        endMs: s1,
+        peakMs: mid,
+        peakEnergy: e,
+        segCount: 1,
+        camera: camName,
+        kind: kind === 'm' ? 'motion' : 'workout',
+      };
+    }
+  }
+  if (cur) raw.push(cur);
+
+  return raw
+    .filter(ev => (ev.endMs - ev.startMs) >= minDurMs)
+    .map(ev => ({
+      ...ev,
+      durationSec: Math.round((ev.endMs - ev.startMs) / 1000),
+      peakEnergy: Math.round(ev.peakEnergy * 10) / 10,
+    }));
+}
+
+function reclusterEventsOnly(redraw = true) {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) {
+    tsState.events = [];
+    if (redraw) {
+      renderTapeEvents();
+      drawTapeTimeline();
+    }
     return;
   }
-  box.innerHTML = bursts.map((b, i) => {
-    const active = tsState.curMs >= b.startMs && tsState.curMs <= b.endMs ? ' on' : '';
-    return `<button class="ts-burst-btn${active}" type="button" data-tsburst="${i}">${fmtClock(b.startMs)} · ${Math.round(b.durationSec || 0)}s</button>`;
+  const rows = tsState.allCamsEvents && Array.isArray(tl.allCamSamples) && tl.allCamSamples.length
+    ? tl.allCamSamples
+    : (Array.isArray(tl.samples) ? tl.samples : []);
+  tsState.events = clusterSampleRows(rows, tsState.allCamsEvents && rows === tl.allCamSamples);
+  if ($('tsEvCountPill')) $('tsEvCountPill').textContent = String(tsState.events.length);
+  if ($('tsStatusPill') && tl.scanStatus !== 'scanning') {
+    $('tsStatusPill').textContent = `${fmtDurShort(Number(tl.recordedSec || 0))} · ${tsState.events.length} events`;
+  }
+  if (redraw) {
+    renderTapeEvents();
+    drawTapeTimeline();
+  }
+}
+
+function renderTapeEvents() {
+  const box = $('tsBurstList');
+  if (!box) return;
+  if (tsState.evObserver) {
+    try { tsState.evObserver.disconnect(); } catch {}
+  }
+  const tl = tsState.timeline;
+  const evs = tsState.events || [];
+  if ($('tsEvCountPill')) $('tsEvCountPill').textContent = String(evs.length);
+  if (!tl || !tl.segmentCount) {
+    box.innerHTML = '<span style="font-size:12px;color:var(--mut)">Select a day/session above to inspect motion events.</span>';
+    return;
+  }
+  if (!evs.length) {
+    const rows = tsState.allCamsEvents && Array.isArray(tl.allCamSamples) && tl.allCamSamples.length
+      ? tl.allCamSamples
+      : (Array.isArray(tl.samples) ? tl.samples : []);
+    const brief = tsState.minDurSec > 2 ? clusterSampleRows(rows, tsState.allCamsEvents && rows === tl.allCamSamples, 2) : [];
+    const briefBtn = brief.length
+      ? `<div style="margin-top:8px"><button class="btn sec sm" type="button" id="tsShowBriefBtn">Show ${brief.length} brief (2–4s) event(s)</button></div>`
+      : '';
+    box.innerHTML = `<div style="font-size:12px;color:var(--mut);padding:6px">No events ≥${tsState.minDurSec}s at sensitivity ${Number(tsState.sensitivity).toFixed(1)}.${briefBtn}</div>`;
+    if ($('tsShowBriefBtn')) {
+      $('tsShowBriefBtn').onclick = () => {
+        tsState.minDurSec = 2;
+        document.querySelectorAll('[data-tsmindur]').forEach(b => b.classList.toggle('on', b.dataset.tsmindur === '2'));
+        reclusterEventsOnly(true);
+      };
+    }
+    return;
+  }
+
+  box.innerHTML = evs.map((b, i) => {
+    const active = tsState.curMs >= b.startMs - 1500 && tsState.curMs <= b.endMs + 1500 ? ' on' : '';
+    const pct = clamp(Math.round((Math.log1p(b.peakEnergy) / Math.log1p(20)) * 100), 10, 100);
+    const barColor = b.kind === 'motion' ? '#a855f7' : (b.peakEnergy >= tsState.sensitivity * 2 ? '#38bdf8' : '#22c55e');
+    const srcTag = b.kind === 'motion'
+      ? '<span class="ts-pill-tag m">24/7</span>'
+      : '<span class="ts-pill-tag w">Workout</span>';
+    const camTag = tsState.allCamsEvents ? `<span class="ts-pill-tag" style="background:#1b2838;color:#93c5fd">${escHtml(b.camera)}</span>` : '';
+    const tq = new URLSearchParams({
+      sessionId: tsState.sessionId || '',
+      camera: b.camera || tsState.camera || 'Rack Cam',
+      source: tsState.sourceFilter || 'all',
+      tsMs: String(b.peakMs || b.startMs),
+      w: '280',
+      maxGapMs: '15000',
+    });
+    const thumbUrl = `/api/tape/frame?${tq.toString()}`;
+    return `<div class="ts-ev-card${active}" role="button" tabindex="0" data-tsburst="${i}">
+      <img class="ts-ev-thumb" data-src="${thumbUrl}" alt="">
+      <div class="ts-ev-meta">
+        <div class="ts-ev-top">
+          <span>${fmtClock(b.startMs)}</span>
+          <span style="color:#86efac">${b.durationSec}s</span>
+        </div>
+        <div class="ts-ev-sub">${srcTag}${camTag}<span>peak ${b.peakEnergy.toFixed(1)}</span></div>
+        <div class="ts-ev-bar"><span style="width:${pct}%;background:${barColor}"></span></div>
+        <div class="ts-ev-foot">
+          <span style="font-size:10px;color:var(--mut)">Click to play</span>
+          <button class="ts-ev-clip" type="button" data-evclip="${i}">Clip [ ]</button>
+        </div>
+      </div>
+    </div>`;
   }).join('');
-  box.querySelectorAll('[data-tsburst]').forEach(btn => {
-    btn.onclick = () => {
-      const b = bursts[Number(btn.dataset.tsburst)];
+
+  if (typeof IntersectionObserver !== 'undefined') {
+    tsState.evObserver = new IntersectionObserver((entries) => {
+      entries.forEach(en => {
+        if (!en.isIntersecting) return;
+        const img = en.target;
+        const ds = img.getAttribute('data-src');
+        if (ds) {
+          img.src = ds;
+          img.removeAttribute('data-src');
+        }
+        tsState.evObserver.unobserve(img);
+      });
+    }, { root: box, rootMargin: '120px' });
+    box.querySelectorAll('img[data-src]').forEach(img => tsState.evObserver.observe(img));
+  } else {
+    box.querySelectorAll('img[data-src]').forEach(img => { img.src = img.getAttribute('data-src'); });
+  }
+
+  box.querySelectorAll('.ts-ev-card[data-tsburst]').forEach(card => {
+    card.onclick = (ev) => {
+      if (ev.target && ev.target.closest && ev.target.closest('[data-evclip]')) return;
+      const b = evs[Number(card.dataset.tsburst)];
       if (!b) return;
-      backToScrubMode();
-      tsState.inMs = b.startMs;
-      tsState.outMs = b.endMs;
-      scrubToMs(b.startMs, true);
+      const startAt = Math.max(tl.minMs, b.startMs - 1500);
+      if (b.camera && b.camera !== tsState.camera && tsState.cameras.includes(b.camera)) {
+        stopTapePlayback(false);
+        tsState.camera = b.camera;
+        renderTapeCamStrip();
+        loadTapeTimeline(true, { resumePlay: true, targetMs: startAt });
+      } else {
+        startTapePlayback(startAt);
+      }
+    };
+  });
+  box.querySelectorAll('[data-evclip]').forEach(btn => {
+    btn.onclick = (ev) => {
+      ev.stopPropagation();
+      const b = evs[Number(btn.dataset.evclip)];
+      if (!b) return;
+      tsState.inMs = Math.max(tl.minMs, b.startMs - 2000);
+      tsState.outMs = Math.min(tl.maxMs, b.endMs + 2000);
+      updateRangeInfo();
+      drawTapeTimeline();
+      showToast(`Range set: ${fmtClock(tsState.inMs)} → ${fmtClock(tsState.outMs)}`, 'ok');
     };
   });
 }
 
-function timelineEnergyAt(ms) {
+function sampleEnergyAt(ms) {
   const tl = tsState.timeline;
-  if (!tl || !Array.isArray(tl.activity) || !tl.activity.length) return 0;
-  const span = Math.max(1, tl.maxMs - tl.minMs);
-  const idx = clamp(Math.floor(((ms - tl.minMs) / span) * tl.activity.length), 0, tl.activity.length - 1);
-  return Number(tl.activity[idx].e || 0);
+  if (!tl) return 0;
+  const rows = tl.samples;
+  if (Array.isArray(rows) && rows.length) {
+    let best = 0;
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      if (ms >= r[0] && ms <= r[0] + r[1]) {
+        if (r[2] > best) best = Number(r[2] || 0);
+      }
+    }
+    if (best > 0) return best;
+  }
+  if (Array.isArray(tl.activity) && tl.activity.length) {
+    const span = Math.max(1, tl.maxMs - tl.minMs);
+    const idx = clamp(Math.floor(((ms - tl.minMs) / span) * tl.activity.length), 0, tl.activity.length - 1);
+    return Number(tl.activity[idx].e || 0);
+  }
+  return 0;
 }
 
 function drawTapeTimeline() {
@@ -11784,18 +13660,18 @@ function drawTapeTimeline() {
   if (rect.width < 40) return;
   const dpr = window.devicePixelRatio || 1;
   const w = Math.round(rect.width * dpr);
-  const h = Math.round(78 * dpr);
+  const h = Math.round(86 * dpr);
   if (canvas.width !== w) canvas.width = w;
   if (canvas.height !== h) canvas.height = h;
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = '#070b10';
+  ctx.fillStyle = '#060a10';
   ctx.fillRect(0, 0, w, h);
 
   const tl = tsState.timeline;
-  if (!tl || !tl.segmentCount || !Array.isArray(tl.activity) || !tl.activity.length) {
+  if (!tl || !tl.segmentCount) {
     ctx.fillStyle = '#64748b';
     ctx.font = `${12 * dpr}px system-ui,sans-serif`;
     ctx.textAlign = 'center';
@@ -11803,37 +13679,127 @@ function drawTapeTimeline() {
     return;
   }
 
-  const acts = tl.activity;
-  const n = acts.length;
-  const th = Number(tl.threshold || 2.2);
-  const maxE = Math.max(th * 2.5, ...acts.map(a => Number(a.e || 0)), 4.0);
-  const span = Math.max(1, tl.maxMs - tl.minMs);
-  const barTop = 10 * dpr;
-  const baseH = 12 * dpr;
-  const chartH = h - barTop - baseH;
-  const bw = w / n;
+  const v0 = tsState.viewStartFrac;
+  const vSpan = Math.max(1e-6, tsState.viewEndFrac - tsState.viewStartFrac);
+  const fracToX = (f) => ((f - v0) / vSpan) * w;
 
-  for (let i = 0; i < n; i++) {
-    const a = acts[i];
-    const x = i * bw;
-    const bwFill = Math.max(1, bw - 0.5);
-    const hasVid = a.v !== 0;
-    const eng = Number(a.e || 0);
-    if (hasVid) {
-      ctx.fillStyle = '#1b2838';
-      ctx.fillRect(x, h - baseH, bwFill, baseH);
-    }
-    if (eng > 0.15) {
-      const frac = clamp(eng / maxE, 0.04, 1);
-      const bh = Math.max(2 * dpr, frac * chartH);
-      ctx.fillStyle = eng >= th ? (eng >= th * 1.8 ? '#38bdf8' : '#22c55e') : '#3b5675';
-      ctx.fillRect(x, h - baseH - bh, bwFill, bh);
+  const barTop = 10 * dpr;
+  const rulerH = 18 * dpr;
+  const laneH = h - barTop - rulerH;
+  const rulerY = h - rulerH;
+
+  // 1. Draw runs and gaps on track background
+  const segs = tsState.trackSegs || [];
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s.f1 < v0 || s.f0 > tsState.viewEndFrac) continue;
+    const x0 = clamp(fracToX(s.f0), 0, w);
+    const x1 = clamp(fracToX(s.f1), 0, w);
+    const sw = Math.max(1, x1 - x0);
+    if (s.kind === 'run') {
+      ctx.fillStyle = '#0f1826';
+      ctx.fillRect(x0, barTop, sw, laneH);
+      ctx.fillStyle = '#1b293d';
+      ctx.fillRect(x0, rulerY - 5 * dpr, sw, 5 * dpr);
+    } else {
+      ctx.fillStyle = tsState.collapseGaps ? 'rgba(245,158,11,0.28)' : '#070b11';
+      ctx.fillRect(x0, barTop, sw, laneH);
+      if (tsState.collapseGaps) {
+        ctx.fillStyle = '#f59e0b';
+        ctx.fillRect(x0 + sw * 0.5 - dpr, barTop, 2 * dpr, laneH);
+      }
     }
   }
 
-  // Threshold hairline
-  const thY = h - baseH - clamp(th / maxE, 0, 1) * chartH;
-  ctx.strokeStyle = 'rgba(245,158,11,0.38)';
+  // Real-clock gap zones when not collapsing gaps
+  const runs = Array.isArray(tl.runs) ? tl.runs : [];
+  if (!tsState.collapseGaps && runs.length > 1) {
+    for (let i = 0; i < runs.length - 1; i++) {
+      const gf0 = msToTrackFrac(runs[i].endMs);
+      const gf1 = msToTrackFrac(runs[i + 1].startMs);
+      if (gf1 < v0 || gf0 > tsState.viewEndFrac) continue;
+      const gx0 = clamp(fracToX(gf0), 0, w);
+      const gx1 = clamp(fracToX(gf1), 0, w);
+      const gw = gx1 - gx0;
+      if (gw < 2) continue;
+      ctx.fillStyle = 'rgba(2,6,12,0.86)';
+      ctx.fillRect(gx0, barTop, gw, laneH);
+      ctx.strokeStyle = 'rgba(148,163,184,0.16)';
+      ctx.lineWidth = dpr;
+      ctx.beginPath();
+      for (let hx = gx0; hx < gx1; hx += 10 * dpr) {
+        ctx.moveTo(hx, rulerY);
+        ctx.lineTo(Math.min(gx1, hx + 8 * dpr), barTop);
+      }
+      ctx.stroke();
+      if (gw > 76 * dpr) {
+        ctx.fillStyle = 'rgba(148,163,184,0.75)';
+        ctx.font = `700 ${10 * dpr}px ui-monospace,Consolas,monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText(`GAP ${fmtDurShort((runs[i + 1].startMs - runs[i].endMs) / 1000)}`, gx0 + gw / 2, barTop + laneH * 0.5 + 3 * dpr);
+      }
+    }
+  }
+
+  // 2. Perceptual log-scaled motion bars from tl.samples
+  const sens = Number(tsState.sensitivity || 1.5);
+  const normE = (e) => clamp(Math.log1p(Math.max(0, e)) / Math.log1p(20), 0, 1);
+  const samples = Array.isArray(tl.samples) ? tl.samples : [];
+  if (samples.length) {
+    const numCols = Math.max(120, Math.round(rect.width / 2.2));
+    const colE = new Float32Array(numCols);
+    const colKind = new Uint8Array(numCols); // 1=workout, 2=motion
+    const avgSamplePx = (w / Math.max(1, samples.length));
+
+    if (avgSamplePx >= 3.5 * dpr) {
+      // Zoomed in: draw crisp exact-duration segment bars
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        const f0 = msToTrackFrac(s[0]);
+        const f1 = msToTrackFrac(s[0] + s[1]);
+        if (f1 < v0 || f0 > tsState.viewEndFrac) continue;
+        const x0 = fracToX(f0);
+        const x1 = fracToX(f1);
+        const bw = Math.max(2 * dpr, x1 - x0 - 1 * dpr);
+        const e = Number(s[2] || 0);
+        if (e < 0.25) continue;
+        const bh = Math.max(2 * dpr, normE(e) * (laneH - 5 * dpr));
+        const isMot = s[3] === 'm';
+        ctx.fillStyle = e >= sens
+          ? (e >= sens * 2.2 ? (isMot ? '#e879f9' : '#38bdf8') : (isMot ? '#a855f7' : '#22c55e'))
+          : '#38516e';
+        ctx.fillRect(x0, rulerY - 5 * dpr - bh, bw, bh);
+      }
+    } else {
+      // Overview: bin peaks into crisp columns so no spike is ever buried
+      for (let i = 0; i < samples.length; i++) {
+        const s = samples[i];
+        const fMid = msToTrackFrac(s[0] + s[1] * 0.5);
+        if (fMid < v0 || fMid > tsState.viewEndFrac) continue;
+        const ci = clamp(Math.floor(((fMid - v0) / vSpan) * numCols), 0, numCols - 1);
+        const e = Number(s[2] || 0);
+        if (e >= colE[ci]) {
+          colE[ci] = e;
+          colKind[ci] = s[3] === 'm' ? 2 : 1;
+        }
+      }
+      const colW = w / numCols;
+      for (let ci = 0; ci < numCols; ci++) {
+        const e = colE[ci];
+        if (e < 0.25) continue;
+        const bh = Math.max(2 * dpr, normE(e) * (laneH - 5 * dpr));
+        const isMot = colKind[ci] === 2;
+        ctx.fillStyle = e >= sens
+          ? (e >= sens * 2.2 ? (isMot ? '#e879f9' : '#38bdf8') : (isMot ? '#a855f7' : '#22c55e'))
+          : '#38516e';
+        ctx.fillRect(ci * colW, rulerY - 5 * dpr - bh, Math.max(1.3 * dpr, colW - 0.4), bh);
+      }
+    }
+  }
+
+  // 3. Sensitivity threshold hairline
+  const thY = rulerY - 5 * dpr - normE(sens) * (laneH - 5 * dpr);
+  ctx.strokeStyle = 'rgba(245,158,11,0.48)';
   ctx.setLineDash([4 * dpr, 4 * dpr]);
   ctx.lineWidth = Math.max(1, dpr);
   ctx.beginPath();
@@ -11842,43 +13808,173 @@ function drawTapeTimeline() {
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Detected bursts top bar ticks
-  (tl.bursts || []).forEach(b => {
-    const x0 = clamp(((b.startMs - tl.minMs) / span) * w, 0, w);
-    const x1 = clamp(((b.endMs - tl.minMs) / span) * w, x0 + 2 * dpr, w);
-    ctx.fillStyle = '#4ade80';
-    ctx.fillRect(x0, 2 * dpr, x1 - x0, 4 * dpr);
+  // 4. Detected event ribbon ticks at top
+  (tsState.events || []).forEach(b => {
+    const f0 = msToTrackFrac(b.startMs);
+    const f1 = msToTrackFrac(b.endMs);
+    if (f1 < v0 || f0 > tsState.viewEndFrac) return;
+    const x0 = clamp(fracToX(f0), 0, w);
+    const x1 = clamp(fracToX(f1), x0 + 2 * dpr, w);
+    ctx.fillStyle = b.kind === 'motion' ? '#c084fc' : '#4ade80';
+    ctx.fillRect(x0, 2 * dpr, x1 - x0, 5 * dpr);
   });
 
-  // In-Out clip range band
+  // 5. In-Out clip range highlight & draggable handles
   if (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs) {
-    const ix0 = clamp(((tsState.inMs - tl.minMs) / span) * w, 0, w);
-    const ix1 = clamp(((tsState.outMs - tl.minMs) / span) * w, ix0 + 2 * dpr, w);
-    ctx.fillStyle = 'rgba(245,158,11,0.22)';
-    ctx.fillRect(ix0, 0, ix1 - ix0, h);
-    ctx.fillStyle = '#f59e0b';
-    ctx.fillRect(ix0, 0, 2 * dpr, h);
-    ctx.fillRect(ix1 - 2 * dpr, 0, 2 * dpr, h);
+    const ix0 = fracToX(msToTrackFrac(tsState.inMs));
+    const ix1 = fracToX(msToTrackFrac(tsState.outMs));
+    if (ix1 >= 0 && ix0 <= w) {
+      const cx0 = clamp(ix0, 0, w);
+      const cx1 = clamp(ix1, cx0 + 2 * dpr, w);
+      ctx.fillStyle = 'rgba(245,158,11,0.20)';
+      ctx.fillRect(cx0, barTop, cx1 - cx0, laneH);
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(cx0 - dpr, barTop, 2.5 * dpr, laneH);
+      ctx.fillRect(cx1 - 1.5 * dpr, barTop, 2.5 * dpr, laneH);
+      ctx.fillRect(cx0 - 4 * dpr, barTop, 9 * dpr, 12 * dpr);
+      ctx.fillRect(cx1 - 5 * dpr, barTop, 9 * dpr, 12 * dpr);
+    }
+  } else if (tsState.inMs != null) {
+    const ix0 = fracToX(msToTrackFrac(tsState.inMs));
+    if (ix0 >= 0 && ix0 <= w) {
+      ctx.fillStyle = '#f59e0b';
+      ctx.fillRect(ix0 - dpr, barTop, 2.5 * dpr, laneH);
+    }
   }
 
-  // Hover crosshair
-  if (tsState.hoverRatio != null) {
-    const hx = clamp(tsState.hoverRatio * w, 0, w);
-    ctx.fillStyle = 'rgba(255,255,255,0.35)';
-    ctx.fillRect(hx, 0, 1 * dpr, h);
+  // 6. Bottom time ruler ticks
+  ctx.fillStyle = '#090e16';
+  ctx.fillRect(0, rulerY, w, rulerH);
+  ctx.fillStyle = '#8b9cb3';
+  ctx.font = `600 ${10 * dpr}px ui-monospace,Consolas,monospace`;
+  const ticks = 6;
+  for (let i = 0; i <= ticks; i++) {
+    const f = v0 + (i / ticks) * vSpan;
+    const tx = (i / ticks) * w;
+    const tMs = trackFracToMs(f, false);
+    ctx.textAlign = i === 0 ? 'left' : (i === ticks ? 'right' : 'center');
+    const padX = i === 0 ? 4 * dpr : (i === ticks ? w - 4 * dpr : tx);
+    ctx.fillRect(tx, rulerY, dpr, 3 * dpr);
+    ctx.fillText(fmtClock(tMs, vSpan < 0.2), padX, h - 4 * dpr);
   }
 
-  // Playhead needle
-  const px = clamp(((tsState.curMs - tl.minMs) / span) * w, 1, w - 2);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(px - 1.5 * dpr, 0, 3 * dpr, h);
-  ctx.beginPath();
-  ctx.arc(px, 6 * dpr, 5 * dpr, 0, Math.PI * 2);
-  ctx.fillStyle = '#2ea0ff';
-  ctx.fill();
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = 1.5 * dpr;
-  ctx.stroke();
+  // 7. Hover crosshair
+  if (tsState.hoverFrac != null && tsState.hoverFrac >= v0 && tsState.hoverFrac <= tsState.viewEndFrac) {
+    const hx = fracToX(tsState.hoverFrac);
+    ctx.fillStyle = 'rgba(255,255,255,0.40)';
+    ctx.fillRect(hx, barTop, 1.2 * dpr, laneH);
+  }
+
+  // 8. Playhead needle
+  const pf = msToTrackFrac(tsState.curMs);
+  if (pf >= v0 && pf <= tsState.viewEndFrac) {
+    const px = clamp(fracToX(pf), 2, w - 2);
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(px - 1.5 * dpr, 0, 3 * dpr, rulerY);
+    ctx.beginPath();
+    ctx.arc(px, 6 * dpr, 5.5 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = '#2ea0ff';
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.6 * dpr;
+    ctx.stroke();
+  }
+}
+
+async function preloadViewportPack() {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return;
+  const sMs = trackFracToMs(tsState.viewStartFrac, true);
+  const eMs = Math.max(sMs + 2000, trackFracToMs(tsState.viewEndFrac, true));
+  const key = `${tsState.sessionId}|${tsState.sourceFilter}|${tsState.camera}|${Math.round(sMs / 2000)}|${Math.round(eMs / 2000)}`;
+  if (tsState.packCache.has(key)) {
+    tsState.activePack = tsState.packCache.get(key);
+    return;
+  }
+  if (tsState.packAbort) {
+    try { tsState.packAbort.abort(); } catch {}
+  }
+  tsState.packAbort = new AbortController();
+  const q = new URLSearchParams({
+    sessionId: tsState.sessionId || '',
+    camera: tsState.camera || 'Rack Cam',
+    source: tsState.sourceFilter || 'all',
+    startMs: String(sMs),
+    endMs: String(eMs),
+    count: '36',
+    w: '280',
+  });
+  try {
+    const r = await fetch(`/api/tape/pack?${q.toString()}`, { signal: tsState.packAbort.signal, cache: 'no-store' }).then(x => x.json());
+    if (!r || !Array.isArray(r.frames)) return;
+    const pack = r.frames.map(f => ({ tsMs: Number(f.tsMs), src: 'data:image/jpeg;base64,' + f.jpg }));
+    pack.sort((a, b) => a.tsMs - b.tsMs);
+    if (tsState.packCache.size >= 16) {
+      const oldest = tsState.packCache.keys().next().value;
+      if (oldest) tsState.packCache.delete(oldest);
+    }
+    tsState.packCache.set(key, pack);
+    tsState.activePack = pack;
+  } catch {}
+}
+
+function nearestPackThumb(ms, maxDistMs = 45_000) {
+  const pack = tsState.activePack;
+  if (!pack || !pack.length) return null;
+  let lo = 0;
+  let hi = pack.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (pack[mid].tsMs < ms) lo = mid + 1;
+    else hi = mid;
+  }
+  let best = pack[lo];
+  if (lo > 0 && Math.abs(pack[lo - 1].tsMs - ms) < Math.abs(best.tsMs - ms)) {
+    best = pack[lo - 1];
+  }
+  return Math.abs(best.tsMs - ms) <= maxDistMs ? best.src : null;
+}
+
+function showGapOverlay(gapInfo, atMs) {
+  const ov = $('tsGapOverlay');
+  if (!ov) return;
+  ov.hidden = false;
+  if ($('tsGapTitle')) $('tsGapTitle').textContent = `No recording at ${fmtClock(atMs)}`;
+  const hasBounds = gapInfo && gapInfo.prevRun && gapInfo.nextRun;
+  if ($('tsGapSub')) {
+    $('tsGapSub').textContent = hasBounds
+      ? `${fmtDurShort((gapInfo.nextRun.startMs - gapInfo.prevRun.endMs) / 1000)} gap (${fmtClock(gapInfo.prevRun.endMs, false)} → ${fmtClock(gapInfo.nextRun.startMs, false)})`
+      : 'Outside recorded footage window';
+  }
+  const btn = $('tsJumpNextRunBtn');
+  if (btn && gapInfo && gapInfo.fallbackRun) {
+    btn.textContent = gapInfo.nextRun
+      ? `Jump to ${fmtClock(gapInfo.nextRun.startMs, false)} →`
+      : `Jump to ${fmtClock(gapInfo.fallbackRun.startMs, false)} →`;
+    btn.onclick = () => scrubToMs(gapInfo.fallbackRun.startMs, true);
+  }
+}
+
+function hideGapOverlay() {
+  if ($('tsGapOverlay')) $('tsGapOverlay').hidden = true;
+}
+
+function updateHudAtMs(ms, gapInfo = null) {
+  const eng = sampleEnergyAt(ms);
+  const sens = Number(tsState.sensitivity || 1.5);
+  const tag = gapInfo ? 'NO RECORDING (GAP)' : (eng >= sens ? `ACTIVE ${eng.toFixed(1)}` : `quiet ${eng.toFixed(1)}`);
+  if ($('tsTimeHud')) $('tsTimeHud').textContent = `${tsState.camera} · ${fmtClock(ms)} · ${tag}`;
+  if ($('tsCurLbl')) $('tsCurLbl').textContent = fmtClock(ms);
+  document.querySelectorAll('#tsBurstList .ts-ev-card').forEach(card => {
+    const b = tsState.events[Number(card.dataset.tsburst)];
+    card.classList.toggle('on', Boolean(b && ms >= b.startMs - 1500 && ms <= b.endMs + 1500));
+  });
+  const tl = tsState.timeline;
+  const runs = tl && Array.isArray(tl.runs) ? tl.runs : [];
+  document.querySelectorAll('#tsRunStrip .ts-run-btn').forEach(btn => {
+    const r = runs[Number(btn.dataset.tsrun)];
+    btn.classList.toggle('on', Boolean(r && ms >= r.startMs - 1500 && ms <= r.endMs + 1500));
+  });
 }
 
 function scrubToMs(ms, immediate = false) {
@@ -11886,18 +13982,24 @@ function scrubToMs(ms, immediate = false) {
   if (!tl || !tl.segmentCount) return;
   const clamped = Math.round(clamp(ms, tl.minMs, tl.maxMs));
   tsState.curMs = clamped;
-  const eng = timelineEnergyAt(clamped);
-  const th = Number(tl.threshold || 2.2);
-  const actTag = eng >= th ? 'ACTIVE' : 'quiet';
-  if ($('tsTimeHud')) $('tsTimeHud').textContent = `${tsState.camera} · ${fmtClock(clamped)} · motion ${eng.toFixed(1)} (${actTag})`;
-  if ($('tsCurLbl')) $('tsCurLbl').textContent = fmtClock(clamped);
+  const gapInfo = findGapAt(clamped);
+  updateHudAtMs(clamped, gapInfo);
   drawTapeTimeline();
-  document.querySelectorAll('#tsBurstList .ts-burst-btn').forEach(btn => {
-    const b = (tl.bursts || [])[Number(btn.dataset.tsburst)];
-    btn.classList.toggle('on', Boolean(b && clamped >= b.startMs && clamped <= b.endMs));
-  });
 
-  if (tsState.playingVideo) return;
+  if (tsState.playing) return;
+  if (gapInfo) {
+    if (tsState.frameTimer) clearTimeout(tsState.frameTimer);
+    showGapOverlay(gapInfo, clamped);
+    return;
+  }
+  hideGapOverlay();
+
+  const thumb = nearestPackThumb(clamped);
+  if (thumb && $('tsFrameImg')) {
+    $('tsFrameImg').hidden = false;
+    $('tsFrameImg').src = thumb;
+  }
+
   if (tsState.frameTimer) clearTimeout(tsState.frameTimer);
   const runFetch = async () => {
     if (tsState.frameAbort) {
@@ -11907,90 +14009,336 @@ function scrubToMs(ms, immediate = false) {
     const q = new URLSearchParams({
       sessionId: tsState.sessionId || '',
       camera: tsState.camera || 'Rack Cam',
+      source: tsState.sourceFilter || 'all',
       tsMs: String(clamped),
-      w: '640',
+      w: '960',
+      maxGapMs: '10000',
     });
     try {
       const resp = await fetch(`/api/tape/frame?${q.toString()}`, { signal: tsState.frameAbort.signal });
+      if (resp.status === 204) {
+        const g = findGapAt(tsState.curMs) || { fallbackRun: (tl.runs && tl.runs[0]) || { startMs: tl.minMs } };
+        showGapOverlay(g, tsState.curMs);
+        return;
+      }
       if (!resp.ok) return;
       const blob = await resp.blob();
       const objUrl = URL.createObjectURL(blob);
       const prevUrl = tsState.frameObjUrl;
       tsState.frameObjUrl = objUrl;
-      if ($('tsFrameImg')) $('tsFrameImg').src = objUrl;
+      if ($('tsFrameImg')) {
+        $('tsFrameImg').hidden = false;
+        $('tsFrameImg').src = objUrl;
+      }
       if (prevUrl) { try { URL.revokeObjectURL(prevUrl); } catch {} }
     } catch {}
   };
   if (immediate) runFetch();
-  else tsState.frameTimer = setTimeout(runFetch, 55);
+  else tsState.frameTimer = setTimeout(runFetch, 95);
+}
+
+function flashSkipToast(msg) {
+  const el = $('tsSkipToast');
+  if (!el) return;
+  el.textContent = msg;
+  el.hidden = false;
+  if (tsState.skipToastTimer) clearTimeout(tsState.skipToastTimer);
+  tsState.skipToastTimer = setTimeout(() => { el.hidden = true; }, 2200);
+}
+
+function syncPlayControlsUI() {
+  const btn = $('tsPlayBtn');
+  if (btn) {
+    btn.textContent = tsState.playing ? '⏸ Pause' : '▶ Play';
+    btn.className = `btn sm ts-play-main ${tsState.playing ? 'sec on' : 'ok'}`;
+  }
+  if ($('tsPlayBadge')) {
+    $('tsPlayBadge').hidden = !tsState.playing;
+    if (tsState.playing) $('tsPlayBadge').textContent = `LIVE ${tsState.speed}×`;
+  }
+}
+
+function startTapePlayback(startAtMs) {
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return;
+  hideGapOverlay();
+  if (tsState.packTimer) {
+    clearTimeout(tsState.packTimer);
+    tsState.packTimer = null;
+  }
+  if (tsState.packAbort) {
+    try { tsState.packAbort.abort(); } catch {}
+  }
+  if (tsState.frameAbort) {
+    try { tsState.frameAbort.abort(); } catch {}
+  }
+  if (tsState.frameTimer) {
+    clearTimeout(tsState.frameTimer);
+    tsState.frameTimer = null;
+  }
+
+  let targetMs = Math.round(clamp(startAtMs != null ? startAtMs : (tsState.curMs || tl.minMs), tl.minMs, tl.maxMs));
+  const gap = findGapAt(targetMs);
+  if (gap && gap.fallbackRun) {
+    targetMs = gap.fallbackRun.startMs;
+  }
+  const rInfo = findRunAt(targetMs);
+  const run = rInfo.run || { startMs: tl.minMs, endMs: tl.maxMs };
+  if (run.endMs - targetMs < 1500) {
+    targetMs = Math.max(run.startMs, run.endMs - 2000);
+  }
+
+  tsState.playing = true;
+  tsState.buffering = true;
+  tsState.quietSinceMs = 0;
+  tsState.skipCooldownUntil = performance.now() + 2500;
+  const gen = ++tsState.playGen;
+  tsState.streamStartMs = targetMs;
+  tsState.streamEndMs = Math.min(run.endMs, targetMs + 600_000);
+  tsState.curMs = targetMs;
+  syncPlayControlsUI();
+
+  if ($('tsBuffering')) $('tsBuffering').hidden = false;
+  if ($('tsBufferLbl')) $('tsBufferLbl').textContent = `Starting ${tsState.camera} stream…`;
+
+  const vid = $('tsVideo');
+  const q = new URLSearchParams({
+    sessionId: tsState.sessionId || '',
+    camera: tsState.camera || 'Rack Cam',
+    source: tsState.sourceFilter || 'all',
+    startMs: String(targetMs),
+    maxSec: '600',
+    streamId: tsState.streamId,
+    _: String(Date.now()),
+  });
+
+  if (vid) {
+    vid.hidden = false;
+    vid.muted = true;
+    vid.style.opacity = '0';
+    vid.src = `/api/tape/stream.mp4?${q.toString()}`;
+    vid.playbackRate = tsState.speed || 1;
+    vid.onplaying = () => {
+      if (gen !== tsState.playGen) return;
+      tsState.buffering = false;
+      vid.style.opacity = '1';
+      if ($('tsBuffering')) $('tsBuffering').hidden = true;
+      vid.playbackRate = tsState.speed || 1;
+    };
+    vid.onwaiting = () => {
+      if (gen !== tsState.playGen || !tsState.playing) return;
+      if ($('tsBuffering')) $('tsBuffering').hidden = false;
+      if ($('tsBufferLbl')) $('tsBufferLbl').textContent = 'Buffering stream…';
+    };
+    vid.onended = () => {
+      if (gen !== tsState.playGen || !tsState.playing) return;
+      const endedMs = tsState.streamStartMs + Math.round((vid.currentTime || 0) * 1000);
+      if ((run.endMs - Math.max(endedMs, tsState.streamEndMs - 5000)) > 2500 && (vid.currentTime || 0) > 1) {
+        startTapePlayback(endedMs);
+        return;
+      }
+      const nextRun = (rInfo.runs || []).find(r => r.startMs > run.endMs + 1000);
+      if (nextRun) {
+        flashSkipToast(`Skipped ${fmtDurShort((nextRun.startMs - run.endMs) / 1000)} gap →`);
+        startTapePlayback(nextRun.startMs);
+      } else {
+        stopTapePlayback(true);
+        showToast('Reached end of footage', 'ok');
+      }
+    };
+    vid.onerror = () => {
+      if (gen !== tsState.playGen || !tsState.playing) return;
+      stopTapePlayback(true);
+      showToast('Stream unavailable for this segment', 'err');
+    };
+    vid.play().catch(() => {});
+  }
+
+  if (tsState.rafId) cancelAnimationFrame(tsState.rafId);
+  tsState.rafId = requestAnimationFrame(() => tickTapePlayback(gen));
+}
+
+function tickTapePlayback(gen) {
+  if (!tsState.playing || gen !== tsState.playGen) return;
+  const vid = $('tsVideo');
+  const tl = tsState.timeline;
+  if (vid && tl && !vid.paused && vid.readyState >= 2) {
+    const liveMs = Math.round(clamp(tsState.streamStartMs + (vid.currentTime || 0) * 1000, tl.minMs, tl.maxMs));
+    tsState.curMs = liveMs;
+    updateHudAtMs(liveMs, null);
+
+    // Auto-pan zoomed viewport when playhead nears right edge
+    const vSpan = tsState.viewEndFrac - tsState.viewStartFrac;
+    if (vSpan < 0.995) {
+      const pf = msToTrackFrac(liveMs);
+      if (pf > tsState.viewStartFrac + vSpan * 0.92 && tsState.viewEndFrac < 1) {
+        const s = clamp(pf - vSpan * 0.25, 0, 1 - vSpan);
+        tsState.viewStartFrac = s;
+        tsState.viewEndFrac = s + vSpan;
+        preloadViewportPack();
+      }
+    }
+    drawTapeTimeline();
+
+    if (tsState.audioOn && tl.hasAudio) {
+      syncTapeAudio(liveMs);
+    }
+
+    if (tsState.motionOnly && performance.now() > tsState.skipCooldownUntil && tsState.events.length) {
+      const inEv = tsState.events.some(ev => liveMs >= ev.startMs - 2000 && liveMs <= ev.endMs + 2500);
+      if (inEv) {
+        tsState.quietSinceMs = 0;
+      } else {
+        if (!tsState.quietSinceMs) tsState.quietSinceMs = performance.now();
+        if (performance.now() - tsState.quietSinceMs > 1600) {
+          const nextEv = tsState.events.find(ev => ev.startMs > liveMs + 1000);
+          if (nextEv) {
+            const skipSec = Math.round((nextEv.startMs - liveMs) / 1000);
+            flashSkipToast(`⚡ Skipped ${fmtDurShort(skipSec)} quiet`);
+            startTapePlayback(Math.max(tl.minMs, nextEv.startMs - 1500));
+            return;
+          } else {
+            stopTapePlayback(true);
+            showToast('Reached end of motion events', 'ok');
+            return;
+          }
+        }
+      }
+    }
+  }
+  tsState.rafId = requestAnimationFrame(() => tickTapePlayback(gen));
+}
+
+function stopTapePlayback(fetchHiRes = true) {
+  const wasPlaying = tsState.playing;
+  tsState.playing = false;
+  tsState.buffering = false;
+  tsState.playGen += 1;
+  if (tsState.rafId) {
+    cancelAnimationFrame(tsState.rafId);
+    tsState.rafId = 0;
+  }
+  const vid = $('tsVideo');
+  if (vid) {
+    vid.onplaying = null;
+    vid.onwaiting = null;
+    vid.onended = null;
+    vid.onerror = null;
+    try { vid.pause(); } catch {}
+    vid.removeAttribute('src');
+    try { vid.load(); } catch {}
+    vid.style.opacity = '0';
+    vid.hidden = true;
+  }
+  const aud = $('tsAudio');
+  if (aud) {
+    try { aud.pause(); } catch {}
+  }
+  if ($('tsBuffering')) $('tsBuffering').hidden = true;
+  if (wasPlaying) {
+    fetch('/api/tape/stream/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ streamId: tsState.streamId }),
+    }).catch(() => {});
+  }
+  syncPlayControlsUI();
+  if (fetchHiRes && tsState.timeline && tsState.timeline.segmentCount) {
+    scrubToMs(tsState.curMs, true);
+    if (!tsState.activePack || !tsState.activePack.length) preloadViewportPack();
+  }
+}
+
+function syncTapeAudio(curMs) {
+  const aud = $('tsAudio');
+  if (!aud || !tsState.audioOn || !tsState.playing) return;
+  const chunkStart = Math.floor(curMs / 60_000) * 60_000;
+  const chunkEnd = chunkStart + 60_000;
+  const offset = Math.max(0, (curMs - chunkStart) / 1000);
+  if (tsState.audioChunkStart !== chunkStart || !aud.src) {
+    tsState.audioChunkStart = chunkStart;
+    tsState.audioChunkEnd = chunkEnd;
+    aud.src = `/api/audio/clip?startMs=${chunkStart}&endMs=${chunkEnd}`;
+    aud.playbackRate = tsState.speed || 1;
+    aud.onloadedmetadata = () => {
+      try { aud.currentTime = offset; } catch {}
+      if (tsState.audioOn && tsState.playing) aud.play().catch(() => {});
+    };
+    aud.onerror = () => {};
+  } else {
+    aud.playbackRate = tsState.speed || 1;
+    if (aud.readyState >= 2 && Math.abs((aud.currentTime || 0) - offset) > 0.5) {
+      try { aud.currentTime = offset; } catch {}
+    }
+    if (aud.paused && aud.readyState >= 2) {
+      aud.play().catch(() => {});
+    }
+  }
+}
+
+function toggleTapeAudio() {
+  const tl = tsState.timeline;
+  if (!tl || !tl.hasAudio) {
+    showToast('No S330 room audio for this window', 'err');
+    return;
+  }
+  tsState.audioOn = !tsState.audioOn;
+  const btn = $('tsAudioBtn');
+  if (btn) {
+    btn.textContent = tsState.audioOn ? '🔊 Audio ON' : '🔇 Audio';
+    btn.classList.toggle('on', tsState.audioOn);
+  }
+  const aud = $('tsAudio');
+  if (!tsState.audioOn && aud) {
+    try { aud.pause(); } catch {}
+  } else if (tsState.audioOn && tsState.playing) {
+    tsState.audioChunkStart = 0;
+    syncTapeAudio(tsState.curMs);
+  }
+}
+
+function toggleMotionOnly() {
+  tsState.motionOnly = !tsState.motionOnly;
+  tsState.quietSinceMs = 0;
+  if ($('tsMotionOnlyBtn')) $('tsMotionOnlyBtn').classList.toggle('on', tsState.motionOnly);
+  if (tsState.motionOnly) showToast('⚡ Motion-Only playback ON (auto-skips quiet)', 'ok');
+}
+
+function toggleStageFullscreen() {
+  const st = $('tsStage');
+  if (!st) return;
+  if (document.fullscreenElement === st) {
+    document.exitFullscreen().catch(() => {});
+  } else if (st.requestFullscreen) {
+    st.requestFullscreen().catch(() => {});
+  }
 }
 
 function stepScrubSec(deltaSec) {
-  backToScrubMode();
-  scrubToMs((tsState.curMs || 0) + Number(deltaSec) * 1000, true);
+  const wasPlaying = tsState.playing;
+  const tl = tsState.timeline;
+  if (!tl || !tl.segmentCount) return;
+  const nextMs = Math.round(clamp((tsState.curMs || tl.minMs) + Number(deltaSec) * 1000, tl.minMs, tl.maxMs));
+  if (wasPlaying) startTapePlayback(nextMs);
+  else scrubToMs(nextMs, true);
 }
 
 function backToScrubMode() {
-  tsState.playingVideo = false;
-  const vid = $('tsVideo');
-  const img = $('tsFrameImg');
-  if (vid) {
-    try { vid.pause(); } catch {}
-    vid.hidden = true;
-  }
-  if (img) img.hidden = false;
-  if ($('tsBackToScrubBtn')) $('tsBackToScrubBtn').hidden = true;
+  stopTapePlayback(false);
 }
 
-async function playTapeWindow() {
-  const tl = tsState.timeline;
-  if (!tl || !tl.segmentCount) return;
-  const winSec = Number(($('tsWinSec') && $('tsWinSec').value) || 30);
-  let sMs, eMs;
-  if (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs) {
-    sMs = tsState.inMs;
-    eMs = tsState.outMs;
-  } else {
-    sMs = Math.max(tl.minMs, tsState.curMs - 2000);
-    eMs = Math.min(tl.maxMs, sMs + winSec * 1000);
-    if (eMs - sMs < 4000) eMs = Math.min(tl.maxMs, sMs + 4000);
-  }
-  if ($('tsOut')) $('tsOut').textContent = `Rendering ${Math.round((eMs - sMs) / 1000)}s preview MP4…`;
-  try {
-    const r = await fetch('/api/tape/preview', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: tsState.sessionId || '', camera: tsState.camera || 'Rack Cam', startMs: sMs, endMs: eMs }),
-    }).then(x => x.json());
-    if (!r || !r.ok || !r.lanUrl) {
-      if ($('tsOut')) $('tsOut').textContent = `✗ ${(r && r.error) || 'Preview unavailable'}`;
-      return;
-    }
-    tsState.playingVideo = true;
-    const vid = $('tsVideo');
-    const img = $('tsFrameImg');
-    if (img) img.hidden = true;
-    if ($('tsBackToScrubBtn')) $('tsBackToScrubBtn').hidden = false;
-    if (vid) {
-      vid.hidden = false;
-      vid.src = r.lanUrl;
-      vid.playbackRate = Number(($('tsSpeedSel') && $('tsSpeedSel').value) || 1) || 1;
-      vid.play().catch(() => {});
-    }
-    if ($('tsOut')) $('tsOut').textContent = `▶ Playing ${fmtClock(sMs)} – ${fmtClock(eMs)}`;
-  } catch {
-    if ($('tsOut')) $('tsOut').textContent = '✗ Preview failed';
-  }
+function playTapeWindow() {
+  if (tsState.playing) stopTapePlayback(true);
+  else startTapePlayback(tsState.curMs);
 }
 
 function jumpActivityBurst(dir) {
   const tl = tsState.timeline;
-  const bursts = (tl && Array.isArray(tl.bursts)) ? tl.bursts : [];
+  const bursts = tsState.events || [];
   if (!bursts.length) {
-    showToast('No motion bursts ≥8s in this session', 'err');
+    showToast(`No motion events ≥${tsState.minDurSec}s at sensitivity ${Number(tsState.sensitivity).toFixed(1)}`, 'err');
     return;
   }
-  backToScrubMode();
   const cur = tsState.curMs || tl.minMs;
   let pick = bursts[0];
   if (dir > 0) {
@@ -11999,7 +14347,32 @@ function jumpActivityBurst(dir) {
     const prev = bursts.filter(b => b.startMs < cur - 1500);
     pick = prev.length ? prev[prev.length - 1] : bursts[bursts.length - 1];
   }
-  scrubToMs(pick.startMs, true);
+  const targetMs = Math.max(tl.minMs, pick.startMs - 1500);
+  if (pick.camera && pick.camera !== tsState.camera && tsState.cameras.includes(pick.camera)) {
+    const wasPlaying = tsState.playing;
+    stopTapePlayback(false);
+    tsState.camera = pick.camera;
+    renderTapeCamStrip();
+    loadTapeTimeline(true, { resumePlay: wasPlaying, targetMs });
+    return;
+  }
+  if (tsState.playing) startTapePlayback(targetMs);
+  else scrubToMs(targetMs, true);
+}
+
+function updateRangeInfo() {
+  const el = $('tsRangeInfo');
+  if (!el) return;
+  if (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs) {
+    el.textContent = `${fmtClock(tsState.inMs, false)}→${fmtClock(tsState.outMs, false)} (${fmtDurShort((tsState.outMs - tsState.inMs) / 1000)})`;
+    el.style.color = '#fcd34d';
+  } else if (tsState.inMs != null) {
+    el.textContent = `IN ${fmtClock(tsState.inMs)}`;
+    el.style.color = '#fcd34d';
+  } else {
+    el.textContent = 'Default +30s';
+    el.style.color = 'var(--mut)';
+  }
 }
 
 function setScrubInOut(which) {
@@ -12014,19 +14387,19 @@ function setScrubInOut(which) {
     tsState.inMs = null;
     tsState.outMs = null;
   }
+  updateRangeInfo();
   drawTapeTimeline();
 }
 
 async function saveScrubberClip() {
   const tl = tsState.timeline;
   if (!tl || !tl.segmentCount) return;
-  const winSec = Number(($('tsWinSec') && $('tsWinSec').value) || 30);
   const sMs = (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs)
     ? tsState.inMs
     : Math.max(tl.minMs, tsState.curMs - 4000);
   const eMs = (tsState.inMs != null && tsState.outMs != null && tsState.outMs > tsState.inMs)
     ? tsState.outMs
-    : Math.min(tl.maxMs, sMs + winSec * 1000);
+    : Math.min(tl.maxMs, sMs + 30_000);
   const exName = (($('tsClipLabel') && $('tsClipLabel').value.trim()) || 'scrub_clip');
   const includeAudio = Boolean($('tsIncludeAudio') && $('tsIncludeAudio').checked);
   if ($('tsOut')) $('tsOut').textContent = 'Cutting clip MP4 & syncing Drive…';
@@ -12036,6 +14409,7 @@ async function saveScrubberClip() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sessionId: tsState.sessionId || '',
+        source: tsState.sourceFilter || 'all',
         exName,
         startMs: sMs,
         endMs: eMs,
@@ -12057,62 +14431,255 @@ async function saveScrubberClip() {
   }
 }
 
+async function triggerTapeRescan() {
+  const btn = $('tsRescanBtn');
+  if (btn) setBtnFeedback(btn, 'saving', 'Scanning…');
+  try {
+    await fetch('/api/tape/rescan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: tsState.sessionId || '', source: tsState.sourceFilter || 'all', force: true }),
+    });
+    if ($('tsScanPill')) {
+      $('tsScanPill').hidden = false;
+      $('tsScanPill').textContent = 'Scanning v2…';
+      $('tsScanPill').className = 'pill live';
+    }
+    scheduleTapeScanPoll();
+    if (btn) setBtnFeedback(btn, 'saved', '✓ Started', 1600);
+  } catch {
+    if (btn) setBtnFeedback(btn, 'save-err', '✗ Failed', 2000);
+  }
+}
+
+function updateHoverPopover(ev, canvas) {
+  const pop = $('tsHoverPop');
+  const tl = tsState.timeline;
+  const rail = $('tsRailWrap');
+  if (!pop || !tl || !tl.segmentCount || !rail) return;
+  const rect = canvas.getBoundingClientRect();
+  const railRect = rail.getBoundingClientRect();
+  const relRatio = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+  const trackFrac = tsState.viewStartFrac + relRatio * (tsState.viewEndFrac - tsState.viewStartFrac);
+  const hMs = trackFracToMs(trackFrac, false);
+  tsState.hoverFrac = trackFrac;
+  tsState.hoverMs = hMs;
+
+  const isGap = Boolean(findGapAt(hMs));
+  const eng = sampleEnergyAt(hMs);
+  const pxInRail = (ev.clientX - railRect.left);
+  const halfPop = 104;
+  const clampedLeft = clamp(pxInRail, halfPop, Math.max(halfPop, railRect.width - halfPop));
+  pop.hidden = false;
+  pop.style.left = `${clampedLeft.toFixed(1)}px`;
+  if ($('tsHoverTime')) $('tsHoverTime').textContent = fmtClock(hMs);
+  if ($('tsHoverScore')) {
+    $('tsHoverScore').textContent = isGap ? 'GAP' : `motion ${eng.toFixed(1)}`;
+    $('tsHoverScore').style.color = isGap ? '#94a3b8' : (eng >= tsState.sensitivity ? '#86efac' : '#cbd5e1');
+  }
+
+  const hImg = $('tsHoverImg');
+  const hGap = $('tsHoverGap');
+  if (isGap) {
+    if (hImg) hImg.hidden = true;
+    if (hGap) hGap.hidden = false;
+  } else {
+    const thumb = nearestPackThumb(hMs, 90_000);
+    if (thumb && hImg) {
+      if (hImg.src !== thumb) hImg.src = thumb;
+      hImg.hidden = false;
+      if (hGap) hGap.hidden = true;
+    } else {
+      if (hImg) hImg.hidden = true;
+      if (hGap) hGap.hidden = true;
+    }
+  }
+}
+
 function wireTapeScrubber() {
   const canvas = $('tsTimelineCanvas');
   if (canvas) {
-    const ratioForEvent = (ev) => {
+    const trackFracForEv = (ev) => {
       const rect = canvas.getBoundingClientRect();
-      return clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+      const rel = clamp((ev.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+      return {
+        rel,
+        frac: tsState.viewStartFrac + rel * (tsState.viewEndFrac - tsState.viewStartFrac),
+        xPx: ev.clientX - rect.left,
+        wPx: rect.width,
+      };
     };
+
     canvas.addEventListener('pointerdown', (ev) => {
       const tl = tsState.timeline;
       if (!tl || !tl.segmentCount) return;
       canvas.setPointerCapture(ev.pointerId);
-      tsState.dragging = true;
-      backToScrubMode();
-      const ratio = ratioForEvent(ev);
-      scrubToMs(tl.minMs + ratio * Math.max(1, tl.maxMs - tl.minMs), false);
+      const info = trackFracForEv(ev);
+
+      // Hit-test draggable In/Out handles first
+      const pxForMs = (ms) => ((msToTrackFrac(ms) - tsState.viewStartFrac) / Math.max(1e-6, tsState.viewEndFrac - tsState.viewStartFrac)) * info.wPx;
+      if (tsState.inMs != null && Math.abs(info.xPx - pxForMs(tsState.inMs)) <= 10) {
+        tsState.dragMode = 'in';
+        return;
+      }
+      if (tsState.outMs != null && Math.abs(info.xPx - pxForMs(tsState.outMs)) <= 10) {
+        tsState.dragMode = 'out';
+        return;
+      }
+      if (ev.shiftKey && (tsState.viewEndFrac - tsState.viewStartFrac) < 0.995) {
+        tsState.dragMode = 'pan';
+        tsState.panStartX = ev.clientX;
+        tsState.panStartFrac0 = tsState.viewStartFrac;
+        return;
+      }
+
+      tsState.dragMode = 'scrub';
+      tsState.wasPlayingOnDrag = tsState.playing;
+      if (tsState.playing) stopTapePlayback(false);
+      const targetMs = trackFracToMs(info.frac, true);
+      scrubToMs(targetMs, false);
     });
+
     canvas.addEventListener('pointermove', (ev) => {
       const tl = tsState.timeline;
       if (!tl || !tl.segmentCount) return;
-      const ratio = ratioForEvent(ev);
-      tsState.hoverRatio = ratio;
-      const hMs = Math.round(tl.minMs + ratio * Math.max(1, tl.maxMs - tl.minMs));
-      const eng = timelineEnergyAt(hMs);
-      const tip = $('tsHoverTip');
-      if (tip) {
-        tip.hidden = false;
-        tip.style.left = `${(ratio * 100).toFixed(2)}%`;
-        tip.textContent = `${fmtClock(hMs)} · ${eng.toFixed(1)}`;
+      const info = trackFracForEv(ev);
+      updateHoverPopover(ev, canvas);
+
+      if (tsState.dragMode === 'in') {
+        const m = trackFracToMs(info.frac, true);
+        tsState.inMs = tsState.outMs != null ? Math.min(m, tsState.outMs - 1000) : m;
+        updateRangeInfo();
+        drawTapeTimeline();
+      } else if (tsState.dragMode === 'out') {
+        const m = trackFracToMs(info.frac, true);
+        tsState.outMs = tsState.inMs != null ? Math.max(m, tsState.inMs + 1000) : m;
+        updateRangeInfo();
+        drawTapeTimeline();
+      } else if (tsState.dragMode === 'pan') {
+        const span = tsState.viewEndFrac - tsState.viewStartFrac;
+        const dxFrac = ((tsState.panStartX - ev.clientX) / Math.max(1, info.wPx)) * span;
+        const s = clamp(tsState.panStartFrac0 + dxFrac, 0, 1 - span);
+        tsState.viewStartFrac = s;
+        tsState.viewEndFrac = s + span;
+        drawTapeTimeline();
+      } else if (tsState.dragMode === 'scrub') {
+        scrubToMs(trackFracToMs(info.frac, true), false);
+      } else {
+        drawTapeTimeline();
       }
-      if (tsState.dragging) scrubToMs(hMs, false);
-      else drawTapeTimeline();
     });
+
     const endDrag = () => {
-      if (!tsState.dragging) return;
-      tsState.dragging = false;
-      scrubToMs(tsState.curMs, true);
+      const mode = tsState.dragMode;
+      if (!mode) return;
+      tsState.dragMode = '';
+      if (mode === 'pan') {
+        preloadViewportPack();
+      } else if (mode === 'scrub') {
+        if (tsState.wasPlayingOnDrag && !findGapAt(tsState.curMs)) {
+          tsState.wasPlayingOnDrag = false;
+          startTapePlayback(tsState.curMs);
+        } else {
+          tsState.wasPlayingOnDrag = false;
+          scrubToMs(tsState.curMs, true);
+        }
+      }
     };
     canvas.addEventListener('pointerup', endDrag);
     canvas.addEventListener('pointercancel', endDrag);
     canvas.addEventListener('pointerleave', () => {
-      tsState.hoverRatio = null;
-      if ($('tsHoverTip')) $('tsHoverTip').hidden = true;
+      tsState.hoverFrac = null;
+      if ($('tsHoverPop')) $('tsHoverPop').hidden = true;
       drawTapeTimeline();
     });
+    canvas.addEventListener('wheel', (ev) => {
+      const tl = tsState.timeline;
+      if (!tl || !tl.segmentCount) return;
+      ev.preventDefault();
+      const info = trackFracForEv(ev);
+      zoomAtCanvasFrac(info.frac, ev.deltaY < 0);
+    }, { passive: false });
   }
+
+  document.querySelectorAll('[data-tssrc]').forEach(btn => {
+    btn.onclick = () => {
+      const next = btn.dataset.tssrc || 'all';
+      if (tsState.sourceFilter === next) return;
+      stopTapePlayback(false);
+      tsState.sourceFilter = next;
+      document.querySelectorAll('[data-tssrc]').forEach(b => b.classList.toggle('on', b.dataset.tssrc === next));
+      tsState.timeline = null;
+      tsState.sessionId = '';
+      if ($('tsDayStrip')) $('tsDayStrip').innerHTML = `<span class="ts-pill" style="opacity:.7">Loading ${escHtml(next)}…</span>`;
+      loadTapes();
+    };
+  });
+
+  document.querySelectorAll('[data-tsgap]').forEach(btn => {
+    btn.onclick = () => setGapMode(btn.dataset.tsgap);
+  });
+  document.querySelectorAll('[data-tszoom]').forEach(btn => {
+    btn.onclick = () => setZoomMode(btn.dataset.tszoom);
+  });
+  if ($('tsPanLeftBtn')) $('tsPanLeftBtn').onclick = () => panViewport(-1);
+  if ($('tsPanRightBtn')) $('tsPanRightBtn').onclick = () => panViewport(1);
+
   document.querySelectorAll('[data-tsstep]').forEach(btn => {
     btn.onclick = () => stepScrubSec(Number(btn.dataset.tsstep || 0));
   });
+  if ($('tsStage')) {
+    $('tsStage').addEventListener('click', () => playTapeWindow());
+    $('tsStage').addEventListener('dblclick', () => toggleStageFullscreen());
+  }
+  if ($('tsFsBtn')) $('tsFsBtn').onclick = () => toggleStageFullscreen();
   if ($('tsRefreshBtn')) $('tsRefreshBtn').onclick = () => loadTapes().then(() => loadTapeTimeline(true));
+  if ($('tsRescanBtn')) $('tsRescanBtn').onclick = () => triggerTapeRescan();
   if ($('tsPrevBurstBtn')) $('tsPrevBurstBtn').onclick = () => jumpActivityBurst(-1);
   if ($('tsNextBurstBtn')) $('tsNextBurstBtn').onclick = () => jumpActivityBurst(1);
   if ($('tsPlayBtn')) $('tsPlayBtn').onclick = () => playTapeWindow();
-  if ($('tsBackToScrubBtn')) $('tsBackToScrubBtn').onclick = () => backToScrubMode();
+  if ($('tsMotionOnlyBtn')) $('tsMotionOnlyBtn').onclick = () => toggleMotionOnly();
+  if ($('tsAudioBtn')) $('tsAudioBtn').onclick = () => toggleTapeAudio();
   if ($('tsSpeedSel')) $('tsSpeedSel').onchange = () => {
-    if ($('tsVideo')) $('tsVideo').playbackRate = Number($('tsSpeedSel').value || 1) || 1;
+    const sp = Number($('tsSpeedSel').value || 1) || 1;
+    tsState.speed = sp;
+    if ($('tsVideo')) $('tsVideo').playbackRate = sp;
+    if ($('tsAudio')) $('tsAudio').playbackRate = sp;
+    syncPlayControlsUI();
   };
+
+  if ($('tsSensSlider')) $('tsSensSlider').oninput = () => {
+    const val = Number($('tsSensSlider').value || 1.5);
+    tsState.sensitivity = val;
+    if ($('tsSensVal')) $('tsSensVal').textContent = val.toFixed(1);
+    document.querySelectorAll('[data-tssens]').forEach(b => b.classList.toggle('on', Math.abs(Number(b.dataset.tssens) - val) < 0.05));
+    reclusterEventsOnly(true);
+  };
+  document.querySelectorAll('[data-tssens]').forEach(btn => {
+    btn.onclick = () => {
+      const val = Number(btn.dataset.tssens || 1.5);
+      tsState.sensitivity = val;
+      if ($('tsSensSlider')) $('tsSensSlider').value = String(val);
+      if ($('tsSensVal')) $('tsSensVal').textContent = val.toFixed(1);
+      document.querySelectorAll('[data-tssens]').forEach(b => b.classList.toggle('on', b === btn));
+      reclusterEventsOnly(true);
+    };
+  });
+  document.querySelectorAll('[data-tsmindur]').forEach(btn => {
+    btn.onclick = () => {
+      tsState.minDurSec = Number(btn.dataset.tsmindur || 5);
+      document.querySelectorAll('[data-tsmindur]').forEach(b => b.classList.toggle('on', b === btn));
+      reclusterEventsOnly(true);
+    };
+  });
+  document.querySelectorAll('[data-tsscope]').forEach(btn => {
+    btn.onclick = () => {
+      tsState.allCamsEvents = (btn.dataset.tsscope === 'all');
+      document.querySelectorAll('[data-tsscope]').forEach(b => b.classList.toggle('on', b === btn));
+      reclusterEventsOnly(true);
+    };
+  });
+
   if ($('tsSetInBtn')) $('tsSetInBtn').onclick = () => setScrubInOut('in');
   if ($('tsSetOutBtn')) $('tsSetOutBtn').onclick = () => setScrubInOut('out');
   if ($('tsClearRangeBtn')) $('tsClearRangeBtn').onclick = () => setScrubInOut('clear');
@@ -12215,7 +14782,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Range"
-        resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Length, Content-Range, Accept-Ranges, X-Stream-Start-Ms, X-Stream-End-Ms"
         return resp
 
     @app.errorhandler(Exception)
@@ -12304,6 +14871,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "preRollSec": service.pre_roll_sec,
                 "driveBackupDir": service.drive_backup_dir,
                 "bumpAlertNtfy": service.bump_alert_ntfy,
+                "motionRecord247": service.motion_record_247,
                 "cameras": cams,
                 "wallboard": service.wallboard_cfg.to_dict(),
                 "voice": service.voice_cfg.to_dict(),
@@ -13271,7 +15839,8 @@ def create_app(service: ArmoryCamService) -> Flask:
 
     @app.get("/api/tapes")
     def api_tapes() -> Response:
-        resp = jsonify(service.list_tapes())
+        src = request.args.get("source", "all")
+        resp = jsonify(service.list_tapes(source_filter=src))
         resp.headers["Cache-Control"] = "no-store"
         return resp
 
@@ -13279,13 +15848,25 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_tape_timeline() -> Response:
         sid = request.args.get("sessionId", "")
         cam = request.args.get("camera", "Rack Cam")
+        src = request.args.get("source", "all")
         buckets = int(_parse_num(request.args.get("buckets"), 80, 10, 400, as_int=True))
-        return jsonify(service.tape_timeline(cam, sid, buckets=buckets))
+        resp = jsonify(service.tape_timeline(cam, sid, buckets=buckets, source_filter=src))
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/tape/rescan")
+    def api_tape_rescan() -> Response:
+        body = request.get_json(silent=True) or {}
+        sid = str(body.get("sessionId") or "")
+        src = str(body.get("source") or "all")
+        force = bool(body.get("force", True))
+        return jsonify(service.rescan_tapes(sid, force=force, source_filter=src))
 
     @app.get("/api/tape/pack")
     def api_tape_pack() -> Response:
         sid = request.args.get("sessionId", "")
         cam = request.args.get("camera", "Rack Cam")
+        src = request.args.get("source", "all")
         start_ms = _parse_num(request.args.get("startMs"), None, 0, 9_000_000_000_000, as_int=True)
         end_ms = _parse_num(request.args.get("endMs"), None, 0, 9_000_000_000_000, as_int=True)
         count = int(_parse_num(request.args.get("count"), 80, 1, 240, as_int=True))
@@ -13298,6 +15879,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 end_ms=end_ms,
                 count=count,
                 max_w=max_w,
+                source_filter=src,
             )
         )
         resp.headers["Cache-Control"] = "no-store"
@@ -13307,15 +15889,45 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_tape_frame() -> Response:
         sid = request.args.get("sessionId", "")
         cam = request.args.get("camera", "Rack Cam")
+        src = request.args.get("source", "all")
         now_ms = int(time.time() * 1000)
         ts_ms = int(_parse_num(request.args.get("tsMs"), now_ms, 0, 9_000_000_000_000, as_int=True))
         max_w = int(_parse_num(request.args.get("w"), 480, 80, 1920, as_int=True))
-        jpg = service.get_tape_frame_jpeg(cam, sid, ts_ms, max_w=max_w)
+        max_gap_ms = _parse_num(request.args.get("maxGapMs"), None, 500, 3_600_000, as_int=True)
+        jpg = service.get_tape_frame_jpeg(cam, sid, ts_ms, max_w=max_w, max_gap_ms=max_gap_ms, source_filter=src)
         if not jpg:
+            if max_gap_ms is not None:
+                return Response(status=204)
             return Response(status=404)
         resp = Response(jpg, mimetype="image/jpeg")
         resp.headers["Cache-Control"] = "public, max-age=300"
         return resp
+
+    @app.get("/api/tape/stream.mp4")
+    def api_tape_stream() -> Response:
+        sid = request.args.get("sessionId", "")
+        cam = request.args.get("camera", "Rack Cam")
+        src = request.args.get("source", "all")
+        stream_id = request.args.get("streamId", "")
+        now_ms = int(time.time() * 1000)
+        start_ms = int(_parse_num(request.args.get("startMs"), now_ms - 10_000, 0, 9_000_000_000_000, as_int=True))
+        max_sec = int(_parse_num(request.args.get("maxSec"), 600, 15, 1800, as_int=True))
+        res = service.stream_tape_fmp4(cam, sid, start_ms, source_filter=src, max_sec=max_sec, stream_id=stream_id)
+        if res is None:
+            return jsonify({"ok": False, "gap": True, "error": "No recording at this timestamp"}), 404
+        actual_s, actual_e, gen_fn = res
+        resp = Response(gen_fn(), mimetype="video/mp4", direct_passthrough=True)
+        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Accept-Ranges"] = "none"
+        resp.headers["X-Stream-Start-Ms"] = str(actual_s)
+        resp.headers["X-Stream-End-Ms"] = str(actual_e)
+        return resp
+
+    @app.post("/api/tape/stream/stop")
+    def api_tape_stream_stop() -> Response:
+        body = request.get_json(silent=True) or {}
+        stream_id = str(body.get("streamId") or "")
+        return jsonify({"ok": True, "stopped": service.stop_stream(stream_id)})
 
     @app.get("/api/tape/angles")
     def api_tape_angles() -> Response:
@@ -13393,7 +16005,8 @@ def create_app(service: ArmoryCamService) -> Flask:
             end_ms = int(float(e_raw)) if e_raw is not None and e_raw != "" else start_ms + 5000
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "Invalid camera or startMs/endMs"}), 400
-        prev = service.cut_preview(sid, start_ms, end_ms, cam)
+        src = str(body.get("source") or "all")
+        prev = service.cut_preview(sid, start_ms, end_ms, cam, source_filter=src)
         if not prev:
             return jsonify({"ok": False, "error": "No alternate camera tape for this timestamp"}), 404
         return jsonify(prev)
@@ -13420,6 +16033,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             if s_cam:
                 cams_list = [s_cam]
         include_audio = bool(body.get("includeAudio", False))
+        src = str(body.get("source") or "all")
         clips = service.cut_clips_multi(
             session_id=sid,
             ex_name=ex_name,
@@ -13427,6 +16041,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             end_ms=end_ms,
             cameras=cams_list,
             include_audio=include_audio,
+            source_filter=src,
         )
         if not clips:
             return jsonify({"ok": False, "error": "No matching video segments found"}), 404

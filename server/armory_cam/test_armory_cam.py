@@ -5163,6 +5163,271 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_motion_engine_v2_slow_movement_and_inter_segment_continuity(self) -> None:
+        # Static frames with subtle 1-LSB camera noise must stay well below threshold
+        rng = np.random.default_rng(42)
+        base = np.full((135, 240, 3), 80, dtype=np.uint8)
+        f0 = np.clip(base.astype(np.int16) + rng.integers(-1, 2, size=base.shape), 0, 255).astype(np.uint8)
+        f1 = np.clip(base.astype(np.int16) + rng.integers(-1, 2, size=base.shape), 0, 255).astype(np.uint8)
+        f2 = np.clip(base.astype(np.int16) + rng.integers(-1, 2, size=base.shape), 0, 255).astype(np.uint8)
+        self.assertLess(ac.compute_motion_energy_from_frames([f0, f1, f2]), 0.5)
+
+        # Slow continuous shift across 3 frames (or across segment boundary via prev_frame) scores > 1.4
+        s0 = np.full((135, 240, 3), 40, dtype=np.uint8)
+        cv2.rectangle(s0, (60, 30), (110, 110), (220, 220, 220), -1)
+        s1 = np.full((135, 240, 3), 40, dtype=np.uint8)
+        cv2.rectangle(s1, (65, 30), (115, 110), (220, 220, 220), -1)
+        s2 = np.full((135, 240, 3), 40, dtype=np.uint8)
+        cv2.rectangle(s2, (70, 30), (120, 110), (220, 220, 220), -1)
+        self.assertGreater(ac.compute_motion_energy_from_frames([s0, s1, s2]), 1.4)
+
+        # Single static frame within segment vs shifted prev_frame still detects inter-segment motion
+        self.assertGreater(ac.compute_motion_energy_from_frames([s2], prev_frame=s0), 1.4)
+
+        # Masked mirror exclusion zone suppresses motion inside that quad to 0.0
+        excl = [[(0.2, 0.1), (0.6, 0.1), (0.6, 0.9), (0.2, 0.9)]]
+        self.assertEqual(ac.compute_motion_energy_from_frames([s0, s1, s2], exclusions=excl), 0.0)
+
+    def test_always_on_ring_and_247_motion_archiving_lifecycle(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_m247_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            client.post("/api/config", json={
+                "motionRecord247": True,
+                "cameras": [
+                    {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.2},
+                    {"name": "Smith Cam", "slug": "smith_cam", "rtspUrl": "", "enabled": True, "motionThreshold": 2.2},
+                ],
+            })
+            self.assertTrue(svc.motion_record_247)
+
+            ff = shutil.which("ffmpeg") or svc.ffmpeg
+            static_ts = tmp / "static.ts"
+            active_ts = tmp / "active.ts"
+            subprocess.run(
+                [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=320x240:r=10:d=2",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(static_ts)],
+                check=True,
+            )
+            subprocess.run(
+                [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                 "color=c=black:s=320x240:r=10:d=2,geq=lum='if(lt(X\\,60*T)\\,240\\,10)':cb=128:cr=128",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(active_ts)],
+                check=True,
+            )
+
+            rack_cfg = svc._find_camera("Rack Cam")
+            assert rack_cfg is not None
+            ring_rack = svc.ring_root / "rack_cam"
+            ring_rack.mkdir(parents=True, exist_ok=True)
+            base_dt = datetime(2026, 11, 22, 11, 0, 0)
+            base_ms = int(base_dt.timestamp() * 1000)
+
+            # 1. Idle quiet ring pre-roll segment (0s..6s) -> copied on trigger as pre-roll
+            p0 = ring_rack / f"seg_{base_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+            shutil.copy2(static_ts, p0)
+            old_t = time.time() - 2.0
+            os.utime(p0, (old_t, old_t))
+            svc._ingest_closed_segments(rack_cfg, time.time(), compute_energy=True)
+            motion_sid = f"motion_{base_dt.strftime('%Y-%m-%d')}"
+            self.assertFalse((svc.tapes_root / motion_sid).exists())
+
+            # 2. High motion segment outside workout triggers motion_YYYY-MM-DD + copies pre-roll
+            dt1 = datetime.fromtimestamp((base_ms + 3000) / 1000.0)
+            p1 = ring_rack / f"seg_{dt1.strftime('%Y%m%d_%H%M%S')}.ts"
+            shutil.copy2(active_ts, p1)
+            os.utime(p1, (old_t, old_t))
+            svc._ingest_closed_segments(rack_cfg, time.time(), compute_energy=True)
+            self.assertTrue((svc.tapes_root / motion_sid / "rack_cam").is_dir())
+            copied = sorted((svc.tapes_root / motion_sid / "rack_cam").glob("seg_*.ts"))
+            self.assertEqual([c.name for c in copied], [p0.name, p1.name])
+            self.assertGreater(svc.latest_energy.get("rack_cam", 0.0), 1.8)
+
+            # Calling again never duplicates lines in motion.jsonl
+            svc._copy_segment_to_session(motion_sid, rack_cfg, ac.SegmentInfo(path=p1, start_ms=base_ms + 3000, end_ms=base_ms + 5000, energy=8.0, camera="Rack Cam"))
+            lines = (svc.tapes_root / motion_sid / "motion.jsonl").read_text(encoding="utf-8").splitlines()
+            p1_lines = [ln for ln in lines if p1.name in ln]
+            self.assertEqual(len(p1_lines), 1)
+
+            # 3. During an active workout, segments go ONLY to the workout session, never to motion_YYYY-MM-DD
+            client.post("/api/session/start", json={"sessionId": "workout_nov22", "name": "Upper 1"})
+            dt2 = datetime.fromtimestamp((base_ms + 90_000) / 1000.0)
+            p2 = ring_rack / f"seg_{dt2.strftime('%Y%m%d_%H%M%S')}.ts"
+            shutil.copy2(active_ts, p2)
+            os.utime(p2, (old_t, old_t))
+            svc._ingest_closed_segments(rack_cfg, time.time(), compute_energy=True)
+            self.assertTrue((svc.tapes_root / "workout_nov22" / "rack_cam" / p2.name).is_file())
+            self.assertFalse((svc.tapes_root / motion_sid / "rack_cam" / p2.name).exists())
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_nvr_scrubber_whole_day_source_filter_gap_frame_fmp4_stream_and_rescan(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_nvr_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            cfg_res = client.post("/api/config", json={
+                "motionRecord247": False,
+                "cameras": [
+                    {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "crop": [0.0, 0.0, 1.0, 1.0]},
+                    {"name": "Rack Alt", "slug": "rack_alt", "sourceSlug": "rack_cam", "rtspUrl": "", "enabled": True, "crop": [0.1, 0.1, 0.9, 0.9]},
+                ],
+            })
+            self.assertEqual(cfg_res.status_code, 200)
+            self.assertTrue(cfg_res.get_json()["ok"])
+            self.assertFalse(client.get("/api/config").get_json()["motionRecord247"])
+            client.post("/api/config", json={"motionRecord247": True})
+            self.assertTrue(client.get("/api/config").get_json()["motionRecord247"])
+
+            ff = shutil.which("ffmpeg") or svc.ffmpeg
+            green_ts = tmp / "green.ts"
+            blue_ts = tmp / "blue.ts"
+            subprocess.run(
+                [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=green:s=320x240:r=20:d=2",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(green_ts)],
+                check=True,
+            )
+            subprocess.run(
+                [ff, "-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                 "color=c=blue:s=320x240:r=20:d=2,geq=lum='if(lt(X\\,50*T)\\,230\\,20)':cb=128:cr=128",
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(blue_ts)],
+                check=True,
+            )
+
+            # Seed Nov 21 workout with two runs separated by a 60-minute gap, a 1-seg stub on same day,
+            # a 24/7 motion tape on same day, AND a live ring segment (must not bleed into Nov 21).
+            run1_ms = int(datetime(2026, 11, 21, 14, 0, 0).timestamp() * 1000)
+            run2_ms = int(datetime(2026, 11, 21, 15, 0, 0).timestamp() * 1000)
+            mot_ms = int(datetime(2026, 11, 21, 19, 30, 0).timestamp() * 1000)
+            stub_ms = int(datetime(2026, 11, 21, 13, 0, 0).timestamp() * 1000)
+
+            w_dir = svc.tapes_root / "w_nov21"
+            (w_dir / "rack_cam").mkdir(parents=True, exist_ok=True)
+            (w_dir / "session.json").write_text(json.dumps({"sessionId": "w_nov21", "name": "Lower 2", "kind": "workout", "startedAtMs": run1_ms}), encoding="utf-8")
+            w_lines = []
+            for base_t, count in ((run1_ms, 3), (run2_ms, 2)):
+                for i in range(count):
+                    tms = base_t + i * 2000
+                    sn = f"seg_{datetime.fromtimestamp(tms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts"
+                    shutil.copy2(blue_ts if i == 1 else green_ts, w_dir / "rack_cam" / sn)
+                    w_lines.append(json.dumps({"camera": "Rack Cam", "slug": "rack_cam", "file": sn, "startMs": tms, "endMs": tms + 2000, "energy": 7.5 if i == 1 else 0.4}))
+            (w_dir / "motion.jsonl").write_text("\n".join(w_lines) + "\n", encoding="utf-8")
+
+            stub_dir = svc.tapes_root / "stub_nov21"
+            (stub_dir / "rack_cam").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(green_ts, stub_dir / "rack_cam" / f"seg_{datetime.fromtimestamp(stub_ms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts")
+
+            m_dir = svc.tapes_root / "motion_2026-11-21"
+            (m_dir / "rack_cam").mkdir(parents=True, exist_ok=True)
+            (m_dir / "session.json").write_text(json.dumps({"sessionId": "motion_2026-11-21", "name": "24/7 Motion (2026-11-21)", "kind": "motion", "startedAtMs": mot_ms}), encoding="utf-8")
+            m_lines = []
+            for i in range(2):
+                tms = mot_ms + i * 2000
+                sn = f"seg_{datetime.fromtimestamp(tms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts"
+                shutil.copy2(blue_ts, m_dir / "rack_cam" / sn)
+                m_lines.append(json.dumps({"camera": "Rack Cam", "slug": "rack_cam", "file": sn, "startMs": tms, "endMs": tms + 2000, "energy": 6.2}))
+            (m_dir / "motion.jsonl").write_text("\n".join(m_lines) + "\n", encoding="utf-8")
+
+            ring_dir = svc.ring_root / "rack_cam"
+            ring_dir.mkdir(parents=True, exist_ok=True)
+            ring_ms = int(datetime(2026, 11, 22, 9, 0, 0).timestamp() * 1000)
+            shutil.copy2(green_ts, ring_dir / f"seg_{datetime.fromtimestamp(ring_ms / 1000.0).strftime('%Y%m%d_%H%M%S')}.ts")
+
+            # 1. Zero live-ring bleed into historical workout session_samples()
+            hist_samples = svc.session_samples("w_nov21")
+            self.assertTrue(all(int(s["startMs"]) < ring_ms for s in hist_samples))
+
+            # 2. /api/tapes?source=all|workout|motion suppresses 1-seg stub and exposes true durations & workoutNames
+            t_all = client.get("/api/tapes?source=all").get_json()
+            self.assertEqual(len(t_all["days"]), 1)
+            day = t_all["days"][0]
+            self.assertEqual(day["date"], "2026-11-21")
+            self.assertEqual(day["tapeCount"], 2)  # stub suppressed!
+            self.assertEqual(day["workoutNames"], ["Lower 2"])
+            self.assertGreater(day["workoutSec"], 0)
+            self.assertGreater(day["motionSec"], 0)
+            self.assertLess(day["recordedSec"], 60)  # true recorded seconds, not 5.5h wall-clock span!
+
+            t_mot = client.get("/api/tapes?source=motion").get_json()
+            self.assertEqual(len(t_mot["days"]), 1)
+            self.assertEqual(t_mot["days"][0]["tapes"][0]["kind"], "motion")
+
+            t_wrk = client.get("/api/tapes?source=workout").get_json()
+            self.assertEqual(t_wrk["days"][0]["tapes"][0]["sessionId"], "w_nov21")
+
+            # 3. Whole-day timeline (__day__:2026-11-21) merges workout + 24/7 runs cleanly
+            tl_day = client.get("/api/tape/timeline?sessionId=__day__:2026-11-21&camera=Rack%20Cam&source=all").get_json()
+            self.assertTrue(tl_day["ok"])
+            self.assertEqual(tl_day["segmentCount"], 7)
+            self.assertEqual(len(tl_day["runs"]), 3)
+            self.assertGreaterEqual(len(tl_day["samples"]), 7)
+            self.assertIn("Rack Cam", tl_day["cameraActivity"])
+
+            tl_only_mot = client.get("/api/tape/timeline?sessionId=__day__:2026-11-21&camera=Rack%20Cam&source=motion").get_json()
+            self.assertEqual(tl_only_mot["segmentCount"], 2)
+            self.assertEqual(len(tl_only_mot["runs"]), 1)
+
+            # 4. Gap-aware /api/tape/frame?maxGapMs=10000 returns 204 inside 60m gap, 200 on footage
+            gap_ts = run1_ms + 30 * 60_000
+            gap_fr = client.get(f"/api/tape/frame?sessionId=__day__:2026-11-21&camera=Rack%20Cam&tsMs={gap_ts}&maxGapMs=10000")
+            self.assertEqual(gap_fr.status_code, 204)
+            ok_fr = client.get(f"/api/tape/frame?sessionId=__day__:2026-11-21&camera=Rack%20Cam&tsMs={run1_ms + 1000}&maxGapMs=10000")
+            self.assertEqual(ok_fr.status_code, 200)
+            self.assertTrue(ok_fr.data.startswith(b"\xff\xd8"))
+
+            # 5. Continuous fMP4 /api/tape/stream.mp4 produces valid ISO BMFF boxes and 404 in empty gaps
+            stream_gap = client.get(f"/api/tape/stream.mp4?sessionId=__day__:2026-11-21&camera=Rack%20Cam&startMs={gap_ts}")
+            self.assertEqual(stream_gap.status_code, 404)
+            self.assertTrue(stream_gap.get_json()["gap"])
+
+            stream_ok = client.get(f"/api/tape/stream.mp4?sessionId=__day__:2026-11-21&camera=Rack%20Cam&startMs={run1_ms}&streamId=test_s1")
+            self.assertEqual(stream_ok.status_code, 200)
+            self.assertEqual(stream_ok.mimetype, "video/mp4")
+            self.assertEqual(stream_ok.headers.get("Accept-Ranges"), "none")
+            self.assertIn("X-Stream-Start-Ms", stream_ok.headers)
+            self.assertIn("X-Stream-End-Ms", stream_ok.headers)
+            mp4_bytes = stream_ok.data
+            self.assertIn(b"ftyp", mp4_bytes[:64])
+            self.assertIn(b"moov", mp4_bytes)
+            self.assertIn(b"moof", mp4_bytes)
+
+            stop_res = client.post("/api/tape/stream/stop", json={"streamId": "test_s1"})
+            self.assertEqual(stop_res.status_code, 200)
+            self.assertEqual(len(svc._stream_procs), 0)
+
+            # 6. POST /api/tape/rescan writes motion_v2.json including virtual views ("Rack Alt")
+            rescan_res = client.post("/api/tape/rescan", json={"sessionId": "__day__:2026-11-21", "force": True})
+            self.assertEqual(rescan_res.status_code, 200)
+            self.assertTrue(rescan_res.get_json()["ok"])
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if (w_dir / "motion_v2.json").is_file() and not svc._scan_active:
+                    break
+                time.sleep(0.05)
+            self.assertTrue((w_dir / "motion_v2.json").is_file())
+            v2_obj = json.loads((w_dir / "motion_v2.json").read_text(encoding="utf-8"))
+            self.assertEqual(v2_obj["version"], ac.MOTION_RESCAN_VERSION)
+            self.assertIn("rack_cam", v2_obj["views"])
+            self.assertIn("rack_alt", v2_obj["views"])
+            self.assertEqual(len(v2_obj["views"]["rack_alt"]["scores"]), 5)
+            tl_alt = client.get("/api/tape/timeline?sessionId=w_nov21&camera=Rack%20Alt").get_json()
+            self.assertEqual(tl_alt["scanStatus"], "ready")
+
+            # 7. Dashboard HTML exposes NVR scrubber controls & zero legacy tokens
+            dash = client.get("/").get_data(as_text=True)
+            for tok in ("data-tssrc", "motionRecord247", "tsGapOverlay", "tsHoverPop", "tsSensSlider", "tsMotionOnlyBtn", "tsRescanBtn"):
+                self.assertIn(tok, dash, msg=f"Missing NVR UI token: {tok}")
+            for dead_tok in ("alignBar", "pinRefBtn", "realignModeBtn", "driftNtfyBtn", "Secondary / Pinned"):
+                self.assertNotIn(dead_tok, dash)
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
