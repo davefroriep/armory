@@ -5,9 +5,12 @@ import { bikeStatusNote, ensureSensors } from '../ble/sources';
 import { audio, buzz } from '../audio/audio';
 import { WorkoutEngine } from '../domain/engine';
 import { CORRIDOR_RPM, CORRIDOR_WATTS, cueFor, hrCue, pacerDecision, wattsCueFor, type Cue, type PacerConfig } from '../domain/pacer';
-import { recoveryLimitBpm } from '../domain/gate';
+import { recoveryLimitBpm, type RecoveryMode } from '../domain/gate';
 import { repNote, repStats, type RepStat } from '../domain/reps';
-import { PHASE_COLOR, fmtDur, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds, type Program, type Segment } from '../domain/programs';
+import {
+  PHASE_COLOR, applyProgramTarget, clampProgramTarget, effectiveProgramTarget, evaluateCardioProgression,
+  fmtDur, fmtRpm, programById, targetWatts, totalSeconds, workSeconds, type Program, type Segment,
+} from '../domain/programs';
 import { FTP_LINE_H, profileBar } from '../domain/profile';
 import { WindowAvg } from '../domain/smooth';
 import { calendar } from '../intervals/calendar';
@@ -35,14 +38,17 @@ export function hudScreen(root: HTMLElement, args: string[], query: URLSearchPar
     location.hash = '#/airbike';
     return () => {};
   }
-  return new Hud(root, program, query.get('pick'), query.get('resume')).mount();
+  return new Hud(root, program, query.get('pick'), query.get('resume'), query.get('guest') === '1', query.get('target')).mount();
 }
 
 class Hud {
   private baseProgram: Program;
   private eq: 'airbike' | 'spin';
   private p: Program;
-  private offsetWatts = 0;
+  private readonly guest: boolean;
+  private storedTarget: number | null;
+  private initialTarget: number | null;
+  private sessionTarget: number | null;
   private manualLvl = 10;
   private lastErgMode: number | null = null;
   private lastErgWatts: number | null = null;
@@ -79,11 +85,22 @@ class Hud {
     baseProgram: Program,
     private planSlot: string | null = null,
     private resumeId: string | null = null,
+    guest = false,
+    targetParam: string | null = null,
   ) {
+    const st = getSettings();
     this.baseProgram = baseProgram;
     this.eq = baseProgram.equipment ?? 'airbike';
-    this.p = resolveProgram(baseProgram, getSettings().ftp, 0);
+    this.guest = guest;
+    this.storedTarget = effectiveProgramTarget(baseProgram, st.programTargets);
+    const parsedParam = targetParam != null ? Number(targetParam) : NaN;
+    this.initialTarget = this.guest && Number.isFinite(parsedParam) && parsedParam > 0
+      ? clampProgramTarget(baseProgram, parsedParam)
+      : this.storedTarget;
+    this.sessionTarget = this.initialTarget;
+    this.p = applyProgramTarget(baseProgram, this.sessionTarget);
     this.engine = new WorkoutEngine(this.p);
+    this.engine.setRecoveryMode(this.guest ? 'timed' : st.recoveryMode);
     this.goal = this.p.goal?.def ?? 0;
   }
 
@@ -92,7 +109,7 @@ class Hud {
   mount(): () => void {
     ensureSensors({ bike: this.eq });
     this.paintHud();
-    if (this.resumeId) void this.hydrateResume(this.resumeId);
+    if (this.resumeId && !this.guest) void this.hydrateResume(this.resumeId);
     this.loop();
     this.offSmooth = bikeFrame.on((f) => {
       const t = Date.now();
@@ -171,13 +188,15 @@ class Hud {
     const goalCtl = p.goal
       ? `<div class="goal" id="goalCtl"><button data-goal="-1" aria-label="Less">−</button><div><b id="goalVal">${this.goal}</b> <small>${p.goal.unit}</small></div><button data-goal="1" aria-label="More">+</button></div>`
       : '';
-    const hasTrim = this.baseProgram.zone === 'Z5' || this.baseProgram.zone === 'Z2';
+    const hasTrim = this.sessionTarget != null && (this.baseProgram.zone === 'Z5' || this.baseProgram.zone === 'Z2');
     const hasFreeLvl = this.eq === 'spin' && !segs.length;
+    const trimStep = this.eq === 'spin' ? 5 : 1;
+    const trimUnit = this.eq === 'spin' ? 'W' : 'RPM';
     const trimRow = hasTrim
       ? `<div class="trim" id="trimCtl">
-          <button type="button" data-trim="-5" aria-label="Lower target 5 watts">−5 W</button>
-          <button type="button" class="trim-mid" id="trimLbl" title="Tap to reset trim"></button>
-          <button type="button" data-trim="5" aria-label="Raise target 5 watts">+5 W</button>
+          <button type="button" data-trim="-${trimStep}" aria-label="Lower target ${trimStep} ${trimUnit}">−${trimStep} ${trimUnit}</button>
+          <button type="button" class="trim-mid" id="trimLbl" title="Tap to reset target"></button>
+          <button type="button" data-trim="${trimStep}" aria-label="Raise target ${trimStep} ${trimUnit}">+${trimStep} ${trimUnit}</button>
         </div>`
       : hasFreeLvl
       ? `<div class="trim" id="trimCtl">
@@ -187,8 +206,9 @@ class Hud {
         </div>`
       : '';
 
-    this.root.innerHTML = `<div class="hud">
-      ${topbar({ back: '#/', title: p.name, bike: true })}
+    this.root.innerHTML = `<div class="hud${this.guest ? ' guest' : ''}">
+      ${topbar({ back: this.guest ? `#/${this.eq}` : '#/', title: this.guest ? `Guest · ${p.name}` : p.name, bike: true })}
+      ${this.guest ? '<div class="guest-strip">GUEST MODE · FIXED TIMERS · NO UPLOAD</div>' : ''}
       <div class="hud-top">
         <div class="overview"><span id="ovText">${overview}</span><span id="ovRight"></span></div>
         ${tl}
@@ -249,12 +269,25 @@ class Hud {
     this.bind();
   }
 
-  private adjustTarget(nextOffset: number): void {
-    const clamped = Math.max(-80, Math.min(120, nextOffset));
-    if (clamped === this.offsetWatts) return;
-    this.offsetWatts = clamped;
-    this.p = resolveProgram(this.baseProgram, getSettings().ftp, this.offsetWatts);
+  private refreshProfileBars(): void {
+    const ftp = getSettings().ftp;
+    this.el.tl?.querySelectorAll<HTMLElement>('.tl-seg').forEach((el, i) => {
+      const g = this.p.segments[i];
+      if (!g) return;
+      const b = profileBar(g, ftp);
+      el.style.height = `${(b.h * 100).toFixed(1)}%`;
+      el.style.background = b.color;
+    });
+  }
+
+  private setSessionTarget(nextTarget: number): void {
+    if (this.sessionTarget == null) return;
+    const clamped = clampProgramTarget(this.baseProgram, nextTarget);
+    if (clamped === this.sessionTarget) return;
+    this.sessionTarget = clamped;
+    this.p = applyProgramTarget(this.baseProgram, this.sessionTarget);
     this.engine.setProgram(this.p);
+    this.refreshProfileBars();
     this.loop();
   }
 
@@ -262,7 +295,7 @@ class Hud {
     const on = (id: string, fn: () => void) => this.root.querySelector('#' + id)!.addEventListener('click', fn);
     on('skip', () => {
       if (this.engine.skip(Date.now())) {
-        if (this.rec) {
+        if (this.rec && !this.guest) {
           this.rec.meta.releasedGates = this.engine.exportReleased();
           void putMeta(this.rec.meta);
         }
@@ -281,8 +314,12 @@ class Hud {
       updateSettings({ metroEnabled: !getSettings().metroEnabled });
     });
     this.root.querySelectorAll<HTMLElement>('[data-trim]').forEach((b) =>
-      b.addEventListener('click', () => this.adjustTarget(this.offsetWatts + Number(b.dataset.trim))));
-    this.root.querySelector('#trimLbl')?.addEventListener('click', () => this.adjustTarget(0));
+      b.addEventListener('click', () => {
+        if (this.sessionTarget != null) this.setSessionTarget(this.sessionTarget + Number(b.dataset.trim));
+      }));
+    this.root.querySelector('#trimLbl')?.addEventListener('click', () => {
+      if (this.initialTarget != null) this.setSessionTarget(this.initialTarget);
+    });
     this.root.querySelectorAll<HTMLElement>('[data-lvl]').forEach((b) =>
       b.addEventListener('click', () => this.adjustManualLevel(Number(b.dataset.lvl))));
     this.root.querySelectorAll<HTMLElement>('[data-goal]').forEach((b) =>
@@ -365,10 +402,10 @@ class Hud {
         (this.baseProgram.zone === 'Z2' || this.baseProgram.zone === 'Z5')
       ) {
         const delta = live.tgtW - desiredW;
-        if (Math.abs(delta) <= 25) {
+        if (Math.abs(delta) <= 25 && this.sessionTarget != null) {
           this.lastErgWatts = live.tgtW;
           this.lastErgAt = now;
-          this.adjustTarget(this.offsetWatts + delta);
+          this.setSessionTarget(this.sessionTarget + delta);
           return;
         }
       } else if (!this.ergAcked && now - this.lastErgAt > 3000 && (live.mode !== 1 || Math.abs(live.tgtW - desiredW) > 1)) {
@@ -399,15 +436,16 @@ class Hud {
     audio.unlock();
     audio.setVolume(getSettings().metroVolume);
     const s = getSettings();
-    const slot = this.planSlot ?? calendar.forEquipment(this.eq).find((i) => i.programId === this.p.id)?.planSlot ?? null;
+    const slot = this.guest ? null : (this.planSlot ?? calendar.forEquipment(this.eq).find((i) => i.programId === this.p.id)?.planSlot ?? null);
     const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    this.rec = new Recorder(id, this.eq, this.p.id, this.p.intervalsName, null, s.hrMax, undefined, slot);
+    const recName = this.guest ? `Guest · ${this.p.intervalsName}` : this.p.intervalsName;
+    this.rec = new Recorder(id, this.eq, this.p.id, recName, null, s.hrMax, undefined, slot, !this.guest);
     this.attachRecorderSensors();
     this.engine.start(Date.now());
     this.guard.arm();
     this.lastIndex = -2;
     void this.acquireLock();
-    void workoutService.start(`Armory Fit · ${this.p.name}`, 'Starting…');
+    void workoutService.start(this.guest ? `Guest · ${this.p.name}` : `Armory Fit · ${this.p.name}`, 'Starting…');
     this.el.go.textContent = 'PAUSE';
     this.el.go.classList.add('pause');
     this.root.querySelector('#goalCtl')?.setAttribute('hidden', '');
@@ -465,11 +503,11 @@ class Hud {
     setWallboardCardioState(null);
     void workoutService.stop();
     if (this.rec) {
-      await discard(this.rec.meta.id);
+      if (!this.guest) await discard(this.rec.meta.id);
       this.rec = null;
     }
     allowNextRoute();
-    location.hash = '#/';
+    location.hash = this.guest ? `#/${this.eq}` : '#/';
   }
 
   // ------------------------------------------------------------------ main loop (10 Hz)
@@ -479,13 +517,15 @@ class Hud {
     const now = Date.now();
     const st = getSettings();
     const running = this.engine.state === 'running';
+    const effectiveMode: RecoveryMode = this.guest ? 'timed' : st.recoveryMode;
+    this.engine.setRecoveryMode(effectiveMode);
     // HR-gated recovery: end the block when HR is back at the target (floor / ceiling rules in domain/gate.ts)
     const hrNow = hrFresh() ? live.hr : null;
     const hrLimit = recoveryLimitBpm(st.hrMax, st.recoveryHrPct);
     if (running) {
-      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: st.recoveryMode, lead: st.metroLead ?? 5, debounceMs: 2500 });
+      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: effectiveMode, lead: st.metroLead ?? 5, debounceMs: 2500 });
       if (released !== null) {
-        if (this.rec) {
+        if (this.rec && !this.guest) {
           this.rec.meta.releasedGates = this.engine.exportReleased();
           void putMeta(this.rec.meta);
         }
@@ -497,7 +537,7 @@ class Hud {
     const seg = loc.seg;
     const waiting = !!seg?.gate && this.engine.waitingOnGate(now);
     this.gateState = seg?.gate
-      ? { waiting, timerOnly: st.recoveryMode === 'timed' || hrNow == null, into: loc.into, minSec: seg.gate.minSec, nominal: this.p.segments[loc.index]?.seconds ?? seg.seconds, hrLimit }
+      ? { waiting, timerOnly: effectiveMode === 'timed' || hrNow == null, into: loc.into, minSec: seg.gate.minSec, nominal: this.p.segments[loc.index]?.seconds ?? seg.seconds, hrLimit }
       : null;
     const targetRpm = seg?.rpm ?? (this.p.segments.length === 0 ? this.p.paceRpm ?? 0 : 0);
     const spinTargetW = this.eq === 'spin' ? (seg?.watts ?? 0) : 0;
@@ -610,9 +650,10 @@ class Hud {
         else shownLeft = Math.max(0, gs.minSec - gs.into);
       }
       const hrWait = !!gs?.waiting && !gs.timerOnly && gs.into >= gs.minSec;
-      e.cdLabel.textContent = hrWait ? `RECOVER TO HR ≤ ${gs!.hrLimit}` : gs?.waiting && !gs.timerOnly ? 'MINIMUM REST' : next ? 'NEXT TRANSITION' : 'WORKOUT ENDS IN';
+      const waitingOnHr = !!gs?.waiting && !gs.timerOnly;
+      e.cdLabel.textContent = hrWait ? `RECOVER TO HR ≤ ${gs!.hrLimit}` : waitingOnHr ? 'MINIMUM REST' : next ? 'NEXT TRANSITION' : 'WORKOUT ENDS IN';
       e.cd.textContent = ready ? mmss(p.segments[0].seconds) : hrWait ? `+${mmss(Math.floor(gs!.into - gs!.minSec))}` : mmss(Math.ceil(shownLeft));
-      e.cd.classList.toggle('hot', !ready && shownLeft <= 5 && running && !hrWait);
+      e.cd.classList.toggle('hot', !ready && shownLeft <= 5 && running && !hrWait && !waitingOnHr);
       e.next.innerHTML = ready
         ? `FIRST UP: ${esc(p.segments[0].label)}`
         : next ? `NEXT: <b>${esc(next.label)}</b>${next.watts != null ? ` · ${Math.round(next.watts)} W` : next.rpm != null ? ` · ${rpmTxt(next)} RPM${next.allOut ? '' : ` · ${targetWatts(next)} W`}` : ' · full rest'}` : 'LAST BLOCK';
@@ -670,13 +711,15 @@ class Hud {
     e.mCad.dataset.level = cue.level;
     e.mW.dataset.level = cue.level === 'bad' ? 'bad' : 'idle';
     if (e.trimLbl) {
-      const ref = p.segments.find((g) => g.kind === 'work' || g.kind === 'steady');
-      if (ref) {
-        const off = this.offsetWatts ? ` (${this.offsetWatts > 0 ? '+' : '−'}${Math.abs(this.offsetWatts)} W)` : '';
+      const ref = p.segments.find((g) => (g.kind === 'work' || g.kind === 'steady') && !g.allOut);
+      if (ref && this.sessionTarget != null) {
+        const delta = this.initialTarget != null ? this.sessionTarget - this.initialTarget : 0;
+        const unit = this.eq === 'spin' ? 'W' : 'RPM';
+        const deltaTxt = delta ? ` (${delta > 0 ? '+' : '−'}${Math.abs(delta)} ${unit})` : '';
         e.trimLbl.textContent = ref.watts != null
-          ? `WORK ${targetWatts(ref)} W · ERG${off}`
+          ? `WORK ${targetWatts(ref)} W · ERG${deltaTxt}`
           : ref.rpm != null
-          ? `WORK ${targetWatts(ref)} W · ${fmtRpm(ref.rpm)} RPM${off}`
+          ? `WORK ${fmtRpm(ref.rpm)} RPM · ${targetWatts(ref)} W${deltaTxt}`
           : '';
       }
     }
@@ -715,7 +758,7 @@ class Hud {
         : k === 'cooldown' ? 'cool'
         : 'warm';
       setWallboardCardioState({
-        title: p.name,
+        title: this.guest ? `GUEST · ${p.name}` : p.name,
         phase: e.ph.textContent || 'CARDIO',
         phaseTone: tone,
         repText: e.tag.textContent || '',
@@ -787,13 +830,13 @@ class Hud {
     const meta = rec ? rec.finalize() : null;
     if (!rec || !meta || meta.seconds < 5) {
       this.root.innerHTML = `${topbar({})}<main class="page"><section class="card"><h3>Nothing recorded</h3><p>The workout ended before any data was captured.</p>
-        <a class="btn primary" href="#/">Back to Home</a></section></main>`;
-      if (meta) void discard(meta.id);
+        <a class="btn primary" href="${this.guest ? `#/${this.eq}` : '#/'}">${this.guest ? 'Back' : 'Back to Home'}</a></section></main>`;
+      if (meta && !this.guest) void discard(meta.id);
       return;
     }
     const reps = repStats(this.engine.segments(this.engine.elapsed(Date.now())), rec.samples);
     const note = repNote(reps);
-    if (note) { meta.notes = note; void putMeta(meta); }
+    if (note && !this.guest) { meta.notes = note; void putMeta(meta); }
     const avgCad = rec.samples.length ? rec.samples.reduce((a, x) => a + x.cad, 0) / rec.samples.length : 0;
     const stats: [string, string][] = [
       ['AVG POWER', `${Math.round(meta.avgW)} W`],
@@ -804,9 +847,43 @@ class Hud {
       ['WORK', `${Math.round(meta.kj)} kJ`],
       [this.eq === 'spin' ? 'SPIN CAL' : 'ASSAULT CAL', `${Math.round(rec.lastKcal)}`],
       ['DISTANCE', `${(rec.lastDist / 1609.344).toFixed(2)} mi`],
-      this.p.zone === 'Z5' ? ['Z5 BANK (≥88%)', mmss(rec.z5Seconds)] : ['TIME', hms(meta.seconds)],
+      this.p.zone === 'Z5' ? ['Z5 BANK (≥90%)', mmss(rec.z5Seconds)] : ['TIME', hms(meta.seconds)],
     ];
-    renderSummary(this.root, { title: this.p.name, meta, stats, extra: repTable(reps), backHref: `#/${this.eq}` });
+    if (this.guest) {
+      renderSummary(this.root, {
+        title: `Guest · ${this.p.name}`,
+        meta,
+        stats,
+        extra: repTable(reps),
+        backHref: `#/${this.eq}`,
+        guest: true,
+      });
+      return;
+    }
+    renderSummary(this.root, {
+      title: this.p.name,
+      meta,
+      stats,
+      extra: repTable(reps),
+      backHref: `#/${this.eq}`,
+      progression: (rpe) => (this.storedTarget != null && this.sessionTarget != null
+        ? evaluateCardioProgression({
+            program: this.baseProgram,
+            storedTarget: this.storedTarget,
+            sessionTarget: this.sessionTarget,
+            elapsedSec: meta.seconds,
+            totalPlannedSec: totalSeconds(this.p),
+            z5Seconds: rec.z5Seconds,
+            maxHr: meta.maxHr,
+            hrMax: getSettings().hrMax,
+            rpe,
+          })
+        : null),
+      onApplyProgression: (adv) => {
+        const cur = getSettings().programTargets ?? {};
+        updateSettings({ programTargets: { ...cur, [adv.programId]: adv.nextTarget } });
+      },
+    });
   }
 }
 

@@ -7,6 +7,7 @@ import { calendar } from '../intervals/calendar';
 import { audio } from '../audio/audio';
 import { recoveryLimitBpm } from '../domain/gate';
 import { PHASE1_PLAN } from '../domain/plan';
+import { scaleSpinTargetsForFtp } from '../domain/programs';
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { liftSettings, toDisplay, fmtNum, fromDisplay } from '../lifts/settings';
 import { lifts } from '../lifts/store';
@@ -40,13 +41,14 @@ export function settingsScreen(root: HTMLElement): () => void {
   <main class="page settings">
     <h2 class="sec">TRAINING &amp; FTP</h2>
     <section class="card">
-      <div class="line"><span>Cycling &amp; AirBike FTP<small>Scales AirBike &amp; Spin Z2/Z5 % FTP targets (182 W baseline)</small></span>${num('ftp', s.ftp, 80, 450)}<em>W</em></div>
+      <div class="line"><span>Cycling &amp; AirBike FTP<small>Reference scale for profile charts &amp; Intervals readout (or apply to Spin ERG below)</small></span>${num('ftp', s.ftp, 80, 450)}<em>W</em></div>
       <div class="line"><span>Bodyweight<small>Auto-pulls latest smart-scale weigh-in from Intervals.icu</small></span><input class="num" type="number" inputmode="decimal" step="0.1" id="bwIn" placeholder="195" value="${bwVal}"><em>${unit}</em></div>
       <div class="line"><span>Auto-sync eFTP from Intervals<small>Updates FTP automatically when Intervals models a new eFTP</small></span>${tog('ftpAutoSync', s.ftpAutoSync)}</div>
       <div class="hint" id="ftpInfo">${ftpStatus()}</div>
       <div class="row">
         <button class="btn sm" id="useEftp" ${s.intervalsEftp ? '' : 'disabled'}>Use modeled eFTP</button>
         <button class="btn sm" id="syncFtp">Sync from Intervals</button>
+        <button class="btn sm" id="applySpinFtp">Apply FTP to Spin targets</button>
       </div>
     </section>
 
@@ -126,12 +128,16 @@ export function settingsScreen(root: HTMLElement): () => void {
       </div>
     </section>
 
-    <h2 class="sec">RECOVERIES · AIRBIKE Z5</h2>
+    <h2 class="sec">RECOVERIES · CARDIO Z5</h2>
     <section class="card">
-      <div class="line"><span>Rest between reps<small>HR-gated: the rest never ends before the protocol's own rest, then stays easy until HR has recovered (capped at 5 min). Fixed timers: plain countdowns.</small></span></div>
-      ${seg('recoveryMode', s.recoveryMode, [['gated', 'HR-gated'], ['timed', 'Fixed timers']])}
+      <div class="line"><span>Rest between reps<small>Fixed timers (recommended for VO2 max): exact protocol countdowns. HR-gated: stays easy past the protocol rest until HR recovers (capped at 5 min).</small></span></div>
+      ${seg('recoveryMode', s.recoveryMode, [['timed', 'Fixed timers'], ['gated', 'HR-gated']])}
       <div class="line"><span>Recovered at<small>% of max HR (${recoveryLimitBpm(s.hrMax, s.recoveryHrPct)} bpm now). Falls back to the timer if the HR strap is silent.</small></span>${num('recoveryHrPct', s.recoveryHrPct, 50, 90)}<em>%</em></div>
-      <div class="row"><button class="btn sm" id="resetProgs">Reset AirBike program list</button><span id="resetOut" class="hint"></span></div>
+      <div class="row">
+        <button class="btn sm" id="resetProgs">Reset AirBike program list</button>
+        <button class="btn sm" id="resetTargets">Reset cardio targets</button>
+        <span id="resetOut" class="hint"></span>
+      </div>
       <p class="hint">Tap Reorder on the AirBike screen to pin, move or hide programs.</p>
     </section>
 
@@ -143,7 +149,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       <div class="line"><span>Keep going after<small>Transitions mode only</small></span>${num('metroTail', s.metroTail, 0, 60)}<em>sec</em></div>
       <div class="line"><span>Auto-mute when locked in<small>Stop early once cadence holds target ±1.5 RPM for 3 s</small></span>${tog('metroAutoMute', s.metroAutoMute)}</div>
       <div class="line"><span>Volume</span><input id="vol" type="range" min="0.1" max="1" step="0.05" value="${s.metroVolume}"></div>
-      <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 54.5 RPM · 223 W ticks at 109 BPM.</p>
+      <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 55 RPM · 228 W ticks at 110 BPM.</p>
     </section>
 
     <h2 class="sec">WORKOUT</h2>
@@ -152,7 +158,7 @@ export function settingsScreen(root: HTMLElement): () => void {
       <div class="line"><span>Vibration<small>Transitions and overshoot warnings</small></span>${tog('haptics', s.haptics)}</div>
       <div class="line"><span>Cadence bar smoothing<small>Averages the needle and the ON TARGET / PICK IT UP cue. More = steadier but laggier. Big numbers stay at 3 s.</small></span></div>
       ${seg('needleSmooth', s.needleSmooth, [['0', 'Raw'], ['1', '1 s'], ['2', '2 s'], ['3', '3 s']])}
-      <div class="line"><span>Max heart rate<small>Drives HR zones &amp; the Z5 bank (≥ 88%)</small></span>${num('hrMax', s.hrMax, 120, 230)}<em>bpm</em></div>
+      <div class="line"><span>Max heart rate<small>Drives HR zones &amp; the Z5 bank (≥ 90%)</small></span>${num('hrMax', s.hrMax, 120, 230)}<em>bpm</em></div>
     </section>
 
     <h2 class="sec">DEVICES</h2>
@@ -380,10 +386,20 @@ export function settingsScreen(root: HTMLElement): () => void {
       if (ef) updateSettings({ ftp: ef });
     }
     if (t.closest('#syncFtp')) void syncFtp();
+    if (t.closest('#applySpinFtp')) {
+      const ftp = getSettings().ftp;
+      updateSettings({ programTargets: { ...getSettings().programTargets, ...scaleSpinTargetsForFtp(ftp) } });
+      toast(`Updated Spin targets for ${ftp} W FTP`);
+    }
     if (t.closest('#forget')) void forget();
     if (t.closest('#resetProgs')) {
       updateSettings({ programOrder: [], programHidden: null, spinProgramOrder: [], spinProgramHidden: null });
       $('#resetOut', root).textContent = '✓ Back to the default list';
+    }
+    if (t.closest('#resetTargets')) {
+      updateSettings({ programTargets: {} });
+      $('#resetOut', root).textContent = '✓ Cardio targets reset to defaults';
+      toast('Cardio targets reset to defaults');
     }
     if (t.closest('#test')) void test();
     if (t.closest('#wbTog')) void wallboard.setEnabled(!getSettings().wallboardEnabled).then(paintFtpBox);

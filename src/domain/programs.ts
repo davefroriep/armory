@@ -3,8 +3,7 @@ import { rpmForWatts, wattsForRpm } from './airbikeCurve';
 export const BASE_FTP = 182;
 
 export function fmtRpm(rpm: number): string {
-  const half = Math.round(rpm * 2) / 2;
-  return Number.isInteger(half) ? String(half) : half.toFixed(1);
+  return String(Math.round(rpm));
 }
 
 export type PhaseKind = 'warmup' | 'work' | 'steady' | 'float' | 'rest' | 'cooldown';
@@ -72,9 +71,9 @@ export const PHASE_COLOR: Record<PhaseKind, string> = {
   cooldown: '#14b8a6',
 };
 
-const WARM_RPM = 44.0;
-const EASY_RPM = 40.0;
-export const FREE_PACE_RPM = 44.5;
+const WARM_RPM = 44;
+const EASY_RPM = 40;
+export const FREE_PACE_RPM = 45;
 
 const s = (kind: PhaseKind, label: string, seconds: number, rpm: number | null, extra: Partial<Segment> = {}): Segment => ({
   kind, label, seconds, rpm, ...extra,
@@ -99,7 +98,7 @@ function billat(): Segment[] {
   const sets = 2, reps = 8;
   for (let st = 1; st <= sets; st++) {
     for (let r = 1; r <= reps; r++) {
-      out.push(s('work', 'WORK', 60, 55.0, { tag: `SET ${st}/${sets} - REP ${r}/${reps}` }));
+      out.push(s('work', 'WORK', 60, 56, { tag: `SET ${st}/${sets} - REP ${r}/${reps}` }));
       if (r < reps) out.push(s('float', 'FLOAT', 30, EASY_RPM, { tag: `SET ${st}/${sets} - KEEP FAN MOVING` }));
     }
     if (st < sets) out.push(s('rest', 'SET REST', 180, null, { tag: 'FULL REST OR <=35 RPM', gate: { minSec: 180, maxSec: 300 } }));
@@ -122,21 +121,20 @@ function rounds(n: number, workSec: number, restSec: number, workRpm: number): S
  * screen (hold a card); that choice is stored in settings, so editing this list never needs a rebuild
  * to keep their arrangement.
  *
- * Targets are deliberately conservative: arms + legs on a fan bike, so %FTP is a ceiling, not a goal.
- * Work cadences (52.5 / 53.5 / 55 RPM) = 111% / 117% / 125% of the 182 W baseline.
+ * Whole-integer AirBike work RPM defaults: 54 (218 W) / 55 (228 W) / 56 (240 W).
  */
 export const PROGRAMS: Program[] = [
   {
     id: 'n4x4', name: 'Norwegian 4×4', intervalsName: 'AirBike Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5',
-    blurb: 'NTNU CERG · 4 × 4:00 @ 111% FTP (HR 85–95%), recover to HR ≤ target.', segments: repeats(4, 240, 52.5, 180, 300),
+    blurb: 'NTNU CERG · 4 × 4:00 / 3:00 easy. Chase HR ≥ 90%.', segments: repeats(4, 240, 54, 180, 300),
   },
   {
     id: 'v5x3', name: 'Classic VO2 5×3', intervalsName: 'AirBike Z5 — Classic VO2 5×3', group: 'z5', zone: 'Z5',
-    blurb: 'Macro-intervals · 5 × 3:00 @ 117% FTP, recover to HR ≤ target.', segments: repeats(5, 180, 53.5, 120, 240),
+    blurb: 'Macro-intervals · 5 × 3:00 / 2:00 easy. Chase HR ≥ 90%.', segments: repeats(5, 180, 55, 120, 240),
   },
   {
     id: 'b6030', name: '60/30 Float', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
-    blurb: '2 × 8 × (60s @ 125% FTP / 30s float). Fast clock, keep the fan moving.', segments: billat(),
+    blurb: '2 × 8 × (60s work / 30s float). Fast clock, keep the fan moving.', segments: billat(),
   },
   {
     id: 'sprint1020', name: 'Sprint 10/20', intervalsName: 'AirBike Sprint 10/20', group: 'hiit', zone: null,
@@ -144,7 +142,7 @@ export const PROGRAMS: Program[] = [
   },
   {
     id: 'p6x2', name: 'Cardiac Power 6×2', intervalsName: 'AirBike Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5', hidden: true,
-    blurb: 'Jamieson-style · 6 × 2:00 @ 119% FTP, recover to HR ≤ target (2–5 min).', segments: repeats(6, 120, 54.0, 120, 300),
+    blurb: 'Jamieson-style · 6 × 2:00 / 2:00 easy.', segments: repeats(6, 120, 56, 120, 300),
   },
   {
     id: 'tabata', name: 'Tabata 20/10', intervalsName: 'AirBike Tabata 20/10', group: 'hiit', zone: null, hidden: true,
@@ -152,10 +150,10 @@ export const PROGRAMS: Program[] = [
   },
   {
     id: 'z2', name: 'Zone 2 Base', intervalsName: 'AirBike Z2', group: 'z2', zone: 'Z2', hidden: true,
-    blurb: 'Aerobic base · 45:00 steady @ 72% FTP (Z2 lives on spin / treadmill).',
+    blurb: 'Aerobic base · 45:00 steady (Z2 lives on spin / treadmill).',
     segments: [
       s('warmup', 'WARM-UP', 300, EASY_RPM),
-      s('steady', 'ZONE 2', 2700, 44.5),
+      s('steady', 'ZONE 2', 2700, 45),
       s('cooldown', 'COOL-DOWN', 300, EASY_RPM),
     ],
   },
@@ -226,22 +224,22 @@ export const SPIN_PROGRAMS: Program[] = [
   },
   {
     id: 'spin-n4x4', name: 'Norwegian 4×4 (ERG)', intervalsName: 'Spin Z5 — Norwegian 4×4', group: 'z5', zone: 'Z5', equipment: 'spin',
-    blurb: 'NTNU CERG · 4 × 4:00 @ 220 W (121% FTP, ~85 RPM) Auto-ERG, recover to HR ≤ target.',
+    blurb: 'NTNU CERG · 4 × 4:00 / 3:00 easy · Auto-ERG.',
     segments: spinRepeats(4, 240, 220, 85, 180, 300),
   },
   {
     id: 'spin-v5x3', name: 'Classic VO2 5×3 (ERG)', intervalsName: 'Spin Z5 — Classic VO2 5×3', group: 'z5', zone: 'Z5', equipment: 'spin',
-    blurb: 'Macro-intervals · 5 × 3:00 @ 225 W (124% FTP, ~85 RPM) Auto-ERG, recover to HR ≤ target.',
+    blurb: 'Macro-intervals · 5 × 3:00 / 2:00 easy · Auto-ERG.',
     segments: spinRepeats(5, 180, 225, 85, 120, 240),
   },
   {
     id: 'spin-b6030', name: '60/30 Billat (ERG)', intervalsName: 'Spin Z5 — Billat 60/30', group: 'z5', zone: 'Z5', equipment: 'spin',
-    blurb: '2 × 8 × (60s @ 245 W / 30s @ 110 W) Auto-ERG, HR-gated set rest.',
+    blurb: '2 × 8 × (60s / 30s) · Auto-ERG.',
     segments: spinBillat(),
   },
   {
     id: 'spin-p6x2', name: 'Cardiac Power 6×2 (ERG)', intervalsName: 'Spin Z5 — Cardiac Power 6×2', group: 'z5', zone: 'Z5', equipment: 'spin', hidden: true,
-    blurb: 'Jamieson-style · 6 × 2:00 @ 235 W (129% FTP, ~88 RPM) Auto-ERG, recover to HR ≤ target.',
+    blurb: 'Jamieson-style · 6 × 2:00 / 2:00 easy · Auto-ERG.',
     segments: spinRepeats(6, 120, 235, 88, 120, 300),
   },
   {
@@ -253,7 +251,173 @@ export const SPIN_PROGRAMS: Program[] = [
 
 export const programsForEquipment = (eq: 'airbike' | 'spin'): Program[] => (eq === 'spin' ? SPIN_PROGRAMS : PROGRAMS);
 
-export function resolveProgram(p: Program, ftp = BASE_FTP, offsetWatts = 0): Program {
+export function defaultProgramTarget(p: Program): number | null {
+  const ref = p.segments.find((g) => (g.kind === 'work' || g.kind === 'steady') && !g.allOut);
+  if (!ref) return null;
+  if (ref.watts != null) return Math.round(ref.watts);
+  if (ref.rpm != null) return Math.round(ref.rpm);
+  return null;
+}
+
+export function clampProgramTarget(p: Program, value: number): number {
+  const isSpin = p.equipment === 'spin' || p.segments.some((g) => g.watts != null);
+  const rounded = Math.round(value);
+  return isSpin ? Math.max(50, Math.min(550, rounded)) : Math.max(30, Math.min(85, rounded));
+}
+
+export function effectiveProgramTarget(p: Program, storedTargets?: Record<string, number> | null): number | null {
+  const def = defaultProgramTarget(p);
+  if (def == null) return null;
+  const stored = storedTargets?.[p.id];
+  if (typeof stored === 'number' && Number.isFinite(stored) && stored > 0) return clampProgramTarget(p, stored);
+  return def;
+}
+
+export function applyProgramTarget(p: Program, target: number | null | undefined): Program {
+  if (target == null || !Number.isFinite(target) || target <= 0) return p;
+  const val = clampProgramTarget(p, target);
+  return {
+    ...p,
+    segments: p.segments.map((g) => {
+      if ((g.kind !== 'work' && g.kind !== 'steady') || g.allOut) return g;
+      if (g.watts != null) return { ...g, watts: val };
+      if (g.rpm != null) return { ...g, rpm: val };
+      return g;
+    }),
+  };
+}
+
+export function formatProgramTarget(p: Program, target: number): string {
+  const isSpin = p.equipment === 'spin' || p.segments.some((g) => g.watts != null);
+  const rounded = Math.round(target);
+  return isSpin ? `${rounded} W` : `${rounded} RPM (${Math.round(wattsForRpm(rounded))} W)`;
+}
+
+export function scaleSpinTargetsForFtp(ftp: number): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!Number.isFinite(ftp) || ftp <= 0) return out;
+  for (const p of SPIN_PROGRAMS) {
+    if (p.zone !== 'Z2' && p.zone !== 'Z5') continue;
+    const def = defaultProgramTarget(p);
+    if (def == null) continue;
+    const raw = def * (ftp / BASE_FTP);
+    const val = p.zone === 'Z5' ? Math.round(raw / 5) * 5 : Math.round(raw);
+    out[p.id] = clampProgramTarget(p, val);
+  }
+  return out;
+}
+
+export interface ProgressionAdvice {
+  kind: 'adopt' | 'bump' | 'ease' | 'hold';
+  programId: string;
+  currentTarget: number;
+  nextTarget: number;
+  currentLabel: string;
+  nextLabel: string;
+  reason: string;
+  defaultApply: boolean;
+}
+
+export function evaluateCardioProgression(args: {
+  program: Program;
+  storedTarget: number;
+  sessionTarget: number;
+  elapsedSec: number;
+  totalPlannedSec: number;
+  z5Seconds: number;
+  maxHr: number;
+  hrMax: number;
+  rpe: number;
+}): ProgressionAdvice | null {
+  const { program: p, storedTarget, sessionTarget, elapsedSec, totalPlannedSec, z5Seconds, maxHr, hrMax, rpe } = args;
+  if (p.zone !== 'Z5' && p.zone !== 'Z2') return null;
+  if (defaultProgramTarget(p) == null || totalPlannedSec <= 0 || elapsedSec < totalPlannedSec * 0.5) return null;
+  const isSpin = p.equipment === 'spin' || p.segments.some((g) => g.watts != null);
+  const step = isSpin ? 5 : 1;
+  const unit = isSpin ? 'W' : 'RPM';
+  const currentLabel = formatProgramTarget(p, storedTarget);
+
+  if (sessionTarget !== storedTarget) {
+    const nextTarget = clampProgramTarget(p, sessionTarget);
+    const nextLabel = formatProgramTarget(p, nextTarget);
+    return {
+      kind: 'adopt',
+      programId: p.id,
+      currentTarget: storedTarget,
+      nextTarget,
+      currentLabel,
+      nextLabel,
+      reason: `You finished at ${nextLabel} — save as your new target`,
+      defaultApply: true,
+    };
+  }
+
+  if (p.zone === 'Z5' && elapsedSec >= totalPlannedSec * 0.8 && maxHr > 0 && hrMax > 0) {
+    const cap = isSpin ? 450 : 68;
+    const floor = isSpin ? 100 : 42;
+    const underCooked =
+      (rpe <= 6 && (z5Seconds < 210 || maxHr < Math.round(hrMax * 0.92)))
+      || (rpe <= 7 && z5Seconds < 120 && maxHr < Math.round(hrMax * 0.91));
+    if (underCooked) {
+      const nextTarget = Math.min(cap, storedTarget + step);
+      if (nextTarget > storedTarget) {
+        const nextLabel = formatProgramTarget(p, nextTarget);
+        return {
+          kind: 'bump',
+          programId: p.id,
+          currentTarget: storedTarget,
+          nextTarget,
+          currentLabel,
+          nextLabel,
+          reason: `Z5 bank ${fmtDur(z5Seconds)} (peak ${Math.round(maxHr)} bpm, RPE ${rpe}) — bump +${step} ${unit} next time`,
+          defaultApply: true,
+        };
+      }
+    }
+
+    const redlined = rpe >= 9 && (rpe === 10 || maxHr >= Math.round(hrMax * 0.97));
+    if (redlined) {
+      const nextTarget = Math.max(floor, storedTarget - step);
+      if (nextTarget < storedTarget) {
+        const nextLabel = formatProgramTarget(p, nextTarget);
+        return {
+          kind: 'ease',
+          programId: p.id,
+          currentTarget: storedTarget,
+          nextTarget,
+          currentLabel,
+          nextLabel,
+          reason: `Very hard (peak ${Math.round(maxHr)} bpm, RPE ${rpe}) — optionally ease −${step} ${unit}`,
+          defaultApply: false,
+        };
+      }
+    }
+
+    return {
+      kind: 'hold',
+      programId: p.id,
+      currentTarget: storedTarget,
+      nextTarget: storedTarget,
+      currentLabel,
+      nextLabel: currentLabel,
+      reason: `Z5 bank ${fmtDur(z5Seconds)} · RPE ${rpe} — target dialed in`,
+      defaultApply: false,
+    };
+  }
+
+  return null;
+}
+
+export function resolveProgram(
+  p: Program,
+  ftp = BASE_FTP,
+  offsetWatts = 0,
+  storedTargets?: Record<string, number> | null,
+): Program {
+  const stored = storedTargets?.[p.id];
+  if (typeof stored === 'number' && Number.isFinite(stored) && stored > 0 && offsetWatts === 0) {
+    return applyProgramTarget(p, stored);
+  }
   if ((p.zone !== 'Z5' && p.zone !== 'Z2') || (ftp === BASE_FTP && offsetWatts === 0)) return p;
   return {
     ...p,
@@ -268,11 +432,11 @@ export function resolveProgram(p: Program, ftp = BASE_FTP, offsetWatts = 0): Pro
       if (g.rpm == null || g.allOut) return g;
       if (g.kind === 'work' || g.kind === 'steady') {
         const w = Math.max(50, Math.round(wattsForRpm(g.rpm) * (ftp / BASE_FTP)) + offsetWatts);
-        return { ...g, rpm: rpmForWatts(w) };
+        return { ...g, rpm: Math.min(85, Math.max(30, Math.round(rpmForWatts(w)))) };
       }
       if (ftp === BASE_FTP) return g;
       const w = wattsForRpm(g.rpm) * (ftp / BASE_FTP);
-      return { ...g, rpm: Math.min(48, Math.max(36, rpmForWatts(w))) };
+      return { ...g, rpm: Math.min(48, Math.max(36, Math.round(rpmForWatts(w)))) };
     }),
   };
 }

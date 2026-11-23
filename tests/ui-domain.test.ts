@@ -10,8 +10,9 @@ import { msUntilNextLocalMidnight } from '../src/intervals/calendar';
 import { PHASE1_ROUTINES } from '../src/lifts/seed';
 import { KG_PER_LB, liftSettings } from '../src/lifts/settings';
 import type { LiftSession } from '../src/lifts/types';
+import { DEFAULTS, TIMED_RECOVERY_MIG_KEY, migrateTimedRecoveryDefault } from '../src/store/settings';
 import { groupDayLogs, renderDayZoomCard, todayCompletedItems, type ZoomLookup } from '../src/ui/dayZoom';
-import { hrDropStats } from '../src/ui/hr';
+import { hrDropStats, hrZone } from '../src/ui/hr';
 
 describe('3 s smoothing', () => {
   it('averages the trailing window and drops old samples', () => {
@@ -73,7 +74,7 @@ describe('workout profile bars', () => {
     const easy = bars.filter((b) => b.k !== 'work');
     expect(work).toHaveLength(4);
     for (const w of work) for (const e of easy) expect(w.h).toBeGreaterThan(e.h);
-    expect(work.every((w) => w.color === intensityColor(111))).toBe(true); // 52.5 RPM = 202 W = 111 % FTP -> Z5 orange
+    expect(work.every((w) => w.color === intensityColor(120))).toBe(true); // 54 RPM = 218 W = 120 % FTP -> Z5 orange
     expect(easy.every((e) => e.pct < 76)).toBe(true);
   });
   it('puts all-out efforts at full height and in the top colour', () => {
@@ -336,5 +337,25 @@ describe('live HR sheet telemetry helpers', () => {
     expect(removedHtml).not.toContain('(skipped)');
     expect(removedHtml).not.toContain('✓ Done');
     expect(removedHtml).not.toContain('Spin Bike Z2');
+  });
+
+  it('aligns Z5 HR zone to >= 90% HRmax and migrates existing installs to timed recovery once', () => {
+    expect(hrZone(161, 180).z).toBe(4);
+    expect(hrZone(162, 180).z).toBe(5);
+
+    const store = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+    };
+    const first = migrateTimedRecoveryDefault({ ...DEFAULTS, recoveryMode: 'gated' }, storage);
+    expect(first.migrated).toBe(true);
+    expect(first.settings.recoveryMode).toBe('timed');
+    expect(store.get(TIMED_RECOVERY_MIG_KEY)).toBe('1');
+
+    // Subsequent loads respect user switching back to gated
+    const second = migrateTimedRecoveryDefault({ ...DEFAULTS, recoveryMode: 'gated' }, storage);
+    expect(second.migrated).toBe(false);
+    expect(second.settings.recoveryMode).toBe('gated');
   });
 });

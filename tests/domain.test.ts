@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { bpmForRpm, rpmForWatts, wattsForRpm } from '../src/domain/airbikeCurve';
-import { PROGRAMS, SPIN_PROGRAMS, fmtRpm, programById, resolveProgram, targetWatts, totalSeconds, workSeconds } from '../src/domain/programs';
+import {
+  PROGRAMS, SPIN_PROGRAMS, applyProgramTarget, defaultProgramTarget, effectiveProgramTarget,
+  evaluateCardioProgression, fmtRpm, programById, resolveProgram, scaleSpinTargetsForFtp,
+  targetWatts, totalSeconds, workSeconds,
+} from '../src/domain/programs';
 import { locate } from '../src/domain/timeline';
 import { Emitter } from '../src/emitter';
 import { WorkoutEngine } from '../src/domain/engine';
@@ -59,13 +63,19 @@ describe('programs', () => {
     expect(new Set(PROGRAMS.map((p) => p.id)).size).toBe(PROGRAMS.length);
     expect(PROGRAMS.filter((p) => p.group === 'z5' && !p.hidden).map((p) => p.id)).toEqual(['n4x4', 'v5x3', 'b6030']);
     expect(PROGRAMS.filter((p) => p.hidden).map((p) => p.id).sort()).toEqual(['p6x2', 'tabata', 'z2']);
-    expect([56, 55, 57, 54.5].map(fmtRpm)).toEqual(['56', '55', '57', '54.5']);
+    expect([56, 55, 57, 54.5, 53.5].map(fmtRpm)).toEqual(['56', '55', '57', '55', '54']);
   });
-  it('conservative VO2 targets: 4x4 ~111%, 5x3 ~117%, 60/30 ~125% of the 182 W baseline', () => {
-    const w = (id: string) => targetWatts(programById(id)!.segments.find((g) => g.kind === 'work')!)!;
-    expect(w('n4x4') / 182).toBeCloseTo(1.11, 1);
-    expect(w('v5x3') / 182).toBeCloseTo(1.17, 1);
-    expect(w('b6030') / 182).toBeCloseTo(1.25, 1);
+  it('whole-integer AirBike targets: 4x4=54 (218W), 5x3=55 (228W), 60/30=56 (240W), Z2/Free=45', () => {
+    const rpm = (id: string) => programById(id)!.segments.find((g) => g.kind === 'work' || g.kind === 'steady')!.rpm!;
+    expect(rpm('n4x4')).toBe(54);
+    expect(rpm('v5x3')).toBe(55);
+    expect(rpm('b6030')).toBe(56);
+    expect(rpm('p6x2')).toBe(56);
+    expect(rpm('z2')).toBe(45);
+    expect(programById('free')!.paceRpm).toBe(45);
+    expect(targetWatts(programById('n4x4')!.segments.find((g) => g.kind === 'work')!)).toBe(218);
+    expect(targetWatts(programById('v5x3')!.segments.find((g) => g.kind === 'work')!)).toBe(228);
+    expect(targetWatts(programById('b6030')!.segments.find((g) => g.kind === 'work')!)).toBe(240);
   });
   it('recoveries between reps are HR-gated, warm-up / cool-down / floats are not', () => {
     for (const id of ['n4x4', 'v5x3', 'p6x2']) {
@@ -77,19 +87,61 @@ describe('programs', () => {
     expect(b.filter((g) => g.gate).map((g) => g.label)).toEqual(['SET REST']);
     expect(b.filter((g) => g.kind === 'float').every((g) => !g.gate)).toBe(true);
   });
-  it('resolveProgram scales by FTP and shifts work watts cleanly with live +/-5 W trim', () => {
+  it('resolveProgram snaps AirBike targets to whole RPMs and applies stored programTargets directly', () => {
     const p = programById('p6x2')!;
     const baseWork = resolveProgram(p, 182, 0).segments.find((g) => g.kind === 'work')!;
-    const base = targetWatts(baseWork)!;
-    expect(base).toBeGreaterThan(200);
-    const trimmedDown = resolveProgram(p, 182, -10).segments.find((g) => g.kind === 'work')!;
-    expect(Math.abs(targetWatts(trimmedDown)! - (base - 10))).toBeLessThanOrEqual(1);
-    const trimmedUp = resolveProgram(p, 182, 5).segments.find((g) => g.kind === 'work')!;
-    expect(Math.abs(targetWatts(trimmedUp)! - (base + 5))).toBeLessThanOrEqual(1);
+    expect(baseWork.rpm).toBe(56);
+    const trimmedDown = resolveProgram(p, 182, -12).segments.find((g) => g.kind === 'work')!;
+    expect(Number.isInteger(trimmedDown.rpm)).toBe(true);
+    expect(trimmedDown.rpm).toBe(55);
     const scaled = resolveProgram(p, 165, 0);
     const scaledWork = scaled.segments.find((g) => g.kind === 'work')!;
-    expect(Math.abs(targetWatts(scaledWork)! - Math.round(base * (165 / 182)))).toBeLessThanOrEqual(1);
+    expect(Number.isInteger(scaledWork.rpm)).toBe(true);
+    expect(scaledWork.rpm).toBe(54);
     expect(scaled.segments.find((g) => g.kind === 'rest')!.rpm!).toBeGreaterThanOrEqual(36);
+
+    const direct = resolveProgram(programById('v5x3')!, 210, 0, { v5x3: 57 });
+    expect(direct.segments.find((g) => g.kind === 'work')!.rpm).toBe(57);
+  });
+  it('direct program target helpers & automatic Z5 progression evaluator', () => {
+    const v5x3 = programById('v5x3')!;
+    const spin4 = programById('spin-n4x4')!;
+    expect(defaultProgramTarget(v5x3)).toBe(55);
+    expect(defaultProgramTarget(spin4)).toBe(220);
+    expect(defaultProgramTarget(programById('sprint1020')!)).toBeNull();
+    expect(effectiveProgramTarget(v5x3, { v5x3: 56 })).toBe(56);
+    expect(applyProgramTarget(v5x3, 56).segments.find((g) => g.kind === 'work')!.rpm).toBe(56);
+    expect(scaleSpinTargetsForFtp(200)['spin-n4x4']).toBe(240);
+
+    // Mid-ride manual bump -> adopt new target
+    expect(evaluateCardioProgression({
+      program: v5x3, storedTarget: 55, sessionTarget: 56, elapsedSec: 1800, totalPlannedSec: 1800,
+      z5Seconds: 200, maxHr: 165, hrMax: 180, rpe: 7,
+    })).toMatchObject({ kind: 'adopt', nextTarget: 56, defaultApply: true });
+
+    // Under-cooked Z5 (like 5x3 @ RPE 6, peak 162, 20s Z5) -> auto-bump +1 RPM
+    expect(evaluateCardioProgression({
+      program: v5x3, storedTarget: 55, sessionTarget: 55, elapsedSec: 1800, totalPlannedSec: 1800,
+      z5Seconds: 20, maxHr: 162, hrMax: 180, rpe: 6,
+    })).toMatchObject({ kind: 'bump', nextTarget: 56, defaultApply: true });
+
+    // Dialed-in Z5 (like Spin 4x4 @ RPE 8, peak 169, 4:34 Z5) -> hold
+    expect(evaluateCardioProgression({
+      program: spin4, storedTarget: 220, sessionTarget: 220, elapsedSec: 1720, totalPlannedSec: 1980,
+      z5Seconds: 274, maxHr: 169, hrMax: 180, rpe: 8,
+    })).toMatchObject({ kind: 'hold', nextTarget: 220, defaultApply: false });
+
+    // Redlined RPE 10 -> optional ease (not auto-applied)
+    expect(evaluateCardioProgression({
+      program: spin4, storedTarget: 225, sessionTarget: 225, elapsedSec: 1980, totalPlannedSec: 1980,
+      z5Seconds: 420, maxHr: 176, hrMax: 180, rpe: 10,
+    })).toMatchObject({ kind: 'ease', nextTarget: 220, defaultApply: false });
+
+    // Aborted early (<50%) -> no progression
+    expect(evaluateCardioProgression({
+      program: v5x3, storedTarget: 55, sessionTarget: 55, elapsedSec: 500, totalPlannedSec: 1800,
+      z5Seconds: 0, maxHr: 140, hrMax: 180, rpe: 5,
+    })).toBeNull();
   });
 });
 
@@ -142,8 +194,8 @@ describe('pacer (metronome)', () => {
     expect(at(294, cfg()).play).toBe(false); // 6 s out
     const lead = at(295, cfg()); // 5 s out
     expect(lead.play).toBe(true);
-    expect(lead.bpm).toBe(105); // 2 x 52.5, tempo of the work block that is coming
-    expect(at(300, cfg()).bpm).toBe(105);
+    expect(lead.bpm).toBe(108); // 2 x 54, tempo of the work block that is coming
+    expect(at(300, cfg()).bpm).toBe(108);
     expect(at(314.9, cfg()).play).toBe(true);
     expect(at(315.1, cfg()).play).toBe(false);
   });
@@ -159,13 +211,13 @@ describe('pacer (metronome)', () => {
   });
   it('whole mode plays continuously and switches tempo in the lead window', () => {
     expect(at(100, cfg({ mode: 'whole' })).bpm).toBe(88); // warm-up 44 RPM
-    expect(at(296, cfg({ mode: 'whole' })).bpm).toBe(105);
+    expect(at(296, cfg({ mode: 'whole' })).bpm).toBe(108);
   });
   it('free ride only plays in whole mode', () => {
     const f = programById('free')!;
     const loc = locate(f.segments, 60);
     expect(pacerDecision(f, loc, cfg(), true, false).play).toBe(false);
-    expect(pacerDecision(f, loc, cfg({ mode: 'whole' }), true, false).bpm).toBe(89);
+    expect(pacerDecision(f, loc, cfg({ mode: 'whole' }), true, false).bpm).toBe(90);
   });
   it('no tempo for full-rest segments', () => {
     const b = programById('b6030')!;
@@ -179,8 +231,8 @@ describe('cadence cues', () => {
   const work = programById('n4x4')!.segments[1];
   const float = programById('b6030')!.segments[2];
   it('on target / hot / low', () => {
-    expect(cueFor(work, 52.5, 30).level).toBe('ok');
-    expect(cueFor(work, 53.9, 30).level).toBe('ok');
+    expect(cueFor(work, 54, 30).level).toBe('ok');
+    expect(cueFor(work, 55.4, 30).level).toBe('ok');
     const hot = cueFor(work, 58, 5);
     expect(hot.level).toBe('bad');
     expect(hot.chirp).toBe(true);
@@ -278,6 +330,38 @@ describe('engine with gated recoveries', () => {
     const t = (REST1_START + 100) * 1000;
     expect(e.remainingNominal(t)).toBe(33 * 60 - (REST1_START + 100));
     expect(e.remainingNominal((REST1_START + 250) * 1000)).toBe(33 * 60 - (REST1_START + 180));
+  });
+  it('timed recovery keeps exact protocol duration without +5s lead overhang', () => {
+    const e = new WorkoutEngine(programById('v5x3')!);
+    e.setRecoveryMode('timed');
+    e.start(0);
+    const restStart = 300 + 180;
+    expect(e.waitingOnGate((restStart + 115) * 1000)).toBe(false);
+    expect(e.locate((restStart + 115) * 1000).remaining).toBeCloseTo(5, 5);
+    expect(e.locate((restStart + 120) * 1000).seg!.kind).toBe('work');
+    expect(e.locate((restStart + 120) * 1000).into).toBeCloseTo(0, 5);
+  });
+  it('gated mode tracks debounce before minSec so early HR recovery finishes right on minSec without flashing', () => {
+    const e = new WorkoutEngine(programById('v5x3')!);
+    e.start(0);
+    const restStart = 300 + 180; // Rest 1 minSec = 120s, lead = 5s
+    // HR hits <= 130 at 1:40 (into=100s), held steady past 1:55 (into=115s)
+    expect(e.checkGate((restStart + 100) * 1000, ctx(128, { debounceMs: 2500 }))).toBeNull();
+    expect(e.checkGate((restStart + 103) * 1000, ctx(128, { debounceMs: 2500 }))).toBeNull();
+    // At minSec - lead (115s), gate pre-releases at exact minSec (120s) for one clean 5s countdown
+    expect(e.checkGate((restStart + 115) * 1000, ctx(128, { debounceMs: 2500 }))).toBe(2);
+    expect(e.waitingOnGate((restStart + 115) * 1000)).toBe(false);
+    expect(e.locate((restStart + 115) * 1000).remaining).toBeCloseTo(5, 5);
+    expect(e.locate((restStart + 120) * 1000).seg!.kind).toBe('work');
+    expect(e.locate((restStart + 120) * 1000).into).toBeCloseTo(0, 5);
+
+    // Late pre-floor recovery (into=118s) preserves 2s of debounce across minSec=120s
+    const e2 = new WorkoutEngine(programById('v5x3')!);
+    e2.start(0);
+    expect(e2.checkGate((restStart + 118) * 1000, ctx(129, { debounceMs: 2500 }))).toBeNull();
+    expect(e2.checkGate((restStart + 120) * 1000, ctx(129, { debounceMs: 2500 }))).toBeNull();
+    expect(e2.checkGate((restStart + 120.5) * 1000, ctx(129, { debounceMs: 2500 }))).toBe(2);
+    expect(e2.exportReleased()[2]).toBeCloseTo(125.5, 5);
   });
 });
 

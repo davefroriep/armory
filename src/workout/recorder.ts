@@ -1,6 +1,7 @@
 import { bikeFrame, bikeFresh, hrAtTime, hrBeat, live } from '../ble/telemetry';
 import { putMeta, putSample } from '../store/db';
 import type { Equipment, Sample, WorkoutMeta } from '../types';
+import { Z5_HR_FRAC } from '../ui/hr';
 
 /**
  * 1 Hz session recorder. Accumulates the 5 Hz bike frames and records the per-second mean (so sprint
@@ -23,7 +24,7 @@ export class Recorder {
   private wTotal = 0;
   private hrTotal = 0;
   private hrCount = 0;
-  /** Seconds at or above 88% HRmax (the "Z5 bank"). */
+  /** Seconds at or above 90% HRmax (the "Z5 bank", aligned with Intervals.icu Z5 / T@VO2max). */
   z5Seconds = 0;
   lastDist = 0;
   lastKcal = 0;
@@ -34,6 +35,7 @@ export class Recorder {
     /** Continue a recording that was interrupted (app killed mid-workout) instead of starting a new one. */
     resumeFrom?: { meta: WorkoutMeta; samples: Sample[] },
     planSlot: string | null = null,
+    private readonly persist = true,
   ) {
     if (resumeFrom) {
       this.meta = { ...resumeFrom.meta };
@@ -46,7 +48,7 @@ export class Recorder {
           this.hrTotal += s.hr;
           this.hrCount++;
           this.meta.maxHr = Math.max(this.meta.maxHr, s.hr);
-          if (s.hr >= 0.88 * hrMax) this.z5Seconds++;
+          if (s.hr >= Z5_HR_FRAC * hrMax) this.z5Seconds++;
         }
       }
       const tail = resumeFrom.samples[resumeFrom.samples.length - 1];
@@ -66,7 +68,7 @@ export class Recorder {
       upload: 'none', patched: false,
       activityId: null, lastError: null,
     };
-    void putMeta(this.meta);
+    if (this.persist) void putMeta(this.meta);
   }
 
   get kj(): number { return this.kjAcc; }
@@ -128,7 +130,7 @@ export class Recorder {
       this.lastKcal = kcal;
       const s: Sample = { t: this.nextT, w, cad, hr, dist, kcal, tr: targetRpm };
       this.samples.push(s);
-      void putSample(this.meta.id, s);
+      if (this.persist) void putSample(this.meta.id, s);
 
       this.kjAcc += w / 1000;
       this.wTotal += w;
@@ -137,7 +139,7 @@ export class Recorder {
         this.hrTotal += hr;
         this.hrCount++;
         this.meta.maxHr = Math.max(this.meta.maxHr, hr);
-        if (hr >= 0.88 * this.hrMax) this.z5Seconds++;
+        if (hr >= Z5_HR_FRAC * this.hrMax) this.z5Seconds++;
       }
       this.wSum = this.cadSum = 0;
       this.frames = 0;
@@ -152,7 +154,7 @@ export class Recorder {
     this.meta.kj = this.kjAcc;
     this.meta.avgW = this.avgW;
     this.meta.avgHr = this.avgHr;
-    void putMeta(this.meta);
+    if (this.persist) void putMeta(this.meta);
     return this.meta;
   }
 }

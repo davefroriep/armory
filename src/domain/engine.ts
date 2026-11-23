@@ -1,4 +1,4 @@
-import { gateOpen, type RecoveryMode } from './gate';
+import { type RecoveryMode } from './gate';
 import type { Program, Segment } from './programs';
 import { locate, type Locate } from './timeline';
 
@@ -18,12 +18,13 @@ export interface GateContext {
  * Wall-clock workout timer. All methods take an explicit `now` (ms) so it is deterministic in tests
  * and stays correct when the browser throttles timers in the background.
  *
- * Gated recovery blocks have no fixed length: the block stays open (up to its ceiling) until the HUD
- * reports that HR has recovered, which "releases" it. Released blocks keep their real, shorter or
- * longer, length so the rest of the timeline simply shifts.
+ * Gated recovery blocks have no fixed length in `'gated'` mode: the block stays open (up to its
+ * ceiling) until the HUD reports that HR has recovered, which "releases" it. In `'timed'` mode,
+ * blocks stay at their exact protocol duration without stretching or extra lead-time overhang.
  */
 export class WorkoutEngine {
   state: EngineState = 'ready';
+  private recoveryMode: RecoveryMode = 'gated';
   private accMs = 0;
   private resumedAt = 0;
   /** segment index -> real length (s) once a gated / skipped block has ended. */
@@ -35,6 +36,10 @@ export class WorkoutEngine {
 
   setProgram(p: Program): void {
     this.program = p;
+  }
+
+  setRecoveryMode(mode: RecoveryMode): void {
+    this.recoveryMode = mode;
   }
 
   start(now: number): void {
@@ -105,7 +110,9 @@ export class WorkoutEngine {
       let sec = g.seconds;
       const rel = this.released.get(i);
       if (rel !== undefined) sec = rel;
-      else if (g.gate && elapsed >= start) sec = Math.max(g.seconds, g.gate.maxSec + 2); // +2 s slack: the ceiling check runs before the block can roll over
+      else if (g.gate && this.recoveryMode === 'gated' && elapsed >= start) {
+        sec = Math.max(g.seconds, g.gate.maxSec + 2); // +2 s slack: the ceiling check runs before the block can roll over
+      }
       out.push(sec === g.seconds ? g : { ...g, seconds: sec });
       start += sec;
     });
@@ -119,6 +126,7 @@ export class WorkoutEngine {
 
   /** True while the current block is a gated recovery that has not been released yet. */
   waitingOnGate(now: number): boolean {
+    if (this.recoveryMode === 'timed') return false;
     const loc = this.locate(now);
     return !loc.complete && !!loc.seg?.gate && !this.released.has(loc.index);
   }
@@ -129,7 +137,7 @@ export class WorkoutEngine {
     const loc = locate(this.segments(el), el);
     if (loc.complete) return 0;
     const base = this.program.segments;
-    let rest = loc.seg?.gate && !this.released.has(loc.index)
+    let rest = loc.seg?.gate && this.recoveryMode === 'gated' && !this.released.has(loc.index)
       ? Math.max(0, base[loc.index].seconds - loc.into)
       : loc.remaining;
     for (let i = loc.index + 1; i < base.length; i++) rest += base[i].seconds;
@@ -146,27 +154,56 @@ export class WorkoutEngine {
     const loc = locate(this.segments(el), el);
     const gate = loc.seg?.gate;
     if (loc.complete || !gate || this.released.has(loc.index)) return null;
-    const open = gateOpen({
-      gate, nominal: this.program.segments[loc.index].seconds, into: loc.into, hr: ctx.hr, hrLimit: ctx.hrLimit, mode: ctx.mode,
-    });
-    if (!open) {
-      if (loc.index === this.gateLowIdx) this.gateLowSince = null;
-      return null;
+    const nominal = this.program.segments[loc.index].seconds;
+    const lead = Math.max(0, ctx.lead);
+
+    if (ctx.mode === 'timed' || ctx.hr == null) {
+      if (loc.index === this.gateLowIdx) {
+        this.gateLowSince = null;
+        this.gateLowIdx = -1;
+      }
+      if (loc.into < nominal) return null;
+      this.released.set(loc.index, loc.into <= nominal + 0.5 ? nominal : loc.into);
+      return loc.index;
     }
-    const debounceMs = ctx.debounceMs ?? 0;
-    const inHrWindow = ctx.mode === 'gated' && ctx.hr != null && loc.into >= gate.minSec && loc.into < gate.maxSec;
-    if (inHrWindow && debounceMs > 0) {
+
+    // Track HR-below-target stability even before `gate.minSec` so hitting HR early finishes right on `minSec`.
+    if (ctx.hr <= ctx.hrLimit) {
       if (loc.index !== this.gateLowIdx) {
         this.gateLowIdx = loc.index;
         this.gateLowSince = now;
       } else {
         this.gateLowSince ??= now;
       }
-      if (now - this.gateLowSince < debounceMs) return null;
+    } else if (loc.index === this.gateLowIdx) {
+      this.gateLowSince = null;
     }
+
+    const debounceMs = ctx.debounceMs ?? 0;
+    const recovered = ctx.hr <= ctx.hrLimit
+      && (debounceMs <= 0 || (this.gateLowIdx === loc.index && this.gateLowSince != null && now - this.gateLowSince >= debounceMs));
+
+    if (loc.into >= gate.maxSec) {
+      this.gateLowSince = null;
+      this.gateLowIdx = -1;
+      this.released.set(loc.index, loc.into + lead);
+      return loc.index;
+    }
+
+    if (loc.into < gate.minSec) {
+      if (recovered && loc.into >= Math.max(0, gate.minSec - lead)) {
+        this.gateLowSince = null;
+        this.gateLowIdx = -1;
+        this.released.set(loc.index, gate.minSec);
+        return loc.index;
+      }
+      return null;
+    }
+
+    if (!recovered) return null;
     this.gateLowSince = null;
     this.gateLowIdx = -1;
-    this.released.set(loc.index, loc.into + Math.max(0, ctx.lead));
+    this.released.set(loc.index, loc.into + lead);
     return loc.index;
   }
 

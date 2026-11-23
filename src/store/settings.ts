@@ -37,6 +37,8 @@ export interface Settings {
   spinProgramOrder: string[];
   /** Hidden Spin Bike programs; null = never customised (library defaults). */
   spinProgramHidden: string[] | null;
+  /** Direct per-program work targets (whole RPM for AirBike, watts for Spin ERG). */
+  programTargets: Record<string, number>;
   metroEnabled: boolean;
   metroMode: MetroMode;
   metroLead: number;
@@ -85,6 +87,7 @@ export interface Settings {
 
 const KEY = 'armory.settings.v1';
 export const ROOM_VOICE_MIG_KEY = 'armory.mig.room_voice_default.v1';
+export const TIMED_RECOVERY_MIG_KEY = 'armory.mig.timed_recovery_default.v1';
 const BAKED_PREVIEW_URL = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_GYM_CAM_PREVIEW_URL ?? '').trim();
 
 export const DEFAULTS: Settings = {
@@ -99,12 +102,13 @@ export const DEFAULTS: Settings = {
   weightKg: null,
   weightDate: null,
   birthDate: null,
-  recoveryMode: 'gated',
+  recoveryMode: 'timed',
   recoveryHrPct: 72,
   programOrder: [],
   programHidden: null,
   spinProgramOrder: [],
   spinProgramHidden: null,
+  programTargets: {},
   metroEnabled: true,
   metroMode: 'transitions',
   metroLead: 5,
@@ -166,6 +170,34 @@ export function migrateRoomVoiceDefault(
   }
 }
 
+function sanitizeProgramTargets(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === 'number' && Number.isFinite(v) && v > 0) out[k] = Math.round(v);
+  }
+  return out;
+}
+
+export function migrateTimedRecoveryDefault(
+  settings: Settings,
+  storage?: Pick<Storage, 'getItem' | 'setItem'> | null,
+): { settings: Settings; migrated: boolean } {
+  if (!storage) return { settings, migrated: false };
+  try {
+    if (storage.getItem(TIMED_RECOVERY_MIG_KEY)) return { settings, migrated: false };
+    const next: Settings = {
+      ...settings,
+      recoveryMode: 'timed',
+    };
+    storage.setItem(KEY, JSON.stringify(next));
+    storage.setItem(TIMED_RECOVERY_MIG_KEY, '1');
+    return { settings: next, migrated: true };
+  } catch {
+    return { settings, migrated: false };
+  }
+}
+
 function load(): Settings {
   try {
     const parsed = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<Settings>;
@@ -183,9 +215,12 @@ function load(): Settings {
       gymCamPreviewUrl: typeof parsed.gymCamPreviewUrl === 'string' && parsed.gymCamPreviewUrl.trim() ? parsed.gymCamPreviewUrl.trim() : DEFAULTS.gymCamPreviewUrl,
       gymCamPreviewUpdatedMs: typeof parsed.gymCamPreviewUpdatedMs === 'number' && Number.isFinite(parsed.gymCamPreviewUpdatedMs) ? parsed.gymCamPreviewUpdatedMs : null,
       voiceCustomAliases: sanitizeAliases(parsed.voiceCustomAliases),
+      programTargets: sanitizeProgramTargets(parsed.programTargets),
       queue: q,
     };
-    return typeof localStorage !== 'undefined' ? migrateRoomVoiceDefault(base, localStorage).settings : base;
+    if (typeof localStorage === 'undefined') return base;
+    const afterVoice = migrateRoomVoiceDefault(base, localStorage).settings;
+    return migrateTimedRecoveryDefault(afterVoice, localStorage).settings;
   } catch {
     return { ...DEFAULTS, queue: defaultQueueState() };
   }

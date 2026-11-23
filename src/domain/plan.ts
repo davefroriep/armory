@@ -265,34 +265,34 @@ function buildPhase1Steps(): PlanStep[] {
   const weeks = [
     {
       w: 1, pct: '~60%',
-      z5a: z5Slot('v5x3', 'AirBike Z5 — Classic VO2 5×3', '5m WU + 5x3m @ 53.5 RPM (220-228 W) / 2m easy. Chase HR 155+.', 30),
+      z5a: z5Slot('v5x3', 'AirBike Z5 — Classic VO2 5×3', '5m WU + 5x3m @ 55 RPM (228 W) / 2m easy. Chase HR ≥ 90%.', 30),
       mid: [z2Slot(45, 'Zone 2 Spin: 45m @ 128-130 W (82-88 RPM, HR 122-132 bpm). No impact.')],
-      z5b: [z5Slot('b6030', 'AirBike Z5 — Billat 60/30', '2x8x(60s @ 55 RPM / 30s float @ 40 RPM). Or 11.5m Z5 Snack.', 33)],
+      z5b: [z5Slot('b6030', 'AirBike Z5 — Billat 60/30', '2x8x(60s @ 56 RPM / 30s float @ 40 RPM). Or 11.5m Z5 Snack.', 33)],
     },
     {
       w: 2, pct: '~65%',
-      z5a: z5Slot('n4x4', 'AirBike Z5 — Norwegian 4×4', '5m WU + 4x4m @ 52.5-54.5 RPM (218-225 W) / 3m easy. Chase HR 155+.', 33),
+      z5a: z5Slot('n4x4', 'AirBike Z5 — Norwegian 4×4', '5m WU + 4x4m @ 54 RPM (218 W) / 3m easy. Chase HR ≥ 90%.', 33),
       mid: [z2Slot(45, 'Zone 2 Spin: 45m @ 128-130 W (82-88 RPM, HR 122-132 bpm). Final no-impact week.')],
-      z5b: [z5Slot('v5x3', 'AirBike Z5 — Classic VO2 5×3', '5m WU + 5x3m @ 53.5 RPM / 2m easy. Or 10.5m express Z5 snack.', 30)],
+      z5b: [z5Slot('v5x3', 'AirBike Z5 — Classic VO2 5×3', '5m WU + 5x3m @ 55 RPM (228 W) / 2m easy. Or 10.5m express Z5 snack.', 30)],
     },
     {
       w: 3, pct: '~70%',
-      z5a: z5Slot('n4x4', 'AirBike Z5 — Norwegian 4×4', '5m WU + 4x4m @ 52.5-54.5 RPM / 3m easy. Chase HR 155+.', 33),
+      z5a: z5Slot('n4x4', 'AirBike Z5 — Norwegian 4×4', '5m WU + 4x4m @ 54 RPM (218 W) / 3m easy. Chase HR ≥ 90%.', 33),
       mid: [
         runSlot('Treadmill Galloway 30s/90s (20m)', 20, 'FIRST GALLOWAY: 30s easy jog / 90s walk x 10 @ 0.5-1% incline, 170-180 spm.'),
         z2Slot(25, 'Zone 2 Spin Top-Off: 25m @ 128-130 W (82-88 RPM, HR 122-132 bpm).'),
       ],
-      z5b: [z5Slot('b6030', 'AirBike Z5 — Billat 60/30', '2x8x(60s @ 55 RPM / 30s float @ 40 RPM).', 33)],
+      z5b: [z5Slot('b6030', 'AirBike Z5 — Billat 60/30', '2x8x(60s @ 56 RPM / 30s float @ 40 RPM).', 33)],
     },
     {
       w: 4, pct: '~75%',
-      z5a: z5Slot('n4x4', 'AirBike Z5 — Norwegian 4×4', '5m WU + 4x4m @ 52.5-54.5 RPM / 3m easy. Chase HR 155+.', 33),
+      z5a: z5Slot('n4x4', 'AirBike Z5 — Norwegian 4×4', '5m WU + 4x4m @ 54 RPM (218 W) / 3m easy. Chase HR ≥ 90%.', 33),
       mid: [
         runSlot('Treadmill Galloway 30s/60s (28m)', 28, 'Galloway 30s jog / 60s walk for 28m, 170-180 spm.'),
         z2Slot(20, 'Zone 2 Spin Top-Off: 20m @ 128-130 W (82-88 RPM, HR 122-132 bpm).'),
       ],
       z5b: [
-        z5Slot('v5x3', 'AirBike Z5 — Classic VO2 5×3', '5m WU + 5x3m @ 53.5 RPM / 2m easy.', 30),
+        z5Slot('v5x3', 'AirBike Z5 — Classic VO2 5×3', '5m WU + 5x3m @ 55 RPM (228 W) / 2m easy.', 30),
         runSlot('Treadmill Galloway Shakeout (15m)', 15, 'Easy Galloway 30s jog / 60s walk (15m) shakeout.'),
       ],
     },

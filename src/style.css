@@ -91,7 +91,7 @@ a.cal-empty { color: var(--blue); }
 .free small { grid-area: s; color: var(--mut); font-size: .8rem; }
 .free i { grid-area: c; font-style: normal; font-size: 1.8rem; color: var(--mut); }
 .progs { display: flex; flex-direction: column; gap: 10px; }
-.prog { background: var(--card); border-radius: 16px; padding: 13px 15px; display: flex; flex-direction: column; gap: 5px; border-left: 4px solid var(--blue); transition: transform .1s; }
+.prog { background: var(--card); border-radius: 16px; padding: 13px 15px; display: flex; flex-direction: column; gap: 5px; border-left: 4px solid var(--blue); transition: transform .1s; text-align: left; width: 100%; }
 .prog:active { transform: scale(.985); }
 .prog.z2 { border-left-color: var(--green); }
 .prog.z5 { border-left-color: var(--red); }
@@ -539,3 +539,28 @@ a.metro { text-decoration: none; }
 .vx-ex { padding: 4px 9px; border-radius: 999px; background: var(--card2); border: 1px solid var(--line); font-size: .73rem; font-weight: 700; color: #cbd5e1; }
 .vx-ex:active { background: rgba(30, 155, 255, .2); border-color: var(--blue); }
 .vx-ex.custom { background: rgba(30, 155, 255, .14); border-color: rgba(30, 155, 255, .48); color: #93c5fd; }
+
+/* ---------- Cardio Guest Mode & Summary Auto-Progression ---------- */
+.sec-acts { display: flex; align-items: center; gap: 8px; }
+.btn.guest-on { background: rgba(245, 158, 11, .2); color: #fcd34d; box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .55); }
+.guest-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: rgba(245, 158, 11, .11); box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .45); }
+.guest-banner b { display: block; font-size: .82rem; letter-spacing: .08em; color: #fcd34d; }
+.guest-banner small { display: block; color: var(--mut); font-size: .76rem; margin-top: 2px; line-height: 1.3; }
+.guest-strip { margin: 0 16px 8px; padding: 5px 10px; border-radius: 999px; background: rgba(245, 158, 11, .14); box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .42); color: #fcd34d; font-size: .68rem; font-weight: 800; letter-spacing: .09em; text-align: center; }
+.guest-ref { font-size: .84rem; color: var(--mut); }
+.guest-ref b { color: #fff; }
+.guest-tgt-val { display: flex; align-items: baseline; justify-content: center; gap: 10px; padding: 12px; border-radius: 16px; background: var(--card2); font-variant-numeric: tabular-nums; }
+.guest-tgt-val b { font-size: 2.15rem; font-weight: 900; color: #fff; }
+.guest-tgt-val small { font-size: 1rem; font-weight: 800; color: var(--blue); }
+.guest-tgt-btns { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.guest-tgt-btns button { height: 48px; border-radius: 12px; background: var(--card2); color: #fff; font-weight: 800; font-size: .95rem; font-variant-numeric: tabular-nums; box-shadow: inset 0 0 0 1px var(--line); }
+.guest-tgt-btns button:active { background: rgba(30, 155, 255, .2); border-color: var(--blue); }
+.prog-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 13px; background: rgba(30, 155, 255, .12); box-shadow: inset 0 0 0 1px rgba(30, 155, 255, .4); cursor: pointer; }
+.prog-card.bump, .prog-card.adopt { background: rgba(34, 197, 94, .12); box-shadow: inset 0 0 0 1px rgba(34, 197, 94, .42); }
+.prog-card.ease { background: rgba(245, 158, 11, .11); box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .4); }
+.prog-txt { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.prog-txt b { font-size: .88rem; color: #fff; }
+.prog-txt small { font-size: .74rem; color: var(--mut); line-height: 1.3; }
+.prog-card input[type=checkbox] { width: 22px; height: 22px; accent-color: var(--green); flex: none; }
+.prog-note { text-align: center; padding: 8px 12px; border-radius: 12px; background: var(--card); font-size: .8rem; font-weight: 700; color: var(--green); }
+.status.guest-stat { color: #fcd34d; box-shadow: inset 0 0 0 1px rgba(245, 158, 11, .35); }

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('../src/store/db', () => ({ putMeta: vi.fn(), putSample: vi.fn() }));
+const mocks = vi.hoisted(() => ({ putMeta: vi.fn(), putSample: vi.fn() }));
+vi.mock('../src/store/db', () => mocks);
 
 import { ageOn, bodyProfile, kcalFromSamples, keytelKcalPerMin } from '../src/domain/energy';
 import { buildTcx } from '../src/domain/tcx';
@@ -155,5 +156,20 @@ describe('HR-based calories (Keytel et al. 2005)', () => {
     rec.tick(0, 0, now);
     expect(rec.lastDist).toBe(235);
     expect(rec.lastKcal).toBe(17);
+  });
+
+  it('counts Z5 bank at >= 90% HRmax and skips IndexedDB writes when persist is false (Guest Mode)', () => {
+    mocks.putMeta.mockClear();
+    mocks.putSample.mockClear();
+    pushHr(161, T0);
+    pushHr(162, T0 + 1000);
+    pushHr(165, T0 + 2000);
+    const guestRec = new Recorder('guest-1', 'airbike', 'v5x3', 'Guest · AirBike Z5', null, 180, undefined, null, false);
+    guestRec.tick(2, 55, T0 + 2000);
+    expect(guestRec.z5Seconds).toBe(2); // 162 & 165 (>= 90% of 180), not 161
+    const meta = guestRec.finalize();
+    expect(meta.seconds).toBe(3);
+    expect(mocks.putMeta).not.toHaveBeenCalled();
+    expect(mocks.putSample).not.toHaveBeenCalled();
   });
 });
