@@ -244,6 +244,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "go back",
         "open the gym",
         "close the gym",
+        "shut down",
         "SmartSpin TV",
         "Fire TV Cube",
         "wallboard",
@@ -278,6 +279,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
     hotwords = ", ".join([
         wake, "check", "done", "skip rest", "next exercise", "add set", "undo", "back",
         "rack", "smith", "replay", "play music", "lights", "PR",
+        "open the gym", "close the gym", "shut down",
         *extras[:6],
     ])
     return prompt, hotwords

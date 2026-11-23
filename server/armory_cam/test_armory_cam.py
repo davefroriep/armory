@@ -1762,6 +1762,9 @@ class ArmoryCamTests(unittest.TestCase):
         prompt, hotwords = rv.build_whisper_prompt("armory", ["Barbell Bench Press", "Smith Machine Row"])
         self.assertIn("Barbell Bench Press", prompt)
         self.assertIn("Smith Machine Row", hotwords)
+        self.assertIn("open the gym", hotwords)
+        self.assertIn("close the gym", hotwords)
+        self.assertIn("shut down", hotwords)
 
         fake_devs = {
             "inputs": [
@@ -2298,6 +2301,22 @@ class ArmoryCamTests(unittest.TestCase):
 
         self.assertEqual(dc.parse_display_voice_command("Armory, open the gym"), {"target": "open_gym", "targets": ["open_gym"], "action": "run", "speech": "", "silent": True})
         self.assertEqual(dc.parse_display_voice_command("Armory, close the gym"), {"target": "close_gym", "targets": ["close_gym"], "action": "run", "speech": "", "silent": True})
+        for close_phrase in (
+            "Armory, shut down",
+            "Armory, close gym",
+            "Armory, close up",
+            "Armory, clothes the gym",
+            "Armory, first the gym",
+        ):
+            self.assertEqual(
+                dc.parse_display_voice_command(close_phrase),
+                {"target": "close_gym", "targets": ["close_gym"], "action": "run", "speech": "", "silent": True},
+                msg=close_phrase,
+            )
+        self.assertEqual(
+            dc.parse_display_voice_command("Armory, shut down TV"),
+            {"target": "tv", "targets": ["tv"], "action": "off", "speech": "TV off"},
+        )
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV"), {"target": "tv", "targets": ["tv"], "action": "on", "speech": "TV on"})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on SmartSpin TV"), {"target": "spin", "targets": ["spin"], "action": "on", "speech": "SmartSpin TV on"})
         self.assertEqual(dc.parse_display_voice_command("Armory, turn on TV and SmartSpin TV"), {"target": "multi", "targets": ["tv", "spin"], "action": "on", "speech": "TV and SmartSpin TV on"})

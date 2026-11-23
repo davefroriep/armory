@@ -525,7 +525,9 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
             "silent": True,
         }
     if re.search(
-        r"\b(?:close|shut\s*(?:down|off)|turn\s+off)\s+(?:the\s+)?gym\b|\bgym\s+off$",
+        r"\b(?:close[ds]?|clothes?|cloze|flows|first|shut\s*(?:down|off)|power\s*(?:down|off)|turn\s+off)\s+(?:(?:the|this)\s+)?gym\b"
+        r"|\bgym\s+off$"
+        r"|^(?:please\s+)?(?:shut\s*down|shutdown|power\s+down|close\s+up|close\s+(?:it\s+)?down)(?:\s+(?:now|please))?$",
         cmd,
     ):
         return {
