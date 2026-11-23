@@ -693,6 +693,8 @@ class ShowSpec:
     intro_start_sec: float = 2.3
     exclude_main_tv: bool = False
     theater_scene: str = ""
+    dj_seamless_intro: bool = False
+    dj_drop_sec: float = 0.0
     speech_cues: list[dict[str, Any]] = field(default_factory=list)
     fx_cues: list[dict[str, Any]] = field(default_factory=list)
 
@@ -758,6 +760,8 @@ class ShowSpec:
             "introStartSec": round(float(self.intro_start_sec), 2),
             "excludeMainTv": bool(self.exclude_main_tv),
             "theaterScene": self.theater_scene,
+            "djSeamlessIntro": bool(self.dj_seamless_intro),
+            "djDropSec": round(float(self.dj_drop_sec), 2),
             "speechCues": list(self.speech_cues),
             "fxCues": list(self.fx_cues),
         }
@@ -891,6 +895,8 @@ class ShowSpec:
             intro_start_sec=_clamp(_f("introStartSec", 2.3), 0.0, 15.0),
             exclude_main_tv=bool(raw.get("excludeMainTv", False)),
             theater_scene=t_scene,
+            dj_seamless_intro=bool(raw.get("djSeamlessIntro", False)),
+            dj_drop_sec=_clamp(_f("djDropSec", 0.0), 0.0, 20.0),
             speech_cues=speech_cues,
             fx_cues=fx_cues,
         )
@@ -949,19 +955,21 @@ def default_shows() -> list[ShowSpec]:
             cube_mode="duck",
             overlay_gain=1.0,
             announcer_text=(
-                "Ladies and gentlemen! Straight out of Brick, New Jersey... "
-                "the Plow Bolt King of Toms River... Matthew... Cookson!!"
+                "[excited] Straight out of Brick, New Jersey! "
+                "The Plow Bolt King of Toms River! [shouting] MATTHEW COOKSON!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
-            announcer_rate="-8%",
-            announcer_pitch="-4Hz",
+            announcer_rate="-4%",
+            announcer_pitch="",
             demo_style="boombap",
             song_start_sec=0.0,
-            song_duration_sec=20.0,
-            fade_out_sec=2.8,
+            song_duration_sec=21.47,
+            fade_out_sec=2.2,
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
+            voice_reverb_wet=0.11,
+            voice_boost_db=2.0,
             theater_scene="walkin",
         ),
         ShowSpec(
@@ -1034,8 +1042,7 @@ def default_shows() -> list[ShowSpec]:
             cube_mode="takeover",
             overlay_gain=1.0,
             announcer_text=(
-                "Ladies and gentlemen! ... Clear the floor! ... "
-                "Headlining tonight at The Armory... the one, the only... JENNA!!"
+                "[excited] Clear the floor! Headlining tonight at The Armory! [shouting] JENNA!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
             announcer_rate="-4%",
@@ -1043,7 +1050,7 @@ def default_shows() -> list[ShowSpec]:
             demo_style="hype",
             song_start_sec=0.0,
             song_duration_sec=0.0,
-            fade_out_sec=2.2,
+            fade_out_sec=2.0,
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
@@ -1053,18 +1060,20 @@ def default_shows() -> list[ShowSpec]:
             trigger_fog=True,
             fog_burst_sec=3.5,
             lightning_flash_sec=0.0,
-            intro_start_sec=0.4,
+            intro_start_sec=0.15,
             youtube_url="https://www.youtube.com/watch?v=aOt4xRE05wQ",
             video_source_file="jenna_walkin_video.mp4",
             three_screen_video=True,
-            video_hold_sec=42.0,
-            voice_reverb_wet=0.06,
+            video_hold_sec=28.72,
+            voice_reverb_wet=0.10,
             voice_boost_db=2.0,
             voice_style=(
                 "Charismatic MTV VMA and Super Bowl Halftime live concert host. "
                 "Electric, stylish, rockstar energy, exploding with excitement on JENNA."
             ),
             theater_scene="jenna",
+            dj_seamless_intro=True,
+            dj_drop_sec=5.67,
         ),
         ShowSpec(
             id="avenleigh_walkin",
@@ -1086,8 +1095,7 @@ def default_shows() -> list[ShowSpec]:
             cube_mode="takeover",
             overlay_gain=1.0,
             announcer_text=(
-                "Put your hands together! ... Live on the VIP stage... "
-                "the star of the show... AVENLEIGH!!"
+                "[excited] Hands up! Live on the VIP stage, the star of the show! [shouting] Avinlee!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
             announcer_rate="-4%",
@@ -1095,7 +1103,7 @@ def default_shows() -> list[ShowSpec]:
             demo_style="hype",
             song_start_sec=0.0,
             song_duration_sec=0.0,
-            fade_out_sec=2.2,
+            fade_out_sec=1.8,
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
@@ -1105,18 +1113,20 @@ def default_shows() -> list[ShowSpec]:
             trigger_fog=True,
             fog_burst_sec=3.5,
             lightning_flash_sec=0.0,
-            intro_start_sec=0.4,
+            intro_start_sec=0.15,
             youtube_url="https://www.youtube.com/shorts/ET3HB1xzx14",
             video_source_file="avenleigh_walkin_video.mp4",
             three_screen_video=True,
-            video_hold_sec=45.0,
-            voice_reverb_wet=0.05,
+            video_hold_sec=37.07,
+            voice_reverb_wet=0.09,
             voice_boost_db=2.0,
             voice_style=(
                 "Warm, joyful, sparkling pop-concert arena MC welcoming a young superstar "
                 "onto a bright pink VIP dance stage. Upbeat, enthusiastic, fun."
             ),
             theater_scene="avenleigh",
+            dj_seamless_intro=True,
+            dj_drop_sec=7.34,
         ),
         ShowSpec(
             id="jared_mark_walkin",
@@ -1136,16 +1146,15 @@ def default_shows() -> list[ShowSpec]:
             cube_mode="takeover",
             overlay_gain=1.0,
             announcer_text=(
-                "Ladies and gentlemen! ... Lights down, volume up! ... "
-                "Stepping into The Armory... your guests of honor... JARED... and MARK!!"
+                "[excited] Lights down, volume up! Your guests of honor at The Armory! [shouting] JARED and MARK!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
-            announcer_rate="-5%",
+            announcer_rate="-4%",
             announcer_pitch="",
             demo_style="anthem",
             song_start_sec=0.0,
             song_duration_sec=0.0,
-            fade_out_sec=2.5,
+            fade_out_sec=2.2,
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
@@ -1155,18 +1164,20 @@ def default_shows() -> list[ShowSpec]:
             trigger_fog=True,
             fog_burst_sec=3.5,
             lightning_flash_sec=0.0,
-            intro_start_sec=0.4,
+            intro_start_sec=0.15,
             youtube_url="https://www.youtube.com/watch?v=id2-K3daNRQ",
             video_source_file="jared_mark_prism_video.mp4",
             three_screen_video=True,
-            video_hold_sec=42.0,
-            voice_reverb_wet=0.05,
+            video_hold_sec=42.89,
+            voice_reverb_wet=0.10,
             voice_boost_db=2.0,
             voice_style=(
                 "Sleek, classy, celebratory prime-time awards-show host. "
                 "Warm, charismatic, high-energy welcome without sports-announcer cliches."
             ),
             theater_scene="vip_prism",
+            dj_seamless_intro=True,
+            dj_drop_sec=6.80,
         ),
         ShowSpec(
             id="jared_mark_vip",
@@ -1183,16 +1194,15 @@ def default_shows() -> list[ShowSpec]:
             cube_mode="takeover",
             overlay_gain=1.0,
             announcer_text=(
-                "Ladies and gentlemen! ... Roll out the red carpet! ... "
-                "The VIPs have officially entered the building... give it up for JARED... and MARK!!"
+                "[excited] Roll out the red carpet! Welcome to The Armory, [shouting] JARED and MARK!!"
             ),
             announcer_voice=DEFAULT_ANNOUNCER_VOICE,
-            announcer_rate="-5%",
+            announcer_rate="-4%",
             announcer_pitch="",
             demo_style="anthem",
             song_start_sec=0.0,
             song_duration_sec=0.0,
-            fade_out_sec=2.5,
+            fade_out_sec=2.2,
             trim_leading_silence=True,
             add_cheer=True,
             cheer_delay_sec=0.0,
@@ -1202,18 +1212,20 @@ def default_shows() -> list[ShowSpec]:
             trigger_fog=True,
             fog_burst_sec=3.5,
             lightning_flash_sec=0.0,
-            intro_start_sec=0.4,
+            intro_start_sec=0.15,
             youtube_url="https://www.youtube.com/watch?v=id2-K3daNRQ",
             video_source_file="jared_mark_vip_video.mp4",
             three_screen_video=True,
-            video_hold_sec=42.0,
-            voice_reverb_wet=0.05,
+            video_hold_sec=42.89,
+            voice_reverb_wet=0.10,
             voice_boost_db=2.0,
             voice_style=(
                 "Glamorous red-carpet gala and VIP lounge host. "
                 "Smooth, upbeat, genuinely warm and celebratory."
             ),
             theater_scene="vip_gold",
+            dj_seamless_intro=True,
+            dj_drop_sec=6.80,
         ),
         ShowSpec(
             id="gabe_walkin",
@@ -2011,7 +2023,7 @@ def master_announcer_stereo(
         if pk2 > 0.90:
             stereo *= 0.90 / pk2
 
-    return trim_edge_silence_stereo(stereo.astype(np.float32), sr=target_sr, thresh=0.008, pad_lead_ms=10.0, pad_tail_ms=90.0)
+    return trim_edge_silence_stereo(stereo.astype(np.float32), sr=target_sr, thresh=0.003, pad_lead_ms=10.0, pad_tail_ms=90.0)
 
 
 def duck_bed_under_speech(
@@ -2023,23 +2035,61 @@ def duck_bed_under_speech(
     duck_gain: float = 0.16,
     base_gain: float = 0.85,
 ) -> np.ndarray:
-    """Smoothly duck thunder/crowd bed `-16 dB` whenever speech is speaking so every syllable dominates."""
+    """Broadcast/DJ sidechain ducker: 70ms lookahead attack, 650ms hold, 650ms smooth release."""
     out = bed.copy()
-    if out.shape[0] == 0 or speech.shape[0] == 0:
-        return out * float(base_gain)
-    sp_env_full = np.zeros(out.shape[0], dtype=np.float32)
+    n_out = out.shape[0]
+    if n_out == 0 or speech.shape[0] == 0:
+        return (out * float(base_gain)).astype(np.float32)
+
+    sp_abs_full = np.zeros(n_out, dtype=np.float32)
     s0 = max(0, int(speech_offset_samples))
-    avail = min(speech.shape[0], out.shape[0] - s0)
+    avail = min(speech.shape[0], n_out - s0)
     if avail > 0:
-        sp_abs = np.max(np.abs(speech[:avail]), axis=1)
-        sos_env = butter(1, 4.5, btype="lowpass", fs=sr, output="sos")
-        smooth = sosfilt(sos_env, sp_abs).astype(np.float32)
-        sp_env_full[s0 : s0 + avail] = smooth
-    # Normalize speech envelope into [0, 1] duck control signal (active above gentle speech floor)
-    gate = np.clip((sp_env_full - 0.015) / 0.065, 0.0, 1.0)
-    # Zero-phase forward-backward smoothing so duck dips slightly BEFORE each word
-    sos_sm = butter(1, 5.5, btype="lowpass", fs=sr, output="sos")
-    gate = np.clip(sosfilt(sos_sm, gate[::-1])[::-1], 0.0, 1.0)
+        sp_abs_full[s0 : s0 + avail] = np.max(np.abs(speech[:avail]), axis=1)
+
+    # Downsample to 100 Hz (10 ms blocks) for hold-and-release broadcast dynamics
+    hop = max(1, int(round(0.010 * sr)))
+    n_blk = max(1, int(math.ceil(float(n_out) / float(hop))))
+    pad_len = n_blk * hop - n_out
+    env_padded = np.pad(sp_abs_full, (0, pad_len)) if pad_len > 0 else sp_abs_full[: n_blk * hop]
+    blk_peak = env_padded.reshape(n_blk, hop).max(axis=1)
+
+    active = np.clip((blk_peak - 0.015) / 0.045, 0.0, 1.0)
+    held = active.copy()
+
+    # 70 ms lookahead pre-dip so initial speech consonants stay clear
+    ahead_blks = max(1, int(round(0.070 / 0.010)))
+    for sh in range(1, min(n_blk, ahead_blks + 1)):
+        held[:-sh] = np.maximum(held[:-sh], active[sh:])
+
+    # 650 ms hold dilation across commas, breaths, and dramatic gaps
+    hold_blks = max(1, int(round(0.650 / 0.010)))
+    hold_rem = 0
+    hold_lvl = 0.0
+    for idx in range(n_blk):
+        cur_v = float(held[idx])
+        if cur_v >= 0.25:
+            hold_lvl = max(cur_v, hold_lvl * 0.96 if hold_rem > 0 else cur_v)
+            hold_rem = hold_blks
+            held[idx] = max(cur_v, hold_lvl)
+        elif hold_rem > 0:
+            held[idx] = max(cur_v, hold_lvl)
+            hold_rem -= 1
+
+    # Asymmetric smoothing: ~70ms attack, ~650ms silky release
+    gate_blk = np.zeros(n_blk, dtype=np.float32)
+    alpha_atk = 1.0 - math.exp(-0.010 / 0.024)
+    alpha_rel = 1.0 - math.exp(-0.010 / 0.220)
+    g_cur = 0.0
+    for idx in range(n_blk):
+        tgt = float(held[idx])
+        a = alpha_atk if tgt >= g_cur else alpha_rel
+        g_cur = g_cur + a * (tgt - g_cur)
+        gate_blk[idx] = g_cur
+
+    t_blk = (np.arange(n_blk, dtype=np.float32) + 0.5) * float(hop)
+    t_samp = np.arange(n_out, dtype=np.float32)
+    gate = np.interp(t_samp, t_blk, gate_blk).astype(np.float32)
     gain_curve = (float(base_gain) - gate * (float(base_gain) - float(duck_gain))).astype(np.float32)
     return (out * gain_curve[:, None]).astype(np.float32)
 
@@ -2095,10 +2145,11 @@ def _decode_wav_bytes_mono(wav_bytes: bytes, *, target_sr: int = 24_000) -> np.n
 def _trim_mono_edges(seg: np.ndarray, sr: int = 24_000) -> np.ndarray:
     if seg.size == 0:
         return seg
-    nz = np.flatnonzero(np.abs(seg) >= 0.008)
+    nz = np.flatnonzero(np.abs(seg) >= 0.003)
     if nz.size:
-        pad = int(0.02 * sr)
-        return seg[max(0, int(nz[0]) - pad) : min(seg.size, int(nz[-1]) + pad)].astype(np.float32)
+        pad_lead = int(0.025 * sr)
+        pad_tail = int(0.085 * sr)
+        return seg[max(0, int(nz[0]) - pad_lead) : min(seg.size, int(nz[-1]) + pad_tail)].astype(np.float32)
     return seg.astype(np.float32)
 
 
@@ -2538,16 +2589,19 @@ def decode_and_trim_song_file(
     dur = max(1.0, float(duration_sec or 15.0))
     start = max(0.0, float(start_sec or 0.0))
 
-    if src_path.suffix.lower() == ".wav" and not ffmpeg_bin:
+    pcm = np.zeros((0, 2), dtype=np.float32)
+    if src_path.suffix.lower() == ".wav":
         pcm = read_wav_stereo_float(src_path, target_sr=SHOW_SR)
-        s0 = int(round(start * SHOW_SR))
-        pcm = pcm[s0:]
-        if trim_leading_silence:
-            pcm = trim_edge_silence_stereo(pcm, sr=SHOW_SR, thresh=0.015, pad_lead_ms=8.0, pad_tail_ms=0.0)
-        max_n = int(round(dur * SHOW_SR))
-        if pcm.shape[0] > max_n:
-            pcm = pcm[:max_n]
-    elif ffmpeg_bin:
+        if pcm.shape[0] > 0:
+            s0 = int(round(start * SHOW_SR))
+            pcm = pcm[s0:]
+            if trim_leading_silence:
+                pcm = trim_edge_silence_stereo(pcm, sr=SHOW_SR, thresh=0.015, pad_lead_ms=8.0, pad_tail_ms=0.0)
+            max_n = int(round(dur * SHOW_SR))
+            if pcm.shape[0] > max_n:
+                pcm = pcm[:max_n]
+
+    if pcm.shape[0] == 0 and ffmpeg_bin:
         tmp_out = src_path.parent / f".decode_{threading.get_ident()}_{int(time.time() * 1000)}.wav"
         try:
             cmd = [ffmpeg_bin, "-y"]
@@ -2592,7 +2646,7 @@ def decode_and_trim_song_file(
                 tmp_out.unlink(missing_ok=True)
             except Exception:
                 pass
-    else:
+    elif pcm.shape[0] == 0 and src_path.suffix.lower() != ".wav":
         raise RuntimeError("FFmpeg is required to decode compressed audio files (.mp3/.m4a/.ogg)")
 
     if pcm.shape[0] == 0:
@@ -2600,6 +2654,8 @@ def decode_and_trim_song_file(
     peak = float(np.max(np.abs(pcm)))
     if peak > 1e-6:
         pcm = (pcm * (0.88 / peak)).astype(np.float32)
+    if float(fade_out_sec) <= 0.01:
+        return pcm.astype(np.float32)
     return apply_fade_out_stereo(pcm, sr=SHOW_SR, fade_out_sec=fade_out_sec)
 
 
@@ -3593,8 +3649,175 @@ class ShowDirector:
         res = self.update_show(sid, {"videoSourceFile": target_name}, rebuild=True)
         return {**res, "videoSourceFile": target_name}
 
+    def _mix_dj_seamless_audio(
+        self,
+        spec: ShowSpec,
+        ent_pcm: np.ndarray,
+        *,
+        sr: int = STAGE_VIDEO_SR,
+    ) -> tuple[np.ndarray, float]:
+        """Mix live studio announcer + smooth stadium roar cleanly over a DJ buildup -> beat-drop slam."""
+        if ent_pcm.shape[0] == 0:
+            return ent_pcm.copy(), 0.0
+        total_n = ent_pcm.shape[0]
+        total_sec = float(total_n) / float(sr)
+        max_drop = max(0.8, total_sec - 0.35)
+        drop_s = min(_clamp(float(spec.dj_drop_sec or 3.8), 0.8, 20.0), max_drop)
+        drop_n = max(int(round(0.4 * sr)), min(total_n - 1, int(round(drop_s * sr))))
+
+        ann_44k = self._get_announcer_stem(spec, suffix="announcer")
+        ann_pcm = resample_stereo_pcm(ann_44k, SHOW_SR, sr) if (ann_44k is not None and ann_44k.shape[0] > 0) else np.zeros((0, 2), dtype=np.float32)
+        if ann_pcm.shape[0] > 0:
+            ann_pcm = trim_edge_silence_stereo(ann_pcm, sr=sr, thresh=0.003, pad_lead_ms=10.0, pad_tail_ms=85.0)
+        ann_off = 0
+        if ann_pcm.shape[0] > 0:
+            target_end = max(int(round(0.25 * sr)), drop_n - int(round(0.06 * sr)))
+            ann_off = max(int(round(0.08 * sr)), target_end - ann_pcm.shape[0])
+
+        # DJ fader curve: steady 0.28 (-11 dB) during buildup -> crisp 140ms S-curve slam to 1.00 right at drop_n
+        fader = np.ones(total_n, dtype=np.float32)
+        slam_n = min(drop_n // 2, max(16, int(round(0.14 * sr))))
+        hold_end = max(0, drop_n - slam_n)
+        fader[:hold_end] = 0.28
+        click_n = min(hold_end, int(round(0.020 * sr)))
+        if click_n > 2:
+            fader[:click_n] = np.linspace(0.0, 0.28, click_n, dtype=np.float32)
+        if drop_n > hold_end:
+            u = np.linspace(0.0, 1.0, drop_n - hold_end, dtype=np.float32)
+            fader[hold_end:drop_n] = 0.28 + 0.72 * 0.5 * (1.0 - np.cos(math.pi * u))
+        mixed = (ent_pcm * fader[:, None]).astype(np.float32)
+
+        # Steady stadium bed under speech (zero choppy word-pumping) -> celebratory roar on drop -> silky fade
+        if spec.add_cheer:
+            c_len = min(total_sec, drop_s + 2.5)
+            cheer = load_studio_fx_stereo(
+                self.fx_dir,
+                "stadium_crowd.wav",
+                c_len,
+                allow_default_fallback=self.allow_network,
+                swell_sec=0.25,
+                fade_out_sec=1.9,
+                sr=sr,
+            )
+            if cheer is None:
+                cheer = synth_crowd_cheer_stereo(c_len, sr=sr, swell_sec=0.25, fade_out_sec=1.9)
+            c_n = min(cheer.shape[0], total_n)
+            if c_n > 16:
+                c_env = np.zeros(c_n, dtype=np.float32)
+                fi_n = min(c_n, int(round(0.18 * sr)))
+                sw_s = max(fi_n, min(c_n, drop_n - int(round(0.16 * sr))))
+                sw_e = max(sw_s + 1, min(c_n, drop_n + int(round(0.12 * sr))))
+                if fi_n > 1:
+                    c_env[:fi_n] = np.linspace(0.0, 0.15, fi_n, dtype=np.float32)
+                if sw_s > fi_n:
+                    c_env[fi_n:sw_s] = 0.15
+                if sw_e > sw_s:
+                    u_sw = np.linspace(0.0, 1.0, sw_e - sw_s, dtype=np.float32)
+                    c_env[sw_s:sw_e] = 0.15 + 0.27 * 0.5 * (1.0 - np.cos(math.pi * u_sw))
+                if c_n > sw_e:
+                    u_dc = np.linspace(0.0, 1.0, c_n - sw_e, dtype=np.float32)
+                    c_env[sw_e:] = 0.42 * (np.cos(0.5 * math.pi * u_dc) ** 2)
+                mix_into(mixed, cheer[:c_n] * c_env[:, None], 0, gain=1.0)
+
+        if ann_pcm.shape[0] > 0:
+            mix_into(mixed, ann_pcm, ann_off, gain=1.0)
+
+        pk = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+        if pk > 0.94:
+            mixed = (mixed * (0.92 / pk)).astype(np.float32)
+        return mixed, round(drop_s, 3)
+
+    def _build_norm_source_mezzanine(self, src_vid: Path, stamp: str) -> tuple[Path, bool]:
+        """Cache a clean 1080p H.264 Main L4.0 30fps (-bf 0) mezzanine once per source video."""
+        vid_key = hashlib.sha1(
+            f"v1|{src_vid.name}|{src_vid.stat().st_size}|{int(src_vid.stat().st_mtime_ns)}".encode("utf-8")
+        ).hexdigest()[:12]
+        norm_src_mp4 = self.rendered_dir / f".norm_{vid_key}.mp4"
+        if norm_src_mp4.is_file() and norm_src_mp4.stat().st_size > 1000:
+            return norm_src_mp4, True
+        tmp_norm = self.rendered_dir / f".norm_{vid_key}_{stamp}.tmp.mp4"
+        try:
+            n_proc = subprocess.run(
+                [
+                    self.ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    str(src_vid),
+                    "-an",
+                    "-vf",
+                    (
+                        "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p"
+                    ),
+                    "-c:v",
+                    "libx264",
+                    "-profile:v",
+                    "main",
+                    "-level:v",
+                    "4.0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-r",
+                    "30",
+                    "-g",
+                    "60",
+                    "-bf",
+                    "0",
+                    "-video_track_timescale",
+                    "90000",
+                    "-crf",
+                    "21",
+                    "-preset",
+                    "veryfast",
+                    str(tmp_norm),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=300,
+                **_no_window_kwargs(),
+            )
+            if n_proc.returncode == 0 and tmp_norm.is_file() and tmp_norm.stat().st_size > 1000:
+                tmp_norm.replace(norm_src_mp4)
+                return norm_src_mp4, True
+        finally:
+            try:
+                tmp_norm.unlink(missing_ok=True)
+            except Exception:
+                pass
+        return norm_src_mp4, False
+
+    def _extract_source_video_audio(self, src_vid: Path, tmp_wav: Path, *, target_sr: int, max_sec: float | None = None) -> tuple[np.ndarray, float]:
+        """Decode source MP4 soundtrack cleanly to stereo float32 PCM + probed duration."""
+        cmd = [self.ffmpeg_bin, "-y", "-i", str(src_vid)]
+        if max_sec is not None and max_sec > 0.2:
+            cmd += ["-t", f"{float(max_sec):.2f}"]
+        cmd += ["-vn", "-ar", str(int(target_sr)), "-ac", "2", "-c:a", "pcm_s16le", str(tmp_wav)]
+        ext_proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60, **_no_window_kwargs())
+        src_vid_dur = _probe_media_duration_sec(src_vid, self.ffmpeg_bin)
+        if ext_proc.returncode == 0 and tmp_wav.is_file() and tmp_wav.stat().st_size > 100:
+            ent_pcm = read_wav_stereo_float(tmp_wav, target_sr=target_sr)
+        else:
+            fallback_dur = min(max_sec, src_vid_dur) if max_sec else src_vid_dur
+            ent_pcm = np.zeros((max(int(target_sr), int(round(max(1.0, fallback_dur) * target_sr))), 2), dtype=np.float32)
+
+        dur = src_vid_dur if src_vid_dur > 0.2 else (float(ent_pcm.shape[0]) / float(target_sr))
+        if max_sec is not None and max_sec > 0.2:
+            dur = min(dur, float(max_sec))
+        target_samples = max(1, int(round(dur * target_sr)))
+        if ent_pcm.shape[0] < target_samples:
+            ent_pcm = np.concatenate([ent_pcm, np.zeros((target_samples - ent_pcm.shape[0], 2), dtype=np.float32)], axis=0)
+        else:
+            ent_pcm = ent_pcm[:target_samples]
+
+        cur_rms = float(np.sqrt(np.mean(ent_pcm ** 2))) if ent_pcm.size else 0.0
+        cur_peak = float(np.max(np.abs(ent_pcm))) if ent_pcm.size else 0.0
+        if cur_rms > 1e-5 and cur_peak > 1e-5:
+            scale = min(0.22 / cur_rms, 0.88 / cur_peak)
+            ent_pcm = np.tanh(ent_pcm * scale * 1.05).astype(np.float32) * 0.92
+        return ent_pcm.astype(np.float32), dur
+
     def build_show_multimedia(self, show_id: str, *, force: bool = False) -> dict[str, Any]:
-        """Assemble self-contained 1080p H.264+AAC MP4 combining intro pulses/voice + entrance video + 1:20 ducked overlay."""
+        """Assemble self-contained 1080p H.264+AAC MP4 combining intro pulses/voice (or seamless DJ buildup) + entrance video."""
         sid = _safe_show_id(show_id)
         spec = self.get_show(sid)
         if spec is None:
@@ -3617,7 +3840,7 @@ class ShowDirector:
             has_src_vid = bool(src_vid and src_vid.is_file() and src_vid.stat().st_size > 1000)
 
             sig_parts = [
-                "v2",
+                "v3",
                 f"p={p_wav.stat().st_size}:{int(p_wav.stat().st_mtime_ns)}" if p_wav.is_file() else "p=0",
                 f"o={o_wav.stat().st_size}:{int(o_wav.stat().st_mtime_ns)}" if o_wav.is_file() else "o=0",
                 f"vid={src_vid.name}:{src_vid.stat().st_size}:{int(src_vid.stat().st_mtime_ns)}" if has_src_vid else "vid=none",
@@ -3626,6 +3849,7 @@ class ShowDirector:
                 f"fc={spec.lights_flash_count}",
                 f"ts={spec.theater_scene}",
                 f"th={int(bool(spec.add_thunder))}",
+                f"dj={int(bool(spec.dj_seamless_intro))}:{spec.dj_drop_sec:.2f}",
                 f"ov={spec.overlay_at_sec:.2f}:{spec.overlay_text}",
                 f"sc={json.dumps(spec.speech_cues, sort_keys=True)}",
             ]
@@ -3650,73 +3874,44 @@ class ShowDirector:
             tmp_mp4 = out_mp4.with_name(f"{out_mp4.stem}.tmp{out_mp4.suffix}")
 
             try:
-                intro_pcm_44k = read_wav_stereo_float(p_wav, target_sr=SHOW_SR)
-                intro_pcm_48k = resample_stereo_pcm(intro_pcm_44k, SHOW_SR, STAGE_VIDEO_SR)
-                raw_intro_dur = float(intro_pcm_48k.shape[0]) / float(STAGE_VIDEO_SR)
-
-                intro_video_dur = _generate_intro_pulse_video(
-                    intro_mp4,
-                    duration_sec=max(1.5, raw_intro_dur),
-                    lightning_sec=spec.lightning_flash_sec,
-                    flash_count=spec.lights_flash_count,
-                    tint_rgb=_intro_tint_for_scene(spec.theater_scene),
-                    ffmpeg_bin=self.ffmpeg_bin,
-                )
-                intro_target_samples = max(1, int(round(intro_video_dur * STAGE_VIDEO_SR)))
-                if intro_pcm_48k.shape[0] < intro_target_samples:
-                    pad_n = intro_target_samples - intro_pcm_48k.shape[0]
-                    intro_pcm_48k = np.concatenate(
-                        [intro_pcm_48k, np.zeros((pad_n, 2), dtype=np.float32)], axis=0
-                    )
-                else:
-                    intro_pcm_48k = intro_pcm_48k[:intro_target_samples]
-
+                use_seamless = bool(spec.dj_seamless_intro and has_src_vid and src_vid is not None)
                 src_dur = 0.0
                 overlay_dur = 0.0
                 speech_cue_timings: list[dict[str, Any]] = []
-                if has_src_vid and src_vid is not None:
-                    # Decode entrance video's audio track cleanly to 48 kHz stereo PCM
-                    ext_proc = subprocess.run(
-                        [
-                            self.ffmpeg_bin,
-                            "-y",
-                            "-i",
-                            str(src_vid),
-                            "-vn",
-                            "-ar",
-                            str(STAGE_VIDEO_SR),
-                            "-ac",
-                            "2",
-                            "-c:a",
-                            "pcm_s16le",
-                            str(src_audio_wav),
-                        ],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                        timeout=60,
-                        **_no_window_kwargs(),
-                    )
-                    src_vid_dur = _probe_media_duration_sec(src_vid, self.ffmpeg_bin)
-                    if ext_proc.returncode == 0 and src_audio_wav.is_file() and src_audio_wav.stat().st_size > 100:
-                        ent_pcm = read_wav_stereo_float(src_audio_wav, target_sr=STAGE_VIDEO_SR)
-                    else:
-                        ent_pcm = np.zeros((max(STAGE_VIDEO_SR, int(round(max(1.0, src_vid_dur) * STAGE_VIDEO_SR))), 2), dtype=np.float32)
 
-                    src_dur = src_vid_dur if src_vid_dur > 0.2 else (float(ent_pcm.shape[0]) / float(STAGE_VIDEO_SR))
-                    ent_target_samples = max(1, int(round(src_dur * STAGE_VIDEO_SR)))
-                    if ent_pcm.shape[0] < ent_target_samples:
-                        ent_pcm = np.concatenate(
-                            [ent_pcm, np.zeros((ent_target_samples - ent_pcm.shape[0], 2), dtype=np.float32)], axis=0
+                if use_seamless and src_vid is not None:
+                    ent_pcm, src_dur = self._extract_source_video_audio(src_vid, src_audio_wav, target_sr=STAGE_VIDEO_SR)
+                    ent_pcm, drop_s = self._mix_dj_seamless_audio(spec, ent_pcm, sr=STAGE_VIDEO_SR)
+                    intro_video_dur = drop_s
+                    cue_show_offset = 0.0
+                    intro_pcm_48k = np.zeros((0, 2), dtype=np.float32)
+                else:
+                    intro_pcm_44k = read_wav_stereo_float(p_wav, target_sr=SHOW_SR)
+                    intro_pcm_48k = resample_stereo_pcm(intro_pcm_44k, SHOW_SR, STAGE_VIDEO_SR)
+                    raw_intro_dur = float(intro_pcm_48k.shape[0]) / float(STAGE_VIDEO_SR)
+
+                    intro_video_dur = _generate_intro_pulse_video(
+                        intro_mp4,
+                        duration_sec=max(1.5, raw_intro_dur),
+                        lightning_sec=spec.lightning_flash_sec,
+                        flash_count=spec.lights_flash_count,
+                        tint_rgb=_intro_tint_for_scene(spec.theater_scene),
+                        ffmpeg_bin=self.ffmpeg_bin,
+                    )
+                    intro_target_samples = max(1, int(round(intro_video_dur * STAGE_VIDEO_SR)))
+                    if intro_pcm_48k.shape[0] < intro_target_samples:
+                        pad_n = intro_target_samples - intro_pcm_48k.shape[0]
+                        intro_pcm_48k = np.concatenate(
+                            [intro_pcm_48k, np.zeros((pad_n, 2), dtype=np.float32)], axis=0
                         )
                     else:
-                        ent_pcm = ent_pcm[:ent_target_samples]
+                        intro_pcm_48k = intro_pcm_48k[:intro_target_samples]
+                    cue_show_offset = intro_video_dur
+                    ent_pcm = np.zeros((0, 2), dtype=np.float32)
 
-                    # RMS match entrance soundtrack cleanly without clipping
-                    cur_rms = float(np.sqrt(np.mean(ent_pcm ** 2))) if ent_pcm.size else 0.0
-                    cur_peak = float(np.max(np.abs(ent_pcm))) if ent_pcm.size else 0.0
-                    if cur_rms > 1e-5 and cur_peak > 1e-5:
-                        scale = min(0.22 / cur_rms, 0.88 / cur_peak)
-                        ent_pcm = np.tanh(ent_pcm * scale * 1.05).astype(np.float32) * 0.92
+                if has_src_vid and src_vid is not None:
+                    if not use_seamless:
+                        ent_pcm, src_dur = self._extract_source_video_audio(src_vid, src_audio_wav, target_sr=STAGE_VIDEO_SR)
 
                     # Bake all timed video speech cues (duck soundtrack + mix voice cleanly at exact timestamps)
                     vid_cues = sorted(
@@ -3765,7 +3960,7 @@ class ShowDirector:
                                 "id": str(cue.get("id") or f"sc_{v_idx + 1}"),
                                 "target": "video",
                                 "atSec": round(cue_at, 2),
-                                "showAtSec": round(intro_video_dur + cue_at, 2),
+                                "showAtSec": round(cue_show_offset + cue_at, 2),
                                 "durSec": cue_dur,
                                 "text": str(cue["text"]),
                                 "postDenonVol": int(cue.get("postDenonVol") or 0),
@@ -3775,101 +3970,74 @@ class ShowDirector:
                         if pk_ent > 0.94:
                             ent_pcm = ent_pcm * (0.92 / pk_ent)
 
-                    master_pcm = np.concatenate([intro_pcm_48k, ent_pcm], axis=0)
+                    master_pcm = ent_pcm if use_seamless else np.concatenate([intro_pcm_48k, ent_pcm], axis=0)
                     master_wav.write_bytes(encode_stereo_pcm16_wav(master_pcm, sr=STAGE_VIDEO_SR))
 
-                    # Cache normalized 1080p H.264 Main L4.0 30fps (-bf 0) mezzanine once per source video
-                    vid_key = hashlib.sha1(
-                        f"v1|{src_vid.name}|{src_vid.stat().st_size}|{int(src_vid.stat().st_mtime_ns)}".encode("utf-8")
-                    ).hexdigest()[:12]
-                    norm_src_mp4 = self.rendered_dir / f".norm_{vid_key}.mp4"
-                    norm_ready = norm_src_mp4.is_file() and norm_src_mp4.stat().st_size > 1000
-                    if not norm_ready:
-                        tmp_norm = self.rendered_dir / f".norm_{vid_key}_{stamp}.tmp.mp4"
-                        try:
-                            n_proc = subprocess.run(
-                                [
-                                    self.ffmpeg_bin,
-                                    "-y",
-                                    "-i",
-                                    str(src_vid),
-                                    "-an",
-                                    "-vf",
-                                    (
-                                        "scale=1920:1080:force_original_aspect_ratio=decrease,"
-                                        "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p"
-                                    ),
-                                    "-c:v",
-                                    "libx264",
-                                    "-profile:v",
-                                    "main",
-                                    "-level:v",
-                                    "4.0",
-                                    "-pix_fmt",
-                                    "yuv420p",
-                                    "-r",
-                                    "30",
-                                    "-g",
-                                    "60",
-                                    "-bf",
-                                    "0",
-                                    "-video_track_timescale",
-                                    "90000",
-                                    "-crf",
-                                    "21",
-                                    "-preset",
-                                    "veryfast",
-                                    str(tmp_norm),
-                                ],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE,
-                                timeout=300,
-                                **_no_window_kwargs(),
-                            )
-                            if n_proc.returncode == 0 and tmp_norm.is_file() and tmp_norm.stat().st_size > 1000:
-                                tmp_norm.replace(norm_src_mp4)
-                                norm_ready = True
-                        finally:
-                            try:
-                                tmp_norm.unlink(missing_ok=True)
-                            except Exception:
-                                pass
+                    norm_src_mp4, norm_ready = self._build_norm_source_mezzanine(src_vid, stamp)
 
                     mux_ok = False
                     if norm_ready:
-                        p_intro_s = intro_mp4.resolve().as_posix().replace("'", r"\'")
-                        p_norm_s = norm_src_mp4.resolve().as_posix().replace("'", r"\'")
-                        concat_txt.write_text(f"file '{p_intro_s}'\nfile '{p_norm_s}'\n", encoding="utf-8")
-                        fast_cmd = [
-                            self.ffmpeg_bin,
-                            "-y",
-                            "-f",
-                            "concat",
-                            "-safe",
-                            "0",
-                            "-i",
-                            str(concat_txt),
-                            "-i",
-                            str(master_wav),
-                            "-map",
-                            "0:v",
-                            "-map",
-                            "1:a",
-                            "-c:v",
-                            "copy",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            str(STAGE_VIDEO_SR),
-                            "-ac",
-                            "2",
-                            "-movflags",
-                            "+faststart",
-                            "-shortest",
-                            str(tmp_mp4),
-                        ]
+                        if use_seamless:
+                            fast_cmd = [
+                                self.ffmpeg_bin,
+                                "-y",
+                                "-i",
+                                str(norm_src_mp4),
+                                "-i",
+                                str(master_wav),
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "1:a",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-ar",
+                                str(STAGE_VIDEO_SR),
+                                "-ac",
+                                "2",
+                                "-movflags",
+                                "+faststart",
+                                "-shortest",
+                                str(tmp_mp4),
+                            ]
+                        else:
+                            p_intro_s = intro_mp4.resolve().as_posix().replace("'", r"\'")
+                            p_norm_s = norm_src_mp4.resolve().as_posix().replace("'", r"\'")
+                            concat_txt.write_text(f"file '{p_intro_s}'\nfile '{p_norm_s}'\n", encoding="utf-8")
+                            fast_cmd = [
+                                self.ffmpeg_bin,
+                                "-y",
+                                "-f",
+                                "concat",
+                                "-safe",
+                                "0",
+                                "-i",
+                                str(concat_txt),
+                                "-i",
+                                str(master_wav),
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "1:a",
+                                "-c:v",
+                                "copy",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-ar",
+                                str(STAGE_VIDEO_SR),
+                                "-ac",
+                                "2",
+                                "-movflags",
+                                "+faststart",
+                                "-shortest",
+                                str(tmp_mp4),
+                            ]
                         mux_proc = subprocess.run(
                             fast_cmd,
                             stdout=subprocess.DEVNULL,
@@ -3880,59 +4048,110 @@ class ShowDirector:
                         mux_ok = mux_proc.returncode == 0 and tmp_mp4.is_file() and tmp_mp4.stat().st_size > 1000
 
                     if not mux_ok:
-                        fallback_cmd = [
-                            self.ffmpeg_bin,
-                            "-y",
-                            "-i",
-                            str(intro_mp4),
-                            "-i",
-                            str(src_vid),
-                            "-i",
-                            str(master_wav),
-                            "-filter_complex",
-                            (
-                                "[0:v]setsar=1,setpts=PTS-STARTPTS[v0];"
-                                "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
-                                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1];"
-                                "[v0][v1]concat=n=2:v=1:a=0[v]"
-                            ),
-                            "-map",
-                            "[v]",
-                            "-map",
-                            "2:a",
-                            "-c:v",
-                            "libx264",
-                            "-profile:v",
-                            "main",
-                            "-level:v",
-                            "4.0",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-r",
-                            "30",
-                            "-g",
-                            "60",
-                            "-bf",
-                            "0",
-                            "-video_track_timescale",
-                            "90000",
-                            "-crf",
-                            "21",
-                            "-preset",
-                            "veryfast",
-                            "-c:a",
-                            "aac",
-                            "-b:a",
-                            "192k",
-                            "-ar",
-                            str(STAGE_VIDEO_SR),
-                            "-ac",
-                            "2",
-                            "-movflags",
-                            "+faststart",
-                            "-shortest",
-                            str(tmp_mp4),
-                        ]
+                        if use_seamless:
+                            fallback_cmd = [
+                                self.ffmpeg_bin,
+                                "-y",
+                                "-i",
+                                str(src_vid),
+                                "-i",
+                                str(master_wav),
+                                "-map",
+                                "0:v",
+                                "-map",
+                                "1:a",
+                                "-vf",
+                                (
+                                    "scale=1920:1080:force_original_aspect_ratio=decrease,"
+                                    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p"
+                                ),
+                                "-c:v",
+                                "libx264",
+                                "-profile:v",
+                                "main",
+                                "-level:v",
+                                "4.0",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-r",
+                                "30",
+                                "-g",
+                                "60",
+                                "-bf",
+                                "0",
+                                "-video_track_timescale",
+                                "90000",
+                                "-crf",
+                                "21",
+                                "-preset",
+                                "veryfast",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-ar",
+                                str(STAGE_VIDEO_SR),
+                                "-ac",
+                                "2",
+                                "-movflags",
+                                "+faststart",
+                                "-shortest",
+                                str(tmp_mp4),
+                            ]
+                        else:
+                            fallback_cmd = [
+                                self.ffmpeg_bin,
+                                "-y",
+                                "-i",
+                                str(intro_mp4),
+                                "-i",
+                                str(src_vid),
+                                "-i",
+                                str(master_wav),
+                                "-filter_complex",
+                                (
+                                    "[0:v]setsar=1,setpts=PTS-STARTPTS[v0];"
+                                    "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,"
+                                    "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v1];"
+                                    "[v0][v1]concat=n=2:v=1:a=0[v]"
+                                ),
+                                "-map",
+                                "[v]",
+                                "-map",
+                                "2:a",
+                                "-c:v",
+                                "libx264",
+                                "-profile:v",
+                                "main",
+                                "-level:v",
+                                "4.0",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-r",
+                                "30",
+                                "-g",
+                                "60",
+                                "-bf",
+                                "0",
+                                "-video_track_timescale",
+                                "90000",
+                                "-crf",
+                                "21",
+                                "-preset",
+                                "veryfast",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "192k",
+                                "-ar",
+                                str(STAGE_VIDEO_SR),
+                                "-ac",
+                                "2",
+                                "-movflags",
+                                "+faststart",
+                                "-shortest",
+                                str(tmp_mp4),
+                            ]
                         mux_proc = subprocess.run(
                             fallback_cmd,
                             stdout=subprocess.DEVNULL,
@@ -3984,7 +4203,8 @@ class ShowDirector:
 
                 tmp_mp4.replace(out_mp4)
                 probed_total = _probe_media_duration_sec(out_mp4, self.ffmpeg_bin)
-                total_dur = round(probed_total if probed_total > 0.5 else (intro_video_dur + src_dur), 2)
+                fallback_total = src_dur if use_seamless else (intro_video_dur + src_dur)
+                total_dur = round(probed_total if probed_total > 0.5 else fallback_total, 2)
                 meta = {
                     "ok": True,
                     "showId": sid,
@@ -4287,7 +4507,7 @@ class ShowDirector:
                 src_path,  # type: ignore[arg-type]
                 start_sec=spec.song_start_sec,
                 duration_sec=song_dur,
-                fade_out_sec=spec.fade_out_sec,
+                fade_out_sec=0.0,
                 trim_leading_silence=spec.trim_leading_silence,
                 ffmpeg_bin=self.ffmpeg_bin,
             )
@@ -4303,7 +4523,6 @@ class ShowDirector:
                     if s1 > s0:
                         music_pcm[s0:s1] *= 0.68
                         mix_into(music_pcm, shout_pcm, s0, gain=0.90)
-            music_pcm = apply_fade_out_stereo(music_pcm, sr=SHOW_SR, fade_out_sec=spec.fade_out_sec)
 
         # 2. Assemble by show kind
         if spec.kind == "pr_drop":
@@ -4335,65 +4554,99 @@ class ShowDirector:
             mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(spec.fade_out_sec, 3.0))
 
         elif spec.kind == "debut_video":
-            ann_pcm = self._get_announcer_stem(spec, suffix="announcer")
-            if ann_pcm is None:
-                ann_pcm = np.zeros((int(2.0 * SHOW_SR), 2), dtype=np.float32)
-            extra_intro: list[tuple[float, np.ndarray]] = []
-            for idx_ic, ic in enumerate(spec.speech_cues):
-                if ic.get("target") == "intro" and ic.get("text"):
-                    ic_pcm = self._get_announcer_stem(
-                        spec,
-                        suffix=f"icue_{idx_ic}",
-                        text_override=str(ic["text"]),
-                        voice_override=str(ic.get("voice") or ""),
+            src_vid_p = (self.sources_dir / spec.video_source_file) if spec.video_source_file else None
+            if (
+                spec.dj_seamless_intro
+                and src_vid_p is not None
+                and src_vid_p.is_file()
+                and src_vid_p.stat().st_size > 1000
+                and self.ffmpeg_bin
+            ):
+                tmp_pv_wav = self.rendered_dir / f".pv_src_{spec.id}_{threading.get_ident()}_{int(time.time() * 1000)}.wav"
+                try:
+                    ent_44k, _ = self._extract_source_video_audio(
+                        src_vid_p, tmp_pv_wav, target_sr=SHOW_SR, max_sec=22.0
                     )
-                    if ic_pcm is not None and ic_pcm.shape[0] > 0:
-                        extra_intro.append((float(ic.get("atSec") or 0.0), ic_pcm))
-            mix = self._mix_debut_intro_stereo(
-                ann_pcm,
-                lightning_flash_sec=spec.lightning_flash_sec or 0.75,
-                add_cheer=spec.add_cheer,
-                add_thunder=spec.add_thunder,
-                intro_start_sec=spec.intro_start_sec,
-                extra_intro_cues=extra_intro,
-            )
+                    mix, _ = self._mix_dj_seamless_audio(spec, ent_44k, sr=SHOW_SR)
+                    mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=min(2.2, spec.fade_out_sec or 2.2))
+                finally:
+                    try:
+                        tmp_pv_wav.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            else:
+                ann_pcm = self._get_announcer_stem(spec, suffix="announcer")
+                if ann_pcm is None:
+                    ann_pcm = np.zeros((int(2.0 * SHOW_SR), 2), dtype=np.float32)
+                extra_intro: list[tuple[float, np.ndarray]] = []
+                for idx_ic, ic in enumerate(spec.speech_cues):
+                    if ic.get("target") == "intro" and ic.get("text"):
+                        ic_pcm = self._get_announcer_stem(
+                            spec,
+                            suffix=f"icue_{idx_ic}",
+                            text_override=str(ic["text"]),
+                            voice_override=str(ic.get("voice") or ""),
+                        )
+                        if ic_pcm is not None and ic_pcm.shape[0] > 0:
+                            extra_intro.append((float(ic.get("atSec") or 0.0), ic_pcm))
+                mix = self._mix_debut_intro_stereo(
+                    ann_pcm,
+                    lightning_flash_sec=spec.lightning_flash_sec or 0.75,
+                    add_cheer=spec.add_cheer,
+                    add_thunder=spec.add_thunder,
+                    intro_start_sec=spec.intro_start_sec,
+                    extra_intro_cues=extra_intro,
+                )
 
-        else:  # "walkin": announcer intro -> tight crossfade into walk-in song
+        else:  # "walkin": announcer intro -> tight beat-1 slam into walk-in song
             ann_pcm = self._get_announcer_stem(spec, suffix="announcer")
             ann_n = ann_pcm.shape[0] if ann_pcm is not None else 0
-            overlap_n = min(ann_n // 4, int(round(0.30 * SHOW_SR))) if (ann_pcm is not None and music_pcm is not None) else 0
+            overlap_n = min(ann_n // 4, int(round(0.18 * SHOW_SR))) if (ann_pcm is not None and music_pcm is not None) else 0
             song_off = max(0, ann_n - overlap_n)
             song_n = music_pcm.shape[0] if music_pcm is not None else 0
             total_n = max(SHOW_SR, song_off + song_n)
             mix = np.zeros((total_n, 2), dtype=np.float32)
             if spec.add_cheer and ann_n > 0:
-                c_dur = float(ann_n) / SHOW_SR + 1.5
+                c_dur = min(float(total_n) / float(SHOW_SR), float(ann_n) / float(SHOW_SR) + 2.4)
                 cheer_bed = load_studio_fx_stereo(
                     self.fx_dir,
                     "stadium_crowd.wav",
                     c_dur,
                     allow_default_fallback=self.allow_network,
-                    swell_sec=0.5,
-                    fade_out_sec=1.4,
+                    swell_sec=0.25,
+                    fade_out_sec=1.8,
                     sr=SHOW_SR,
                 )
                 if cheer_bed is None:
                     cheer_bed = synth_crowd_cheer_stereo(
                         c_dur,
                         sr=SHOW_SR,
-                        swell_sec=0.5,
-                        fade_out_sec=1.4,
+                        swell_sec=0.25,
+                        fade_out_sec=1.8,
                     )
-                mix_into(mix, cheer_bed, 0, gain=0.26)
+                c_n = min(cheer_bed.shape[0], total_n)
+                if c_n > 16:
+                    c_env = np.zeros(c_n, dtype=np.float32)
+                    sw_s = max(0, min(c_n, song_off - int(round(0.12 * SHOW_SR))))
+                    sw_e = max(sw_s + 1, min(c_n, song_off + int(round(0.10 * SHOW_SR))))
+                    if sw_s > 0:
+                        c_env[:sw_s] = 0.14
+                    if sw_e > sw_s:
+                        u_sw = np.linspace(0.0, 1.0, sw_e - sw_s, dtype=np.float32)
+                        c_env[sw_s:sw_e] = 0.14 + 0.24 * 0.5 * (1.0 - np.cos(math.pi * u_sw))
+                    if c_n > sw_e:
+                        u_dc = np.linspace(0.0, 1.0, c_n - sw_e, dtype=np.float32)
+                        c_env[sw_e:] = 0.38 * (np.cos(0.5 * math.pi * u_dc) ** 2)
+                    mix_into(mix, cheer_bed[:c_n] * c_env[:, None], 0, gain=1.0)
             if ann_pcm is not None:
                 mix_into(mix, ann_pcm, 0, gain=1.0)
             if music_pcm is not None:
-                # 180ms ramp-in on the song entry when overlapping announcer end
+                # Crisp 10ms anti-click onset ONLY so beat 1 hits with full punch right out of announcer's last word
                 s_entry = music_pcm.copy()
-                if overlap_n > 16:
-                    r_n = min(overlap_n, s_entry.shape[0])
-                    s_entry[:r_n] *= np.linspace(0.25, 1.0, r_n, dtype=np.float32)[:, None]
-                mix_into(mix, s_entry, song_off, gain=0.95)
+                r_n = min(s_entry.shape[0], max(8, int(round(0.010 * SHOW_SR))))
+                if r_n > 2:
+                    s_entry[:r_n] *= np.linspace(0.0, 1.0, r_n, dtype=np.float32)[:, None]
+                mix_into(mix, s_entry, song_off, gain=0.96)
             mix = apply_fade_out_stereo(mix, sr=SHOW_SR, fade_out_sec=spec.fade_out_sec)
 
         wav_bytes = encode_stereo_pcm16_wav(mix, sr=SHOW_SR)

@@ -5021,6 +5021,85 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_duck_bed_hold_smoothness(self) -> None:
+        sr = sd.SHOW_SR
+        bed = np.ones((int(round(3.0 * sr)), 2), dtype=np.float32) * 0.5
+        speech = np.zeros((int(round(1.6 * sr)), 2), dtype=np.float32)
+        # Word 1 [0.0..0.4s], 300ms inter-word silence gap [0.4..0.7s], Word 2 [0.7..1.2s]
+        speech[: int(0.4 * sr)] = 0.40
+        speech[int(0.7 * sr) : int(1.2 * sr)] = 0.40
+        ducked = sd.duck_bed_under_speech(bed, speech, int(0.4 * sr), sr=sr, duck_gain=0.16, base_gain=0.85)
+        gap_mid = ducked[int(0.95 * sr) : int(1.00 * sr)]
+        tail = ducked[int(2.60 * sr) : int(2.90 * sr)]
+        self.assertLess(float(np.mean(np.abs(gap_mid))), 0.14)
+        self.assertGreater(float(np.mean(np.abs(tail))), 0.35)
+
+    def test_dj_seamless_intro_multimedia_and_walkin_beat1(self) -> None:
+        ffmpeg_bin = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+        if not ffmpeg_bin:
+            self.skipTest("FFmpeg binary not present")
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_dj_seamless_"))
+        try:
+            src_dir = tmp / "shows" / "sources"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            vid_path = src_dir / "jenna_walkin_video.mp4"
+            proc = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=640x360:rate=30:duration=6.0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=6.0",
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(vid_path),
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr.decode("utf-8", "ignore"))
+
+            # Loud steady Beat-1 WAV for matt_walkin onset verification
+            beat_pcm = np.ones((int(round(6.0 * sd.SHOW_SR)), 2), dtype=np.float32) * 0.45
+            (src_dir / "matt_beat_test.wav").write_bytes(sd.encode_stereo_pcm16_wav(beat_pcm, sr=sd.SHOW_SR))
+
+            director = sd.ShowDirector(root_dir=tmp, ffmpeg_bin=ffmpeg_bin, allow_network=False)
+            director.update_show(
+                "jenna_walkin",
+                {"djSeamlessIntro": True, "djDropSec": 2.0, "videoSourceFile": "jenna_walkin_video.mp4", "overlayText": ""},
+                rebuild=False,
+            )
+            mm_res = director.build_show_multimedia("jenna_walkin", force=True)
+            self.assertTrue(mm_res["ok"], msg=str(mm_res))
+            self.assertAlmostEqual(float(mm_res["introDurationSec"]), 2.0, delta=0.1)
+            self.assertGreater(float(mm_res["totalDurationSec"]), 5.5)
+            self.assertLess(float(mm_res["totalDurationSec"]), 6.5)
+
+            director.update_show(
+                "matt_walkin",
+                {"sourceFile": "matt_beat_test.wav", "songStartSec": 0.0, "songDurationSec": 5.5, "fadeOutSec": 1.0, "addCheer": False},
+                rebuild=False,
+            )
+            p_res = director.build_show_preview("matt_walkin", force=True)
+            self.assertTrue(p_res["ok"], msg=str(p_res))
+            wav_pcm = sd.read_wav_stereo_float(director.preview_wav_path("matt_walkin"))
+            # Last 2.0s before outro fade must have strong beat energy (full-volume onset without muted ramp)
+            mid_beat = wav_pcm[-int(round(2.5 * sd.SHOW_SR)) : -int(round(1.5 * sd.SHOW_SR))]
+            self.assertGreater(float(np.sqrt(np.mean(mid_beat ** 2))), 0.20)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

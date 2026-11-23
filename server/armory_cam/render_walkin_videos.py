@@ -58,6 +58,8 @@ class ThemeSpec:
     style: str
     bpm: float
     use_serif: bool = False
+    drop_sec: float = 5.0
+    drum_teaser_sec: float = 0.0
 
 
 THEMES: list[ThemeSpec] = [
@@ -67,8 +69,8 @@ THEMES: list[ThemeSpec] = [
         raw_audio_name="jenna_raw.wav",
         youtube_url="https://www.youtube.com/watch?v=aOt4xRE05wQ",
         start_sec=0.15,
-        end_sec=41.80,
-        fade_out_sec=2.5,
+        end_sec=27.00,
+        fade_out_sec=2.0,
         eyebrow="H E A D L I N I N G   T O N I G H T",
         headline="JENNA",
         footer="L I V E   A T   T H E   A R M O R Y",
@@ -81,15 +83,16 @@ THEMES: list[ThemeSpec] = [
         glow_rgb=(215, 70, 255),
         style="rockstar",
         bpm=125.0,
+        drop_sec=5.67,
     ),
     ThemeSpec(
         id="avenleigh",
         out_filename="avenleigh_walkin_video.mp4",
         raw_audio_name="avenleigh_raw.wav",
         youtube_url="https://www.youtube.com/shorts/ET3HB1xzx14",
-        start_sec=0.08,
-        end_sec=None,
-        fade_out_sec=2.0,
+        start_sec=26.00,
+        end_sec=44.72,
+        fade_out_sec=1.8,
         eyebrow="L I V E   O N   T H E   V I P   S T A G E",
         headline="AVENLEIGH",
         footer="T H E   A R M O R Y",
@@ -102,15 +105,16 @@ THEMES: list[ThemeSpec] = [
         glow_rgb=(255, 75, 185),
         style="pink_pop",
         bpm=130.0,
+        drop_sec=7.34,
     ),
     ThemeSpec(
         id="jared_mark_prism",
         out_filename="jared_mark_prism_video.mp4",
         raw_audio_name="whitney_raw.wav",
         youtube_url="https://www.youtube.com/watch?v=id2-K3daNRQ",
-        start_sec=56.00,
-        end_sec=98.80,
-        fade_out_sec=2.5,
+        start_sec=62.55,
+        end_sec=98.70,
+        fade_out_sec=2.2,
         eyebrow="G U E S T S   O F   H O N O R",
         headline="JARED & MARK",
         footer="L I V E   A T   T H E   A R M O R Y",
@@ -123,15 +127,17 @@ THEMES: list[ThemeSpec] = [
         glow_rgb=(170, 225, 255),
         style="prism",
         bpm=119.0,
+        drop_sec=8.00,
+        drum_teaser_sec=6.74,
     ),
     ThemeSpec(
         id="jared_mark_vip",
         out_filename="jared_mark_vip_video.mp4",
         raw_audio_name="whitney_raw.wav",
         youtube_url="https://www.youtube.com/watch?v=id2-K3daNRQ",
-        start_sec=56.00,
-        end_sec=98.80,
-        fade_out_sec=2.5,
+        start_sec=62.55,
+        end_sec=98.70,
+        fade_out_sec=2.2,
         eyebrow="T H E   V I P s   H A V E   A R R I V E D",
         headline="JARED & MARK",
         footer="L I V E   A T   T H E   A R M O R Y",
@@ -145,6 +151,8 @@ THEMES: list[ThemeSpec] = [
         style="velvet_gold",
         bpm=119.0,
         use_serif=True,
+        drop_sec=8.00,
+        drum_teaser_sec=6.74,
     ),
 ]
 
@@ -180,6 +188,15 @@ def ensure_raw_audio(theme: ThemeSpec) -> Path:
     return raw_wav
 
 
+def _xfade_stereo(a: np.ndarray, b: np.ndarray, xf_sec: float) -> np.ndarray:
+    n = min(int(round(xf_sec * SR)), a.shape[0] // 2, b.shape[0] // 2)
+    if n <= 1:
+        return np.vstack([a, b]).astype(np.float32)
+    t = np.linspace(0.0, math.pi * 0.5, n, dtype=np.float32)[:, None]
+    mid = a[-n:] * np.cos(t) + b[:n] * np.sin(t)
+    return np.vstack([a[:-n], mid, b[n:]]).astype(np.float32)
+
+
 def prepare_trimmed_wav(theme: ThemeSpec) -> tuple[Path, np.ndarray, float]:
     raw_wav = ensure_raw_audio(theme)
     trimmed_wav = AUDIO_CACHE_DIR / f"{theme.id}_trimmed.wav"
@@ -204,24 +221,49 @@ def prepare_trimmed_wav(theme: ThemeSpec) -> tuple[Path, np.ndarray, float]:
         g = math.gcd(in_sr, SR)
         pcm = resample_poly(pcm, SR // g, in_sr // g, axis=0).astype(np.float32)
 
-    i0 = max(0, min(pcm.shape[0] - 1, int(round(theme.start_sec * SR))))
-    i1 = pcm.shape[0] if theme.end_sec is None else min(pcm.shape[0], int(round(theme.end_sec * SR)))
-    clip = pcm[i0:i1].copy()
+    fi_8ms = min(pcm.shape[0] // 8, max(2, int(round(0.008 * SR))))
+    if theme.id == "jenna":
+        # 3-bar "Music make you lose control" buildup -> exact "LET'S GO!" beat drop at 5.67s -> clean exit at 27.00s
+        lp = pcm[int(0.15 * SR):int(2.05 * SR)].copy()
+        lp[:fi_8ms] *= np.linspace(0.0, 1.0, fi_8ms, dtype=np.float32)[:, None]
+        main = pcm[int(0.15 * SR):int(27.00 * SR)].copy()
+        clip = _xfade_stereo(lp, main, 0.030)
+    elif theme.id == "avenleigh":
+        # Clean 7.34s synth riser buildup -> "LA LA LA" laser chorus drop repeated cleanly twice
+        b1 = pcm[int(26.00 * SR):int(27.85 * SR)].copy()
+        b1[:fi_8ms] *= np.linspace(0.0, 1.0, fi_8ms, dtype=np.float32)[:, None]
+        main = pcm[int(26.00 * SR):int(44.45 * SR)].copy()
+        rep = pcm[int(29.70 * SR):].copy()
+        clip = _xfade_stereo(_xfade_stereo(_xfade_stereo(b1, b1.copy(), 0.030), main, 0.030), rep, 0.045)
+    elif theme.id in ("jared_mark_prism", "jared_mark_vip"):
+        # Bar-1 sparkle -> Bars 1+2 claps -> iconic "duh-duh-duh-DUM" drum fill (6.74..8.00s) -> "OH! I Wanna Dance With Somebody!"
+        b1 = pcm[int(0.75 * SR):int(2.77 * SR)].copy()
+        b1[:fi_8ms] *= np.linspace(0.0, 1.0, fi_8ms, dtype=np.float32)[:, None]
+        b12 = pcm[int(0.75 * SR):int(5.58 * SR)].copy()
+        drop_hook = pcm[int(62.55 * SR):int(98.70 * SR)].copy()
+        clip = _xfade_stereo(_xfade_stereo(b1, b12, 0.050), drop_hook, 0.060)
+    else:
+        i0 = max(0, min(pcm.shape[0] - 1, int(round(theme.start_sec * SR))))
+        i1 = pcm.shape[0] if theme.end_sec is None else min(pcm.shape[0], int(round(theme.end_sec * SR)))
+        clip = pcm[i0:i1].copy()
+        fi_n = min(clip.shape[0] // 4, int(round(0.015 * SR)))
+        if fi_n > 2:
+            clip[:fi_n] *= np.linspace(0.0, 1.0, fi_n, dtype=np.float32)[:, None]
+
     dur_sec = float(clip.shape[0]) / float(SR)
 
     rms = float(np.sqrt(np.mean(clip ** 2))) if clip.size else 0.0
     if rms > 1e-4:
-        gain = min(0.22 / rms, 2.5)
-        clip = np.tanh(clip * gain * 1.04).astype(np.float32) * 0.92
-
-    fi_n = min(clip.shape[0] // 4, int(round(0.035 * SR)))
-    if fi_n > 2:
-        clip[:fi_n] *= np.linspace(0.0, 1.0, fi_n, dtype=np.float32)[:, None]
+        clip = clip * min(0.22 / rms, 2.5)
+    pk = float(np.max(np.abs(clip))) if clip.size else 0.0
+    if pk > 0.92:
+        clip = clip * (0.92 / pk)
+    clip = clip.astype(np.float32)
 
     fo_n = min(clip.shape[0] // 2, int(round(theme.fade_out_sec * SR)))
     if fo_n > 8:
-        fade = 0.5 * (1.0 + np.cos(np.linspace(0.0, math.pi, fo_n, dtype=np.float32)))
-        clip[-fo_n:] *= fade[:, None]
+        t_fo = np.linspace(0.0, math.pi * 0.5, fo_n, dtype=np.float32)[:, None]
+        clip[-fo_n:] *= np.cos(t_fo) ** 2
 
     int16_pcm = np.clip(np.round(clip * 32767.0), -32767, 32767).astype("<i2")
     with wave.open(str(trimmed_wav), "wb") as wf_out:
@@ -328,7 +370,7 @@ def _fit_font(path: Path, text: str, max_width: int, start_size: int) -> ImageFo
     return ImageFont.truetype(str(path), 44)
 
 
-def build_typography_plate(theme: ThemeSpec) -> tuple[np.ndarray, np.ndarray]:
+def build_typography_plate(theme: ThemeSpec, *, include_headline: bool = True) -> tuple[np.ndarray, np.ndarray]:
     """Render supersampled 1920x1080 BGRA nameplate with dark vignette & neon/gold halo."""
     # Contrast backing vignette centered around text
     yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH].astype(np.float32)
@@ -355,10 +397,11 @@ def build_typography_plate(theme: ThemeSpec) -> tuple[np.ndarray, np.ndarray]:
     cy_foot = 602
 
     gr, gg, gb = theme.glow_rgb
-    dg.text((cx, cy_head), theme.headline, font=f_head, fill=(gr, gg, gb, 215), anchor="mm")
-    glow_blur = glow_layer.filter(ImageFilter.GaussianBlur(radius=22))
-    plate_pil.alpha_composite(glow_blur)
-    plate_pil.alpha_composite(glow_layer.filter(ImageFilter.GaussianBlur(radius=6)))
+    if include_headline:
+        dg.text((cx, cy_head), theme.headline, font=f_head, fill=(gr, gg, gb, 215), anchor="mm")
+        glow_blur = glow_layer.filter(ImageFilter.GaussianBlur(radius=22))
+        plate_pil.alpha_composite(glow_blur)
+        plate_pil.alpha_composite(glow_layer.filter(ImageFilter.GaussianBlur(radius=6)))
 
     # Crisp foreground typography + subtle hairline framing rules
     fg = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
@@ -376,9 +419,10 @@ def build_typography_plate(theme: ThemeSpec) -> tuple[np.ndarray, np.ndarray]:
     df.text((cx, cy_eye + 2), theme.eyebrow, font=f_eye, fill=(0, 0, 0, 190), anchor="mm")
     df.text((cx, cy_eye), theme.eyebrow, font=f_eye, fill=(242, 244, 250, 238), anchor="mm")
 
-    hr, hg, hb = theme.headline_rgb
-    df.text((cx, cy_head + 6), theme.headline, font=f_head, fill=(0, 0, 0, 215), anchor="mm")
-    df.text((cx, cy_head), theme.headline, font=f_head, fill=(hr, hg, hb, 255), anchor="mm")
+    if include_headline:
+        hr, hg, hb = theme.headline_rgb
+        df.text((cx, cy_head + 6), theme.headline, font=f_head, fill=(0, 0, 0, 215), anchor="mm")
+        df.text((cx, cy_head), theme.headline, font=f_head, fill=(hr, hg, hb, 255), anchor="mm")
 
     df.text((cx, cy_foot + 2), theme.footer, font=f_foot, fill=(0, 0, 0, 190), anchor="mm")
     df.text((cx, cy_foot), theme.footer, font=f_foot, fill=(gr, gg, gb, 240), anchor="mm")
@@ -539,7 +583,14 @@ def render_theme_video(theme: ThemeSpec) -> Path:
     snare_arr = feats["snare"]
     chorus_arr = feats["chorus"]
 
-    fg_prem, inv_alpha = build_typography_plate(theme)
+    fg_pre, inv_pre = build_typography_plate(theme, include_headline=False)
+    fg_prem, inv_alpha = build_typography_plate(theme, include_headline=True)
+    if len(theme.headline) > 10:
+        halo_mult1 = 2.58 if theme.use_serif else 2.25
+        halo_mult2 = 2.66 if theme.use_serif else 2.33
+    else:
+        halo_mult1 = 1.75
+        halo_mult2 = 1.83
     particles = ParticleField(theme, seed=abs(hash(theme.id)) % 10_000)
 
     # Half-res grid for silky gradients and sweeping volumetric beams
@@ -655,9 +706,17 @@ def render_theme_video(theme: ThemeSpec) -> Path:
     y_eq = 918
 
     try:
-        print(f"START {theme.id}: {n_frames} frames ({dur_sec:.2f}s)", flush=True)
+        print(f"START {theme.id}: {n_frames} frames ({dur_sec:.2f}s, drop@{theme.drop_sec:.2f}s)", flush=True)
         for f in range(n_frames):
             t = float(f) / float(FPS)
+            is_dropped = t >= theme.drop_sec
+            pre_prog = min(1.0, max(0.0, t / max(0.5, theme.drop_sec)))
+            drum_pulse = 0.0
+            if (not is_dropped) and theme.drum_teaser_sec > 0.0 and t >= theme.drum_teaser_sec:
+                dt_fill = t - theme.drum_teaser_sec
+                beat_pos = (dt_fill * 3.6) % 1.0
+                drum_pulse = max(0.0, 1.0 - beat_pos * 2.2)
+
             kick = float(kick_arr[f])
             snare = float(snare_arr[f])
             chorus = float(chorus_arr[f])
@@ -665,7 +724,11 @@ def render_theme_video(theme: ThemeSpec) -> Path:
 
             # 1. Half-res volumetric stage backdrop + sweeping beam lobes
             bg_half = base_bg.copy()
-            pulse_boost = 0.20 + 0.55 * kick + 0.25 * chorus
+            if is_dropped:
+                pulse_boost = 0.20 + 0.55 * kick + 0.25 * chorus
+            else:
+                bg_half *= (0.45 + 0.45 * pre_prog)
+                pulse_boost = 0.06 + 0.18 * pre_prog + 0.45 * drum_pulse
             bg_half += p_col[None, None, :] * (rad_glow_mask[:, :, None] * pulse_boost * 0.45)
 
             beam_half = np.zeros((HALF_H, HALF_W, 3), dtype=np.float32)
@@ -705,62 +768,83 @@ def render_theme_video(theme: ThemeSpec) -> Path:
                     )
                     cv2.fillConvexPoly(beam_half, pts, tuple(float(v) * (0.30 + 0.28 * kick) for v in col_b))
 
+            if not is_dropped:
+                beam_half *= (0.26 + 0.34 * pre_prog + 0.65 * drum_pulse)
+
             beam_half = cv2.GaussianBlur(beam_half, (0, 0), sigmaX=12.0, sigmaY=12.0)
             comb_half = np.clip(bg_half + beam_half, 0, 255).astype(np.uint8)
             frame = cv2.resize(comb_half, (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
 
-            # 2. Crisp 1080p additive glow layer (halo ring + spectrum bars + floor reflections + particles)
+            # 2. Crisp 1080p additive glow layer (halo ring + post-drop spectrum bars + particles)
             fx_layer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
 
-            # Audio-reactive central spotlight halo ring
-            halo_r = int(282 + 28 * kick + 14 * chorus)
-            halo_col1 = tuple(int(v * (0.55 + 0.45 * kick)) for v in theme.primary_bgr)
-            halo_col2 = tuple(int(v * (0.40 + 0.45 * snare)) for v in theme.secondary_bgr)
-            cv2.ellipse(fx_layer, (cx_stage, 468), (int(halo_r * 1.75), int(halo_r * 0.78)), 0, 0, 360, halo_col1, 4, cv2.LINE_AA)
-            cv2.ellipse(fx_layer, (cx_stage, 468), (int(halo_r * 1.83), int(halo_r * 0.83)), 0, 0, 360, halo_col2, 2, cv2.LINE_AA)
+            # Audio-reactive central spotlight halo ring (wider for long headlines like JARED & MARK)
+            if is_dropped:
+                halo_r = int(282 + 28 * kick + 14 * chorus)
+                halo_col1 = tuple(int(v * (0.55 + 0.45 * kick)) for v in theme.primary_bgr)
+                halo_col2 = tuple(int(v * (0.40 + 0.45 * snare)) for v in theme.secondary_bgr)
+            else:
+                halo_r = int(235 + 47 * pre_prog + 18 * drum_pulse)
+                k_pre = 0.25 + 0.40 * pre_prog + 0.55 * drum_pulse
+                halo_col1 = tuple(min(255, int(v * k_pre)) for v in theme.primary_bgr)
+                halo_col2 = tuple(min(255, int(v * (k_pre * 0.85))) for v in theme.secondary_bgr)
+            cv2.ellipse(fx_layer, (cx_stage, 468), (int(halo_r * halo_mult1), int(halo_r * 0.78)), 0, 0, 360, halo_col1, 4, cv2.LINE_AA)
+            cv2.ellipse(fx_layer, (cx_stage, 468), (int(halo_r * halo_mult2), int(halo_r * 0.83)), 0, 0, 360, halo_col2, 2, cv2.LINE_AA)
 
-            # Mirrored 32-band symmetric equalizer + reflection + peak caps
-            peak_caps = np.maximum(bands, peak_caps * 0.945 - 0.004)
-            step_x = bar_w + bar_gap
-            for b in range(n_half):
-                val = float(bands[b])
-                cap = float(peak_caps[b])
-                h_px = max(6, int(val * 195.0))
-                cap_y = y_eq - max(8, int(cap * 195.0)) - 6
-                frac = float(b) / float(n_half - 1)
-                if theme.style == "prism":
-                    col_rgb = hsv_lut[int((b * 6 + int(t * 28)) % 256)] * (195.0 + 60.0 * val)
-                    b_col = (int(col_rgb[0]), int(col_rgb[1]), int(col_rgb[2]))
-                else:
-                    b_col = (
-                        int(theme.primary_bgr[0] * (1.0 - frac) + theme.secondary_bgr[0] * frac),
-                        int(theme.primary_bgr[1] * (1.0 - frac) + theme.secondary_bgr[1] * frac),
-                        int(theme.primary_bgr[2] * (1.0 - frac) + theme.secondary_bgr[2] * frac),
-                    )
-                r_col = tuple(int(c * 0.28) for c in b_col)
-                cap_col = theme.accent_bgr
+            if is_dropped:
+                # Mirrored 32-band symmetric equalizer + reflection + peak caps
+                peak_caps = np.maximum(bands, peak_caps * 0.945 - 0.004)
+                step_x = bar_w + bar_gap
+                for b in range(n_half):
+                    val = float(bands[b])
+                    cap = float(peak_caps[b])
+                    h_px = max(6, int(val * 195.0))
+                    cap_y = y_eq - max(8, int(cap * 195.0)) - 6
+                    frac = float(b) / float(n_half - 1)
+                    if theme.style == "prism":
+                        col_rgb = hsv_lut[int((b * 6 + int(t * 28)) % 256)] * (195.0 + 60.0 * val)
+                        b_col = (int(col_rgb[0]), int(col_rgb[1]), int(col_rgb[2]))
+                    else:
+                        b_col = (
+                            int(theme.primary_bgr[0] * (1.0 - frac) + theme.secondary_bgr[0] * frac),
+                            int(theme.primary_bgr[1] * (1.0 - frac) + theme.secondary_bgr[1] * frac),
+                            int(theme.primary_bgr[2] * (1.0 - frac) + theme.secondary_bgr[2] * frac),
+                        )
+                    r_col = tuple(int(c * 0.28) for c in b_col)
+                    cap_col = theme.accent_bgr
 
-                for dir_sign in (-1, 1):
-                    x_mid = cx_stage + dir_sign * ((b * step_x) + step_x // 2)
-                    x0 = x_mid - bar_w // 2
-                    x1 = x_mid + bar_w // 2
-                    cv2.rectangle(fx_layer, (x0, y_eq - h_px), (x1, y_eq), b_col, -1)
-                    # Peak cap
-                    cv2.rectangle(fx_layer, (x0, cap_y), (x1, cap_y + 3), cap_col, -1)
-                    # Stage floor reflection
-                    ref_h = max(4, int(h_px * 0.34))
-                    cv2.rectangle(fx_layer, (x0, y_eq + 6), (x1, y_eq + 6 + ref_h), r_col, -1)
+                    for dir_sign in (-1, 1):
+                        x_mid = cx_stage + dir_sign * ((b * step_x) + step_x // 2)
+                        x0 = x_mid - bar_w // 2
+                        x1 = x_mid + bar_w // 2
+                        cv2.rectangle(fx_layer, (x0, y_eq - h_px), (x1, y_eq), b_col, -1)
+                        # Peak cap
+                        cv2.rectangle(fx_layer, (x0, cap_y), (x1, cap_y + 3), cap_col, -1)
+                        # Stage floor reflection
+                        ref_h = max(4, int(h_px * 0.34))
+                        cv2.rectangle(fx_layer, (x0, y_eq + 6), (x1, y_eq + 6 + ref_h), r_col, -1)
 
-            # Particles / Firework blooms
-            particles.step_and_draw(fx_layer, f, t, kick, snare, chorus)
+                # Particles / Firework blooms
+                particles.step_and_draw(fx_layer, f, t, kick, snare, chorus)
 
             # Soft glow pass + crisp add
             soft_glow = cv2.GaussianBlur(fx_layer, (0, 0), sigmaX=7.0, sigmaY=7.0)
             frame = cv2.add(frame, cv2.addWeighted(fx_layer, 0.92, soft_glow, 0.55, 0))
 
-            # 3. Composite pre-rendered razor-sharp PIL typography plate cleanly
+            # 3. Composite pre-rendered razor-sharp PIL typography plate (pre-drop eyebrow/footer -> post-drop hero)
             bg_u16 = frame.astype(np.uint16)
-            frame = np.clip((bg_u16 * inv_alpha) // 255 + fg_prem, 0, 255).astype(np.uint8)
+            if is_dropped:
+                frame = np.clip((bg_u16 * inv_alpha) // 255 + fg_prem, 0, 255).astype(np.uint8)
+                dt_drop = t - theme.drop_sec
+                if 0.0 <= dt_drop < 0.22:
+                    flash_k = ((1.0 - dt_drop / 0.22) ** 2) * 0.48
+                    flash_col = np.array(
+                        [220.0 + 35.0 * theme.primary_bgr[c] / 255.0 for c in range(3)],
+                        dtype=np.float32,
+                    )
+                    frame = np.clip(frame.astype(np.float32) + flash_col[None, None, :] * flash_k, 0, 255).astype(np.uint8)
+            else:
+                frame = np.clip((bg_u16 * inv_pre) // 255 + fg_pre, 0, 255).astype(np.uint8)
 
             # 4. Gentle entrance fade-in (0.35s) and show tail fade-out (1.0s)
             if t < 0.35:
