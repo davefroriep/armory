@@ -1,4 +1,4 @@
-import { $, ICON, esc, mmss } from './dom';
+import { $, ICON, esc, hms } from './dom';
 import { chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
 import { PHASE1_PLAN, fmtWeekSpan, nextEquipmentSlot, parseExtraKey, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
@@ -64,7 +64,7 @@ export function mountTopResume(root: HTMLElement): () => void {
     const paused = isSessionPaused(running);
     dotEl.classList.toggle('paused', paused);
     if (nameEl.textContent !== running.name) nameEl.textContent = running.name;
-    const elapsed = paused ? `${mmss(active.elapsedSec())} · paused` : mmss(active.elapsedSec());
+    const elapsed = paused ? `${hms(active.elapsedSec())} · paused` : hms(active.elapsedSec());
     if (clockEl.textContent !== elapsed) clockEl.textContent = elapsed;
 
     const bar = root.querySelector<HTMLElement>('header.bar');

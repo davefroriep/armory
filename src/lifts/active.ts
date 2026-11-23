@@ -3,15 +3,15 @@ import { Emitter } from '../emitter';
 import { hrBeat, hrFresh, live } from '../ble/telemetry';
 import { calendar, localDate } from '../intervals/calendar';
 import { isNative, onNativeRestSync, workoutService } from '../native/service';
-import { getMeta, getSamples, putMeta } from '../store/db';
+import { getMeta, getSamples, putMeta, replaceSamples } from '../store/db';
 import { getSettings } from '../store/settings';
 import { discard as discardWorkout, syncWorkout } from '../workout/sync';
-import { Recorder } from '../workout/recorder';
+import { compactSamplesToDuration, Recorder } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
 import {
   effectiveRestAuto, elapsedSessionSec, hasLogged, hasSessionActivity, isSessionPaused,
   isSessionStarted, midSuperset, pauseSessionClock, pruneUnlogged, resetSessionClock,
-  resumeSessionClock, startSessionClock,
+  resumeSessionClock, setSessionElapsedSec, startSessionClock,
 } from './logic';
 import { liftSettings } from './settings';
 import { gymCam } from './gymCam';
@@ -146,6 +146,40 @@ class ActiveWorkout {
     lifts.saveSession(s, true);
     void this.attach(s, true);
     void gymCam.sessionResume(s);
+    this.tick.emit();
+    return true;
+  }
+
+  /** Adjust the active workout's elapsed duration and compact any long idle gap in recorded HR samples. */
+  async setElapsedSec(targetSec: number): Promise<boolean> {
+    const s = this.session;
+    if (!s) return false;
+    const now = Date.now();
+    const wasStarted = isSessionStarted(s);
+    if (!setSessionElapsedSec(s, targetSec, now)) return false;
+    const targetFloor = Math.max(0, Math.floor(targetSec));
+    if (this.rec) {
+      this.rec.meta.startEpochMs = s.startMs;
+      this.rec.trimTo(targetFloor);
+    } else if (wasStarted && typeof indexedDB !== 'undefined') {
+      const [prevMeta, prevSamples] = await Promise.all([getMeta(s.id), getSamples(s.id)]);
+      if (prevSamples.length > targetFloor) {
+        await replaceSamples(s.id, compactSamplesToDuration(prevSamples, targetFloor));
+      }
+      if (prevMeta) {
+        prevMeta.startEpochMs = s.startMs;
+        prevMeta.seconds = Math.round(targetSec);
+        await putMeta(prevMeta, false);
+      }
+    }
+    lifts.saveSession(s, true);
+    if (!wasStarted && isSessionStarted(s) && !isSessionPaused(s)) {
+      void this.attach(s, false);
+      void gymCam.sessionEnter(s);
+    } else if (isSessionStarted(s) && !isSessionPaused(s)) {
+      this.lastSvc = 0;
+      this.pushServiceStatus(0);
+    }
     this.tick.emit();
     return true;
   }
@@ -321,21 +355,30 @@ class ActiveWorkout {
     s.status = 'done';
     const rec = this.rec;
     const el = elapsedSessionSec(s, s.endMs);
-    rec?.tick(el, 0, s.endMs);
+    const elSec = Math.round(el);
     let meta: WorkoutMeta;
     if (rec) {
+      rec.meta.startEpochMs = s.startMs;
+      if (rec.samples.length > elSec + 1) rec.trimTo(elSec);
+      rec.tick(el, 0, s.endMs);
       meta = rec.finalize();
+      meta.seconds = elSec;
     } else {
       const prevMeta = await getMeta(s.id);
       if (prevMeta) {
+        const prevSamples = await getSamples(s.id);
+        const trimmed = prevSamples.length > elSec + 1 ? compactSamplesToDuration(prevSamples, elSec) : prevSamples;
+        if (trimmed.length !== prevSamples.length) await replaceSamples(s.id, trimmed);
         meta = new Recorder(
           s.id, 'strength', 'strength', s.name, s.eventId, getSettings().hrMax,
-          { meta: prevMeta, samples: await getSamples(s.id) },
+          { meta: prevMeta, samples: trimmed },
         ).finalize();
+        meta.startEpochMs = s.startMs;
+        meta.seconds = elSec;
       } else {
         meta = {
           id: s.id, equipment: 'strength', programId: 'strength', name: s.name,
-          startEpochMs: s.startMs, status: 'saved', seconds: Math.round(el),
+          startEpochMs: s.startMs, status: 'saved', seconds: elSec,
           kj: 0, avgW: 0, maxW: 0, avgHr: 0, maxHr: 0, rpe: null,
           eventId: s.eventId, upload: 'pending', patched: false, activityId: null, lastError: null,
         };

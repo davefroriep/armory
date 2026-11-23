@@ -1,11 +1,11 @@
 import { sessionStats } from '../../lifts/calc';
 import { routineFromSession } from '../../lifts/logic';
-import { resyncSession } from '../../lifts/intervals';
+import { resyncSession, updateFinishedDuration } from '../../lifts/intervals';
 import { liftSettings, fmtKg } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { fmtDuration, fmtVolume, sessionPRs } from '../../lifts/summary';
 import { RPE_STEPS } from '../../domain/rpe';
-import { getMeta, getSamples } from '../../store/db';
+import { getMeta, getSamples, metaSaved } from '../../store/db';
 import { getSettings } from '../../store/settings';
 import { retryPending } from '../../workout/sync';
 import { revFooter } from '../chrome';
@@ -13,6 +13,7 @@ import { esc, hms } from '../dom';
 import { ZONE_COLOR, hrZone } from '../hr';
 import { openShareCard, stat } from './cards';
 import { LI, mount, promptSheet, toast } from './kit';
+import { openEditTimeSheet } from './timeSheet';
 import { playVideo } from './video';
 
 /** Post-workout: numbers, PRs, effort rating, share card. The Intervals.icu upload has already started by itself. */
@@ -30,7 +31,7 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
 
     root.innerHTML = `<main class="page summary">
       <h1 class="sum-title">${esc(s.name)}</h1>
-      <div class="sum-sub">${new Date(s.startMs).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })} · ${fmtDuration(st.durationSec)}</div>
+      <div class="sum-sub">${new Date(s.startMs).toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' })} · <button class="sum-time-btn" id="sumTimeBtn" type="button" data-act="edittime" aria-label="Edit workout duration">${fmtDuration(st.durationSec)}</button></div>
       <section class="stats four">${stat('SETS', String(st.sets))}${stat('VOLUME', fmtVolume(st.volumeKg, unit).replace(` ${unit}`, ''))}${stat('EXERCISES', String(st.exercises))}${stat('PRs', String(prs.count))}</section>
       ${prLines.length ? `<section class="card prs"><div class="card-h"><span>NEW RECORDS</span></div>${prLines.map(({ e, x, h }) => {
         const ex = lifts.exOrStub(e.exId);
@@ -87,9 +88,20 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
     };
     void paintSync();
     const poll = setInterval(() => void paintSync(), 1200);
+    const offMeta = metaSaved.on((m) => { if (alive && m.id === s.id) void paintSync(); });
 
     root.addEventListener('click', async (e) => {
       const t = e.target as HTMLElement;
+      if (t.closest('[data-act="edittime"]')) {
+        const nextSec = await openEditTimeSheet(s, { initialSec: sessionStats(s, lifts.exOrStub).durationSec });
+        if (alive && nextSec != null && (await updateFinishedDuration(s.id, nextSec))) {
+          const b = q('sumTimeBtn');
+          if (b) b.textContent = fmtDuration(nextSec);
+          void paintSync();
+          toast(`Workout time set to ${fmtDuration(nextSec)}`);
+        }
+        return;
+      }
       const play = t.closest<HTMLElement>('[data-play]');
       if (play) return void (await playVideo(play.dataset.play!));
       const rpe = t.closest<HTMLElement>('[data-rpe]');
@@ -113,6 +125,6 @@ export function summaryScreen(root: HTMLElement, args: string[]): () => void {
         toast(`“${name}” saved. Find it under My Days`);
       }
     });
-    return () => { alive = false; clearInterval(poll); };
+    return () => { alive = false; clearInterval(poll); offMeta(); };
   });
 }

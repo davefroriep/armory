@@ -252,6 +252,83 @@ export function resetSessionClock(s: LiftSession, now = Date.now()): boolean {
   return true;
 }
 
+/**
+ * Sets the elapsed duration of an active or finished strength session to `targetSec` without
+ * mutating `LiftSet.at` timestamps (preserving Gym Cam DVR tape markers).
+ */
+export function setSessionElapsedSec(s: LiftSession, targetSec: number, now = Date.now()): boolean {
+  if (!Number.isFinite(targetSec) || targetSec < 0) return false;
+  const targetMs = Math.max(0, Math.round(targetSec * 1000));
+  if (s.status === 'done') {
+    const refEnd = s.endMs ?? now;
+    s.endMs = refEnd;
+    delete s.pausedAt;
+    const wallMs = Math.max(0, refEnd - s.startMs);
+    if (targetMs <= wallMs) {
+      const paused = wallMs - targetMs;
+      if (paused > 0) s.pausedMs = paused;
+      else delete s.pausedMs;
+    } else {
+      delete s.pausedMs;
+      s.endMs = s.startMs + targetMs;
+    }
+    return true;
+  }
+  if (!isSessionStarted(s)) {
+    if (targetMs === 0) return false;
+    s.started = true;
+    s.manualStart = true;
+    s.startMs = now - targetMs;
+    delete s.pausedAt;
+    delete s.pausedMs;
+    return true;
+  }
+  s.started = true;
+  if (targetMs > 0) s.manualStart = true;
+  const refEnd = s.pausedAt ?? now;
+  const wallMs = Math.max(0, refEnd - s.startMs);
+  if (targetMs <= wallMs) {
+    const paused = wallMs - targetMs;
+    if (paused > 0) s.pausedMs = paused;
+    else delete s.pausedMs;
+  } else {
+    delete s.pausedMs;
+    s.startMs = refEnd - targetMs;
+  }
+  return true;
+}
+
+/**
+ * Estimates true active lifting duration (seconds) by collapsing long gaps between logged sets
+ * (`> gapThresholdSec` -> `gapReplacementSec`) and dropping trailing forgotten-to-pause idle time.
+ */
+export function estimateActiveSessionSec(
+  s: LiftSession,
+  now = Date.now(),
+  gapThresholdSec = 900,
+  gapReplacementSec = 120,
+): number | null {
+  const refEnd = s.endMs ?? s.pausedAt ?? now;
+  const ts: number[] = [];
+  for (const se of s.exs) {
+    for (const st of se.sets) {
+      if (st.done && st.at != null && st.at >= s.startMs && st.at <= refEnd) ts.push(st.at);
+    }
+  }
+  if (ts.length === 0) return null;
+  ts.sort((a, b) => a - b);
+  let total = 0;
+  const d0 = Math.max(0, (ts[0] - s.startMs) / 1000);
+  total += d0 > gapThresholdSec ? gapReplacementSec : d0;
+  for (let i = 0; i < ts.length - 1; i++) {
+    const d = Math.max(0, (ts[i + 1] - ts[i]) / 1000);
+    total += d > gapThresholdSec ? gapReplacementSec : d;
+  }
+  const dt = Math.max(0, (refEnd - ts[ts.length - 1]) / 1000);
+  total += dt > gapThresholdSec ? 0 : dt;
+  return Math.max(0, Math.round(total));
+}
+
 export interface SupersetSpan {
   start: number;
   end: number;

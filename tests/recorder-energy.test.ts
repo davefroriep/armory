@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ putMeta: vi.fn(), putSample: vi.fn() }));
+const mocks = vi.hoisted(() => ({ putMeta: vi.fn(), putSample: vi.fn(), putSamples: vi.fn(), replaceSamples: vi.fn() }));
 vi.mock('../src/store/db', () => mocks);
 
 import { ageOn, bodyProfile, kcalFromSamples, keytelKcalPerMin } from '../src/domain/energy';
 import { buildTcx } from '../src/domain/tcx';
 import { clearHrLog, hrAtTime, live, pushBike, pushHr, resetSpinOdometer } from '../src/ble/telemetry';
-import { Recorder } from '../src/workout/recorder';
+import { compactSamplesToDuration, Recorder } from '../src/workout/recorder';
 
 const T0 = 1_800_000_000_000;
 
@@ -171,5 +171,51 @@ describe('HR-based calories (Keytel et al. 2005)', () => {
     expect(meta.seconds).toBe(3);
     expect(mocks.putMeta).not.toHaveBeenCalled();
     expect(mocks.putSample).not.toHaveBeenCalled();
+  });
+
+  it('compacts trailing and middle zero-HR idle gaps and recalculates Recorder stats on trimTo', () => {
+    clearHrLog();
+    mocks.replaceSamples.mockClear();
+    const mk = (t: number, hr: number) => ({ t, w: 0, cad: 0, hr, dist: 0, kcal: 0, tr: 0 });
+
+    // Trailing 100s zero-HR idle gap after 30s active lifting -> keep 30s preserves all 30 HR samples
+    const trailing = [
+      ...Array.from({ length: 30 }, (_, i) => mk(i, 120 + (i % 10))),
+      ...Array.from({ length: 100 }, (_, i) => mk(30 + i, 0)),
+    ];
+    const compactTrail = compactSamplesToDuration(trailing, 30);
+    expect(compactTrail).toHaveLength(30);
+    expect(compactTrail.every((s, idx) => s.t === idx && s.hr >= 120)).toBe(true);
+
+    // Middle 60s zero-HR break between two 20s active segments -> keep 40s preserves both segments
+    const middle = [
+      ...Array.from({ length: 20 }, (_, i) => mk(i, 115)),
+      ...Array.from({ length: 60 }, (_, i) => mk(20 + i, 0)),
+      ...Array.from({ length: 20 }, (_, i) => mk(80 + i, 145)),
+    ];
+    const compactMid = compactSamplesToDuration(middle, 40);
+    expect(compactMid).toHaveLength(40);
+    expect(compactMid.slice(0, 20).every((s, idx) => s.t === idx && s.hr === 115)).toBe(true);
+    expect(compactMid.slice(20, 40).every((s, idx) => s.t === 20 + idx && s.hr === 145)).toBe(true);
+
+    // Live Recorder.trimTo shrinks 6h back to active duration, updates stats, and continues ticking cleanly
+    for (let i = 0; i < 60; i++) pushHr(130, T0 + i * 1000);
+    const rec = new Recorder('trim-rec', 'strength', 'strength', 'Upper 1', null, 180);
+    rec.tick(300, 0, T0 + 300_000);
+    expect(rec.samples.length).toBe(301);
+    expect(rec.trimTo(60)).toBe(true);
+    expect(rec.samples).toHaveLength(60);
+    expect(rec.meta.seconds).toBe(60);
+    expect(rec.avgHr).toBe(130);
+    expect(rec.meta.maxHr).toBe(130);
+    expect(mocks.replaceSamples).toHaveBeenCalledTimes(1);
+
+    pushHr(165, T0 + 301_000); // >= 90% of 180 -> Z5
+    rec.tick(60, 0, T0 + 301_000);
+    expect(rec.samples).toHaveLength(61);
+    expect(rec.samples[60].t).toBe(60);
+    expect(rec.samples[60].hr).toBe(165);
+    expect(rec.z5Seconds).toBe(1);
+    expect(rec.meta.maxHr).toBe(165);
   });
 });

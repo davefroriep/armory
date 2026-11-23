@@ -1,6 +1,6 @@
 import { audio, buzz } from '../../audio/audio';
 import { active } from '../../lifts/active';
-import { computePRBaseline, computeSessionPRs } from '../../lifts/calc';
+import { computePRBaseline, computeSessionPRs, sessionStats } from '../../lifts/calc';
 import { advanceCursorAfterLog, jumpToExerciseCursor, resolveTargetSet } from '../../lifts/cursor';
 import {
   addSet, buildExercise, camsForExercise, canLog, collectUnfinishedItems, DEFAULT_CAM_OPTIONS, DEFAULT_FALLBACK_CAM,
@@ -14,8 +14,8 @@ import { PHASE1_PLAN } from '../../domain/plan';
 import { fmtKg, fmtNum, fromDisplay, liftSettings, liftSettingsChanged, stepsFor, updateLiftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { gymCam } from '../../lifts/gymCam';
-import { resyncSession } from '../../lifts/intervals';
-import { setText } from '../../lifts/summary';
+import { resyncSession, updateFinishedDuration } from '../../lifts/intervals';
+import { fmtDuration, setText } from '../../lifts/summary';
 import { shortCamLabel } from '../../lifts/tape';
 import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
 import { voice } from '../../lifts/voice';
@@ -27,6 +27,7 @@ import { wireChips } from '../chrome';
 import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
+import { openEditTimeSheet } from './timeSheet';
 import { castClipToWallboard, closeWallboardReplay, openSetVideoSheet, pickRecordCameraSheet, playVideo } from './video';
 import { openVoiceAbShootoutSheet } from './voiceAbSheet';
 
@@ -207,9 +208,12 @@ function build(root: HTMLElement, id?: string): () => void {
   const header = (): string => {
     const back = edit ? `#/strength/workout/${s.id}` : '#/';
     const micBtn = edit ? '' : '<button class="s-mic" id="smic" type="button" data-act="voice" aria-label="Voice commands"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v7a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg><span class="s-mic-lbl" id="smicLbl"></span></button>';
+    const sub = edit
+      ? `${new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })} <button class="sclock-btn" type="button" data-act="edittime" aria-label="Edit workout duration">${esc(fmtDuration(sessionStats(s, exOf).durationSec))}</button> · editing`
+      : '<button class="sclock-btn" type="button" data-act="edittime" aria-label="Edit workout time" title="Tap to edit workout time"><span data-clock>0:00</span></button><span class="since-pill" id="ssince">Since last —</span><span id="scampill"></span>';
     return `<header class="bar sbar">
       <a class="icon-btn" href="${back}" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a>
-      <div class="stitle"><button class="stitle-btn" type="button" data-act="rename"><b>${esc(s.name)}</b></button><small>${edit ? new Date(s.startMs).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' }) + ' · editing' : '<span data-clock>0:00</span><span class="since-pill" id="ssince">Since last —</span><span id="scampill"></span>'}</small></div>
+      <div class="stitle"><button class="stitle-btn" type="button" data-act="rename"><b>${esc(s.name)}</b></button><small>${sub}</small></div>
       <div class="chips"><span id="sclkctl">${clockCtlHtml()}</span>${micBtn}<button class="chip" data-chip="hr"></button><button class="icon-btn" data-act="wkmenu" aria-label="Workout options">⋯</button></div>
     </header>`;
   };
@@ -361,6 +365,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const paused = isSessionPaused(s);
     const txt = started ? `${clock(active.elapsedSec())}${paused ? ' · paused' : ''}` : '0:00';
     root.querySelectorAll<HTMLElement>('[data-clock]').forEach((e) => { e.textContent = txt; });
+    root.querySelector<HTMLElement>('.sclock-btn')?.classList.toggle('paused', started && paused);
     const sinceEl = root.querySelector<HTMLElement>('#ssince');
     if (sinceEl) {
       const sec = secondsSinceLastSet(s);
@@ -1058,11 +1063,13 @@ function build(root: HTMLElement, id?: string): () => void {
     const wbSt = wallboard.status;
     const k = await actionSheet(s.name, [
       { key: 'rename', label: 'Rename workout' },
+      { key: 'time', label: 'Edit workout time', sub: edit ? fmtDuration(sessionStats(s, exOf).durationSec) : clock(active.elapsedSec()) },
       { key: 'note', label: s.note ? 'Edit workout note' : 'Add workout note' },
       ...(!edit ? [{ key: 'wallboard', label: wbSt.running ? `TV Wallboard · ${wbSt.url}` : 'TV Wallboard (Gym Display)', sub: wbSt.running ? `${wbSt.clients} TV${wbSt.clients === 1 ? '' : 's'} connected` : 'Stream live HR, rest timer & next set over Wi-Fi' }] : []),
       { key: 'del', label: edit ? 'Delete workout' : 'Discard workout', danger: true },
     ]);
     if (k === 'rename') await rename();
+    else if (k === 'time') await editTime();
     else if (k === 'note') {
       const v = await promptSheet('Workout note', s.note ?? '', 'How it felt…', true);
       if (v != null) { if (v) s.note = v; else delete s.note; save(); }
@@ -1098,6 +1105,26 @@ function build(root: HTMLElement, id?: string): () => void {
   const rename = async (): Promise<void> => {
     const v = await promptSheet('Workout name', s.name);
     if (v) { s.name = v; save(); const b = root.querySelector('.stitle b'); if (b) b.textContent = v; }
+  };
+  const editTime = async (): Promise<void> => {
+    const curSec = edit ? sessionStats(s, exOf).durationSec : active.elapsedSec();
+    const nextSec = await openEditTimeSheet(s, { initialSec: curSec, paused: !edit && isSessionPaused(s) });
+    if (dead || nextSec == null) return;
+    if (!edit) {
+      const ok = await active.setElapsedSec(nextSec);
+      if (ok) {
+        buzz(20);
+        paintClock();
+        toast(`Workout time set to ${clock(nextSec)}`);
+      }
+    } else {
+      const ok = await updateFinishedDuration(s.id, nextSec);
+      if (ok) {
+        dirty = true;
+        paint();
+        toast(`Workout time set to ${fmtDuration(nextSec)}`);
+      }
+    }
   };
 
   root.addEventListener('click', async (e) => {
@@ -1139,6 +1166,7 @@ function build(root: HTMLElement, id?: string): () => void {
     if (act === 'finish') return void (await finish());
     if (act === 'discard') return void (await discardCurrentWorkout());
     if (act === 'rename') return void (await rename());
+    if (act === 'edittime') return void (await editTime());
     if (act === 'camstatus') {
       const sh = openSheet('<div id="camStatusBody"></div>');
       const renderCamSheet = (): void => {

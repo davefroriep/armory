@@ -1,7 +1,41 @@
 import { bikeFrame, bikeFresh, hrAtTime, hrBeat, live } from '../ble/telemetry';
-import { putMeta, putSample } from '../store/db';
+import { putMeta, putSample, putSamples, replaceSamples } from '../store/db';
 import type { Equipment, Sample, WorkoutMeta } from '../types';
 import { Z5_HR_FRAC } from '../ui/hr';
+
+/**
+ * Compacts a 1 Hz sample stream down to `targetSec` seconds by dropping longest idle gaps
+ * (`hr <= 30 && w === 0`, preferring later gaps on ties) before truncating trailing active samples,
+ * then re-indexing `t = 0..n-1`.
+ */
+export function compactSamplesToDuration(samples: Sample[], targetSec: number): Sample[] {
+  const keep = Math.max(0, Math.floor(targetSec));
+  if (samples.length <= keep) return samples;
+  if (keep === 0) return [];
+  const runs: { start: number; len: number }[] = [];
+  for (let i = 0; i < samples.length; ) {
+    if (samples[i].hr <= 30 && samples[i].w === 0) {
+      let j = i + 1;
+      while (j < samples.length && samples[j].hr <= 30 && samples[j].w === 0) j++;
+      runs.push({ start: i, len: j - i });
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  runs.sort((a, b) => b.len - a.len || b.start - a.start);
+  const drop = new Uint8Array(samples.length);
+  let toDrop = samples.length - keep;
+  for (const run of runs) {
+    if (toDrop <= 0) break;
+    const take = Math.min(toDrop, run.len);
+    for (let i = run.start + run.len - take; i < run.start + run.len; i++) drop[i] = 1;
+    toDrop -= take;
+  }
+  const kept = samples.filter((_, i) => !drop[i]);
+  const trimmed = kept.length > keep ? kept.slice(0, keep) : kept;
+  return trimmed.map((s, idx) => (s.t === idx ? s : { ...s, t: idx }));
+}
 
 /**
  * 1 Hz session recorder. Accumulates the 5 Hz bike frames and records the per-second mean (so sprint
@@ -39,26 +73,8 @@ export class Recorder {
   ) {
     if (resumeFrom) {
       this.meta = { ...resumeFrom.meta };
-      for (const s of resumeFrom.samples) {
-        this.samples.push(s);
-        this.wTotal += s.w;
-        this.kjAcc += s.w / 1000;
-        this.meta.maxW = Math.max(this.meta.maxW, s.w);
-        if (s.hr > 0) {
-          this.hrTotal += s.hr;
-          this.hrCount++;
-          this.meta.maxHr = Math.max(this.meta.maxHr, s.hr);
-          if (s.hr >= Z5_HR_FRAC * hrMax) this.z5Seconds++;
-        }
-      }
-      const tail = resumeFrom.samples[resumeFrom.samples.length - 1];
-      if (tail) {
-        this.accDist = tail.dist;
-        this.accKcal = tail.kcal;
-        this.lastDist = tail.dist;
-        this.lastKcal = tail.kcal;
-      }
-      this.nextT = resumeFrom.samples.length;
+      this.samples.push(...resumeFrom.samples);
+      this.recomputeFromSamples();
       return;
     }
     this.meta = {
@@ -112,6 +128,51 @@ export class Recorder {
     return () => offs.forEach((off) => off());
   }
 
+  private recomputeFromSamples(): void {
+    this.wTotal = 0;
+    this.kjAcc = 0;
+    this.hrTotal = 0;
+    this.hrCount = 0;
+    this.z5Seconds = 0;
+    this.meta.maxW = 0;
+    this.meta.maxHr = 0;
+    for (const s of this.samples) {
+      this.wTotal += s.w;
+      this.kjAcc += s.w / 1000;
+      this.meta.maxW = Math.max(this.meta.maxW, s.w);
+      if (s.hr > 0) {
+        this.hrTotal += s.hr;
+        this.hrCount++;
+        this.meta.maxHr = Math.max(this.meta.maxHr, s.hr);
+        if (s.hr >= Z5_HR_FRAC * this.hrMax) this.z5Seconds++;
+      }
+    }
+    const tail = this.samples[this.samples.length - 1];
+    this.accDist = tail ? tail.dist : 0;
+    this.accKcal = tail ? tail.kcal : 0;
+    this.lastDist = this.accDist;
+    this.lastKcal = this.accKcal;
+    this.nextT = this.samples.length;
+  }
+
+  /**
+   * Compacts recorded samples down to `targetSec` (dropping longest idle gaps first)
+   * and recalculates live stats/aggregates.
+   */
+  trimTo(targetSec: number): boolean {
+    const next = compactSamplesToDuration(this.samples, targetSec);
+    if (next.length === this.samples.length) return false;
+    this.samples.length = 0;
+    this.samples.push(...next);
+    this.recomputeFromSamples();
+    this.meta.seconds = this.samples.length;
+    if (this.persist) {
+      void replaceSamples(this.meta.id, this.samples);
+      void putMeta(this.meta, false);
+    }
+    return true;
+  }
+
   /**
    * Fills every second up to `elapsed`. Heart rate comes from the beat nearest to that second's wall
    * time, so a late call back-fills real data, and a stretch with no beats records 0 (a gap) rather than
@@ -120,6 +181,7 @@ export class Recorder {
   tick(elapsed: number, targetRpm: number, now = Date.now()): void {
     const bike = bikeFresh();
     if (bike) this.accumulateBikeTotals();
+    const batch: Sample[] = [];
     while (this.nextT <= Math.floor(elapsed)) {
       const w = this.frames && bike ? this.wSum / this.frames : bike ? live.w : 0;
       const cad = this.frames && bike ? this.cadSum / this.frames : bike ? live.cad : 0;
@@ -130,7 +192,7 @@ export class Recorder {
       this.lastKcal = kcal;
       const s: Sample = { t: this.nextT, w, cad, hr, dist, kcal, tr: targetRpm };
       this.samples.push(s);
-      if (this.persist) void putSample(this.meta.id, s);
+      batch.push(s);
 
       this.kjAcc += w / 1000;
       this.wTotal += w;
@@ -144,6 +206,10 @@ export class Recorder {
       this.wSum = this.cadSum = 0;
       this.frames = 0;
       this.nextT++;
+    }
+    if (this.persist) {
+      if (batch.length === 1) void putSample(this.meta.id, batch[0]);
+      else if (batch.length > 1) void putSamples(this.meta.id, batch);
     }
   }
 

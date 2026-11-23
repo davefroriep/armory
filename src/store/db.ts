@@ -60,6 +60,14 @@ export async function putSamples(id: string, samples: Sample[]): Promise<void> {
   await done(t);
 }
 
+export async function replaceSamples(id: string, samples: Sample[]): Promise<void> {
+  const t = await tx(['workout_samples'], 'readwrite');
+  const os = t.objectStore('workout_samples');
+  os.delete(IDBKeyRange.bound([id, 0], [id, Infinity]));
+  for (const s of samples) os.put({ id, ...s });
+  await done(t);
+}
+
 export async function getMeta(id: string): Promise<WorkoutMeta | undefined> {
   const t = await tx(['workouts_meta'], 'readonly');
   return wrap(t.objectStore('workouts_meta').get(id));

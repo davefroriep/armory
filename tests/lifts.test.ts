@@ -9,10 +9,10 @@ import { LIBRARY, LIBRARY_BY_ID } from '../src/lifts/library';
 import { buildBoostcampSessions } from '../src/lifts/boostcampSeed';
 import {
   addSet, buildExercise, canLog, collectUnfinishedItems, camsForExercise, defaultCamsForExercise, DEFAULT_FALLBACK_CAM,
-  driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec, hasSessionActivity, inferredCamForExercise,
+  driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec, estimateActiveSessionSec, hasSessionActivity, inferredCamForExercise,
   isSessionPaused, isSessionStarted, labels, midSuperset, newSet, normalizeCamList, pauseSessionClock,
   preferredCamForExercise, prevSetFor, pruneUnlogged, removeExerciseAt, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
-  startSessionClock, supersetGroups, swapExercise, toggleDone,
+  setSessionElapsedSec, startSessionClock, supersetGroups, swapExercise, toggleDone,
 } from '../src/lifts/logic';
 import {
   extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs, sortDeviceVideosNewestFirst,
@@ -713,6 +713,119 @@ describe('Phase 1 routine seed', () => {
     expect(s.pausedAt ?? null).toBeNull();
     expect(s.pausedMs ?? 0).toBe(0);
     expect(isSessionPaused(s)).toBe(false);
+  });
+
+  it('edits active, paused, unstarted, and finished session durations without shifting set timestamps', () => {
+    const t0 = 1_700_000_000_000;
+    const setAt = t0 + 180_000;
+    const sixHoursLater = t0 + 21_600_000;
+    const running = sess('edit-run', t0, [sx('bench', [set(lb(135), 8, { done: true, at: setAt })])], {
+      status: 'active',
+      started: true,
+      manualStart: false,
+      startMs: t0,
+      endMs: null,
+    });
+    expect(setSessionElapsedSec(running, 2700, sixHoursLater)).toBe(true);
+    expect(running.startMs).toBe(t0);
+    expect(running.pausedMs).toBe(21_600_000 - 2_700_000);
+    expect(running.manualStart).toBe(true);
+    expect(running.exs[0].sets[0].at).toBe(setAt);
+    expect(elapsedSessionSec(running, sixHoursLater)).toBe(2700);
+    expect(elapsedSessionSec(running, sixHoursLater + 60_000)).toBe(2760);
+    expect(sessionStats({ ...running, endMs: sixHoursLater }, exOf).durationSec).toBe(2700);
+
+    // Paused session stays paused at the newly edited duration and resumes cleanly from there
+    const paused = sess('edit-pause', t0, [sx('bench', [set(lb(135), 8, { done: true, at: setAt })])], {
+      status: 'active',
+      started: true,
+      manualStart: true,
+      startMs: t0,
+      endMs: null,
+      pausedAt: sixHoursLater,
+    });
+    expect(setSessionElapsedSec(paused, 1800, sixHoursLater + 300_000)).toBe(true);
+    expect(isSessionPaused(paused)).toBe(true);
+    expect(elapsedSessionSec(paused, sixHoursLater + 600_000)).toBe(1800);
+    expect(resumeSessionClock(paused, sixHoursLater + 600_000)).toBe(true);
+    expect(elapsedSessionSec(paused, sixHoursLater + 660_000)).toBe(1860);
+
+    // Lengthening active session past wall-clock time shifts startMs earlier and clears pausedMs
+    expect(setSessionElapsedSec(running, 25_200, sixHoursLater)).toBe(true);
+    expect(running.pausedMs ?? 0).toBe(0);
+    expect(running.startMs).toBe(sixHoursLater - 25_200_000);
+    expect(elapsedSessionSec(running, sixHoursLater)).toBe(25_200);
+
+    // Unstarted 0:00 session: 0 is no-op, positive duration starts & sets manualStart
+    const unstarted = sess('edit-new', t0, [sx('bench', [set(lb(135), 8, { done: false })])], {
+      status: 'active',
+      started: false,
+      startMs: t0,
+      endMs: null,
+    });
+    expect(setSessionElapsedSec(unstarted, 0, t0 + 5_000)).toBe(false);
+    expect(setSessionElapsedSec(unstarted, 900, t0 + 10_000)).toBe(true);
+    expect(unstarted.started).toBe(true);
+    expect(unstarted.manualStart).toBe(true);
+    expect(elapsedSessionSec(unstarted, t0 + 10_000)).toBe(900);
+
+    // Finished session: shortening sets pausedMs (keeping startMs/endMs); lengthening updates endMs (keeping startMs)
+    const doneSess = sess('edit-done', t0, [sx('bench', [set(lb(185), 5, { done: true, at: setAt })])], {
+      status: 'done',
+      started: true,
+      startMs: t0,
+      endMs: sixHoursLater,
+    });
+    expect(setSessionElapsedSec(doneSess, 3000, sixHoursLater + 100_000)).toBe(true);
+    expect(doneSess.startMs).toBe(t0);
+    expect(doneSess.endMs).toBe(sixHoursLater);
+    expect(sessionStats(doneSess, exOf).durationSec).toBe(3000);
+
+    expect(setSessionElapsedSec(doneSess, 28_800, sixHoursLater + 100_000)).toBe(true);
+    expect(doneSess.startMs).toBe(t0);
+    expect(doneSess.pausedMs ?? 0).toBe(0);
+    expect(doneSess.endMs).toBe(t0 + 28_800_000);
+    expect(sessionStats(doneSess, exOf).durationSec).toBe(28_800);
+  });
+
+  it('estimates true active duration across trailing and mid-workout idle gaps', () => {
+    const t0 = 1_700_000_000_000;
+    // 6h forgotten-to-pause trailing gap: last set logged at 35m -> estimates 35m (2100s)
+    const trailing = sess('est-trail', t0, [
+      sx('bench', [
+        set(lb(185), 5, { done: true, at: t0 + 300_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 1_200_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 2_100_000 }),
+      ]),
+    ], { status: 'active', started: true, startMs: t0, endMs: null });
+    expect(estimateActiveSessionSec(trailing, t0 + 21_600_000)).toBe(2100);
+
+    // 5h mid-workout break (e.g. morning 10m + 5h break + afternoon 10m) -> collapses 5h gap to 120s
+    const midGap = sess('est-mid', t0, [
+      sx('bench', [
+        set(lb(185), 5, { done: true, at: t0 + 300_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 600_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 18_600_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 19_200_000 }),
+      ]),
+    ], { status: 'active', started: true, startMs: t0, endMs: null });
+    expect(estimateActiveSessionSec(midGap, t0 + 19_260_000)).toBe(1380);
+
+    // Normal continuous workout (all set gaps <= 15m) returns actual duration
+    const normal = sess('est-norm', t0, [
+      sx('bench', [
+        set(lb(185), 5, { done: true, at: t0 + 300_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 900_000 }),
+        set(lb(185), 5, { done: true, at: t0 + 1_500_000 }),
+      ]),
+    ], { status: 'active', started: true, startMs: t0, endMs: null });
+    expect(estimateActiveSessionSec(normal, t0 + 1_620_000)).toBe(1620);
+
+    // No stamped sets returns null
+    const noStamps = sess('est-empty', t0, [sx('bench', [set(lb(185), 5, { done: false })])], {
+      status: 'active', started: true, startMs: t0, endMs: null,
+    });
+    expect(estimateActiveSessionSec(noStamps, t0 + 3_600_000)).toBeNull();
   });
 });
 

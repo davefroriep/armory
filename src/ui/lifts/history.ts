@@ -5,9 +5,12 @@ import { condenseSets, fmtDuration, fmtVolume, sessionPRs } from '../../lifts/su
 import { startWorkout } from './train';
 import { getMeta, getSamples } from '../../store/db';
 import { hrSummary } from '../../lifts/intervals';
+import { updateFinishedDuration } from '../../lifts/intervals';
+import type { LiftSession } from '../../lifts/types';
 import { esc } from '../dom';
 import { openShareCard, sessionRow, stat } from './cards';
 import { LI, actionSheet, confirmSheet, mount, resumeBar, tabBar, toast, wireClock } from './kit';
+import { openEditTimeSheet } from './timeSheet';
 import { playVideo } from './video';
 
 /** Month grid with a dot on every day you trained, then the list. */
@@ -106,7 +109,7 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
           <div class="chips"><button class="icon-btn" data-act="share" aria-label="Share">${LI.share}</button><button class="icon-btn" data-act="menu" aria-label="More">${LI.more}</button></div></header>
         <main class="page">
           <div class="sum-sub">${new Date(s.startMs).toLocaleString([], { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div>
-          <section class="stats four">${stat('TIME', fmtDuration(st.durationSec))}${stat('SETS', String(st.sets))}${stat('VOLUME', fmtVolume(st.volumeKg, unit).replace(` ${unit}`, ''))}${stat('PRs', String(pr.count))}</section>
+          <section class="stats four"><button class="stat-btn" type="button" data-act="edittime" aria-label="Edit workout duration"><small>TIME ✎</small><b>${fmtDuration(st.durationSec)}</b></button>${stat('SETS', String(st.sets))}${stat('VOLUME', fmtVolume(st.volumeKg, unit).replace(` ${unit}`, ''))}${stat('PRs', String(pr.count))}</section>
           <div id="hrline"></div>
           ${s.note ? `<section class="card"><p class="note-p">${esc(s.note)}</p></section>` : ''}
           ${exHtml}
@@ -133,6 +136,13 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
     paint();
     const offStore = lifts.changed.on(paint);
 
+    const editTime = async (sess: LiftSession): Promise<void> => {
+      const nextSec = await openEditTimeSheet(sess, { initialSec: sessionStats(sess, lifts.exOrStub).durationSec });
+      if (nextSec != null && (await updateFinishedDuration(sess.id, nextSec))) {
+        toast(`Workout time set to ${fmtDuration(nextSec)}`);
+      }
+    };
+
     root.addEventListener('click', async (e) => {
       const s = lifts.sessions.get(id);
       if (!s) return;
@@ -140,6 +150,7 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
       const p = t.closest<HTMLElement>('[data-play]');
       if (p) return void (await playVideo(p.dataset.play!));
       const a = t.closest<HTMLElement>('[data-act]')?.dataset.act;
+      if (a === 'edittime') return void (await editTime(s));
       if (a === 'share') return void (await openShareCard(s));
       if (a === 'repeat') {
         const r = s.routineId ? lifts.routines.get(s.routineId) : undefined;
@@ -148,7 +159,12 @@ export function workoutScreen(root: HTMLElement, args: string[]): () => void {
         return void (await startWorkout({ name: s.name, items }));
       }
       if (a === 'menu') {
-        const k = await actionSheet(s.name, [{ key: 'edit', label: 'Edit sets' }, { key: 'del', label: 'Delete workout', danger: true }]);
+        const k = await actionSheet(s.name, [
+          { key: 'time', label: 'Edit workout time' },
+          { key: 'edit', label: 'Edit sets' },
+          { key: 'del', label: 'Delete workout', danger: true },
+        ]);
+        if (k === 'time') await editTime(s);
         if (k === 'edit') location.hash = `#/strength/session/${s.id}`;
         if (k === 'del' && (await confirmSheet('Delete workout?', 'Removes it from History and its videos from this phone. The Intervals.icu activity stays.', 'Delete', true))) {
           await lifts.deleteSession(s.id);

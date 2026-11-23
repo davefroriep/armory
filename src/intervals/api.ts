@@ -154,7 +154,10 @@ export async function uploadActivity(a: UploadArgs): Promise<string> {
 }
 
 /** Patches RPE + sport type (VirtualRide, matching the existing Bowflex/AirBike history). */
-export async function patchActivity(id: string, fields: { icu_rpe?: number; type?: string; description?: string; name?: string; kg_lifted?: number }): Promise<void> {
+export async function patchActivity(
+  id: string,
+  fields: { icu_rpe?: number; type?: string; description?: string; name?: string; kg_lifted?: number; moving_time?: number; elapsed_time?: number },
+): Promise<void> {
   await call(`/activity/${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

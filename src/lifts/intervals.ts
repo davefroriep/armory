@@ -3,10 +3,12 @@ import { buildTcx } from '../domain/tcx';
 import { createManualActivity, patchActivity, syncAthleteFtp, uploadActivity } from '../intervals/api';
 import { calendar, localDate } from '../intervals/calendar';
 import { getSettings } from '../store/settings';
-import { getMeta, getSamples, putMeta } from '../store/db';
+import { getMeta, getSamples, putMeta, replaceSamples } from '../store/db';
+import { compactSamplesToDuration } from '../workout/recorder';
 import type { WorkoutMeta } from '../types';
 import { sessionStats } from './calc';
 import { liftSettings } from './settings';
+import { setSessionElapsedSec } from './logic';
 import { lifts } from './store';
 import { intervalsDescription } from './summary';
 import type { LiftSession } from './types';
@@ -77,6 +79,7 @@ async function runSync(meta: WorkoutMeta, s: LiftSession): Promise<WorkoutMeta> 
       m.patched = true;
       // Intervals.icu has a native "kg lifted" field; best-effort so an unexpected rejection never blocks the log.
       if (kgLifted > 0) await patchActivity(m.activityId, { kg_lifted: kgLifted }).catch(() => {});
+      if (secs > 0) await patchActivity(m.activityId, { moving_time: secs, elapsed_time: secs }).catch(() => {});
     }
     m.upload = 'done';
     m.lastError = null;
@@ -98,8 +101,26 @@ export async function resyncSession(sessionId: string): Promise<WorkoutMeta | nu
   const s = lifts.sessions.get(sessionId);
   if (!meta || !s || meta.status !== 'saved') return null;
   meta.rpe = s.rpe;
+  meta.seconds = Math.max(0, sessionStats(s, lifts.exOrStub).durationSec);
   meta.patched = false;
   meta.upload = 'pending';
   await putMeta(meta);
   return syncLiftWorkout(meta, s);
+}
+
+/** Updates a finished session's duration, compacts any idle HR gaps, and re-syncs Intervals.icu. */
+export async function updateFinishedDuration(sessionId: string, targetSec: number): Promise<boolean> {
+  const s = lifts.sessions.get(sessionId);
+  if (!s || s.status !== 'done') return false;
+  if (!setSessionElapsedSec(s, targetSec)) return false;
+  lifts.saveSession(s, true);
+  if (typeof indexedDB !== 'undefined') {
+    const prevSamples = await getSamples(s.id);
+    const targetCount = Math.max(0, Math.round(targetSec));
+    if (prevSamples.length > targetCount + 1) {
+      await replaceSamples(s.id, compactSamplesToDuration(prevSamples, targetCount));
+    }
+  }
+  void resyncSession(s.id);
+  return true;
 }
