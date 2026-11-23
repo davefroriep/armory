@@ -54,8 +54,8 @@ Copy-Item -Force $builtApk $apk
 Write-Host "APK: $((Resolve-Path $apk).Path)"
 if ($Install) { & "$env:ANDROID_HOME\platform-tools\adb.exe" install -r $apk }
 if ($Publish) {
-  $dirty = git status --porcelain --untracked-files=no
-  if ($LASTEXITCODE -or $dirty) { throw 'tracked working tree is dirty; commit before publishing' }
+  $dirty = git status --porcelain --untracked-files=no -- . ':!server/'
+  if ($LASTEXITCODE -or $dirty) { throw 'tracked APK working tree is dirty; commit before publishing' }
   npx vitest run
   if ($LASTEXITCODE) { throw 'vitest failed before publish' }
   $rev = Get-Content rev.json -Raw | ConvertFrom-Json
