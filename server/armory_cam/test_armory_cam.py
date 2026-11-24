@@ -4763,9 +4763,48 @@ class ShowDirectorTests(unittest.TestCase):
 
     def test_room_voice_cuda_warmup_fallback_and_end_silence_default(self) -> None:
         cfg = rv.RoomVoiceConfig()
-        self.assertEqual(cfg.end_silence_ms, 380)
+        self.assertEqual(cfg.end_silence_ms, 580)
+        self.assertEqual(cfg.model_size, "small.en")
+        self.assertAlmostEqual(cfg.vad_threshold, 0.48, places=2)
         svc = rv.RoomVoiceService(config=cfg, allow_hardware_audio=False)
         self.assertIn("asrDevice", svc.status_dict())
+
+        # Prompt must lead with capitalized wake-word command pairs so Whisper never drops "Armory"
+        prompt, hotwords = rv.build_whisper_prompt("armory", ["Lat Pulldown"])
+        self.assertTrue(prompt.startswith("Armory, record this. Armory, done."))
+        self.assertIn("Armory", hotwords)
+        self.assertIn("record this", hotwords)
+
+        # Idle Silero VAD LSTM reset prevents continuous music drift without interrupting speech
+        class _IdleVad:
+            def __init__(self) -> None:
+                self.resets = 0
+
+            def reset(self) -> None:
+                self.resets += 1
+
+            def score_frame(self, _frame: np.ndarray, rms_gate: float = 0.0025) -> float:
+                return 0.05
+
+        idle_vad = _IdleVad()
+        det = rv.UtteranceDetector(vad=idle_vad, vad_threshold=0.48, rms_gate=0.0025, idle_reset_frames=10)
+        music_chunk = np.full(rv.VAD_FRAME_SAMPLES * 25, 0.02, dtype=np.float32)
+        self.assertEqual(det.push_samples(music_chunk), [])
+        self.assertEqual(idle_vad.resets, 2)
+        self.assertFalse(det.is_user_speaking())
+
+        # Ready chime must NOT mute capture and must skip entirely if user is already speaking
+        v_chime = rv.RoomVoiceService(config=cfg, allow_hardware_audio=True)
+        v_chime._started = True
+        v_chime._mute_until_mono = 0.0
+        v_chime._detector._in_speech = True
+        self.assertFalse(v_chime.play_ready_chime())
+        self.assertEqual(v_chime._mute_until_mono, 0.0)
+        v_chime._detector._in_speech = False
+        self.assertTrue(v_chime.play_ready_chime())
+        self.assertEqual(v_chime._mute_until_mono, 0.0)
+        q_kind, _q_data = v_chime._speaker_queue.get_nowait()
+        self.assertEqual(q_kind, "ready_chime")
 
         calls: list[tuple[str, str]] = []
 

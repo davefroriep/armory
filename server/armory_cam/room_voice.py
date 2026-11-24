@@ -38,6 +38,7 @@ import sounddevice as sd
 SAMPLE_RATE_16K = 16_000
 VAD_FRAME_SAMPLES = 512  # 32 ms @ 16 kHz (native Silero VAD window)
 VAD_CONTEXT_SAMPLES = 64
+VAD_IDLE_RESET_FRAMES = 94  # ~3.0 s of idle non-speech -> reset Silero LSTM to prevent music drift
 PRE_ROLL_FRAMES = 18     # ~576 ms pre-roll so far-field "Ar-" onset of "Armory" is never clipped
 ARM_WINDOW_MS = 7_000
 MAX_RECENT_TRANSCRIPTS = 12
@@ -228,11 +229,18 @@ def has_command_tail(text: str, wake_word: str = "armory") -> bool:
 
 
 def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tuple[str, str]:
-    """Build concise Whisper `initial_prompt` + `hotwords` seeded with gym commands and current exercises."""
+    """Build concise Whisper `initial_prompt` + `hotwords` led by wake-word gym commands and current exercises."""
     wake = (wake_word or "armory").strip() or "armory"
+    wake_cap = wake[0].upper() + wake[1:]
+    # Always lead `initial_prompt` with natural punctuated wake+command pairs so Whisper biases
+    # strongly toward the wake word ("Armory") over music rather than substituting show names ("Ryder").
+    lead_sentences = (
+        f"{wake_cap}, record this. "
+        f"{wake_cap}, done. "
+        f"{wake_cap}, check. "
+    )
     core = [
-        "check",
-        "done",
+        "start hold",
         "rpe",
         "next exercise",
         "add set",
@@ -278,11 +286,11 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         if len(extras) >= 12:
             break
     all_terms = core + extras
-    prompt = ", ".join(all_terms) + "."
+    prompt = lead_sentences + ", ".join(all_terms) + "."
     hotwords = ", ".join([
-        wake, "check", "done", "skip rest", "next exercise", "add set", "undo", "back",
-        "rack", "smith", "replay", "switch views", "play music", "lights", "PR",
-        "open the gym", "close the gym", "shut down",
+        wake_cap, "record this", "done", "check", "start hold", "skip rest", "next exercise",
+        "add set", "undo", "back", "rack", "smith", "replay", "switch views", "play music",
+        "lights", "PR", "open the gym", "close the gym", "shut down",
         *extras[:6],
     ])
     return prompt, hotwords
@@ -294,15 +302,15 @@ class RoomVoiceConfig:
     device_match: str = "PowerConf S330"
     speaker_match: str = "PowerConf S330"
     listen_mode: str = "workout"  # "workout" | "always"
-    model_size: str = "base.en"   # empirically benchmarked <= 1.2s on i7-4790
+    model_size: str = "small.en"  # empirically 18/18 (100%) over gym music on GTX 1650 CUDA
     wake_word: str = "armory"
     speaker_readback: bool = True
     room_command_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
     set_commit_mode: str = "voice"  # "voice" | "chime"
-    vad_threshold: float = 0.42
+    vad_threshold: float = 0.48
     min_speech_ms: int = 280
-    end_silence_ms: int = 380
+    end_silence_ms: int = 580
     max_utterance_sec: float = 4.8
     rms_gate: float = 0.0025
 
@@ -331,8 +339,8 @@ class RoomVoiceConfig:
             return cls()
         mode_raw = str(raw.get("listenMode", "workout")).strip().lower()
         listen_mode = "always" if mode_raw == "always" else "workout"
-        model_raw = str(raw.get("modelSize", "base.en")).strip()
-        model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en") else "base.en"
+        model_raw = str(raw.get("modelSize", "small.en")).strip()
+        model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en") else "small.en"
         wake = str(raw.get("wakeWord") or "armory").strip().lower() or "armory"
         tts_raw = str(raw.get("ttsVoice") or DEFAULT_TTS_VOICE).strip()
         tts_raw = _LEGACY_TTS_VOICE_MAP.get(tts_raw, tts_raw)
@@ -350,9 +358,9 @@ class RoomVoiceConfig:
             room_command_readback=bool(raw.get("roomCommandReadback", True)),
             tts_voice=tts_voice,
             set_commit_mode=set_commit_mode,
-            vad_threshold=_clamp(float(raw.get("vadThreshold", 0.42) or 0.42), 0.15, 0.90),
+            vad_threshold=_clamp(float(raw.get("vadThreshold", 0.48) or 0.48), 0.15, 0.90),
             min_speech_ms=max(160, min(1200, int(raw.get("minSpeechMs", 280) or 280))),
-            end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 380) or 380))),
+            end_silence_ms=max(250, min(2000, int(raw.get("endSilenceMs", 580) or 580))),
             max_utterance_sec=_clamp(float(raw.get("maxUtteranceSec", 4.8) or 4.8), 2.5, 15.0),
             rms_gate=_clamp(float(raw.get("rmsGate", 0.0025) or 0.0025), 0.0005, 0.05),
         )
@@ -936,11 +944,12 @@ class UtteranceDetector:
     def __init__(
         self,
         vad: SileroStreamingVad | None = None,
-        vad_threshold: float = 0.42,
+        vad_threshold: float = 0.48,
         min_speech_ms: int = 280,
-        end_silence_ms: int = 520,
+        end_silence_ms: int = 580,
         max_utterance_sec: float = 4.8,
         rms_gate: float = 0.0025,
+        idle_reset_frames: int = VAD_IDLE_RESET_FRAMES,
     ) -> None:
         self.vad = vad or SileroStreamingVad()
         self.vad_threshold = vad_threshold
@@ -948,6 +957,7 @@ class UtteranceDetector:
         self.end_silence_frames = max(3, int(round(end_silence_ms / 32.0)))
         self.max_frames = max(20, int(round((max_utterance_sec * 1000.0) / 32.0)))
         self.rms_gate = rms_gate
+        self.idle_reset_frames = max(0, int(idle_reset_frames))
 
         self._buf16 = np.zeros(0, dtype=np.float32)
         self._pre_roll: deque[np.ndarray] = deque(maxlen=PRE_ROLL_FRAMES)
@@ -955,9 +965,14 @@ class UtteranceDetector:
         self._onset_streak = 0
         self._silence_streak = 0
         self._speech_frames = 0
+        self._idle_frames = 0
         self._collected: list[np.ndarray] = []
         self.latest_rms = 0.0
         self.latest_vad = 0.0
+
+    def is_user_speaking(self) -> bool:
+        """Return True if speech onset or an active utterance is currently in progress."""
+        return bool(self._in_speech or self._onset_streak > 0)
 
     def configure(self, cfg: RoomVoiceConfig) -> None:
         self.vad_threshold = cfg.vad_threshold
@@ -973,6 +988,7 @@ class UtteranceDetector:
         self._onset_streak = 0
         self._silence_streak = 0
         self._speech_frames = 0
+        self._idle_frames = 0
         self._collected.clear()
         self.vad.reset()
 
@@ -1006,6 +1022,7 @@ class UtteranceDetector:
             if not self._in_speech:
                 self._pre_roll.append(frame.copy())
                 if is_speech:
+                    self._idle_frames = 0
                     self._onset_streak += 1
                     if self._onset_streak >= 2:
                         self._in_speech = True
@@ -1015,7 +1032,15 @@ class UtteranceDetector:
                         self._onset_streak = 0
                 else:
                     self._onset_streak = 0
+                    if self.idle_reset_frames > 0:
+                        self._idle_frames += 1
+                        if self._idle_frames >= self.idle_reset_frames:
+                            # Periodically reset Silero LSTM hidden state while idle so continuous
+                            # background gym music cannot drift/saturate speech probability downward.
+                            self.vad.reset()
+                            self._idle_frames = 0
             else:
+                self._idle_frames = 0
                 self._collected.append(frame.copy())
                 if is_speech:
                     self._speech_frames += 1
@@ -1041,6 +1066,7 @@ class UtteranceDetector:
                     self._onset_streak = 0
                     self._silence_streak = 0
                     self._speech_frames = 0
+                    self._idle_frames = 0
 
         return completed
 
@@ -2165,13 +2191,15 @@ class RoomVoiceService:
         target_peak: float = 0.84,
         kind: str = "tts",
         allow_router: bool = True,
+        mute_mic: bool = True,
     ) -> bool:
         if mono_pcm.size == 0:
             return False
         duck_ctx_factory = None
         if allow_router and self._house_audio_router is not None:
             est_dur = float(mono_pcm.size) / float(max(1, src_sr))
-            self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + est_dur + 0.70)
+            if mute_mic:
+                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + est_dur + 0.70)
             try:
                 route_res = self._house_audio_router(mono_pcm, src_sr, kind=kind)
             except Exception as exc:
@@ -2180,7 +2208,8 @@ class RoomVoiceService:
             if isinstance(route_res, dict):
                 if route_res.get("handled"):
                     # Blocking HTTP play finished; hold mic closed briefly for room reverb tail only.
-                    self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.55)
+                    if mute_mic:
+                        self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.55)
                     return True
                 duck_ctx_factory = route_res.get("duckContext")
         if not self._allow_hardware_audio:
@@ -2207,7 +2236,8 @@ class RoomVoiceService:
             if payload.size == 0:
                 return False
             dur_sec = float(payload.shape[0]) / float(dst_sr)
-            self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur_sec + 0.35)
+            if mute_mic:
+                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + dur_sec + 0.35)
 
             def _do_hw_play() -> bool:
                 if use_winmm and self._winmm_player is not None:
@@ -2248,6 +2278,20 @@ class RoomVoiceService:
                     pcm, sr, lead_ms, tail_ms, target_peak = data
                     self._play_pcm_blocking(
                         pcm, sr, lead_ms=lead_ms, tail_ms=tail_ms, target_peak=target_peak, kind="chime"
+                    )
+                elif kind == "ready_chime":
+                    # Never interrupt or mute if user is already speaking their command tail ("Armory ... record this").
+                    if self._detector.is_user_speaking():
+                        continue
+                    pcm, sr, lead_ms, tail_ms, target_peak = data
+                    self._play_pcm_blocking(
+                        pcm,
+                        sr,
+                        lead_ms=lead_ms,
+                        tail_ms=tail_ms,
+                        target_peak=target_peak,
+                        kind="chime",
+                        mute_mic=False,
                     )
                 elif kind == "tts":
                     stop_now = False
@@ -2306,8 +2350,10 @@ class RoomVoiceService:
                 return
 
     def play_ready_chime(self) -> bool:
-        """Play a brief 120 ms two-tone ready chime on House Audio / PowerConf S330 speaker."""
+        """Play a brief 120 ms two-tone ready chime without muting capture (skipped if user is already speaking)."""
         if not self._allow_hardware_audio and self._house_audio_router is None:
+            return False
+        if self._detector.is_user_speaking():
             return False
         sr = 48_000
         n1 = int(sr * 0.055)
@@ -2322,12 +2368,15 @@ class RoomVoiceService:
         ]).astype(np.float32)
         if self._started:
             try:
-                self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.85)
-                self._speaker_queue.put_nowait(("pcm", (tone, sr, 220, 150, 0.28)))
+                # Pure 120 ms sine chime is non-speech for Silero VAD; never mute capture so a
+                # user speaking "Armory ... (beep) record this" is never swallowed.
+                self._speaker_queue.put_nowait(("ready_chime", (tone, sr, 100, 60, 0.28)))
                 return True
             except queue.Full:
                 return False
-        return self._play_pcm_blocking(tone, sr, lead_ms=220, tail_ms=150, target_peak=0.28, kind="chime")
+        return self._play_pcm_blocking(
+            tone, sr, lead_ms=100, tail_ms=60, target_peak=0.28, kind="chime", mute_mic=False
+        )
 
     def play_commit_chime(self) -> bool:
         """Play a crisp studio commit chime on PowerConf S330 / House Audio (~0.2-0.4s)."""
