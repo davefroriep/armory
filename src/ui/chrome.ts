@@ -2,6 +2,7 @@ import { $, ICON, esc, hms } from './dom';
 import { chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
 import { PHASE1_PLAN, fmtWeekSpan, nextEquipmentSlot, parseExtraKey, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
+import { programById } from '../domain/programs';
 import { addDays, calendar, localDate, type TodayItem } from '../intervals/calendar';
 import { active } from '../lifts/active';
 import { isSessionPaused, isSessionStarted } from '../lifts/logic';
@@ -13,6 +14,7 @@ import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import type { TodayCompletedItem } from './dayZoom';
 import { openBikeSheet } from './bikeSheet';
 import { openHrSheet } from './hrSheet';
+import { openProgramTargetsSheet } from './targetSheet';
 import { actionSheet, toast } from './lifts/kit';
 
 export interface BarOpts {
@@ -20,6 +22,7 @@ export interface BarOpts {
   back?: string;
   bike?: boolean;
   cog?: boolean;
+  more?: boolean;
 }
 
 export function topbar(o: BarOpts): string {
@@ -29,6 +32,7 @@ export function topbar(o: BarOpts): string {
     <div class="chips">
       ${o.bike ? '<button class="chip" data-chip="bike"></button>' : ''}
       <button class="chip" data-chip="hr"></button>
+      ${o.more ? '<button class="icon-btn bar-more" type="button" id="barMore" aria-label="Targets and setpoints">⋯</button>' : ''}
       ${o.cog ? `<a class="icon-btn" href="#/settings" aria-label="Settings">${ICON.gear}</a>` : ''}
     </div>
   </header>`;
@@ -314,28 +318,41 @@ export async function openCalendarItemMenu(planSlot: string): Promise<void> {
   const it = calendar.items.find((x) => x.planSlot === planSlot);
   if (!it) return;
   const isExtra = !!parseExtraKey(planSlot);
-  const actions: { key: string; label: string; sub?: string; danger?: boolean }[] = isExtra
-    ? [
-        { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
-        { key: 'move', label: 'Move to tomorrow', sub: 'Moves this carry-over workout to tomorrow' },
-        { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
-      ]
-    : it.carried
+  const cardioProg = (it.equipment === 'airbike' || it.equipment === 'spin') && it.programId
+    ? programById(it.programId)
+    : undefined;
+  const targetOpt: { key: string; label: string; sub?: string; danger?: boolean }[] = cardioProg
+    ? [{ key: 'targets', label: 'Targets & setpoints', sub: 'View workout blocks or adjust today’s target' }]
+    : [];
+  const actions: { key: string; label: string; sub?: string; danger?: boolean }[] = [
+    ...targetOpt,
+    ...(isExtra
       ? [
           { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
-          { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
-          { key: 'move', label: 'Move to tomorrow', sub: 'Moves this carried-over workout to tomorrow' },
+          { key: 'move', label: 'Move to tomorrow', sub: 'Moves this carry-over workout to tomorrow' },
           { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
         ]
-      : [
-          { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
-          { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
-          { key: 'push', label: 'Push to tomorrow', sub: 'Moves to tomorrow and holds schedule back' },
-          { key: 'add', label: 'Add to tomorrow', sub: 'Carries to tomorrow and keeps tomorrow’s schedule' },
-          { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
-        ];
+      : it.carried
+        ? [
+            { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
+            { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
+            { key: 'move', label: 'Move to tomorrow', sub: 'Moves this carried-over workout to tomorrow' },
+            { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
+          ]
+        : [
+            { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
+            { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
+            { key: 'push', label: 'Push to tomorrow', sub: 'Moves to tomorrow and holds schedule back' },
+            { key: 'add', label: 'Add to tomorrow', sub: 'Carries to tomorrow and keeps tomorrow’s schedule' },
+            { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
+          ]),
+  ];
   const k = await actionSheet(it.slot.name, actions);
   if (!k) return;
+  if (k === 'targets' && cardioProg) {
+    openProgramTargetsSheet({ baseProgram: cardioProg, mode: 'schedule', planSlot });
+    return;
+  }
   try {
     if (k === 'done') { await calendar.markSlotDone(planSlot); toast('Marked done'); }
     else if (k === 'skip') { calendar.skipSlot(planSlot); toast('Workout skipped'); }

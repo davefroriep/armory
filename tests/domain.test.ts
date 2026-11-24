@@ -3,7 +3,7 @@ import { bpmForRpm, rpmForWatts, wattsForRpm } from '../src/domain/airbikeCurve'
 import {
   PROGRAMS, SPIN_PROGRAMS, applyProgramTarget, defaultProgramTarget, effectiveProgramTarget,
   evaluateCardioProgression, fmtRpm, programById, resolveProgram, scaleSpinTargetsForFtp,
-  targetWatts, totalSeconds, workSeconds,
+  summarizeProgramPhases, targetWatts, totalSeconds, workSeconds,
 } from '../src/domain/programs';
 import { locate } from '../src/domain/timeline';
 import { Emitter } from '../src/emitter';
@@ -498,5 +498,34 @@ describe('Spin Bike ERG programs & cues', () => {
     expect(wattsCueFor(seg, 180, 50, 30)).toMatchObject({ level: 'warn' });
     expect(wattsCueFor(seg, 260, 90, 5)).toMatchObject({ level: 'bad', chirp: true });
     expect(wattsCueFor(seg, 0, 2, 10)).toMatchObject({ level: 'warn', text: 'START PEDALING' });
+  });
+});
+
+describe('summarizeProgramPhases (Targets & Setpoints sheet)', () => {
+  it('condenses AirBike 60/30 Float into chronological phase setpoints and updates with adjusted target', () => {
+    const base = programById('b6030')!;
+    const fixed = summarizeProgramPhases(base, { hrGated: false });
+    expect(fixed.map((r) => [r.label, r.durationText, r.targetText, r.editable])).toEqual([
+      ['WARM-UP', '5:00', '44 RPM · 127 W', false],
+      ['WORK', '16 × 1:00', '56 RPM · 240 W', true],
+      ['FLOAT', '14 × 0:30', '40 RPM · 99 W', false],
+      ['SET REST', '3:00', 'Full rest', false],
+      ['COOL-DOWN', '2:00', '40 RPM · 99 W', false],
+    ]);
+
+    const gatedAdjusted = summarizeProgramPhases(applyProgramTarget(base, 54), { hrGated: true });
+    expect(gatedAdjusted.find((r) => r.label === 'WORK')?.targetText).toBe('54 RPM · 218 W');
+    expect(gatedAdjusted.find((r) => r.label === 'SET REST')?.durationText).toBe('3:00–5:00');
+  });
+
+  it('summarizes Spin Bike ERG protocols with watts and cadence', () => {
+    const n4 = programById('spin-n4x4')!;
+    const rows = summarizeProgramPhases(applyProgramTarget(n4, 230), { hrGated: false });
+    expect(rows.map((r) => [r.label, r.durationText, r.targetText, r.editable])).toEqual([
+      ['WARM-UP', '5:00', '105 W · ~82 RPM', false],
+      ['WORK', '4 × 4:00', '230 W · ~85 RPM', true],
+      ['EASY SPIN', '3 × 3:00', '105 W · ~80 RPM', false],
+      ['COOL-DOWN', '3:00', '95 W · ~78 RPM', false],
+    ]);
   });
 });

@@ -458,3 +458,60 @@ export function fmtDur(sec: number): string {
   const r = Math.round(sec % 60);
   return `${m}:${String(r).padStart(2, '0')}`;
 }
+
+export interface ProgramPhaseSummary {
+  kind: PhaseKind;
+  label: string;
+  count: number;
+  seconds: number;
+  gateMaxSec: number | null;
+  durationText: string;
+  targetText: string;
+  editable: boolean;
+}
+
+/** Condenses a program's segment timeline into chronological phase setpoint rows for inspection. */
+export function summarizeProgramPhases(p: Program, opts?: { hrGated?: boolean }): ProgramPhaseSummary[] {
+  const hrGated = !!opts?.hrGated;
+  const rows: ProgramPhaseSummary[] = [];
+  const byKey = new Map<string, ProgramPhaseSummary>();
+  for (const g of p.segments) {
+    const gateMax = hrGated && g.gate ? g.gate.maxSec : null;
+    const key = [g.kind, g.label, g.seconds, g.rpm ?? '', g.watts ?? '', g.allOut ? '1' : '0', gateMax ?? ''].join('|');
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.count += 1;
+      existing.durationText = formatPhaseDuration(existing.count, existing.seconds, existing.gateMaxSec);
+      continue;
+    }
+    const row: ProgramPhaseSummary = {
+      kind: g.kind,
+      label: g.label,
+      count: 1,
+      seconds: g.seconds,
+      gateMaxSec: gateMax,
+      durationText: formatPhaseDuration(1, g.seconds, gateMax),
+      targetText: formatPhaseTarget(g),
+      editable: (g.kind === 'work' || g.kind === 'steady') && !g.allOut,
+    };
+    byKey.set(key, row);
+    rows.push(row);
+  }
+  return rows;
+}
+
+function formatPhaseDuration(count: number, seconds: number, gateMaxSec: number | null): string {
+  const base = gateMaxSec && gateMaxSec > seconds
+    ? `${fmtDur(seconds)}–${fmtDur(gateMaxSec)}`
+    : fmtDur(seconds);
+  return count > 1 ? `${count} × ${base}` : base;
+}
+
+function formatPhaseTarget(g: Segment): string {
+  if (g.watts != null) {
+    return `${Math.round(g.watts)} W${g.rpm != null ? ` · ~${fmtRpm(g.rpm)} RPM` : ''}`;
+  }
+  if (g.rpm == null) return 'Full rest';
+  if (g.allOut) return `${fmtRpm(g.rpm)}+ RPM · all out`;
+  return `${fmtRpm(g.rpm)} RPM · ${targetWatts(g) ?? 0} W`;
+}

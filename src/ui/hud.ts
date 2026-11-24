@@ -25,6 +25,7 @@ import { topbar, wireChips } from './chrome';
 import { ZONE_COLOR, hrZone } from './hr';
 import { confirmSheet } from './lifts/kit';
 import { renderSummary } from './summaryView';
+import { openProgramTargetsSheet } from './targetSheet';
 import { LeaveGuard } from './leaveGuard';
 import { setWallboardCardioState } from '../wallboard/state';
 
@@ -63,6 +64,7 @@ class Hud {
   private offSmooth: (() => void) | null = null;
   private offBgDrive: (() => void) | null = null;
   private offChips: (() => void) | null = null;
+  private closeTargetsSheet: (() => void) | null = null;
   private lastBgDriveAt = 0;
   private lock: WakeLockSentinel | null = null;
   private lastIndex = -2;
@@ -94,10 +96,11 @@ class Hud {
     this.guest = guest;
     this.storedTarget = effectiveProgramTarget(baseProgram, st.programTargets);
     const parsedParam = targetParam != null ? Number(targetParam) : NaN;
-    this.initialTarget = this.guest && Number.isFinite(parsedParam) && parsedParam > 0
+    const overrideTarget = Number.isFinite(parsedParam) && parsedParam > 0
       ? clampProgramTarget(baseProgram, parsedParam)
-      : this.storedTarget;
-    this.sessionTarget = this.initialTarget;
+      : null;
+    this.initialTarget = this.guest && overrideTarget != null ? overrideTarget : this.storedTarget;
+    this.sessionTarget = overrideTarget ?? this.initialTarget;
     this.p = applyProgramTarget(baseProgram, this.sessionTarget);
     this.engine = new WorkoutEngine(this.p);
     this.engine.setRecoveryMode(this.guest ? 'timed' : st.recoveryMode);
@@ -139,6 +142,8 @@ class Hud {
       this.offSmooth?.();
       this.offBgDrive?.();
       this.offChips?.();
+      this.closeTargetsSheet?.();
+      this.closeTargetsSheet = null;
       audio.setMetronome(false, null);
       sim.setTarget(0, 0);
       this.releaseErg();
@@ -179,7 +184,7 @@ class Hud {
     const segs = p.segments;
     const total = totalSeconds(p);
     const tl = segs.length
-      ? `<div class="tl" id="tl">${segs.map((g, i) =>
+      ? `<div class="tl clickable" id="tl" role="button" tabindex="0" aria-label="View targets and setpoints">${segs.map((g, i) =>
           this.profileSeg(g, i)).join('')}<span class="tl-ftp" style="bottom:${FTP_LINE_H * 100}%"></span><span class="tl-head" id="tlHead"></span></div>`
       : `<div class="tl plain" id="tl"><span class="tl-fill" id="tlFill"></span></div>`;
     const overview = segs.length
@@ -195,7 +200,7 @@ class Hud {
     const trimRow = hasTrim
       ? `<div class="trim" id="trimCtl">
           <button type="button" data-trim="-${trimStep}" aria-label="Lower target ${trimStep} ${trimUnit}">−${trimStep} ${trimUnit}</button>
-          <button type="button" class="trim-mid" id="trimLbl" title="Tap to reset target"></button>
+          <button type="button" class="trim-mid" id="trimLbl" title="View targets and setpoints"></button>
           <button type="button" data-trim="${trimStep}" aria-label="Raise target ${trimStep} ${trimUnit}">+${trimStep} ${trimUnit}</button>
         </div>`
       : hasFreeLvl
@@ -207,7 +212,7 @@ class Hud {
       : '';
 
     this.root.innerHTML = `<div class="hud${this.guest ? ' guest' : ''}">
-      ${topbar({ back: this.guest ? `#/${this.eq}` : '#/', title: this.guest ? `Guest · ${p.name}` : p.name, bike: true })}
+      ${topbar({ back: this.guest ? `#/${this.eq}` : '#/', title: this.guest ? `Guest · ${p.name}` : p.name, bike: true, more: segs.length > 0 })}
       ${this.guest ? '<div class="guest-strip">GUEST MODE · FIXED TIMERS · NO UPLOAD</div>' : ''}
       <div class="hud-top">
         <div class="overview"><span id="ovText">${overview}</span><span id="ovRight"></span></div>
@@ -291,6 +296,24 @@ class Hud {
     this.loop();
   }
 
+  private openTargetsSheet(): void {
+    if (!this.p.segments.length) return;
+    this.closeTargetsSheet?.();
+    this.closeTargetsSheet = openProgramTargetsSheet({
+      baseProgram: this.baseProgram,
+      mode: 'hud',
+      guest: this.guest,
+      currentTarget: this.sessionTarget,
+      onApplyToday: (val) => this.setSessionTarget(val),
+      onSaveDefault: (val) => {
+        this.storedTarget = val;
+        this.initialTarget = val;
+        this.setSessionTarget(val);
+        this.loop();
+      },
+    });
+  }
+
   private bind(): void {
     const on = (id: string, fn: () => void) => this.root.querySelector('#' + id)!.addEventListener('click', fn);
     on('skip', () => {
@@ -313,13 +336,21 @@ class Hud {
       audio.unlock();
       updateSettings({ metroEnabled: !getSettings().metroEnabled });
     });
+    this.root.querySelector('#barMore')?.addEventListener('click', () => this.openTargetsSheet());
+    if (this.p.segments.length) {
+      this.el.tl.addEventListener('click', () => this.openTargetsSheet());
+      this.el.tl.addEventListener('keydown', (e) => {
+        if ((e as KeyboardEvent).key === 'Enter' || (e as KeyboardEvent).key === ' ') {
+          e.preventDefault();
+          this.openTargetsSheet();
+        }
+      });
+    }
     this.root.querySelectorAll<HTMLElement>('[data-trim]').forEach((b) =>
       b.addEventListener('click', () => {
         if (this.sessionTarget != null) this.setSessionTarget(this.sessionTarget + Number(b.dataset.trim));
       }));
-    this.root.querySelector('#trimLbl')?.addEventListener('click', () => {
-      if (this.initialTarget != null) this.setSessionTarget(this.initialTarget);
-    });
+    this.root.querySelector('#trimLbl')?.addEventListener('click', () => this.openTargetsSheet());
     this.root.querySelectorAll<HTMLElement>('[data-lvl]').forEach((b) =>
       b.addEventListener('click', () => this.adjustManualLevel(Number(b.dataset.lvl))));
     this.root.querySelectorAll<HTMLElement>('[data-goal]').forEach((b) =>
@@ -717,9 +748,9 @@ class Hud {
         const unit = this.eq === 'spin' ? 'W' : 'RPM';
         const deltaTxt = delta ? ` (${delta > 0 ? '+' : '−'}${Math.abs(delta)} ${unit})` : '';
         e.trimLbl.textContent = ref.watts != null
-          ? `WORK ${targetWatts(ref)} W · ERG${deltaTxt}`
+          ? `WORK ${targetWatts(ref)} W · ERG${deltaTxt} ▾`
           : ref.rpm != null
-          ? `WORK ${fmtRpm(ref.rpm)} RPM · ${targetWatts(ref)} W${deltaTxt}`
+          ? `WORK ${fmtRpm(ref.rpm)} RPM · ${targetWatts(ref)} W${deltaTxt} ▾`
           : '';
       }
     }
