@@ -43,6 +43,7 @@ import {
   nextBurstPlayIndex,
   nextRecordedView,
   orderedRecordedViews,
+  orderSheetCameras,
   pickNearestBurstIndex,
   shortCamLabel,
   tapeDaysRemaining,
@@ -121,6 +122,12 @@ describe('tape linking & scrubbing helpers', () => {
     expect(shortCamLabel('Smith Cam')).toBe('Smith');
     expect(formatCamListSummary(['Rack Cam'])).toBe('Rack');
     expect(formatCamListSummary(['Smith Wide', 'Smith Cam'])).toBe('★ Smith Wide + Smith');
+    expect(
+      orderSheetCameras(['Fly Machine Cam'], ['Rack Cam', 'Smith Cam', 'Fly Machine Cam', 'Smith Wide']),
+    ).toEqual(['Fly Machine Cam', 'Rack Cam', 'Smith Cam', 'Smith Wide']);
+    expect(
+      orderSheetCameras(['Smith Wide', 'Smith Cam'], ['Rack Cam', 'Smith Cam', 'Smith Wide']),
+    ).toEqual(['Smith Wide', 'Smith Cam', 'Rack Cam']);
     expect(fmtRelativeToCheck(100_000, 102_000)).toBe('right at ✓');
     expect(fmtRelativeToCheck(100_000, 145_000)).toBe('45s before ✓');
     expect(fmtRelativeToCheck(100_000, 200_000)).toBe('1m 40s before ✓');

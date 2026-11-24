@@ -621,7 +621,7 @@ class GymCamController {
   ): Promise<GymCamBurst[]> {
     if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return [];
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 4500);
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
     try {
       const q = new URLSearchParams({ sessionId });
       if (aroundMs != null) q.set('aroundMs', String(Math.round(aroundMs)));
@@ -641,7 +641,7 @@ class GymCamController {
   async getTapeTimeline(sessionId: string, camera: string): Promise<GymCamTimeline | null> {
     if (!this.online || typeof fetch === 'undefined' || typeof AbortController === 'undefined') return null;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 3500);
+    const timer = setTimeout(() => ctrl.abort(), 6000);
     try {
       const q = new URLSearchParams({ sessionId, camera });
       const res = await fetch(`${this.baseUrl()}/api/tape/timeline?${q.toString()}`, { signal: ctrl.signal, cache: 'no-store' });

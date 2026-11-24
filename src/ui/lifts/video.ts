@@ -14,7 +14,7 @@ import { fmtKg, liftSettings } from '../../lifts/settings';
 import {
   applyClipMarker, buildCoachAngleOptions, burstScrubPosition, computeClipZoomWindow, computeScrubWindow,
   findNearestFrameIndex, fmtRelativeToCheck, isTapeWithinRetention, nextBurstPlayIndex, nextRecordedView,
-  orderedRecordedViews, pickNearestBurstIndex, shortCamLabel, tapeDaysRemaining,
+  orderedRecordedViews, orderSheetCameras, pickNearestBurstIndex, shortCamLabel, tapeDaysRemaining,
 } from '../../lifts/tape';
 import {
   computeTrimViewport, createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
@@ -640,10 +640,14 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       </div>`).join('')}`;
   };
 
+  const assignedCams = (): string[] => {
+    const base = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
+    return camsForExercise(ex, lifts.row(t.se.exId), t.se, base);
+  };
+
   const camList = (): string[] => {
     const base = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
-    const assigned = camsForExercise(ex, lifts.row(t.se.exId), t.se, base);
-    return [...new Set([...base, ...assigned])];
+    return orderSheetCameras(assignedCams(), base);
   };
 
   const gymArmHtml = () => {
@@ -706,6 +710,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
   let packAbort: AbortController | null = null;
   let lastPackIdx = -1;
   let activeFrameUrl = '';
+  let immediateFrameUrl = '';
+  let immediateFrameTsMs = 0;
+  let immediateFrameAbort: AbortController | null = null;
   let scrubDirty = false;
 
   let burstCursorMs = 0;
@@ -782,6 +789,16 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     }
   };
 
+  const clearImmediateFrame = (): void => {
+    immediateFrameAbort?.abort();
+    immediateFrameAbort = null;
+    if (immediateFrameUrl) {
+      URL.revokeObjectURL(immediateFrameUrl);
+      immediateFrameUrl = '';
+    }
+    immediateFrameTsMs = 0;
+  };
+
   const clearPack = (): void => {
     packAbort?.abort();
     packAbort = null;
@@ -789,6 +806,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     packKey = '';
     lastPackIdx = -1;
     activeFrameUrl = '';
+    clearImmediateFrame();
     for (const f of packFrames) URL.revokeObjectURL(f.url);
     packFrames = [];
   };
@@ -1020,16 +1038,45 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     ensureBurstPack(b);
   };
 
+  const requestImmediateScrubFrame = (camReq: string, targetMs: number): void => {
+    immediateFrameAbort?.abort();
+    const ctrl = new AbortController();
+    immediateFrameAbort = ctrl;
+    void gymCam.fetchTapeFrameBlobUrl(sid, camReq, targetMs, ctrl.signal, 280).then((url) => {
+      if (!url) return;
+      if (ctrl.signal.aborted || !sh.el.isConnected || camReq !== selectedCam) {
+        URL.revokeObjectURL(url);
+        return;
+      }
+      if (immediateFrameUrl) URL.revokeObjectURL(immediateFrameUrl);
+      immediateFrameUrl = url;
+      immediateFrameTsMs = targetMs;
+      if (viewMode === 'scrub') paintScrubFrameLocal();
+    });
+  };
+
   const paintScrubFrameLocal = (): void => {
     const img = sh.body.querySelector<HTMLImageElement>('#vscrubImg');
     const spin = sh.body.querySelector<HTMLElement>('#vscrubSpin');
     const idx = findNearestFrameIndex(packFrames, cursorMs);
-    if (idx >= 0) {
+    const packDist = idx >= 0 ? Math.abs(packFrames[idx].tsMs - cursorMs) : Infinity;
+    const immDist = immediateFrameUrl ? Math.abs(immediateFrameTsMs - cursorMs) : Infinity;
+    if (idx >= 0 && (!packLoading || packDist <= immDist)) {
       const url = packFrames[idx].url;
       activeFrameUrl = url;
       if (img && (lastPackIdx !== idx || img.getAttribute('src') !== url || img.hidden)) {
         lastPackIdx = idx;
         img.src = url;
+        img.hidden = false;
+      }
+      if (spin) spin.hidden = true;
+      return;
+    }
+    if (immediateFrameUrl) {
+      activeFrameUrl = immediateFrameUrl;
+      if (img && (img.getAttribute('src') !== immediateFrameUrl || img.hidden)) {
+        lastPackIdx = -1;
+        img.src = immediateFrameUrl;
         img.hidden = false;
       }
       if (spin) spin.hidden = true;
@@ -1055,9 +1102,14 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     packAbort = ctrl;
     packKey = key;
     packLoading = true;
-    paintScrubFrameLocal();
     const camReq = selectedCam;
-    void gymCam.fetchTapePack(sid, camReq, winStart, winEnd, 80, ctrl.signal).then((frames) => {
+    const curIdx = findNearestFrameIndex(packFrames, cursorMs);
+    const nearestGap = curIdx >= 0 ? Math.abs(packFrames[curIdx].tsMs - cursorMs) : Infinity;
+    if (!packFrames.length || nearestGap > 15_000) {
+      requestImmediateScrubFrame(camReq, cursorMs);
+    }
+    paintScrubFrameLocal();
+    void gymCam.fetchTapePack(sid, camReq, winStart, winEnd, 60, ctrl.signal).then((frames) => {
       if (ctrl.signal.aborted || !sh.el.isConnected || camReq !== selectedCam || packKey !== key) {
         for (const f of frames) URL.revokeObjectURL(f.url);
         return;
@@ -1209,7 +1261,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     const clipSec = Math.max(1, Math.round((outMs - inMs) / 1000));
     const totalMin = (maxMs - minMs) / 60_000;
     const initIdx = findNearestFrameIndex(packFrames, cursorMs);
-    const initUrl = initIdx >= 0 ? packFrames[initIdx].url : '';
+    const initUrl = initIdx >= 0 ? packFrames[initIdx].url : (immediateFrameUrl || '');
     lastPackIdx = initIdx;
     if (initUrl) activeFrameUrl = initUrl;
 
@@ -1321,14 +1373,21 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     renderGymCam();
   };
 
-  renderGymCam();
+  const defaultPrimaryCam = (): string => assignedCams()[0] || camList()[0] || DEFAULT_FALLBACK_CAM;
+
+  if (camAvail) {
+    void selectCamera(defaultPrimaryCam());
+  } else {
+    renderGymCam();
+  }
   if (!camAvail && tapeAgeOk && getSettings().gymCamEnabled) {
     void gymCam.probe(500).then((r) => {
       if (!sh.el.isConnected || !r.online) return;
       camAvail = true;
       sh.body.classList.add('full');
-      renderGymCam();
       redrawActions();
+      if (!selectedCam) void selectCamera(defaultPrimaryCam());
+      else renderGymCam();
     });
   }
 
@@ -1470,9 +1529,7 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
     const pickCam = el.closest<HTMLElement>('[data-pickcam]');
     if (pickCam) {
       const picked = pickCam.dataset.pickcam!;
-      t.se.cams = [picked];
-      delete t.se.camPref;
-      lifts.saveSession(t.session, true);
+      if (picked === selectedCam && !loadingCam) return;
       void selectCamera(picked);
       return;
     }

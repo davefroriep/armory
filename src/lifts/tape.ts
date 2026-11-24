@@ -304,3 +304,26 @@ export function nextRecordedView<T extends ReplayableClipView>(
   const nextIdx = curIdx >= 0 ? (curIdx + 1) % views.length : 0;
   return { next: views[nextIdx], index: nextIdx, total: views.length };
 }
+
+/**
+ * Orders Gym-Cam sheet switcher pills with the exercise's Primary Cam (`assigned[0]`) first,
+ * followed by any other assigned angles and then remaining station cameras (deduplicated).
+ */
+export function orderSheetCameras(
+  assigned: readonly string[],
+  available: readonly string[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw?: string): void => {
+    const cam = (raw ?? '').trim();
+    if (!cam) return;
+    const key = cam.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(cam);
+  };
+  for (const c of assigned) push(c);
+  for (const c of available) push(c);
+  return out;
+}

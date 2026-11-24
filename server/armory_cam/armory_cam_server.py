@@ -1367,11 +1367,13 @@ def compute_motion_energy_from_frames(
     return min(100.0, best)
 
 
-def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w: int = 480) -> tuple[int, list[np.ndarray]]:
-    """Read up to 4 downscaled BGR frames and duration (ms) from an MPEG-TS segment in one sequential pass."""
+def extract_ts_sampled_frames_with_head(
+    seg_path: Path, fallback_dur_ms: int = 2000, max_w: int = 480
+) -> tuple[int, list[np.ndarray], np.ndarray | None]:
+    """Read up to 4 downscaled BGR frames, duration (ms), and unshrunk opening frame in one sequential pass."""
     cap = cv2.VideoCapture(str(seg_path))
     if not cap.isOpened():
-        return fallback_dur_ms, []
+        return fallback_dur_ms, [], None
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -1385,6 +1387,7 @@ def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w
             return frm
 
         frames: list[np.ndarray] = []
+        first_full: np.ndarray | None = None
         if total >= 4:
             target_set = {0, total // 3, (2 * total) // 3, total - 1}
             for i in range(total):
@@ -1393,6 +1396,8 @@ def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w
                 if i in target_set:
                     ok, frm = cap.retrieve()
                     if ok and frm is not None:
+                        if first_full is None:
+                            first_full = frm
                         frames.append(_shrink(frm))
         else:
             # No reliable frame count: sample sequentially up to 4 frames spread across the file
@@ -1402,6 +1407,8 @@ def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w
                 if not ok or frm is None:
                     break
                 all_read.append(frm)
+            if all_read:
+                first_full = all_read[0]
             if len(all_read) >= 4:
                 n = len(all_read)
                 for idx in sorted({0, n // 3, (2 * n) // 3, n - 1}):
@@ -1412,9 +1419,15 @@ def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w
         dur_ms = int(round((total / fps) * 1000)) if total >= 2 else fallback_dur_ms
         if dur_ms < 400 or dur_ms > 20_000:
             dur_ms = fallback_dur_ms
-        return dur_ms, frames
+        return dur_ms, frames, first_full
     finally:
         cap.release()
+
+
+def extract_ts_sampled_frames(seg_path: Path, fallback_dur_ms: int = 2000, max_w: int = 480) -> tuple[int, list[np.ndarray]]:
+    """Read up to 4 downscaled BGR frames and duration (ms) from an MPEG-TS segment in one sequential pass."""
+    dur_ms, frames, _ = extract_ts_sampled_frames_with_head(seg_path, fallback_dur_ms=fallback_dur_ms, max_w=max_w)
+    return dur_ms, frames
 
 
 def analyze_ts_segment(
@@ -3493,9 +3506,9 @@ class ArmoryCamService:
                 continue
 
             if compute_energy:
-                dur_ms, raw_frames = extract_ts_sampled_frames(p)
+                dur_ms, raw_frames, first_full = extract_ts_sampled_frames_with_head(p)
             else:
-                dur_ms, raw_frames = 2000, []
+                dur_ms, raw_frames, first_full = 2000, [], None
             rot_cache: dict[tuple[int, float], list[np.ndarray]] = {}
             view_results: list[tuple[CameraConfig, SegmentInfo]] = []
             for v in views:
@@ -3539,6 +3552,7 @@ class ArmoryCamService:
                 )
                 view_results.append((v, info))
 
+            archived_views: list[tuple[CameraConfig, SegmentInfo]] = []
             with self.lock:
                 self.seen_files.add(key)
                 for v, info in view_results:
@@ -3551,6 +3565,7 @@ class ArmoryCamService:
                 if self.recording and not self.paused and self.active_session_id:
                     for v, info in view_results:
                         self._copy_segment_to_session(self.active_session_id, v, info)
+                    archived_views = list(view_results)
                 elif self.motion_record_247 and compute_energy and view_results:
                     triggered = False
                     for v, info in view_results:
@@ -3584,6 +3599,21 @@ class ArmoryCamService:
                         self._ensure_motion_session_meta(motion_sid, seg_s0)
                         for v, info in view_results:
                             self._copy_segment_to_session(motion_sid, v, info)
+                        archived_views = list(view_results)
+
+            # Pre-cache 280px scrub thumbnails outside self.lock reusing the already-decoded
+            # opening frame (zero extra H.264 decode) so scrub packs & bursts hit 100% cache (~100ms).
+            if archived_views and first_full is not None:
+                for v, info in archived_views:
+                    try:
+                        self._get_or_create_seg_thumb(
+                            v,
+                            info.path,
+                            max_w=DEFAULT_SCRUB_THUMB_W,
+                            predecoded_frame=first_full,
+                        )
+                    except Exception:
+                        pass
 
     def _ensure_motion_session_meta(self, motion_sid: str, started_ms: int) -> None:
         sdir = self.tapes_root / safe_slug(motion_sid, "motion")
@@ -5338,6 +5368,7 @@ class ArmoryCamService:
         max_w: int = DEFAULT_SCRUB_THUMB_W,
         source_filter: str = "all",
     ) -> dict[str, Any]:
+        self._interactive_busy_until = max(self._interactive_busy_until, time.monotonic() + 3.0)
         cam = self._find_camera(camera_name)
         canon = cam.name if cam else (camera_name or "Rack Cam")
         segs = self._list_camera_segments(canon, session_id, source_filter=source_filter)
@@ -5435,9 +5466,43 @@ class ArmoryCamService:
         else:
             bursts = bursts[-limit:]
 
-        for b in bursts:
-            mid_ms = (int(b["startMs"]) + int(b["endMs"])) // 2
-            b["thumb"] = self._thumb_near_ms(str(b["camera"]), session_id, mid_ms, max_w=DEFAULT_SCRUB_THUMB_W)
+        self._interactive_busy_until = max(self._interactive_busy_until, time.monotonic() + 3.0)
+        if bursts:
+            segs_by_cam: dict[str, tuple[CameraConfig | None, list[SegmentInfo], list[int]]] = {}
+            for b_item in bursts:
+                cname = str(b_item["camera"])
+                if cname not in segs_by_cam:
+                    c_obj = self._find_camera(cname)
+                    c_segs = self._list_camera_segments(cname, session_id)
+                    segs_by_cam[cname] = (c_obj, c_segs, [s.start_ms for s in c_segs])
+
+            def _load_burst_thumb(b_item: dict[str, Any]) -> str:
+                cname = str(b_item["camera"])
+                c_obj, c_segs, starts = segs_by_cam.get(cname, (None, [], []))
+                if not c_segs:
+                    return ""
+                mid_ms = (int(b_item["startMs"]) + int(b_item["endMs"])) // 2
+                idx = bisect.bisect_right(starts, mid_ms) - 1
+                cands: list[SegmentInfo] = []
+                if idx >= 0:
+                    cands.append(c_segs[idx])
+                if idx + 1 < len(c_segs):
+                    cands.append(c_segs[idx + 1])
+                if not cands:
+                    cands.append(c_segs[0])
+                best = min(cands, key=lambda s: abs(((s.start_ms + s.end_ms) // 2) - mid_ms))
+                jpg = self._get_or_create_seg_thumb(c_obj, best.path, max_w=DEFAULT_SCRUB_THUMB_W)
+                if not jpg:
+                    return ""
+                return "data:image/jpeg;base64," + base64.b64encode(jpg).decode("ascii")
+
+            if len(bursts) > 1:
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    thumbs = list(pool.map(_load_burst_thumb, bursts))
+                for b_item, th in zip(bursts, thumbs):
+                    b_item["thumb"] = th
+            else:
+                bursts[0]["thumb"] = _load_burst_thumb(bursts[0])
         return bursts
 
     def _thumb_near_ms(

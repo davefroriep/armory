@@ -5428,6 +5428,69 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_ingest_precaches_scrub_thumbs_and_parallel_bursts(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_precache_"))
+        svc = ac.ArmoryCamService(root_dir=tmp)
+        try:
+            app = ac.create_app(svc)
+            client = app.test_client()
+            client.post(
+                "/api/config",
+                json={
+                    "cameras": [
+                        {"name": "Rack Cam", "slug": "rack_cam", "rtspUrl": "", "enabled": True, "defish": False},
+                    ]
+                },
+            )
+            ff = shutil.which("ffmpeg") or svc.ffmpeg
+            rack_cfg = svc._find_camera("Rack Cam")
+            assert rack_cfg is not None
+            ring_dir = svc.ring_root / "rack_cam"
+            ring_dir.mkdir(parents=True, exist_ok=True)
+            svc.recording = True
+            svc.paused = False
+            svc.active_session_id = "sess_precache"
+
+            base_ms = int(datetime(2026, 11, 23, 22, 0, 0).timestamp() * 1000)
+            seg_names: list[str] = []
+            for i in range(4):
+                seg_dt = datetime.fromtimestamp((base_ms + i * 2000) / 1000.0)
+                seg_name = f"seg_{seg_dt.strftime('%Y%m%d_%H%M%S')}.ts"
+                seg_names.append(seg_name)
+                seg_path = ring_dir / seg_name
+                if i == 0:
+                    subprocess.run(
+                        [
+                            ff, "-y", "-hide_banner", "-loglevel", "error",
+                            "-f", "lavfi", "-i", "color=c=blue:s=320x240:r=20:d=2",
+                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mpegts", str(seg_path),
+                        ],
+                        check=True,
+                    )
+                else:
+                    shutil.copy2(ring_dir / seg_names[0], seg_path)
+                old_t = time.time() - 5.0
+                os.utime(seg_path, (old_t, old_t))
+
+            svc._ingest_closed_segments(rack_cfg, time.time(), compute_energy=True)
+
+            ck = svc._crop_cache_key(rack_cfg)
+            cache_dir = svc.thumbs_root / "rack_cam" / ck
+            cached_jpgs = sorted(p.name for p in cache_dir.glob("*.jpg"))
+            self.assertEqual(len(cached_jpgs), 4)
+            for sn in seg_names:
+                jpg_path = cache_dir / f"{Path(sn).stem}.jpg"
+                self.assertTrue(jpg_path.is_file())
+                self.assertTrue(jpg_path.read_bytes().startswith(b"\xff\xd8"))
+
+            # Subsequent tape_frame_pack must hit the pre-cached thumbnails cleanly
+            pack = svc.tape_frame_pack("Rack Cam", "sess_precache", count=4)
+            self.assertTrue(pack["ok"])
+            self.assertEqual(len(pack["frames"]), 4)
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
