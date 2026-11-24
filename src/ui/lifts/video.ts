@@ -13,8 +13,8 @@ import { lifts } from '../../lifts/store';
 import { fmtKg, liftSettings } from '../../lifts/settings';
 import {
   applyClipMarker, buildCoachAngleOptions, burstScrubPosition, computeClipZoomWindow, computeScrubWindow,
-  findNearestFrameIndex, fmtRelativeToCheck, isTapeWithinRetention, nextBurstPlayIndex, pickNearestBurstIndex,
-  shortCamLabel, tapeDaysRemaining,
+  findNearestFrameIndex, fmtRelativeToCheck, isTapeWithinRetention, nextBurstPlayIndex, nextRecordedView,
+  orderedRecordedViews, pickNearestBurstIndex, shortCamLabel, tapeDaysRemaining,
 } from '../../lifts/tape';
 import {
   computeTrimViewport, createTrimState, dragTrimHandle, fmtPreciseTime, FRAME_FPS, isTrimDirty, isTrimmed,
@@ -27,7 +27,7 @@ import {
   openNativeVideoUri, pickNativeDcimVideo, recordNativeVideo, type DeviceVideoEntry,
 } from '../../native/service';
 import { getSettings } from '../../store/settings';
-import { setWallboardReplay } from '../../wallboard/state';
+import { getWallboardReplay, setWallboardReplay } from '../../wallboard/state';
 import { wallboard } from '../../wallboard/sync';
 import { esc } from '../dom';
 import { confirmSheet, openSheet, promptSheet, toast } from './kit';
@@ -1868,10 +1868,20 @@ export function recordVideo(t: VideoTarget): Promise<VideoMeta | null> {
 }
 
 let wbReplayTimer: ReturnType<typeof setTimeout> | null = null;
+let lastWbReplayCtx: {
+  meta: VideoMeta;
+  exName: string;
+  setLabel?: string;
+  rate: number;
+  expiresAtMs: number;
+} | null = null;
+
+const WB_SWITCH_GRACE_MS = 30_000;
 
 /** Clear any active form replay overlay on the Gym Wallboard TV. */
 export function closeWallboardReplay(): void {
   if (wbReplayTimer) { clearTimeout(wbReplayTimer); wbReplayTimer = null; }
+  lastWbReplayCtx = null;
   setWallboardReplay(null);
   void wallboard.pushNow();
 }
@@ -1879,7 +1889,15 @@ export function closeWallboardReplay(): void {
 /** Cast a Gym-Cam clip onto the Fire TV Wallboard overlay for 2 auto-looped plays. */
 export function castClipToWallboard(
   meta: VideoMeta,
-  opts?: { rate?: number; exName?: string; setLabel?: string; trimStartSec?: number; trimEndSec?: number },
+  opts?: {
+    rate?: number;
+    exName?: string;
+    setLabel?: string;
+    trimStartSec?: number;
+    trimEndSec?: number;
+    viewIndex?: number;
+    viewCount?: number;
+  },
 ): boolean {
   const url = gymCam.resolveLanUrl(meta.lanUrl);
   if (!url) return false;
@@ -1891,6 +1909,14 @@ export function castClipToWallboard(
   const title = opts?.exName || (meta.guest ? 'Guest Clip' : lifts.exOrStub(meta.exId).name);
   const subtitle = [opts?.setLabel, meta.camera].filter(Boolean).join(' · ');
   const now = Date.now();
+  const expiresAtMs = now + durMs;
+  lastWbReplayCtx = {
+    meta,
+    exName: title,
+    ...(opts?.setLabel ? { setLabel: opts.setLabel } : {}),
+    rate,
+    expiresAtMs,
+  };
   setWallboardReplay({
     id: meta.id,
     url,
@@ -1901,7 +1927,8 @@ export function castClipToWallboard(
     trimStartSec,
     trimEndSec,
     startedAtMs: now,
-    expiresAtMs: now + durMs,
+    expiresAtMs,
+    ...(opts?.viewCount && opts.viewCount > 1 && opts?.viewIndex ? { viewIndex: opts.viewIndex, viewCount: opts.viewCount } : {}),
   });
   void wallboard.pushNow();
   if (wbReplayTimer) clearTimeout(wbReplayTimer);
@@ -1911,6 +1938,85 @@ export function castClipToWallboard(
     void wallboard.pushNow();
   }, durMs + 250);
   return true;
+}
+
+/**
+ * Toggles the currently replaying Wallboard clip to the next recorded camera view for that set
+ * and plays it 2x. Reports "No other views" when no alternate recorded view exists.
+ */
+export function switchWallboardReplayView(sessionId?: string): { ok: boolean; text: string; speech: string } {
+  const now = Date.now();
+  const activeSnap = getWallboardReplay();
+  const isLive = !!(activeSnap && activeSnap.expiresAtMs > now);
+  const ctx = lastWbReplayCtx;
+  const graceOk = !!(
+    ctx &&
+    now - ctx.expiresAtMs <= WB_SWITCH_GRACE_MS &&
+    (!sessionId || ctx.meta.sessionId === sessionId)
+  );
+  if (!isLive && !graceOk) {
+    return { ok: false, text: 'No video playing on TV', speech: 'No video playing' };
+  }
+
+  const curMeta = (activeSnap?.id ? lifts.videos.get(activeSnap.id) : undefined) ?? ctx?.meta ?? null;
+  if (!curMeta) {
+    return { ok: false, text: 'No other views', speech: 'No other views' };
+  }
+
+  const sess = lifts.sessions.get(curMeta.sessionId);
+  let foundSe: SessionEx | undefined;
+  let foundSet: LiftSet | undefined;
+  if (sess) {
+    for (const se of sess.exs) {
+      const st = se.sets.find((x) => x.id === curMeta.setId || x.vids?.includes(curMeta.id));
+      if (st) {
+        foundSe = se;
+        foundSet = st;
+        break;
+      }
+    }
+  }
+
+  const clips: VideoMeta[] = [];
+  for (const vidId of foundSet?.vids ?? []) {
+    const v = lifts.videos.get(vidId);
+    if (v) clips.push(v);
+  }
+  if (!clips.some((v) => v.id === curMeta.id)) {
+    clips.push(curMeta);
+  }
+
+  const preferredCams = foundSe
+    ? camsForExercise(lifts.exOrStub(foundSe.exId), lifts.row(foundSe.exId), foundSe, gymCam.cameras)
+    : undefined;
+  const hit = nextRecordedView(
+    clips,
+    { id: activeSnap?.id ?? curMeta.id, camera: activeSnap?.camera ?? curMeta.camera },
+    preferredCams,
+  );
+  if (!hit) {
+    return { ok: false, text: 'No other views', speech: 'No other views' };
+  }
+
+  const rate = activeSnap?.rate ?? ctx?.rate ?? 1;
+  const exName = activeSnap?.title || ctx?.exName || (hit.next.guest ? 'Guest Clip' : lifts.exOrStub(hit.next.exId).name);
+  const setLabel = ctx?.setLabel;
+  const castOk = castClipToWallboard(hit.next, {
+    rate,
+    exName,
+    setLabel,
+    viewIndex: hit.index + 1,
+    viewCount: hit.total,
+  });
+  if (!castOk) {
+    return { ok: false, text: 'No other views', speech: 'No other views' };
+  }
+  const camLbl = shortCamLabel(hit.next.camera || 'Next view');
+  return {
+    ok: true,
+    text: `TV view → ${camLbl} (${hit.index + 1}/${hit.total})`,
+    speech: `Switching to ${camLbl}`,
+  };
 }
 
 /** Play, slow-mo analyze, frame-jog, precision-trim, and export/share a lift clip. */
@@ -2917,14 +3023,22 @@ export async function playVideo(id: string, ctx?: { target?: VideoTarget; setLab
 
     const vp = t.closest<HTMLElement>('[data-vp]')?.dataset.vp;
     if (vp === 'tv') {
+      const castMeta = viewSiblingMeta ?? { ...meta!, lanUrl: viewLanUrl || meta!.lanUrl, camera: viewCam || meta!.camera };
+      const setClips = (set?.vids ?? []).map((vidId) => lifts.videos.get(vidId)).filter((v): v is VideoMeta => !!v);
+      const prefCams = se ? camsForExercise(ex, lifts.row(se.exId), se, gymCam.cameras) : undefined;
+      const views = orderedRecordedViews(setClips.length ? setClips : [castMeta], prefCams);
+      const vIdx = views.findIndex(
+        (v) => v.id === castMeta.id || (v.camera ?? '').trim().toLowerCase() === (castMeta.camera ?? '').trim().toLowerCase(),
+      );
       const ok = castClipToWallboard(
-        { ...meta!, lanUrl: viewLanUrl || meta!.lanUrl, camera: viewCam || meta!.camera },
+        castMeta,
         {
           rate: speed < 1 ? speed : 1,
           exName: clipTitle,
           setLabel: ctx?.setLabel || setTxt,
-          trimStartSec: isTrimmed(st) ? roundMs(st.start) : meta!.trimStartSec,
-          trimEndSec: isTrimmed(st) ? roundMs(st.end) : meta!.trimEndSec,
+          trimStartSec: isTrimmed(st) ? roundMs(st.start) : castMeta.trimStartSec,
+          trimEndSec: isTrimmed(st) ? roundMs(st.end) : castMeta.trimEndSec,
+          ...(views.length > 1 ? { viewIndex: (vIdx >= 0 ? vIdx : 0) + 1, viewCount: views.length } : {}),
         },
       );
       toast(ok ? 'Playing on Wallboard TV' : 'TV replay requires a Gym Cam clip');

@@ -20,6 +20,7 @@ export type VoiceIntent =
   | { kind: 'cam_guest'; camera?: string }
   | { kind: 'buddy_mode'; on?: boolean }
   | { kind: 'wb_replay'; exQuery?: string; setNum?: number; slow?: boolean }
+  | { kind: 'wb_switch_view' }
   | { kind: 'wb_close_replay' };
 
 export type VoiceAliasSlot =
@@ -96,7 +97,7 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
   {
     title: 'Wallboard TV Video Replay',
     slot: 'wb_replay',
-    examples: ['replay', 'replay slow', 'play set 2', 'play bench set 3', 'close video'],
+    examples: ['replay', 'replay slow', 'play set 2', 'play bench set 3', 'switch views', 'close video'],
   },
   {
     title: 'Workout & Undo',
@@ -388,6 +389,9 @@ function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
   const buddyLead = tail.match(/^buddy\s+mode\s+(on|off)\b/);
   if (buddyLead) return { kind: 'buddy_mode', on: buddyLead[1] === 'on' };
   if (/^close\s+(?:the\s+)?(?:replay|video|clip|tv)\b/.test(tail)) return { kind: 'wb_close_replay' };
+  if (/^(?:(?:switch|change|toggle|cycle|swap)\s+(?:the\s+)?(?:to\s+(?:the\s+)?)?(?:(?:next|other|another)\s+)?(?:views?|angles?|cameras?)|(?:next|other|another)\s+(?:view|angle|camera))\b/.test(tail)) {
+    return { kind: 'wb_switch_view' };
+  }
   if (/^replay\s+slow\b/.test(tail)) return { kind: 'wb_replay', slow: true };
   if (/^(?:instant\s+)?replay\b/.test(tail)) return { kind: 'wb_replay' };
   if (/^(?:undo|go\s+back)\b/.test(tail)) return { kind: 'undo' };
@@ -444,6 +448,9 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases, allo
 
   if (/^(?:close|stop|hide|exit|dismiss)\s+(?:replay|video|clip|tv)$/.test(tail)) {
     return { kind: 'wb_close_replay' };
+  }
+  if (/^(?:(?:switch|change|toggle|cycle|swap)\s+(?:the\s+)?(?:to\s+(?:the\s+)?)?(?:(?:next|other|another)\s+)?(?:views?|angles?|cameras?)|(?:next|other|another)\s+(?:view|angle|camera))$/.test(tail)) {
+    return { kind: 'wb_switch_view' };
   }
 
   let repBody = tail;
@@ -725,6 +732,8 @@ export function defaultReadbackForIntent(intent: VoiceIntent, confirmTag = 'got 
       return intent.on === true ? 'Buddy mode on' : intent.on === false ? 'Buddy mode off' : 'Buddy mode toggled';
     case 'wb_replay':
       return intent.slow ? 'Replaying slow motion on TV' : 'Replaying on TV';
+    case 'wb_switch_view':
+      return 'Switching views';
     case 'wb_close_replay':
       return 'Closing video';
   }

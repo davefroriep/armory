@@ -116,7 +116,7 @@ const BASE_BIAS = [
   'add set', 'add set to last exercise', 'delete empty sets',
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
   'camera', 'record set', 'record rack', 'record smith', 'rack camera', 'smith camera', 'clip that', 'save clip', 'clip rack', 'clip smith',
-  'replay', 'replay slow', 'play set', 'close video', 'guest record', 'guest rack', 'guest smith',
+  'replay', 'replay slow', 'play set', 'switch views', 'close video', 'guest record', 'guest rack', 'guest smith',
   'buddy mode', 'buddy mode on', 'buddy mode off', 'solo mode',
 ];
 
@@ -141,6 +141,7 @@ class VoiceController {
   finishTrigger: (() => void) | null = null;
   camHandler: ((mode: 'arm' | 'clip_last' | 'guest', camera?: string) => Promise<string | null> | string | null) | null = null;
   replayHandler: ((req: { exQuery?: string; setNum?: number; slow?: boolean; close?: boolean }) => Promise<string | null> | string | null) | null = null;
+  switchViewHandler: (() => { ok: boolean; text: string; speech: string }) | null = null;
   buddyHandler: ((on?: boolean) => string | null) | null = null;
 
   readonly changed = new Emitter<void>();
@@ -1158,6 +1159,14 @@ class VoiceController {
         false,
         fallbackSpeech,
       );
+    }
+    if (intent.kind === 'wb_switch_view') {
+      if (!this.switchViewHandler) {
+        return this.notice('Open active Strength workout to switch TV views', 'warn', true, 'Open a workout first');
+      }
+      const res = this.switchViewHandler();
+      buzz(20);
+      return this.notice(res.text, res.ok ? 'info' : 'warn', true, res.speech);
     }
     if (intent.kind === 'wb_replay' || intent.kind === 'wb_close_replay') {
       if (!this.replayHandler) {

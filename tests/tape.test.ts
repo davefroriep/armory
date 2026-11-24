@@ -4,11 +4,20 @@ vi.mock('../src/lifts/store', () => ({
   lifts: {
     videos: new Map(),
     sessions: new Map(),
+    routines: new Map(),
+    row: () => undefined,
+    bestE1rm: () => null,
+    previous: () => null,
+    changed: { on: () => () => {} },
     saveVideoMeta: vi.fn(),
     addVideo: vi.fn(),
     saveSession: vi.fn(),
-    exOrStub: (id: string) => ({ id, name: id }),
+    exOrStub: (id: string) => ({ id, name: id, equip: 'smith', type: 'weight', primary: [], secondary: [] }),
   },
+}));
+
+vi.mock('../src/wallboard/sync', () => ({
+  wallboard: { pushNow: vi.fn() },
 }));
 
 import {
@@ -17,6 +26,9 @@ import {
   gymCam,
   gymCamConfigLinkState,
 } from '../src/lifts/gymCam';
+import { lifts } from '../src/lifts/store';
+import { castClipToWallboard, closeWallboardReplay, switchWallboardReplayView } from '../src/ui/lifts/video';
+import { getWallboardReplay } from '../src/wallboard/state';
 import { getSettings, updateSettings } from '../src/store/settings';
 import {
   applyClipMarker,
@@ -28,6 +40,8 @@ import {
   fmtRelativeToCheck,
   isTapeWithinRetention,
   nextBurstPlayIndex,
+  nextRecordedView,
+  orderedRecordedViews,
   pickNearestBurstIndex,
   shortCamLabel,
   tapeDaysRemaining,
@@ -426,6 +440,137 @@ describe('tape linking & scrubbing helpers', () => {
       gymCam.online = false;
       globalThis.fetch = origFetch;
       updateSettings({ gymCamEnabled: origSettings.gymCamEnabled, gymCamUrl: origSettings.gymCamUrl });
+    }
+  });
+
+  it('orders and cycles recorded multi-view Gym-Cam clips cleanly and returns null when no other view exists', () => {
+    const cRack = { id: 'v_rack', camera: 'Rack Cam', lanUrl: 'http://192.168.1.152:8766/clips/rack.mp4' };
+    const cRack2 = { id: 'v_rack2', camera: 'Rack Cam', lanUrl: 'http://192.168.1.152:8766/clips/rack2.mp4' };
+    const cSmith = { id: 'v_smith', camera: 'Smith Cam', lanUrl: 'http://192.168.1.152:8766/clips/smith.mp4' };
+    const cWide = { id: 'v_wide', camera: 'Smith Wide', lanUrl: 'http://192.168.1.152:8766/clips/wide.mp4' };
+    const cPhone = { id: 'v_phone', camera: undefined, lanUrl: undefined };
+
+    // Single view or same-camera duplicate + non-LAN phone clip -> no other views
+    expect(orderedRecordedViews([cRack, cPhone], ['Rack Cam'])).toEqual([cRack]);
+    expect(nextRecordedView([cRack, cPhone], { id: 'v_rack', camera: 'Rack Cam' }, ['Rack Cam'])).toBeNull();
+    expect(orderedRecordedViews([cRack, cRack2], ['Rack Cam'])).toEqual([cRack2]);
+    expect(nextRecordedView([cRack, cRack2], { id: 'v_rack2', camera: 'Rack Cam' }, ['Rack Cam'])).toBeNull();
+
+    // Respects preferredCameras order (e.g. Pull-Up: Smith Wide first, then Smith Cam)
+    const pullUpViews = orderedRecordedViews([cSmith, cWide], ['Smith Wide', 'Smith Cam']);
+    expect(pullUpViews.map((v) => v.id)).toEqual(['v_wide', 'v_smith']);
+    expect(nextRecordedView([cSmith, cWide], { id: 'v_wide' }, ['Smith Wide', 'Smith Cam'])).toEqual({
+      next: cSmith,
+      index: 1,
+      total: 2,
+    });
+    expect(nextRecordedView([cSmith, cWide], { id: 'v_smith' }, ['Smith Wide', 'Smith Cam'])).toEqual({
+      next: cWide,
+      index: 0,
+      total: 2,
+    });
+
+    // 3-view cycle wraps around cleanly (Rack -> Smith -> Smith Wide -> Rack)
+    const prefs = ['Rack Cam', 'Smith Cam', 'Smith Wide'];
+    const three = [cWide, cRack, cSmith];
+    expect(nextRecordedView(three, { id: 'v_rack' }, prefs)).toEqual({ next: cSmith, index: 1, total: 3 });
+    expect(nextRecordedView(three, { camera: 'Smith Cam' }, prefs)).toEqual({ next: cWide, index: 2, total: 3 });
+    expect(nextRecordedView(three, { id: 'v_wide' }, prefs)).toEqual({ next: cRack, index: 0, total: 3 });
+  });
+
+  it('switches live Wallboard replay views end-to-end, preserving rate and resetting 2x playback, or reports "No other views"', () => {
+    closeWallboardReplay();
+    lifts.videos.clear();
+    lifts.sessions.clear();
+    try {
+      // No active replay -> "No video playing"
+      expect(switchWallboardReplayView('sess_sw')).toEqual({
+        ok: false,
+        text: 'No video playing on TV',
+        speech: 'No video playing',
+      });
+
+      const v1 = {
+        id: 'vid_smith',
+        sessionId: 'sess_sw',
+        exId: 'smith-machine-row',
+        setId: 'set_1',
+        ms: 1000,
+        mime: 'video/mp4',
+        bytes: 100_000,
+        thumb: '',
+        source: 'gymcam' as const,
+        camera: 'Smith Cam',
+        lanUrl: 'http://192.168.1.152:8766/clips/row_smith.mp4',
+        durationSec: 12,
+      };
+      const v2 = {
+        ...v1,
+        id: 'vid_wide',
+        camera: 'Smith Wide',
+        lanUrl: 'http://192.168.1.152:8766/clips/row_wide.mp4',
+      };
+      lifts.videos.set(v1.id, v1);
+      lifts.sessions.set('sess_sw', {
+        id: 'sess_sw',
+        name: 'Upper 1',
+        routineId: null,
+        eventId: null,
+        startMs: 1000,
+        endMs: null,
+        status: 'active',
+        exs: [{
+          uid: 'se_row',
+          exId: 'smith-machine-row',
+          cams: ['Smith Cam', 'Smith Wide'],
+          sets: [{ id: 'set_1', w: 50, r: 10, done: true, kind: 'n', vids: [v1.id] }],
+        }],
+        rpe: null,
+        bwKg: null,
+      });
+
+      // Single recorded view -> keeps playing and reports "No other views"
+      expect(castClipToWallboard(v1, { rate: 0.5, exName: 'Smith Machine Row', setLabel: 'Set 1' })).toBe(true);
+      const before = getWallboardReplay()!;
+      expect(before.id).toBe(v1.id);
+      expect(switchWallboardReplayView('sess_sw')).toEqual({
+        ok: false,
+        text: 'No other views',
+        speech: 'No other views',
+      });
+      expect(getWallboardReplay()?.id).toBe(v1.id);
+
+      // Add second recorded view -> switches to Smith Wide, preserves 0.5x rate, sets view 2/2 and fresh 2x playback expiry
+      lifts.videos.set(v2.id, v2);
+      lifts.sessions.get('sess_sw')!.exs[0].sets[0].vids = [v1.id, v2.id];
+      const sw1 = switchWallboardReplayView('sess_sw');
+      expect(sw1).toEqual({
+        ok: true,
+        text: 'TV view → Smith Wide (2/2)',
+        speech: 'Switching to Smith Wide',
+      });
+      const after1 = getWallboardReplay()!;
+      expect(after1.id).toBe(v2.id);
+      expect(after1.camera).toBe('Smith Wide');
+      expect(after1.subtitle).toBe('Set 1 · Smith Wide');
+      expect(after1.rate).toBe(0.5);
+      expect(after1.viewIndex).toBe(2);
+      expect(after1.viewCount).toBe(2);
+      expect(after1.expiresAtMs).toBeGreaterThan(after1.startedAtMs);
+
+      // Switching again cycles back to Smith Cam (1/2)
+      const sw2 = switchWallboardReplayView('sess_sw');
+      expect(sw2).toEqual({
+        ok: true,
+        text: 'TV view → Smith (1/2)',
+        speech: 'Switching to Smith',
+      });
+      expect(getWallboardReplay()?.id).toBe(v1.id);
+      expect(getWallboardReplay()?.viewIndex).toBe(1);
+    } finally {
+      closeWallboardReplay();
+      lifts.videos.clear();
+      lifts.sessions.clear();
     }
   });
 });

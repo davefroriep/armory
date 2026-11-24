@@ -457,4 +457,54 @@ describe('VoiceController room source relay', () => {
     expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's1' });
     expect(sess.exs[0].sets[0]).toMatchObject({ id: 's1', w: null, r: null, done: false });
   });
+
+  it('handles "Armory switch views" synchronously, speaking "No other views" when none exist and switching view otherwise', async () => {
+    const sess = makeBenchSession('sess_switch_views');
+    mockState.activeSess = sess;
+    const ackBodies: { speech?: string; text?: string; kind?: string }[] = [];
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (String(url).includes('/api/voice/ack') && init?.body) {
+        ackBodies.push(JSON.parse(String(init.body)) as { speech?: string; text?: string; kind?: string });
+        return { ok: true, json: async () => ({ ok: true, spoke: true }) };
+      }
+      return { ok: true, json: async () => ({ ok: true }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      voice.switchViewHandler = () => ({ ok: false, text: 'No other views', speech: 'No other views' });
+      voice.receiveExternalEvent({
+        transcript: 'Armory switch views',
+        isFinal: true,
+        source: 'room',
+        state: 'room',
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(voice.lastAction?.text).toBe('No other views');
+      expect(voice.lastAction?.kind).toBe('warn');
+      expect(ackBodies).toHaveLength(1);
+      expect(ackBodies[0].speech).toBe('No other views');
+
+      // Wait past same-source 450ms dedup window (by resetting lastFinalAt) and test multi-view switch
+      (voice as unknown as { lastFinalAt: number }).lastFinalAt = 0;
+      voice.switchViewHandler = () => ({
+        ok: true,
+        text: 'TV view → Smith Wide (2/2)',
+        speech: 'Switching to Smith Wide',
+      });
+      voice.receiveExternalEvent({
+        transcript: 'Armory switch views',
+        isFinal: true,
+        source: 'room',
+        state: 'room',
+      });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(voice.lastAction?.text).toBe('TV view → Smith Wide (2/2)');
+      expect(voice.lastAction?.kind).toBe('info');
+      expect(ackBodies).toHaveLength(2);
+      expect(ackBodies[1].speech).toBe('Switching to Smith Wide');
+    } finally {
+      voice.switchViewHandler = null;
+      vi.unstubAllGlobals();
+    }
+  });
 });

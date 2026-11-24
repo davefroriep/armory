@@ -890,11 +890,22 @@ describe('wallboard snapshot & routing', () => {
     expect(parseVoiceTranscript('Armory replay slow')).toEqual({ kind: 'wb_replay', slow: true });
     expect(parseVoiceTranscript('Armory play set 2')).toEqual({ kind: 'wb_replay', setNum: 2 });
     expect(parseVoiceTranscript('Armory play bench set three slow mo')).toEqual({ kind: 'wb_replay', exQuery: 'bench', setNum: 3, slow: true });
+    expect(parseVoiceTranscript('Armory switch views')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory switch view')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory next view')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory other view')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory switch angles')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory switch camera')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory switch to next view')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory switch views alright guys')).toEqual({ kind: 'wb_switch_view' });
+    expect(parseVoiceTranscript('Armory switch to bench')).toEqual({ kind: 'jump_ex', target: 'bench' });
     expect(parseVoiceTranscript('Armory close video')).toEqual({ kind: 'wb_close_replay' });
     expect(parseVoiceTranscript('Armory guest record')).toEqual({ kind: 'cam_guest' });
     expect(parseVoiceTranscript('Armory guest smith')).toEqual({ kind: 'cam_guest', camera: 'Smith Cam' });
     expect(parseVoiceTranscript('Armory guest fly')).toEqual({ kind: 'cam_guest', camera: 'Fly Machine Cam' });
     expect(defaultReadbackForIntent({ kind: 'wb_replay', slow: true })).toBe('Replaying slow motion on TV');
+    expect(defaultReadbackForIntent({ kind: 'wb_switch_view' })).toBe('Switching views');
+    expect(voiceIntentKey({ kind: 'wb_switch_view' })).toBe('wb_switch_view');
     expect(defaultReadbackForIntent({ kind: 'wb_close_replay' })).toBe('Closing video');
     expect(defaultReadbackForIntent({ kind: 'cam_guest', camera: 'Smith Cam' })).toBe('Guest camera Smith');
 
@@ -993,6 +1004,8 @@ describe('Wave 2 Wallboard & Voice bounds hardening', () => {
     const match = WALLBOARD_HTML.match(/<script>([\s\S]*?)<\/script>/);
     expect(match).not.toBeNull();
     expect(() => new Function(match![1])).not.toThrow();
+    expect(WALLBOARD_HTML).toContain('replayLoading');
+    expect(WALLBOARD_HTML).toContain("VIEW ' + replayMeta.viewIndex");
     expect(WALLBOARD_HTML).toContain('staleBanner');
     expect(WALLBOARD_HTML).toContain('PHONE PAUSED');
   });

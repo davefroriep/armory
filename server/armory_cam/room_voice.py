@@ -91,6 +91,8 @@ PREWARM_TTS_PHRASES: tuple[str, ...] = (
     "Recording Rack",
     "Recording Smith",
     "Clipping last set",
+    "No other views",
+    "No video playing",
     "Buddy mode on",
     "Buddy mode off",
     "Workout paused",
@@ -238,6 +240,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "record rack",
         "clip that",
         "replay slow",
+        "switch views",
         "buddy mode",
         "undo",
         "back",
@@ -278,7 +281,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
     prompt = ", ".join(all_terms) + "."
     hotwords = ", ".join([
         wake, "check", "done", "skip rest", "next exercise", "add set", "undo", "back",
-        "rack", "smith", "replay", "play music", "lights", "PR",
+        "rack", "smith", "replay", "switch views", "play music", "lights", "PR",
         "open the gym", "close the gym", "shut down",
         *extras[:6],
     ])

@@ -274,11 +274,12 @@ let lastState = null;
 let activeReplayKey = '';
 let dismissedReplayKey = '';
 let replayLoopsLeft = 0;
+let replayLoading = false;
 let replayT0 = 0;
 let replayT1 = 0;
 let replayEndBound = 0;
 let replayRate = 1;
-let replayMeta = { camera: '', rate: 1 };
+let replayMeta = { camera: '', rate: 1, viewIndex: 0, viewCount: 0 };
 
 const wbReplayEl = document.getElementById('wbReplay');
 const wbRepVid = document.getElementById('wbRepVid');
@@ -287,12 +288,14 @@ const wbRepBadge = document.getElementById('wbRepBadge');
 function replayBadgeText(playNum) {
   return [
     replayMeta.camera || '',
+    replayMeta.viewCount > 1 && replayMeta.viewIndex > 0 ? 'VIEW ' + replayMeta.viewIndex + '/' + replayMeta.viewCount : '',
     replayMeta.rate && replayMeta.rate !== 1 ? replayMeta.rate + '× SLOW-MO' : '',
     'PLAY ' + playNum + '/2',
   ].filter(Boolean).join(' · ');
 }
 
 function closeLocalReplay() {
+  replayLoading = false;
   try { wbRepVid.pause(); } catch {}
   wbRepVid.removeAttribute('src');
   try { wbRepVid.load(); } catch {}
@@ -301,6 +304,7 @@ function closeLocalReplay() {
 
 if (wbRepVid) {
   wbRepVid.addEventListener('loadedmetadata', () => {
+    replayLoading = false;
     const dur = isFinite(wbRepVid.duration) ? wbRepVid.duration : 0;
     replayEndBound = replayT1 > replayT0 + 0.15 ? (dur ? Math.min(replayT1, dur) : replayT1) : dur;
     if (replayT0 > 0 && dur > 0.2) wbRepVid.currentTime = Math.min(replayT0, dur - 0.1);
@@ -308,7 +312,7 @@ if (wbRepVid) {
     wbRepVid.play().catch(() => {});
   });
   const advanceReplayLoop = (fromEnded) => {
-    if (!activeReplayKey || wbReplayEl.hidden) return;
+    if (!activeReplayKey || wbReplayEl.hidden || replayLoading) return;
     if (!fromEnded && !(replayEndBound > 0 && wbRepVid.currentTime >= replayEndBound - 0.05)) return;
     replayLoopsLeft--;
     if (replayLoopsLeft > 0) {
@@ -349,21 +353,29 @@ function syncReplay(st, hr, hrColor) {
   if (key === dismissedReplayKey) return;
   if (key !== activeReplayKey) {
     activeReplayKey = key;
+    replayLoading = true;
     replayLoopsLeft = 2;
     replayT0 = Math.max(0, Number(rep.trimStartSec) || 0);
     replayT1 = Number(rep.trimEndSec) || 0;
-    replayEndBound = replayT1;
+    replayEndBound = 0;
     replayRate = Number(rep.rate) || 1;
-    replayMeta = { camera: rep.camera || '', rate: replayRate };
+    replayMeta = {
+      camera: rep.camera || '',
+      rate: replayRate,
+      viewIndex: Number(rep.viewIndex) || 0,
+      viewCount: Number(rep.viewCount) || 0,
+    };
     const tEl = document.getElementById('wbRepT');
     const sEl = document.getElementById('wbRepSub');
     if (tEl) tEl.textContent = rep.title || 'Form Replay';
     if (sEl) sEl.textContent = rep.subtitle || '';
     if (wbRepBadge) wbRepBadge.textContent = replayBadgeText(1);
     if (wbReplayEl) wbReplayEl.hidden = false;
+    try { wbRepVid.pause(); } catch {}
     wbRepVid.playbackRate = replayRate;
     wbRepVid.defaultPlaybackRate = replayRate;
     wbRepVid.src = rep.url;
+    try { wbRepVid.load(); } catch {}
   }
 }
 

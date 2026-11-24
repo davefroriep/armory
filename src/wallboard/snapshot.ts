@@ -130,6 +130,8 @@ export interface WallboardReplayState {
   trimEndSec: number;
   startedAtMs: number;
   expiresAtMs: number;
+  viewIndex?: number;
+  viewCount?: number;
 }
 
 export interface WallboardState {

@@ -68,7 +68,7 @@ class WallboardController {
     active.tick.on(throttled);
     wallboardSnapChanged.on(() => {
       const s = buildWallboardState();
-      const key = `${s.mode}|${s.cardio?.phase ?? ''}|${s.cardio?.paused ?? ''}|${s.replay?.url ?? ''}|${s.lift?.hold?.active ?? ''}`;
+      const key = `${s.mode}|${s.cardio?.phase ?? ''}|${s.cardio?.paused ?? ''}|${s.replay?.url ?? ''}|${s.replay?.startedAtMs ?? ''}|${s.lift?.hold?.active ?? ''}`;
       if (key !== this.lastSnapKey) {
         this.lastSnapKey = key;
         immediate();

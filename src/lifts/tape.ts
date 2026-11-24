@@ -232,3 +232,68 @@ export function buildCoachAngleOptions(opts: {
     kind: camera === primary ? 'primary' : savedSet.has(camera) ? 'saved' : 'tape',
   }));
 }
+
+export interface ReplayableClipView {
+  id: string;
+  camera?: string;
+  lanUrl?: string;
+}
+
+/**
+ * Returns the deduplicated, preferred-order list of recorded Gym-Cam views for a set
+ * (keeping only clips with a playable `lanUrl`, letting the newest clip win per camera).
+ */
+export function orderedRecordedViews<T extends ReplayableClipView>(
+  clips: readonly T[],
+  preferredCameras?: readonly string[],
+): T[] {
+  const byKey = new Map<string, T>();
+  const keyOrder: string[] = [];
+  for (const clip of clips) {
+    if (!clip?.lanUrl?.trim()) continue;
+    const camKey = (clip.camera ?? '').trim().toLowerCase() || `id:${clip.id}`;
+    if (!byKey.has(camKey)) keyOrder.push(camKey);
+    byKey.set(camKey, clip);
+  }
+  const out: T[] = [];
+  const used = new Set<string>();
+  for (const rawCam of preferredCameras ?? []) {
+    const key = rawCam.trim().toLowerCase();
+    if (!key || used.has(key)) continue;
+    const hit = byKey.get(key);
+    if (hit) {
+      used.add(key);
+      out.push(hit);
+    }
+  }
+  for (const key of keyOrder) {
+    if (used.has(key)) continue;
+    const hit = byKey.get(key);
+    if (hit) {
+      used.add(key);
+      out.push(hit);
+    }
+  }
+  return out;
+}
+
+/**
+ * Picks the next recorded view after the currently replaying clip/camera (wrapping around).
+ * Returns `null` when fewer than 2 distinct recorded views exist.
+ */
+export function nextRecordedView<T extends ReplayableClipView>(
+  clips: readonly T[],
+  current: { id?: string; camera?: string },
+  preferredCameras?: readonly string[],
+): { next: T; index: number; total: number } | null {
+  const views = orderedRecordedViews(clips, preferredCameras);
+  if (views.length < 2) return null;
+  const curId = current.id ?? '';
+  const curCam = (current.camera ?? '').trim().toLowerCase();
+  let curIdx = curId ? views.findIndex((v) => v.id === curId) : -1;
+  if (curIdx < 0 && curCam) {
+    curIdx = views.findIndex((v) => (v.camera ?? '').trim().toLowerCase() === curCam);
+  }
+  const nextIdx = curIdx >= 0 ? (curIdx + 1) % views.length : 0;
+  return { next: views[nextIdx], index: nextIdx, total: views.length };
+}

@@ -31,6 +31,10 @@ export function setWallboardHoldState(snap: ActiveHoldSnapshot | null): void {
   wallboardSnapChanged.emit();
 }
 
+export function getWallboardReplay(): WallboardReplayState | null {
+  return replaySnap;
+}
+
 export function setWallboardReplay(snap: WallboardReplayState | null): void {
   replaySnap = snap;
   wallboardSnapChanged.emit();

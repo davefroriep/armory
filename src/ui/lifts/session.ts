@@ -16,8 +16,8 @@ import { lifts } from '../../lifts/store';
 import { gymCam } from '../../lifts/gymCam';
 import { resyncSession, updateFinishedDuration } from '../../lifts/intervals';
 import { fmtDuration, setText } from '../../lifts/summary';
-import { shortCamLabel } from '../../lifts/tape';
-import type { Exercise, LiftSession, SessionEx, SetKind } from '../../lifts/types';
+import { orderedRecordedViews, shortCamLabel } from '../../lifts/tape';
+import type { Exercise, LiftSession, SessionEx, SetKind, VideoMeta } from '../../lifts/types';
 import { voice } from '../../lifts/voice';
 import { allowNextRoute } from '../../main';
 import { getSettings, settingsChanged, updateSettings } from '../../store/settings';
@@ -28,7 +28,10 @@ import { $, esc } from '../dom';
 import { LI, clock, actionSheet, confirmSheet, mount, openSheet, promptSheet, toast, type Sheet } from './kit';
 import { pickExercises } from './picker';
 import { openEditTimeSheet } from './timeSheet';
-import { castClipToWallboard, closeWallboardReplay, openSetVideoSheet, pickRecordCameraSheet, playVideo } from './video';
+import {
+  castClipToWallboard, closeWallboardReplay, openSetVideoSheet, pickRecordCameraSheet, playVideo,
+  switchWallboardReplayView,
+} from './video';
 import { openVoiceAbShootoutSheet } from './voiceAbSheet';
 
 const KIND_LABEL: Record<SetKind, string> = { n: 'Normal', w: 'Warm-up', d: 'Drop set', f: 'To failure' };
@@ -1633,12 +1636,16 @@ function build(root: HTMLElement, id?: string): () => void {
       const { se, set, idx } = pick;
       const n = se.sets.slice(0, idx + 1).filter((x) => x.kind !== 'w').length;
       const setLabel = set.kind === 'w' ? 'Warm-up' : `Set ${n}`;
-      let meta = set.vids?.length ? lifts.videos.get(set.vids[set.vids.length - 1]) : undefined;
-      if ((!meta || !meta.lanUrl) && gymCam.online && set.done) {
+      const effCams = camsForEx(se);
+      let setClips = (set.vids ?? []).map((vidId) => lifts.videos.get(vidId)).filter((v): v is VideoMeta => !!v);
+      let views = orderedRecordedViews(setClips, effCams);
+      let meta = views[0];
+      if (!meta && gymCam.online && set.done) {
         toast(`Pulling ${exOf(se.exId).name} ${setLabel} for TV…`);
-        const effCams = camsForEx(se);
         const clips = await gymCam.autoClipPr(s, se, set, effCams, true);
-        meta = clips[0] ?? meta;
+        setClips = (set.vids ?? []).map((vidId) => lifts.videos.get(vidId)).filter((v): v is VideoMeta => !!v);
+        views = orderedRecordedViews(setClips.length ? setClips : clips, effCams);
+        meta = views[0] ?? clips[0];
         if (meta && !dead) { save(); syncVisibleCards(); }
       }
       if (!meta?.lanUrl) return `No Gym Cam clip found for ${exOf(se.exId).name} ${setLabel}`;
@@ -1646,9 +1653,11 @@ function build(root: HTMLElement, id?: string): () => void {
         rate: req.slow ? 0.5 : 1,
         exName: exOf(se.exId).name,
         setLabel,
+        ...(views.length > 1 ? { viewIndex: 1, viewCount: views.length } : {}),
       });
       return `Replaying ${exOf(se.exId).name} ${setLabel}${req.slow ? ' (0.5×)' : ''} on TV`;
     };
+    voice.switchViewHandler = () => switchWallboardReplayView(s.id);
     probeAndEnterCam();
   }
 
@@ -1666,6 +1675,7 @@ function build(root: HTMLElement, id?: string): () => void {
       voice.buddyHandler = null;
       voice.camHandler = null;
       voice.replayHandler = null;
+      voice.switchViewHandler = null;
       voice.setLiftScreenMounted(false);
       void setKeepScreenOn(false);
     }
