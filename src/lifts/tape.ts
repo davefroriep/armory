@@ -101,6 +101,13 @@ export function shortCamLabel(name: string): string {
   return name.trim().replace(/\s+cam$/i, '') || name;
 }
 
+/** Compact summary highlighting Primary Cam (`cams[0]`) with ★ when 2+ cameras are assigned. */
+export function formatCamListSummary(cams: readonly string[]): string {
+  const labels = cams.map(shortCamLabel).filter(Boolean);
+  if (labels.length <= 1) return labels[0] ?? '';
+  return `★ ${labels[0]} + ${labels.slice(1).join(' + ')}`;
+}
+
 /** Formats relative offset between `targetMs` and set check time `checkedMs`. */
 export function fmtRelativeToCheck(targetMs: number, checkedMs: number): string {
   const dSec = Math.round((checkedMs - targetMs) / 1000);

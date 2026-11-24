@@ -1,11 +1,11 @@
 import { PR_MAX_REPS, e1rmTrend, exerciseSessions, repBests, isWorking } from '../../lifts/calc';
 import { gymCam } from '../../lifts/gymCam';
-import { camsForExercise, DEFAULT_CAM_OPTIONS, normalizeCamList } from '../../lifts/logic';
+import { camsForExercise, DEFAULT_CAM_OPTIONS, normalizeCamList, setPrimaryCam, toggleAssignedCam } from '../../lifts/logic';
 import { EQUIP_LABEL, MUSCLE_LABEL } from '../../lifts/muscles';
 import { fmtKg, liftSettings, toDisplay } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { condenseSets } from '../../lifts/summary';
-import { shortCamLabel } from '../../lifts/tape';
+import { formatCamListSummary, shortCamLabel } from '../../lifts/tape';
 import { esc } from '../dom';
 import { lineChart } from './charts';
 import { LI, actionSheet, clock, confirmSheet, mount, openSheet, relDay, resumeBar, tabBar, toast, wireClock } from './kit';
@@ -95,7 +95,7 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
           <section class="card"><div class="card-h"><span>HISTORY</span></div>${sessList.length ? sessList.map(({ s, e }) => `<a class="ehr" href="#/strength/workout/${s.id}"><b>${new Date(s.startMs).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}</b><span>${esc(condenseSets(e, ex, unit))}</span></a>`).join('') : '<div class="empty">Not logged yet.</div>'}</section>
           <section class="card">
             <div class="line"><span>Rest timer<small>For this exercise</small></span><button class="btn sm" data-act="rest">${clock(row?.restSec ?? liftSettings().restSec)}</button></div>
-            <div class="line"><span>Cameras<small>Required · 1+ stations for this lift</small></span><button class="btn sm" data-act="cam">${esc(camsForExercise(ex, row, undefined, gymCam.cameras).map(shortCamLabel).join(' + '))}</button></div>
+            <div class="line"><span>Cameras<small>Required · 1+ stations for this lift</small></span><button class="btn sm" data-act="cam">${esc(formatCamListSummary(camsForExercise(ex, row, undefined, gymCam.cameras)))}</button></div>
           </section>
         </main>${resumeBar()}${tabBar('exercises')}`;
     };
@@ -127,41 +127,60 @@ export function exerciseScreen(root: HTMLElement, args: string[]): () => void {
         for (const c of gymCam.cameras) {
           if (!allCams.some((x) => x.toLowerCase() === c.toLowerCase())) allCams.push(c);
         }
-        const selected = new Set<string>(camsForExercise(curEx, curRow));
+        let selected = camsForExercise(curEx, curRow);
         const sh = openSheet(
           `<h3 class="sh-title">Cameras · ${esc(curEx.name)}</h3>
            <div class="fl">PICK 1 OR MORE STATIONS (REQUIRED)</div>
            <div class="chips-row wrap" id="exCamChips"></div>
+           <div id="exCamPriWrap" hidden>
+             <div class="fl">PRIMARY CAM <small>REPLAYS FIRST ON TV &amp; PHONE</small></div>
+             <div class="chips-row wrap" id="exCamPri"></div>
+           </div>
            <button class="btn primary big" type="button" data-cam-save style="margin-top:14px">Save</button>
            <button class="btn big" type="button" data-cam-no>Cancel</button>`,
         );
         const chipsEl = sh.body.querySelector<HTMLElement>('#exCamChips')!;
+        const priWrapEl = sh.body.querySelector<HTMLElement>('#exCamPriWrap')!;
+        const priEl = sh.body.querySelector<HTMLElement>('#exCamPri')!;
         const saveBtn = sh.body.querySelector<HTMLButtonElement>('[data-cam-save]')!;
         const renderChips = (): void => {
+          const primaryCam = selected[0] ?? '';
           chipsEl.innerHTML = allCams
-            .map((c) => `<button class="fchip${selected.has(c) ? ' on' : ''}" type="button" data-excam="${esc(c)}">${esc(shortCamLabel(c))}</button>`)
+            .map((c) => {
+              const on = selected.includes(c);
+              const isPri = selected.length > 1 && c === primaryCam;
+              return `<button class="fchip${on ? ' on' : ''}" type="button" data-excam="${esc(c)}">${isPri ? '★ ' : ''}${esc(shortCamLabel(c))}</button>`;
+            })
             .join('');
-          saveBtn.disabled = selected.size === 0;
+          priWrapEl.hidden = selected.length <= 1;
+          priEl.innerHTML = selected.length > 1
+            ? selected
+                .map((c, ci) => `<button class="fchip${ci === 0 ? ' pri' : ''}" type="button" data-expri="${esc(c)}">${ci === 0 ? '★ ' : ''}${esc(shortCamLabel(c))}</button>`)
+                .join('')
+            : '';
+          saveBtn.disabled = selected.length === 0;
         };
         renderChips();
         sh.body.addEventListener('click', async (ev) => {
           const el = ev.target as HTMLElement;
           const btn = el.closest<HTMLElement>('[data-excam]');
           if (btn) {
-            const c = btn.dataset.excam!;
-            if (selected.has(c)) {
-              if (selected.size <= 1) { toast('Select at least 1 camera'); return; }
-              selected.delete(c);
-            } else {
-              selected.add(c);
-            }
+            const next = toggleAssignedCam(selected, btn.dataset.excam!);
+            if (!next) { toast('Select at least 1 camera'); return; }
+            selected = next;
+            renderChips();
+            return;
+          }
+          const priBtn = el.closest<HTMLElement>('[data-expri]');
+          if (priBtn) {
+            selected = setPrimaryCam(selected, priBtn.dataset.expri!);
             renderChips();
             return;
           }
           if (el.closest('[data-cam-no]')) { sh.close(); return; }
           if (el.closest('[data-cam-save]')) {
-            if (selected.size === 0) return;
-            const nextRow = { ...(lifts.row(exId) ?? { id: exId }), cams: normalizeCamList([...selected]) };
+            if (selected.length === 0) return;
+            const nextRow = { ...(lifts.row(exId) ?? { id: exId }), cams: normalizeCamList(selected) };
             delete nextRow.camPref;
             await lifts.saveRow(nextRow);
             sh.close();

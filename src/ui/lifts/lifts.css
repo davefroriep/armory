@@ -91,6 +91,7 @@ textarea.lf-input { resize: none; }
 .chips-row.wrap { flex-wrap: wrap; overflow: visible; }
 .fchip, .chipbtn { flex: none; padding: 8px 14px; border-radius: 999px; background: var(--card2); color: var(--mut); font-size: .82rem; font-weight: 700; white-space: nowrap; }
 .fchip.on, .chipbtn.on { background: var(--blue); color: #00131f; }
+.fchip.pri { background: var(--amber); color: #1a1000; }
 .chipbtn:disabled { opacity: .3; }
 .seg.mini button { padding: 6px 9px; font-size: .72rem; }
 .seg.mini { display: inline-grid; }

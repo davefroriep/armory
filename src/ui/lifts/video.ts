@@ -569,8 +569,10 @@ export function pickRecordCameraSheet(
        <div class="vcam-pick${cams.length > 2 ? ' many' : ''}">
          ${cams.map((c) => {
            const assigned = prefList.includes(c);
+           const isPrimary = prefList[0] === c;
+           const role = isPrimary ? '★ Primary' : 'Assigned';
            const sub = assigned
-             ? (buddyMode ? '★ Assigned · Buddy lock · stops on ✓' : '★ Assigned · stops on ✓')
+             ? (buddyMode ? `${role} · Buddy lock · stops on ✓` : `${role} · stops on ✓`)
              : 'Record this angle · stops on ✓';
            return `
            <button class="vcam-btn${assigned ? ' sel' : ''}" type="button" data-rcam="${esc(c)}">
@@ -652,7 +654,9 @@ export async function openSetVideoSheet(t: VideoTarget, setLabel: string): Promi
       : '';
     return multi + camList().map((c) => {
       const isAssigned = assigned.includes(c);
-      return `<button class="aitem${isAssigned ? ' on' : ''}" type="button" data-varmcam="${esc(c)}"><b>Record on ${esc(shortCamLabel(c))}${isAssigned ? ' ★' : ''}</b><small>Arms this set and auto-stops when you tap ✓</small></button>`;
+      const isPrimary = assigned[0] === c;
+      const badge = isPrimary ? ' ★ Primary' : isAssigned ? ' · Assigned' : '';
+      return `<button class="aitem${isAssigned ? ' on' : ''}" type="button" data-varmcam="${esc(c)}"><b>Record on ${esc(shortCamLabel(c))}${badge}</b><small>Arms this set and auto-stops when you tap ✓</small></button>`;
     }).join('');
   };
 

@@ -536,3 +536,29 @@ export function preferredCamForExercise(
 ): string {
   return camsForExercise(ex, row, sessionCamPref ? { camPref: sessionCamPref } : undefined, availableCameras)[0] ?? DEFAULT_FALLBACK_CAM;
 }
+
+/**
+ * Toggles `clicked` in an exercise's ordered camera list while preserving `current[0]` (Primary Cam).
+ * Removing the current Primary Cam promotes the next selected camera; removing the last remaining camera returns `null`.
+ */
+export function toggleAssignedCam(current: readonly string[], clicked: string): string[] | null {
+  const clean = clicked.trim();
+  if (!clean) return normalizeCamList(current);
+  const list = normalizeCamList(current);
+  const idx = list.findIndex((c) => c.toLowerCase() === clean.toLowerCase());
+  if (idx >= 0) {
+    if (list.length <= 1) return null;
+    return list.filter((_, i) => i !== idx);
+  }
+  return [...list, clean];
+}
+
+/** Moves `primary` to index 0 (Primary Cam) while keeping all other selected cameras in order. */
+export function setPrimaryCam(current: readonly string[], primary: string): string[] {
+  const clean = primary.trim();
+  const list = normalizeCamList(current);
+  if (!clean) return list;
+  const hit = list.find((c) => c.toLowerCase() === clean.toLowerCase()) ?? clean;
+  const rest = list.filter((c) => c.toLowerCase() !== hit.toLowerCase());
+  return [hit, ...rest];
+}

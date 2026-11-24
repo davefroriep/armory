@@ -1,4 +1,4 @@
-import { DEFAULT_CAM_OPTIONS, defaultCamsForExercise, normalizeCamList } from '../../lifts/logic';
+import { DEFAULT_CAM_OPTIONS, defaultCamsForExercise, normalizeCamList, setPrimaryCam, toggleAssignedCam } from '../../lifts/logic';
 import { EQUIPS, EQUIP_LABEL, GROUPS, MUSCLE_LABEL } from '../../lifts/muscles';
 import { lifts } from '../../lifts/store';
 import { shortCamLabel } from '../../lifts/tape';
@@ -149,11 +149,9 @@ export function exerciseForm(existing: Exercise | null, presetName = ''): Promis
       if (!allCamOpts.some((x) => x.toLowerCase() === c.toLowerCase())) allCamOpts.push(c);
     }
     const existingCams = existingRow ? normalizeCamList(existingRow.cams ?? existingRow.camPref) : [];
-    const selectedCams = new Set<string>(
-      existingCams.length
-        ? existingCams
-        : defaultCamsForExercise({ id: existing?.id ?? '', name: existing?.name ?? presetName, equip }),
-    );
+    let selectedCams: string[] = existingCams.length
+      ? [...existingCams]
+      : defaultCamsForExercise({ id: existing?.id ?? '', name: existing?.name ?? presetName, equip });
     let camsTouched = existingCams.length > 0;
     const prim = new Set<Muscle>(existing?.primary ?? []);
     const sec = new Set<Muscle>(existing?.secondary ?? []);
@@ -163,6 +161,7 @@ export function exerciseForm(existing: Exercise | null, presetName = ''): Promis
        <div class="fl">LOGGED AS</div><div class="seg" id="ct"></div>
        <div class="fl">EQUIPMENT</div><div class="chips-row wrap" id="ce"></div>
        <div class="fl">CAMERAS <small>Required · pick 1 or more</small></div><div class="chips-row wrap" id="cc"></div>
+       <div id="ccPriWrap" hidden><div class="fl">PRIMARY CAM <small>Replays first on TV &amp; phone</small></div><div class="chips-row wrap" id="ccPri"></div></div>
        <div class="fl">PRIMARY MUSCLES <small>1.0 set each</small></div><div class="chips-row wrap" id="cp"></div>
        <div class="fl">SECONDARY MUSCLES <small>0.5 set each</small></div><div class="chips-row wrap" id="cs"></div>
        <button class="btn primary big" data-save disabled>Save exercise</button>
@@ -173,11 +172,24 @@ export function exerciseForm(existing: Exercise | null, presetName = ''): Promis
     const save = $('[data-save]') as HTMLButtonElement;
     const name = $('#cn') as HTMLInputElement;
     const chip = (k: string, label: string, on: boolean): string => `<button class="fchip${on ? ' on' : ''}" data-k="${k}">${label}</button>`;
-    const canSave = (): boolean => !!name.value.trim() && prim.size > 0 && selectedCams.size > 0;
+    const canSave = (): boolean => !!name.value.trim() && prim.size > 0 && selectedCams.length > 0;
     const draw = (): void => {
       $('#ct').innerHTML = ([['weight', 'Weight × reps'], ['bodyweight', 'Bodyweight'], ['time', 'Time']] as [ExType, string][]).map(([k, l]) => `<button class="${type === k ? 'on' : ''}" data-k="${k}">${l}</button>`).join('');
       $('#ce').innerHTML = EQUIPS.map((k) => chip(k, EQUIP_LABEL[k], equip === k)).join('');
-      $('#cc').innerHTML = allCamOpts.map((c) => chip(esc(c), esc(shortCamLabel(c)), selectedCams.has(c))).join('');
+      const primaryCam = selectedCams[0] ?? '';
+      $('#cc').innerHTML = allCamOpts
+        .map((c) => {
+          const on = selectedCams.includes(c);
+          const isPri = selectedCams.length > 1 && c === primaryCam;
+          return chip(esc(c), `${isPri ? '★ ' : ''}${esc(shortCamLabel(c))}`, on);
+        })
+        .join('');
+      $('#ccPriWrap').hidden = selectedCams.length <= 1;
+      $('#ccPri').innerHTML = selectedCams.length > 1
+        ? selectedCams
+            .map((c, ci) => `<button class="fchip${ci === 0 ? ' pri' : ''}" type="button" data-k="${esc(c)}">${ci === 0 ? '★ ' : ''}${esc(shortCamLabel(c))}</button>`)
+            .join('')
+        : '';
       $('#cp').innerHTML = MUSCLES.map((m) => chip(m, MUSCLE_LABEL[m], prim.has(m))).join('');
       $('#cs').innerHTML = MUSCLES.map((m) => chip(m, MUSCLE_LABEL[m], sec.has(m))).join('');
       save.disabled = !canSave();
@@ -187,8 +199,7 @@ export function exerciseForm(existing: Exercise | null, presetName = ''): Promis
     };
     const syncDefaultCamsIfUntouched = (): void => {
       if (camsTouched) return;
-      selectedCams.clear();
-      defaultCamsForExercise({ id: existing?.id ?? '', name: name.value.trim(), equip }).forEach((c) => selectedCams.add(c));
+      selectedCams = defaultCamsForExercise({ id: existing?.id ?? '', name: name.value.trim(), equip });
     };
     $('#ct').addEventListener('click', (e) => { const b = (e.target as HTMLElement).closest<HTMLElement>('[data-k]'); if (b) { type = b.dataset.k as ExType; draw(); } });
     $('#ce').addEventListener('click', (e) => {
@@ -198,14 +209,17 @@ export function exerciseForm(existing: Exercise | null, presetName = ''): Promis
     $('#cc').addEventListener('click', (e) => {
       const b = (e.target as HTMLElement).closest<HTMLElement>('[data-k]');
       if (!b) return;
-      const cam = b.dataset.k!;
       camsTouched = true;
-      if (selectedCams.has(cam)) {
-        if (selectedCams.size <= 1) { toast('Select at least 1 camera'); return; }
-        selectedCams.delete(cam);
-      } else {
-        selectedCams.add(cam);
-      }
+      const next = toggleAssignedCam(selectedCams, b.dataset.k!);
+      if (!next) { toast('Select at least 1 camera'); return; }
+      selectedCams = next;
+      draw();
+    });
+    $('#ccPri').addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLElement>('[data-k]');
+      if (!b) return;
+      camsTouched = true;
+      selectedCams = setPrimaryCam(selectedCams, b.dataset.k!);
       draw();
     });
     $('#cp').addEventListener('click', (e) => { const b = (e.target as HTMLElement).closest<HTMLElement>('[data-k]'); if (b) { toggle(prim, sec, b.dataset.k as Muscle); draw(); } });
@@ -213,8 +227,8 @@ export function exerciseForm(existing: Exercise | null, presetName = ''): Promis
     name.addEventListener('input', () => { syncDefaultCamsIfUntouched(); save.disabled = !canSave(); });
     $('[data-no]').addEventListener('click', () => sh.close());
     save.addEventListener('click', async () => {
-      if (selectedCams.size === 0) { toast('Select at least 1 camera'); return; }
-      const cams = [...selectedCams];
+      if (selectedCams.length === 0) { toast('Select at least 1 camera'); return; }
+      const cams = normalizeCamList(selectedCams);
       const def = { name: name.value.trim(), type, equip, primary: [...prim], secondary: [...sec] };
       if (existing) {
         const nextRow = { ...(lifts.row(existing.id) ?? { id: existing.id }), ...(existing.custom ? { custom: true } : {}), ...def, cams };

@@ -38,6 +38,7 @@ import {
   computeScrubWindow,
   findNearestFrameIndex,
   fmtRelativeToCheck,
+  formatCamListSummary,
   isTapeWithinRetention,
   nextBurstPlayIndex,
   nextRecordedView,
@@ -118,6 +119,8 @@ describe('tape linking & scrubbing helpers', () => {
   it('formats short camera names and check-off offsets', () => {
     expect(shortCamLabel('Rack Cam')).toBe('Rack');
     expect(shortCamLabel('Smith Cam')).toBe('Smith');
+    expect(formatCamListSummary(['Rack Cam'])).toBe('Rack');
+    expect(formatCamListSummary(['Smith Wide', 'Smith Cam'])).toBe('★ Smith Wide + Smith');
     expect(fmtRelativeToCheck(100_000, 102_000)).toBe('right at ✓');
     expect(fmtRelativeToCheck(100_000, 145_000)).toBe('45s before ✓');
     expect(fmtRelativeToCheck(100_000, 200_000)).toBe('1m 40s before ✓');

@@ -12,7 +12,7 @@ import {
   driveUrlFor, editReps, editWeight, effectiveRestAuto, elapsedSessionSec, estimateActiveSessionSec, hasSessionActivity, inferredCamForExercise,
   isSessionPaused, isSessionStarted, labels, midSuperset, newSet, normalizeCamList, pauseSessionClock,
   preferredCamForExercise, prevSetFor, pruneUnlogged, removeExerciseAt, removeLastSet, resetSessionClock, resumeSessionClock, routineFromSession,
-  setSessionElapsedSec, startSessionClock, supersetGroups, swapExercise, toggleDone,
+  setPrimaryCam, setSessionElapsedSec, startSessionClock, supersetGroups, swapExercise, toggleAssignedCam, toggleDone,
 } from '../src/lifts/logic';
 import {
   extractMp4CreationMs, inferPixelVideoLink, parseMvhdCreationMs, sortDeviceVideosNewestFirst,
@@ -945,6 +945,19 @@ describe('Boostcamp history seed & SBD rep maxes', () => {
     expect(camsForExercise(bench, { camPref: 'auto' })).toEqual(['Rack Cam']);
     expect(preferredCamForExercise(bench, { camPref: 'auto' })).toBe('Rack Cam');
     expect(preferredCamForExercise(bench, { camPref: 'Low Knee Cam' })).toBe('Low Knee Cam');
+
+    // Primary Cam helpers preserve primary ordering on toggle and promote cleanly via setPrimaryCam
+    expect(toggleAssignedCam(['Rack Cam'], 'Rack Cam')).toBeNull();
+    expect(toggleAssignedCam(['Smith Wide'], 'Rack Cam')).toEqual(['Smith Wide', 'Rack Cam']);
+    expect(toggleAssignedCam(['Smith Wide', 'Smith Cam', 'Rack Cam'], 'Smith Cam')).toEqual(['Smith Wide', 'Rack Cam']);
+    expect(toggleAssignedCam(['Smith Wide', 'Smith Cam'], 'Smith Wide')).toEqual(['Smith Cam']);
+    expect(setPrimaryCam(['Rack Cam', 'Smith Cam', 'Smith Wide'], 'Smith Wide')).toEqual(['Smith Wide', 'Rack Cam', 'Smith Cam']);
+    expect(setPrimaryCam(['Smith Cam', 'Smith Wide'], 'Smith Cam')).toEqual(['Smith Cam', 'Smith Wide']);
+    expect(camsForExercise(curl, { cams: setPrimaryCam(['Rack Cam', 'Smith Cam', 'Smith Wide'], 'Smith Wide') })).toEqual([
+      'Smith Wide',
+      'Rack Cam',
+      'Smith Cam',
+    ]);
   });
 
   it('seeds all 19 Phase 1 exercise camera mappings, swaps Lower 1 to Smith RDL, and migrates legacy ExRow/Routine data', () => {

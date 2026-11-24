@@ -5,7 +5,8 @@ import { advanceCursorAfterLog, jumpToExerciseCursor, resolveTargetSet } from '.
 import {
   addSet, buildExercise, camsForExercise, canLog, collectUnfinishedItems, DEFAULT_CAM_OPTIONS, DEFAULT_FALLBACK_CAM,
   deleteSet, editReps, editWeight, hasLogged, isSessionPaused, isSessionStarted, labels, midSuperset,
-  prevSetFor, removeExerciseAt, removeLastSet, secondsSinceLastSet, supersetGroups, swapExercise, toggleDone,
+  prevSetFor, removeExerciseAt, removeLastSet, secondsSinceLastSet, setPrimaryCam, supersetGroups, swapExercise,
+  toggleAssignedCam, toggleDone,
 } from '../../lifts/logic';
 import { setKeepScreenOn } from '../../native/service';
 import { calendar } from '../../intervals/calendar';
@@ -16,7 +17,7 @@ import { lifts } from '../../lifts/store';
 import { gymCam } from '../../lifts/gymCam';
 import { resyncSession, updateFinishedDuration } from '../../lifts/intervals';
 import { fmtDuration, setText } from '../../lifts/summary';
-import { orderedRecordedViews, shortCamLabel } from '../../lifts/tape';
+import { formatCamListSummary, orderedRecordedViews, shortCamLabel } from '../../lifts/tape';
 import type { Exercise, LiftSession, SessionEx, SetKind, VideoMeta } from '../../lifts/types';
 import { voice } from '../../lifts/voice';
 import { allowNextRoute } from '../../main';
@@ -719,7 +720,7 @@ function build(root: HTMLElement, id?: string): () => void {
     const ex = exOf(se.exId);
     const idx = s.exs.indexOf(se);
     const resolvedCams = camsForEx(se);
-    const camSub = resolvedCams.map(shortCamLabel).join(' + ');
+    const camSub = formatCamListSummary(resolvedCams);
     const k = await actionSheet(ex.name, [
       { key: 'swap', label: 'Swap exercise', sub: 'Just today, this day, or everywhere' },
       ...(idx < s.exs.length - 1 ? [{ key: 'ss', label: se.ss ? 'Remove superset with next' : 'Superset with next', sub: 'No rest timer between the pair' }] : []),
@@ -764,6 +765,10 @@ function build(root: HTMLElement, id?: string): () => void {
        <div class="chips-row wrap" id="tdur"></div>
        <div class="fl">ASSIGNED CAMERAS <small>REQUIRED · 1+ STATIONS</small></div>
        <div class="chips-row wrap" id="tcam"></div>
+       <div id="tcamPriWrap" hidden>
+         <div class="fl">PRIMARY CAM <small>REPLAYS FIRST ON TV &amp; PHONE</small></div>
+         <div class="chips-row wrap" id="tcamPri"></div>
+       </div>
        <div class="fl">THIS CARD</div>
        <div class="line"><span>Auto-timer on check<small>Starts countdown automatically when logging a set here</small></span><button class="switch" type="button" data-tcfg="cardAuto" role="switch"><i></i></button></div>
        <div class="fl">ALL EXERCISES (DEFAULTS)</div>
@@ -788,10 +793,22 @@ function build(root: HTMLElement, id?: string): () => void {
         .join('');
       const baseCams = gymCam.cameras.length ? gymCam.cameras : [...DEFAULT_CAM_OPTIONS];
       const assigned = camsForExercise(ex, lifts.row(se.exId), se);
+      const primaryCam = assigned[0] ?? '';
       const camChoices = [...new Set([...DEFAULT_CAM_OPTIONS, ...baseCams, ...assigned])];
       sh.body.querySelector('#tcam')!.innerHTML = camChoices
-        .map((c) => `<button class="fchip${assigned.includes(c) ? ' on' : ''}" type="button" data-xcam="${esc(c)}">${esc(shortCamLabel(c))}</button>`)
+        .map((c) => {
+          const on = assigned.includes(c);
+          const isPri = assigned.length > 1 && c === primaryCam;
+          return `<button class="fchip${on ? ' on' : ''}" type="button" data-xcam="${esc(c)}">${isPri ? '★ ' : ''}${esc(shortCamLabel(c))}</button>`;
+        })
         .join('');
+      const priWrap = sh.body.querySelector<HTMLElement>('#tcamPriWrap')!;
+      priWrap.hidden = assigned.length <= 1;
+      sh.body.querySelector('#tcamPri')!.innerHTML = assigned.length > 1
+        ? assigned
+            .map((c, ci) => `<button class="fchip${ci === 0 ? ' pri' : ''}" type="button" data-xpri="${esc(c)}">${ci === 0 ? '★ ' : ''}${esc(shortCamLabel(c))}</button>`)
+            .join('')
+        : '';
       syncTog('[data-tcfg="showTimer"]', ls.showTimer);
       syncTog('[data-tcfg="showAutoTimer"]', ls.showAutoTimer);
       syncTog('[data-tcfg="cardAuto"]', active.restAutoFor(s, idx));
@@ -815,17 +832,26 @@ function build(root: HTMLElement, id?: string): () => void {
       if (xc) {
         const clicked = xc.dataset.xcam!;
         const cur = camsForExercise(ex, lifts.row(se.exId), se);
-        const known = [...new Set([...DEFAULT_CAM_OPTIONS, ...gymCam.cameras, ...cur])];
-        let nextCams: string[];
-        if (cur.includes(clicked)) {
-          if (cur.length <= 1) {
-            toast('Keep at least 1 camera assigned');
-            return;
-          }
-          nextCams = cur.filter((c) => c !== clicked);
-        } else {
-          nextCams = known.filter((c) => c === clicked || cur.includes(c));
+        const nextCams = toggleAssignedCam(cur, clicked);
+        if (!nextCams) {
+          toast('Keep at least 1 camera assigned');
+          return;
         }
+        delete se.cams;
+        delete se.camPref;
+        const nextRow = { ...(lifts.row(se.exId) ?? { id: se.exId }) };
+        nextRow.cams = nextCams;
+        delete nextRow.camPref;
+        await lifts.saveRow(nextRow);
+        save();
+        draw();
+        return;
+      }
+      const xp = t.closest<HTMLElement>('[data-xpri]');
+      if (xp) {
+        const picked = xp.dataset.xpri!;
+        const cur = camsForExercise(ex, lifts.row(se.exId), se);
+        const nextCams = setPrimaryCam(cur, picked);
         delete se.cams;
         delete se.camPref;
         const nextRow = { ...(lifts.row(se.exId) ?? { id: se.exId }) };
@@ -1447,7 +1473,9 @@ function build(root: HTMLElement, id?: string): () => void {
       const n = se.sets.slice(0, i + 1).filter((x) => x.kind !== 'w').length;
       const setLabel = set.kind === 'w' ? 'Warm-up' : `Set ${n}`;
       if (set.vids?.length) {
-        await playVideo(set.vids[0], { target: { session: s, se, set }, setLabel });
+        const setClips = set.vids.map((vidId) => lifts.videos.get(vidId)).filter((v): v is VideoMeta => !!v);
+        const firstPlayId = orderedRecordedViews(setClips, camsForEx(se))[0]?.id ?? set.vids[0];
+        await playVideo(firstPlayId, { target: { session: s, se, set }, setLabel });
         if (!dead) { save(); paint(); }
         return;
       }
