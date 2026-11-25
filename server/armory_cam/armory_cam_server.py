@@ -2661,6 +2661,10 @@ class ArmoryCamService:
 
         self._procs: dict[str, subprocess.Popen[bytes]] = {}
         self._proc_urls: dict[str, str] = {}
+        self._proc_started_mono: dict[str, float] = {}
+        self._last_frame_mono: dict[str, float] = {}
+        self._last_seg_mono: dict[str, float] = {}
+        self._cam_watchdog_restarts: dict[str, int] = {}
         self._worker_by_slug: dict[str, threading.Thread] = {}
         self._worker_threads: list[threading.Thread] = []
         self._clips_index_lock = threading.RLock()
@@ -3335,6 +3339,9 @@ class ArmoryCamService:
                 _assign_child_to_job(proc)
                 with self.lock:
                     self._procs[cam.slug] = proc
+                    self._proc_started_mono[cam.slug] = time.monotonic()
+                    self._last_frame_mono[cam.slug] = 0.0
+                    self._last_seg_mono[cam.slug] = 0.0
 
                 def drain_stderr(pipe=proc.stderr, sink=err_lines):
                     if not pipe:
@@ -3376,11 +3383,16 @@ class ArmoryCamService:
                         if not got_frame:
                             got_frame = True
                             self.cam_connected[cam.slug] = True
+                        self._last_frame_mono[cam.slug] = time.monotonic()
                         self.live_hub.publish_frame(cam.slug, jpg)
 
                 proc.wait(timeout=3)
                 err_t.join(timeout=1)
                 self.cam_connected[cam.slug] = False
+                with self.lock:
+                    if self._procs.get(cam.slug) is proc:
+                        self._procs.pop(cam.slug, None)
+                        self._proc_started_mono.pop(cam.slug, None)
                 if self._stop_event.is_set():
                     return
                 if err_lines:
@@ -3420,6 +3432,73 @@ class ArmoryCamService:
                 self.log.debug("ADB timer loop error: %s", exc)
             self._stop_event.wait(2.0)
 
+    def check_camera_stall_watchdog(
+        self,
+        now_mono: float | None = None,
+        *,
+        stall_sec: float = 20.0,
+    ) -> list[str]:
+        """Kill & trigger auto-reconnect for any physical camera whose FFmpeg process hung silently.
+
+        Detects stalls where FFmpeg stays alive (blocking `proc.stdout.read`) without emitting
+        either fresh MJPEG preview frames or non-empty `.ts` ring segments for `>= stall_sec`.
+        """
+        now_m = time.monotonic() if now_mono is None else float(now_mono)
+        threshold = max(5.0, float(stall_sec))
+        to_kill: list[tuple[CameraConfig, subprocess.Popen[bytes], float, float]] = []
+        with self.lock:
+            phys_cams = [c for c in self._physical_cameras() if c.enabled]
+            for cam in phys_cams:
+                proc = self._procs.get(cam.slug)
+                started = float(self._proc_started_mono.get(cam.slug, 0.0) or 0.0)
+                if proc is None or started <= 0.0:
+                    continue
+                try:
+                    if proc.poll() is not None:
+                        continue
+                except Exception:
+                    continue
+                uptime = now_m - started
+                if uptime < threshold:
+                    continue
+                last_frame = float(self._last_frame_mono.get(cam.slug, 0.0) or 0.0)
+                last_seg = float(self._last_seg_mono.get(cam.slug, 0.0) or 0.0)
+                frame_age = (now_m - last_frame) if last_frame > 0.0 else uptime
+                seg_age = (now_m - last_seg) if last_seg > 0.0 else uptime
+                if frame_age >= threshold or seg_age >= threshold:
+                    self.cam_connected[cam.slug] = False
+                    self._procs.pop(cam.slug, None)
+                    self._proc_started_mono.pop(cam.slug, None)
+                    self._cam_watchdog_restarts[cam.slug] = self._cam_watchdog_restarts.get(cam.slug, 0) + 1
+                    to_kill.append((cam, proc, frame_age, seg_age))
+
+        restarted: list[str] = []
+        for cam, proc, frame_age, seg_age in to_kill:
+            self.log.warning(
+                "[%s] RTSP stall watchdog: killing hung FFmpeg PID=%s (frame_age=%.1fs, seg_age=%.1fs)",
+                cam.name,
+                getattr(proc, "pid", "?"),
+                frame_age,
+                seg_age,
+            )
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            restarted.append(cam.slug)
+        return restarted
+
+    def _is_source_connected_locked(self, src_slug: str, now_mono: float | None = None) -> bool:
+        """Return True only when the physical camera is connected AND its latest frame is fresh."""
+        if not self.cam_connected.get(src_slug, False):
+            return False
+        last_frame = float(self._last_frame_mono.get(src_slug, 0.0) or 0.0)
+        if last_frame > 0.0:
+            now_m = time.monotonic() if now_mono is None else float(now_mono)
+            if (now_m - last_frame) > 15.0:
+                return False
+        return True
+
     def _segment_poll_loop(self) -> None:
         last_prune = 0.0
         last_bump = 0.0
@@ -3433,6 +3512,10 @@ class ArmoryCamService:
                         self._ingest_closed_segments(cam, now, compute_energy=True)
                     except Exception as exc:
                         self.log.exception("[%s] Segment ingest error: %s", cam.name, exc)
+                try:
+                    self.check_camera_stall_watchdog()
+                except Exception as exc:
+                    self.log.debug("Camera stall watchdog error: %s", exc)
                 if now - last_bump > 30.0:
                     last_bump = now
                     try:
@@ -3493,8 +3576,15 @@ class ArmoryCamService:
                 st = p.stat()
             except FileNotFoundError:
                 continue
+            if st.st_size == 0 and (now_s - st.st_mtime) > 30.0:
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
             if now_s - st.st_mtime < 0.7 or st.st_size < 1024:
                 continue
+            self._last_seg_mono[cam.slug] = time.monotonic()
             start_ms = parse_segment_start_ms(p.name)
             if start_ms is None:
                 start_ms = int(st.st_mtime * 1000) - 2000
@@ -7056,7 +7146,8 @@ class ArmoryCamService:
                     "sourceSlug": c.source_slug,
                     "enabled": c.enabled,
                     "defish": c.defish,
-                    "connected": bool(self.cam_connected.get(self._source_slug_for(c), False)),
+                    "connected": self._is_source_connected_locked(self._source_slug_for(c)),
+                    "watchdogRestarts": int(self._cam_watchdog_restarts.get(self._source_slug_for(c), 0)),
                     "latestEnergy": float(self.latest_energy.get(c.slug, 0.0)),
                     "motionThreshold": c.motion_threshold,
                     "ringSegments": len(

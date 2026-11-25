@@ -5530,6 +5530,67 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_camera_stall_watchdog_and_stale_connected_status(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_wd_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+
+            class _FakeHungProc:
+                def __init__(self, pid: int) -> None:
+                    self.pid = pid
+                    self.killed = False
+
+                def poll(self):
+                    return -9 if self.killed else None
+
+                def kill(self) -> None:
+                    self.killed = True
+
+            p_rack = _FakeHungProc(1001)
+            p_smith = _FakeHungProc(1002)
+            now_m = 1000.0
+            with svc.lock:
+                svc._procs["rack_cam"] = p_rack  # type: ignore[assignment]
+                svc._procs["smith_cam"] = p_smith  # type: ignore[assignment]
+                svc._proc_started_mono["rack_cam"] = now_m - 60.0
+                svc._proc_started_mono["smith_cam"] = now_m - 60.0
+                # Rack Cam is healthy (fresh frame + fresh segment)
+                svc._last_frame_mono["rack_cam"] = now_m - 1.0
+                svc._last_seg_mono["rack_cam"] = now_m - 2.0
+                svc.cam_connected["rack_cam"] = True
+                # Smith Cam hung 25s ago (zero frames, zero segments)
+                svc._last_frame_mono["smith_cam"] = now_m - 25.0
+                svc._last_seg_mono["smith_cam"] = now_m - 25.0
+                svc.cam_connected["smith_cam"] = True
+
+            # Before watchdog kills it, stale connected check must already report False for smith_cam
+            with svc.lock:
+                self.assertTrue(svc._is_source_connected_locked("rack_cam", now_mono=now_m))
+                self.assertFalse(svc._is_source_connected_locked("smith_cam", now_mono=now_m))
+
+            restarted = svc.check_camera_stall_watchdog(now_mono=now_m, stall_sec=20.0)
+            self.assertEqual(restarted, ["smith_cam"])
+            self.assertFalse(p_rack.killed)
+            self.assertTrue(p_smith.killed)
+            self.assertFalse(svc.cam_connected["smith_cam"])
+            self.assertTrue(svc.cam_connected["rack_cam"])
+            self.assertEqual(svc._cam_watchdog_restarts.get("smith_cam"), 1)
+
+            # Orphaned 0-byte .ts file older than 30s must be cleaned up during ingest
+            rack_cfg = svc._find_camera("Rack Cam")
+            assert rack_cfg is not None
+            ring_dir = svc.ring_root / "rack_cam"
+            ring_dir.mkdir(parents=True, exist_ok=True)
+            zero_ts = ring_dir / "seg_20261124_121503.ts"
+            zero_ts.write_bytes(b"")
+            old_t = time.time() - 60.0
+            os.utime(zero_ts, (old_t, old_t))
+            svc._ingest_closed_segments(rack_cfg, time.time(), compute_energy=False)
+            self.assertFalse(zero_ts.exists())
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
