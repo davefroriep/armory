@@ -11,7 +11,10 @@ import { WorkoutEngine } from '../src/domain/engine';
 import { gateOpen } from '../src/domain/gate';
 import { arrange, moveProgram, restoreOrder, toggleHidden } from '../src/domain/library';
 import { repNote, repStats } from '../src/domain/reps';
-import { cueFor, hrCue, pacerDecision, wattsCueFor, type PacerConfig } from '../src/domain/pacer';
+import {
+  computeGaugeModel, cueFor, hrCue, isRampUpTransition, pacerDecision,
+  rampCueFor, rampWattsCueFor, wattsCueFor, type PacerConfig,
+} from '../src/domain/pacer';
 import { buildTcx } from '../src/domain/tcx';
 
 describe('Assault curve', () => {
@@ -182,22 +185,41 @@ describe('timeline + engine', () => {
 
 describe('pacer (metronome)', () => {
   const p = programById('n4x4')!;
-  const cfg = (o: Partial<PacerConfig> = {}): PacerConfig => ({ mode: 'transitions', lead: 5, tail: 15, autoMute: false, ...o });
+  const cfg = (o: Partial<PacerConfig> = {}): PacerConfig => ({ mode: 'transitions', lead: 3, tail: 10, autoMute: false, ...o });
   const at = (t: number, c: PacerConfig, enabled = true, locked = false) => pacerDecision(p, locate(p.segments, t), c, enabled, locked);
 
   it('is silent when disabled', () => {
-    expect(at(295, cfg(), false).play).toBe(false);
-    expect(at(295, cfg({ mode: 'whole' }), false).play).toBe(false);
+    expect(at(297, cfg(), false).play).toBe(false);
+    expect(at(297, cfg({ mode: 'whole' }), false).play).toBe(false);
   });
-  it('transitions mode: lead-in at the UPCOMING tempo, then 15 s after', () => {
+  it('transitions mode: 3 s lead-in before work at UPCOMING tempo, then 10 s after', () => {
     expect(at(100, cfg()).play).toBe(false); // mid warm-up
-    expect(at(294, cfg()).play).toBe(false); // 6 s out
-    const lead = at(295, cfg()); // 5 s out
+    expect(at(296, cfg()).play).toBe(false); // 4 s out
+    const lead = at(297, cfg()); // 3 s out before work
     expect(lead.play).toBe(true);
     expect(lead.bpm).toBe(108); // 2 x 54, tempo of the work block that is coming
     expect(at(300, cfg()).bpm).toBe(108);
-    expect(at(314.9, cfg()).play).toBe(true);
-    expect(at(315.1, cfg()).play).toBe(false);
+    expect(at(309.9, cfg()).play).toBe(true);
+    expect(at(310.1, cfg()).play).toBe(false);
+  });
+  it('never plays rest/float/cooldown metronome during an effort interval — only 10 s intro on rest', () => {
+    // End of work rep 1 (t=300..540) heading into EASY SPIN (40 RPM)
+    expect(at(537, cfg()).play).toBe(false); // 3 s before rest: SILENT during work!
+    expect(at(539.5, cfg()).play).toBe(false);
+    // Whole mode keeps work tempo right up to 0:00 (never drops early to rest tempo)
+    expect(at(538, cfg({ mode: 'whole' })).bpm).toBe(108);
+    // Once rest actually starts (t=540), play 10 s intro metronome at rest tempo (80 BPM)
+    expect(at(540, cfg())).toMatchObject({ play: true, bpm: 80 });
+    expect(at(549.9, cfg())).toMatchObject({ play: true, bpm: 80 });
+    expect(at(550.1, cfg()).play).toBe(false);
+    // Billat 60/30: work -> float has NO lead-in during work, 10 s intro on float, 3 s lead-in before next work
+    const b = programById('b6030')!;
+    const bAt = (t: number) => pacerDecision(b, locate(b.segments, t), cfg(), true, false);
+    expect(bAt(358).play).toBe(false); // 2 s left in WORK Rep 1 -> silent
+    expect(bAt(360)).toMatchObject({ play: true, bpm: 80 }); // FLOAT starts -> 10 s intro @ 40 RPM
+    expect(bAt(370.1).play).toBe(false); // past 10 s intro
+    expect(bAt(386).play).toBe(false); // 4 s left in FLOAT
+    expect(bAt(387)).toMatchObject({ play: true, bpm: 112 }); // 3 s left in FLOAT -> lead-in @ 56 RPM
   });
   it('does not fire for the start of the workout or the end', () => {
     expect(at(0, cfg()).play).toBe(false);
@@ -207,11 +229,11 @@ describe('pacer (metronome)', () => {
   it('auto-mute stops the tail once locked in, but never the lead-in', () => {
     expect(at(305, cfg({ autoMute: true }), true, true).play).toBe(false);
     expect(at(305, cfg({ autoMute: true }), true, false).play).toBe(true);
-    expect(at(296, cfg({ autoMute: true }), true, true).play).toBe(true);
+    expect(at(298, cfg({ autoMute: true }), true, true).play).toBe(true);
   });
-  it('whole mode plays continuously and switches tempo in the lead window', () => {
+  it('whole mode plays continuously and switches tempo in the ramp-up lead window', () => {
     expect(at(100, cfg({ mode: 'whole' })).bpm).toBe(88); // warm-up 44 RPM
-    expect(at(296, cfg({ mode: 'whole' })).bpm).toBe(108);
+    expect(at(298, cfg({ mode: 'whole' })).bpm).toBe(108);
   });
   it('free ride only plays in whole mode', () => {
     const f = programById('free')!;
@@ -219,11 +241,74 @@ describe('pacer (metronome)', () => {
     expect(pacerDecision(f, loc, cfg(), true, false).play).toBe(false);
     expect(pacerDecision(f, loc, cfg({ mode: 'whole' }), true, false).bpm).toBe(90);
   });
-  it('no tempo for full-rest segments', () => {
+  it('no tempo for full-rest segments, but still leads into Set 2 work', () => {
     const b = programById('b6030')!;
     const idx = b.segments.findIndex((g) => g.label === 'SET REST');
     const start = b.segments.slice(0, idx).reduce((a, g) => a + g.seconds, 0);
+    const dur = b.segments[idx].seconds;
     expect(pacerDecision(b, locate(b.segments, start + 2), cfg(), true, false).play).toBe(false);
+    expect(pacerDecision(b, locate(b.segments, start + dur - 2), cfg(), true, false)).toMatchObject({ play: true, bpm: 112 });
+  });
+});
+
+describe('ramp-up transitions, cues & dual-target gauge', () => {
+  const b = programById('b6030')!;
+  const warm = b.segments[0];
+  const work = b.segments[1];
+  const float = b.segments[2];
+  const setRest = b.segments.find((g) => g.label === 'SET REST')!;
+  const cool = b.segments[b.segments.length - 1];
+
+  it('identifies ramp-up transitions only when moving into higher intensity', () => {
+    expect(isRampUpTransition(warm, work)).toBe(true);
+    expect(isRampUpTransition(float, work)).toBe(true);
+    expect(isRampUpTransition(setRest, work)).toBe(true);
+    expect(isRampUpTransition(work, float)).toBe(false);
+    expect(isRampUpTransition(work, setRest)).toBe(false);
+    expect(isRampUpTransition(work, cool)).toBe(false);
+    expect(isRampUpTransition(cool, null)).toBe(false);
+  });
+
+  it('blocks all slow-down / TOO HOT warnings during the 5 s ramp-up countdown', () => {
+    // Mid-float normal cue complains when ramping up to 52 RPM
+    expect(cueFor(float, 52, 10)).toMatchObject({ level: 'bad' });
+    expect(cueFor(float, 52, 10).text).toContain('TOO HOT');
+    // During 5 s ramp-up transition, ramping from 40 -> 56 (or even surging to 60) NEVER complains
+    expect(rampCueFor(float, work, 40)).toMatchObject({ level: 'ok', text: 'RAMP → 56 RPM', chirp: false });
+    expect(rampCueFor(float, work, 50)).toMatchObject({ level: 'ok', text: 'RAMPING → 56 RPM', chirp: false });
+    expect(rampCueFor(float, work, 56)).toMatchObject({ level: 'ok', text: 'ON WORK TARGET', chirp: false });
+    expect(rampCueFor(float, work, 62)).toMatchObject({ level: 'ok', text: 'ON WORK TARGET', chirp: false });
+    // Spin ERG ramp-up also never complains
+    const spinWork = programById('spin-n4x4')!.segments[1];
+    const spinRest = programById('spin-n4x4')!.segments[2];
+    expect(rampWattsCueFor(spinRest, spinWork, 175, 85)).toMatchObject({ level: 'ok', text: 'RAMPING → 220 W', chirp: false });
+    expect(rampWattsCueFor(spinRest, spinWork, 250, 88)).toMatchObject({ level: 'ok', text: 'ON WORK TARGET', chirp: false });
+  });
+
+  it('switches gauge to dual-target low/high endpoints only on ramp-up transitions', () => {
+    const ramp = computeGaugeModel(float, work, 48, 0, true);
+    expect(ramp.off).toBe(false);
+    expect(ramp.ramp).toBe(true);
+    expect(ramp.loLabel).toBe('40');
+    expect(ramp.hiLabel).toBe('56');
+    expect(ramp.loMarkPct!).toBeGreaterThan(5);
+    expect(ramp.loMarkPct!).toBeLessThan(35);
+    expect(ramp.hiMarkPct!).toBeGreaterThan(65);
+    expect(ramp.hiMarkPct!).toBeLessThan(95);
+    expect(ramp.needlePct).toBeGreaterThan(ramp.loMarkPct!);
+    expect(ramp.needlePct).toBeLessThan(ramp.hiMarkPct!);
+
+    // Full rest -> work still activates the ramp gauge with REST -> 56
+    const fromFullRest = computeGaugeModel(setRest, work, 45, 0, true);
+    expect(fromFullRest.off).toBe(false);
+    expect(fromFullRest.ramp).toBe(true);
+    expect(fromFullRest.loLabel).toBe('REST');
+    expect(fromFullRest.hiLabel).toBe('56');
+
+    // Leaving work -> float NEVER activates dual-target ramp mode even if flag is passed
+    const leavingWork = computeGaugeModel(work, float, 56, 0, true);
+    expect(leavingWork.ramp).toBe(false);
+    expect(leavingWork.needlePct).toBeCloseTo(50, 3);
   });
 });
 
@@ -502,8 +587,10 @@ describe('Spin Bike ERG programs & cues', () => {
 });
 
 describe('summarizeProgramPhases (Targets & Setpoints sheet)', () => {
-  it('condenses AirBike 60/30 Float into chronological phase setpoints and updates with adjusted target', () => {
+  it('condenses AirBike Billat 60/30 into chronological phase setpoints and updates with adjusted target', () => {
     const base = programById('b6030')!;
+    expect(base.name).toBe('Billat 60/30');
+    expect(programById('spin-b6030')!.name).toBe('Billat 60/30 (ERG)');
     const fixed = summarizeProgramPhases(base, { hrGated: false });
     expect(fixed.map((r) => [r.label, r.durationText, r.targetText, r.editable])).toEqual([
       ['WARM-UP', '5:00', '44 RPM · 127 W', false],

@@ -4,7 +4,10 @@ import { sim } from '../ble/sim';
 import { bikeStatusNote, ensureSensors } from '../ble/sources';
 import { audio, buzz } from '../audio/audio';
 import { WorkoutEngine } from '../domain/engine';
-import { CORRIDOR_RPM, CORRIDOR_WATTS, cueFor, hrCue, pacerDecision, wattsCueFor, type Cue, type PacerConfig } from '../domain/pacer';
+import {
+  CORRIDOR_RPM, CORRIDOR_WATTS, RAMP_TRANSITION_SEC, computeGaugeModel, cueFor, hrCue,
+  isRampUpTransition, pacerDecision, rampCueFor, rampWattsCueFor, wattsCueFor, type Cue, type PacerConfig,
+} from '../domain/pacer';
 import { recoveryLimitBpm, type RecoveryMode } from '../domain/gate';
 import { repNote, repStats, type RepStat } from '../domain/reps';
 import {
@@ -229,7 +232,7 @@ class Hud {
       </div>
       ${goalCtl}
       <div class="cue" id="cue">&nbsp;</div>
-      <div class="gauge" id="gauge"><span class="g-zone" id="gZone"></span><span class="g-mid"></span><span class="g-needle" id="gNeedle"></span></div>
+      <div class="gauge" id="gauge"><span class="g-zone" id="gZone"></span><span class="g-hizone" id="gHiZone"></span><span class="g-mid"></span><span class="g-mark lo" id="gLo"><em id="gLoLbl"></em></span><span class="g-mark hi" id="gHi"><em id="gHiLbl"></em></span><span class="g-needle" id="gNeedle"></span></div>
       <div class="tiles3">
         <div class="metric" id="mHr"><small>HEART RATE</small><b id="hr">--</b><em id="hrSub">bpm</em></div>
         <div class="metric" id="mW"><small>POWER</small><b id="w">0</b><em id="wSub">watts</em></div>
@@ -261,7 +264,7 @@ class Hud {
 
     const q = (id: string) => this.root.querySelector<HTMLElement>('#' + id)!;
     this.el = {} as Record<string, HTMLElement>;
-    for (const id of ['banner', 'ph', 'tag', 'tgt', 'cdLabel', 'cd', 'next', 'cue', 'gauge', 'gZone', 'gNeedle', 'mHr', 'mW', 'mCad',
+    for (const id of ['banner', 'ph', 'tag', 'tgt', 'cdLabel', 'cd', 'next', 'cue', 'gauge', 'gZone', 'gHiZone', 'gLo', 'gLoLbl', 'gHi', 'gHiLbl', 'gNeedle', 'mHr', 'mW', 'mCad',
       'hr', 'hrSub', 'w', 'wSub', 'cad', 'cadSub', 'sEl', 'sLeft', 'sAvg', 'sCal', 'sX', 'metro', 'metroTxt', 'go', 'pauseModal',
       'pauseSub', 'doneModal', 'ovRight', 'tl', 'sigNote', 'skip']) this.el[id] = q(id);
     if (segs.length) this.el.tlHead = q('tlHead');
@@ -554,7 +557,7 @@ class Hud {
     const hrNow = hrFresh() ? live.hr : null;
     const hrLimit = recoveryLimitBpm(st.hrMax, st.recoveryHrPct);
     if (running) {
-      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: effectiveMode, lead: st.metroLead ?? 5, debounceMs: 2500 });
+      const released = this.engine.checkGate(now, { hr: hrNow, hrLimit, mode: effectiveMode, lead: Math.max(RAMP_TRANSITION_SEC, st.metroLead ?? 3), debounceMs: 2500 });
       if (released !== null) {
         if (this.rec && !this.guest) {
           this.rec.meta.releasedGates = this.engine.exportReleased();
@@ -613,11 +616,23 @@ class Hud {
     const dec = pacerDecision(this.p, loc, cfg, st.metroEnabled, lockedIn);
     audio.setMetronome(running && dec.play, dec.bpm);
 
+    // 5 s red ramp-up transition window (only when stepping UP into higher intensity, never when leaving work)
+    const gs = this.gateState;
+    let shownLeft = loc.remaining;
+    if (gs?.waiting) {
+      shownLeft = gs.timerOnly ? Math.max(0, gs.nominal - gs.into) : Math.max(0, gs.minSec - gs.into);
+    }
+    const waitingOnHr = !!gs?.waiting && !gs.timerOnly;
+    const inRampTransition = running && !waitingOnHr && loc.next !== null
+      && shownLeft <= RAMP_TRANSITION_SEC && isRampUpTransition(seg, loc.next);
+
     // cue + overshoot chirp (smoothed, so a single hard pedal stroke doesn't nag)
-    let cue = running
-      ? (isErgSeg ? wattsCueFor(seg, wN, cadS, loc.into) : cueFor(seg, cadN, loc.into))
-      : ({ level: 'idle', text: '', chirp: false } as Cue);
-    if (running && cue.level !== 'bad') {
+    let cue: Cue = !running
+      ? { level: 'idle', text: '', chirp: false }
+      : inRampTransition
+        ? (loc.next?.watts != null ? rampWattsCueFor(seg, loc.next, wN, cadS) : rampCueFor(seg, loc.next, cadN))
+        : (isErgSeg ? wattsCueFor(seg, wN, cadS, loc.into) : cueFor(seg, cadN, loc.into));
+    if (running && !inRampTransition && cue.level !== 'bad') {
       const gateLimit = waiting && !this.gateState?.timerOnly ? hrLimit : null;
       const extra = hrCue(seg, hrNow ?? 0, st.hrMax, gateLimit);
       if (extra) cue = { ...extra, chirp: cue.chirp };
@@ -650,13 +665,19 @@ class Hud {
       void workoutService.update(`Armory Fit · ${this.p.name}`, `${mmss(elapsed)} · ${Math.round(wS)} W · ${hr || '--'} BPM`);
     }
 
-    this.paint(loc.seg, loc.next, loc.remaining, loc.index, elapsed, cue, dec.bpm, dec.play, running, cadS, wS, cadN, wN);
+    this.paint(
+      loc.seg, loc.next, loc.into, loc.remaining, loc.index, loc.complete, elapsed,
+      cue, inRampTransition, dec.bpm, dec.play, running, cadS, wS, cadN, wN,
+    );
   }
 
   // ------------------------------------------------------------------ painting
 
-  private paint(seg: Segment | null, next: Segment | null, remaining: number, index: number, elapsed: number,
-    cue: Cue, bpm: number | null, playing: boolean, running: boolean, cadS: number, wS: number, cadN: number, wN: number): void {
+  private paint(
+    seg: Segment | null, next: Segment | null, into: number, remaining: number, index: number, complete: boolean,
+    elapsed: number, cue: Cue, inRampTransition: boolean, bpm: number | null, playing: boolean, running: boolean,
+    cadS: number, wS: number, cadN: number, wN: number,
+  ): void {
     const e = this.el;
     const p = this.p;
     const st = getSettings();
@@ -699,7 +720,7 @@ class Hud {
     // timeline
     if (p.segments.length) {
       const total = totalSeconds(p);
-      (e.tlHead as HTMLElement).style.left = `${Math.min(100, this.progress(index, seg, elapsed, ready, total) * 100)}%`;
+      (e.tlHead as HTMLElement).style.left = `${this.timelineHeadPct(index, seg, into, complete, ready, total)}%`;
       if (index !== this.tlIndex || ready !== this.tlReady) {
         this.tlIndex = index;
         this.tlReady = ready;
@@ -722,7 +743,7 @@ class Hud {
     // cue + center bar (the bar uses the Settings → cadence bar smoothing window, default 2 s)
     e.cue.textContent = cue.text || '\u00a0';
     e.cue.className = `cue ${cue.level}`;
-    this.paintGauge(shown, cadN, wN, cue);
+    this.paintGauge(shown, next, cadN, wN, cue, inRampTransition);
 
     // metrics: integers only
     e.hr.textContent = hr ? String(hr) : '--';
@@ -807,46 +828,66 @@ class Hud {
     }
   }
 
-  /** Timeline head position (0..1) on the nominal timeline; gated blocks fill up to their nominal length. */
-  private progress(index: number, seg: Segment | null, elapsed: number, ready: boolean, total: number): number {
+  /**
+   * Timeline head position (0..100%) locked directly to the rendered `.tl-seg` element geometry so
+   * flex `gap` and `min-width` on high-segment-count workouts (e.g. Billat 60/30) never desync the head.
+   */
+  private timelineHeadPct(
+    index: number,
+    seg: Segment | null,
+    into: number,
+    complete: boolean,
+    ready: boolean,
+    total: number,
+  ): number {
     if (ready || !seg || !total) return 0;
     const segs = this.p.segments;
-    if (index >= segs.length - 1 && this.engine.locate(Date.now()).complete) return 1;
-    let before = 0;
-    for (let i = 0; i < index; i++) before += segs[i].seconds;
-    const nominal = segs[index]?.seconds ?? seg.seconds;
-    const into = this.engine.locate(Date.now()).into;
+    if (!segs.length) return 0;
+    const segIdx = complete ? segs.length - 1 : Math.max(0, Math.min(segs.length - 1, index));
+    const nominal = segs[segIdx]?.seconds ?? seg.seconds;
     const len = this.gateState?.waiting ? nominal : Math.max(1, seg.seconds);
-    return Math.min(1, (before + Math.min(1, into / len) * nominal) / total);
+    const frac = complete ? 1 : Math.min(1, Math.max(0, into / len));
+
+    const track = this.el.tl;
+    const segEl = track?.querySelector<HTMLElement>(`.tl-seg[data-i="${segIdx}"]`);
+    if (track && segEl && track.clientWidth > 0 && segEl.offsetWidth > 0) {
+      const headPx = segEl.offsetLeft + frac * segEl.offsetWidth;
+      return Math.min(100, Math.max(0, (headPx / track.clientWidth) * 100));
+    }
+
+    let before = 0;
+    for (let i = 0; i < segIdx; i++) before += segs[i].seconds;
+    return Math.min(100, ((before + frac * nominal) / total) * 100);
   }
 
-  /** Center-bar: target in the middle, smoothed needle left/right of it (RPM for AirBike, W for Spin ERG). */
-  private paintGauge(seg: Segment | null, cad: number, w: number, cue: Cue): void {
+  /** Center-bar: target in the middle, or dual-target ramp bar during the 5 s ramp-up transition. */
+  private paintGauge(
+    seg: Segment | null,
+    next: Segment | null,
+    cad: number,
+    w: number,
+    cue: Cue,
+    inRampTransition: boolean,
+  ): void {
     const e = this.el;
-    if (!seg || (seg.watts == null && seg.rpm == null)) {
+    const m = computeGaugeModel(seg, next, cad, w, inRampTransition);
+    if (m.off) {
       e.gauge.classList.add('off');
+      e.gauge.classList.remove('ramp');
       return;
     }
     e.gauge.classList.remove('off');
-    if (seg.watts != null) {
-      const lo = seg.watts - 40;
-      const hi = seg.watts + 40;
-      const pct = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
-      const zl = pct(seg.watts - CORRIDOR_WATTS);
-      const zh = pct(seg.watts + CORRIDOR_WATTS);
-      e.gZone.style.left = `${zl}%`;
-      e.gZone.style.width = `${zh - zl}%`;
-      e.gNeedle.style.left = `${pct(w)}%`;
-    } else {
-      const rpm = seg.rpm!;
-      const lo = seg.allOut ? rpm - 15 : rpm - 10;
-      const hi = seg.allOut ? rpm + 25 : rpm + 10;
-      const pct = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
-      const zl = seg.allOut ? pct(rpm) : pct(rpm - CORRIDOR_RPM);
-      const zh = seg.allOut ? 100 : pct(rpm + CORRIDOR_RPM);
-      e.gZone.style.left = `${zl}%`;
-      e.gZone.style.width = `${zh - zl}%`;
-      e.gNeedle.style.left = `${pct(cad)}%`;
+    e.gauge.classList.toggle('ramp', m.ramp);
+    e.gZone.style.left = `${m.zoneLeftPct}%`;
+    e.gZone.style.width = `${m.zoneWidthPct}%`;
+    e.gNeedle.style.left = `${m.needlePct}%`;
+    if (m.ramp && m.loMarkPct != null && m.hiMarkPct != null) {
+      e.gHiZone.style.left = `${m.hiZoneLeftPct}%`;
+      e.gHiZone.style.width = `${m.hiZoneWidthPct}%`;
+      e.gLo.style.left = `${m.loMarkPct}%`;
+      e.gLoLbl.textContent = m.loLabel;
+      e.gHi.style.left = `${m.hiMarkPct}%`;
+      e.gHiLbl.textContent = m.hiLabel;
     }
     e.gauge.dataset.level = cue.level;
   }

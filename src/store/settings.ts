@@ -88,6 +88,7 @@ export interface Settings {
 const KEY = 'armory.settings.v1';
 export const ROOM_VOICE_MIG_KEY = 'armory.mig.room_voice_default.v1';
 export const TIMED_RECOVERY_MIG_KEY = 'armory.mig.timed_recovery_default.v1';
+export const METRO_TIMING_MIG_KEY = 'armory.mig.metro_timing_3_10.v1';
 const BAKED_PREVIEW_URL = ((import.meta.env as Record<string, string | undefined> | undefined)?.VITE_GYM_CAM_PREVIEW_URL ?? '').trim();
 
 export const DEFAULTS: Settings = {
@@ -111,8 +112,8 @@ export const DEFAULTS: Settings = {
   programTargets: {},
   metroEnabled: true,
   metroMode: 'transitions',
-  metroLead: 5,
-  metroTail: 15,
+  metroLead: 3,
+  metroTail: 10,
   metroAutoMute: false,
   metroVolume: 0.8,
   chime: true,
@@ -198,6 +199,26 @@ export function migrateTimedRecoveryDefault(
   }
 }
 
+export function migrateMetroTimingDefault(
+  settings: Settings,
+  storage?: Pick<Storage, 'getItem' | 'setItem'> | null,
+): { settings: Settings; migrated: boolean } {
+  if (!storage) return { settings, migrated: false };
+  try {
+    if (storage.getItem(METRO_TIMING_MIG_KEY)) return { settings, migrated: false };
+    const next: Settings = {
+      ...settings,
+      metroLead: 3,
+      metroTail: 10,
+    };
+    storage.setItem(KEY, JSON.stringify(next));
+    storage.setItem(METRO_TIMING_MIG_KEY, '1');
+    return { settings: next, migrated: true };
+  } catch {
+    return { settings, migrated: false };
+  }
+}
+
 function load(): Settings {
   try {
     const parsed = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Partial<Settings>;
@@ -220,7 +241,8 @@ function load(): Settings {
     };
     if (typeof localStorage === 'undefined') return base;
     const afterVoice = migrateRoomVoiceDefault(base, localStorage).settings;
-    return migrateTimedRecoveryDefault(afterVoice, localStorage).settings;
+    const afterRecovery = migrateTimedRecoveryDefault(afterVoice, localStorage).settings;
+    return migrateMetroTimingDefault(afterRecovery, localStorage).settings;
   } catch {
     return { ...DEFAULTS, queue: defaultQueueState() };
   }

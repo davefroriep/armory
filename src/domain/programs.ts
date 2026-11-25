@@ -133,7 +133,7 @@ export const PROGRAMS: Program[] = [
     blurb: 'Macro-intervals · 5 × 3:00 / 2:00 easy. Chase HR ≥ 90%.', segments: repeats(5, 180, 55, 120, 240),
   },
   {
-    id: 'b6030', name: '60/30 Float', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
+    id: 'b6030', name: 'Billat 60/30', intervalsName: 'AirBike Z5 — Billat 60/30', group: 'z5', zone: 'Z5',
     blurb: '2 × 8 × (60s work / 30s float). Fast clock, keep the fan moving.', segments: billat(),
   },
   {
@@ -233,7 +233,7 @@ export const SPIN_PROGRAMS: Program[] = [
     segments: spinRepeats(5, 180, 225, 85, 120, 240),
   },
   {
-    id: 'spin-b6030', name: '60/30 Billat (ERG)', intervalsName: 'Spin Z5 — Billat 60/30', group: 'z5', zone: 'Z5', equipment: 'spin',
+    id: 'spin-b6030', name: 'Billat 60/30 (ERG)', intervalsName: 'Spin Z5 — Billat 60/30', group: 'z5', zone: 'Z5', equipment: 'spin',
     blurb: '2 × 8 × (60s / 30s) · Auto-ERG.',
     segments: spinBillat(),
   },

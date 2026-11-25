@@ -145,8 +145,8 @@ export function settingsScreen(root: HTMLElement): () => void {
     <section class="card">
       <div class="line"><span>When it plays<small>The button on the workout screen turns it on/off</small></span></div>
       ${seg('metroMode', s.metroMode, [['transitions', 'Only on transitions'], ['whole', 'Whole workout']])}
-      <div class="line"><span>Start before transition<small>Lead-in at the upcoming tempo</small></span>${num('metroLead', s.metroLead, 0, 15)}<em>sec</em></div>
-      <div class="line"><span>Keep going after<small>Transitions mode only</small></span>${num('metroTail', s.metroTail, 0, 60)}<em>sec</em></div>
+      <div class="line"><span>Start before transition<small>Lead-in before higher-intensity intervals (never plays rest tempo during work)</small></span>${num('metroLead', s.metroLead, 0, 15)}<em>sec</em></div>
+      <div class="line"><span>Keep going after<small>Intro duration on each new interval (transitions mode)</small></span>${num('metroTail', s.metroTail, 0, 60)}<em>sec</em></div>
       <div class="line"><span>Auto-mute when locked in<small>Stop early once cadence holds target ±1.5 RPM for 3 s</small></span>${tog('metroAutoMute', s.metroAutoMute)}</div>
       <div class="line"><span>Volume</span><input id="vol" type="range" min="0.1" max="1" step="0.05" value="${s.metroVolume}"></div>
       <p class="hint">Tempo = 2 × target RPM (one beat per leg stroke), so e.g. 55 RPM · 228 W ticks at 110 BPM.</p>

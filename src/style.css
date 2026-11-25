@@ -164,11 +164,22 @@ a.cal-empty { color: var(--blue); }
 .cue.warn { color: var(--amber); }
 .cue.bad { color: var(--red); animation: pulse .35s ease-in-out infinite alternate; }
 
-.gauge { position: relative; height: 14px; margin: 0 16px 14px; background: var(--card2); border-radius: 999px; }
+.gauge { position: relative; height: 14px; margin: 2px 16px 20px; background: var(--card2); border-radius: 999px; }
 .gauge.off { opacity: .25; }
 .g-zone { position: absolute; top: 0; bottom: 0; background: rgba(34, 197, 94, .35); box-shadow: 0 0 12px rgba(34, 197, 94, .5); border-radius: 999px; }
+.gauge.ramp .g-zone { background: linear-gradient(90deg, rgba(34, 211, 238, .22), rgba(34, 197, 94, .34)); box-shadow: none; }
+.g-hizone { display: none; position: absolute; top: 0; bottom: 0; background: rgba(34, 197, 94, .52); box-shadow: 0 0 12px rgba(34, 197, 94, .65); border-radius: 999px; }
+.gauge.ramp .g-hizone { display: block; }
 .g-mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; background: #3b4452; }
-.g-needle { position: absolute; top: -5px; width: 6px; height: 24px; border-radius: 3px; background: #fff; transform: translateX(-3px); transition: left .18s linear; box-shadow: 0 0 8px rgba(255, 255, 255, .7); }
+.gauge.ramp .g-mid { display: none; }
+.g-mark { display: none; position: absolute; top: -3px; bottom: -3px; width: 2px; transform: translateX(-1px); pointer-events: none; z-index: 2; }
+.gauge.ramp .g-mark { display: block; }
+.g-mark.lo { background: rgba(148, 163, 184, .85); }
+.g-mark.hi { background: #4ade80; box-shadow: 0 0 6px rgba(74, 222, 128, .75); }
+.g-mark em { position: absolute; top: 19px; left: 50%; transform: translateX(-50%); font-style: normal; font-size: .66rem; font-weight: 800; line-height: 1; letter-spacing: .02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.g-mark.lo em { color: var(--mut); }
+.g-mark.hi em { color: #4ade80; }
+.g-needle { position: absolute; top: -5px; width: 6px; height: 24px; border-radius: 3px; background: #fff; transform: translateX(-3px); transition: left .18s linear; box-shadow: 0 0 8px rgba(255, 255, 255, .7); z-index: 3; }
 .gauge[data-level='bad'] .g-needle { background: var(--red); box-shadow: 0 0 10px var(--red); }
 .gauge[data-level='warn'] .g-needle { background: var(--amber); }
 

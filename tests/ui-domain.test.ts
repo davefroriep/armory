@@ -10,7 +10,10 @@ import { msUntilNextLocalMidnight } from '../src/intervals/calendar';
 import { PHASE1_ROUTINES } from '../src/lifts/seed';
 import { KG_PER_LB, liftSettings } from '../src/lifts/settings';
 import type { LiftSession } from '../src/lifts/types';
-import { DEFAULTS, TIMED_RECOVERY_MIG_KEY, migrateTimedRecoveryDefault } from '../src/store/settings';
+import {
+  DEFAULTS, METRO_TIMING_MIG_KEY, TIMED_RECOVERY_MIG_KEY,
+  migrateMetroTimingDefault, migrateTimedRecoveryDefault,
+} from '../src/store/settings';
 import { groupDayLogs, renderDayZoomCard, todayCompletedItems, type ZoomLookup } from '../src/ui/dayZoom';
 import { hrDropStats, hrZone } from '../src/ui/hr';
 
@@ -357,5 +360,18 @@ describe('live HR sheet telemetry helpers', () => {
     const second = migrateTimedRecoveryDefault({ ...DEFAULTS, recoveryMode: 'gated' }, storage);
     expect(second.migrated).toBe(false);
     expect(second.settings.recoveryMode).toBe('gated');
+
+    // One-time metronome 3s/10s migration upgrades existing 5s/15s installs once
+    expect(DEFAULTS.metroLead).toBe(3);
+    expect(DEFAULTS.metroTail).toBe(10);
+    const m1 = migrateMetroTimingDefault({ ...DEFAULTS, metroLead: 5, metroTail: 15 }, storage);
+    expect(m1.migrated).toBe(true);
+    expect(m1.settings.metroLead).toBe(3);
+    expect(m1.settings.metroTail).toBe(10);
+    expect(store.get(METRO_TIMING_MIG_KEY)).toBe('1');
+    const m2 = migrateMetroTimingDefault({ ...DEFAULTS, metroLead: 4, metroTail: 12 }, storage);
+    expect(m2.migrated).toBe(false);
+    expect(m2.settings.metroLead).toBe(4);
+    expect(m2.settings.metroTail).toBe(12);
   });
 });
