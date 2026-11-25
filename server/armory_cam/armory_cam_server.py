@@ -8668,6 +8668,13 @@ DASHBOARD_HTML = """<!doctype html>
               </select>
             </div>
             <div>
+              <label>Wake Word (Streaming ONNX)</label>
+              <select id="vxWakeWord">
+                <option value="hey jarvis">Hey Jarvis (Built-in ONNX)</option>
+                <option value="hey armory">Hey Armory (Custom ONNX)</option>
+              </select>
+            </div>
+            <div>
               <label>Speaker Voice</label>
               <select id="vxTtsVoice">
                 <optgroup label="Local GPU Instant (~80 ms · Offline)">
@@ -10709,6 +10716,7 @@ async function saveVoiceConfig(triggerBtn) {
     speakerReadback: $('vxReadback').value === '1',
     roomCommandReadback: $('vxRoomCmdReadback') ? ($('vxRoomCmdReadback').value === '1') : true,
     setCommitMode: $('vxSetCommitMode').value || 'voice',
+    wakeWord: $('vxWakeWord') ? ($('vxWakeWord').value || 'hey jarvis') : undefined,
     ttsVoice: $('vxTtsVoice').value || 'kokoro:am_michael',
     modelSize: $('vxModel').value || 'base.en',
     vadThreshold: Number($('vxVad').value) || 0.45,
@@ -11347,6 +11355,7 @@ async function init() {
   $('vxReadback').value = vx.speakerReadback === false ? '0' : '1';
   if ($('vxRoomCmdReadback')) $('vxRoomCmdReadback').value = vx.roomCommandReadback === false ? '0' : '1';
   $('vxSetCommitMode').value = vx.setCommitMode === 'chime' ? 'chime' : 'voice';
+  if ($('vxWakeWord')) $('vxWakeWord').value = vx.wakeWord || 'hey jarvis';
   $('vxTtsVoice').value = vx.ttsVoice || 'kokoro:am_michael';
   $('vxModel').value = vx.modelSize || 'base.en';
   $('vxVad').value = String(vx.vadThreshold != null ? vx.vadThreshold : 0.45);

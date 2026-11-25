@@ -5971,11 +5971,30 @@ class ShowDirectorTests(unittest.TestCase):
         cfg_blend = rv.RoomVoiceConfig.from_dict({"ttsVoice": "kokoro:onyx_fenrir_epic"})
         self.assertEqual(cfg_blend.tts_voice, "kokoro:onyx_fenrir_epic")
 
+        # 5. Multi-wake-word ONNX resolution & hey armory regex/hot-swap
+        self.assertEqual(rv.resolve_oww_model_name("hey armory"), "hey_armory_v0.1")
+        self.assertEqual(rv.resolve_oww_model_name("hey jarvis"), "hey_jarvis_v0.1")
+        self.assertEqual(rv.resolve_oww_model_name("hey atlas"), "hey_atlas_v0.1")
+        self.assertEqual(rv.strip_wake_word("Hey Armory, 225 for 8", "hey armory"), "225 for 8")
+        self.assertEqual(rv.strip_wake_word("Hey Armoury, record this.", "hey armory"), "record this.")
+        self.assertTrue(rv.matches_wake_word("Hey Armory, done", "hey armory"))
+        svc_swap = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(wake_word="hey jarvis", wake_engine="openwakeword"),
+            allow_hardware_audio=False,
+        )
+        self.assertEqual(svc_swap._oww_spotter.model_name, "hey_jarvis_v0.1")
+        svc_swap.update_config({"wakeWord": "hey armory"})
+        self.assertEqual(svc_swap._oww_spotter.model_name, "hey_armory_v0.1")
+
         tmp = Path(tempfile.mkdtemp(prefix="armory_cam_audition_"))
         try:
             svc = ac.ArmoryCamService(root_dir=tmp)
             app = ac.create_app(svc)
             client = app.test_client()
+
+            dash_html = client.get("/").get_data(as_text=True)
+            self.assertIn("vxWakeWord", dash_html)
+            self.assertIn("hey armory", dash_html)
 
             page = client.get("/voice-auditions")
             self.assertEqual(page.status_code, 200)

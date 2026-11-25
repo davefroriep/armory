@@ -324,10 +324,27 @@ def normalize_wake_text(text: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def resolve_oww_model_name(wake_word: str) -> str:
+    """Map configured wake phrase (e.g. 'hey armory', 'hey jarvis', 'hey atlas') to its ONNX model stem."""
+    w = re.sub(r"\s+", " ", (wake_word or "hey jarvis").strip().lower())
+    if "armory" in w or "armoury" in w:
+        return "hey_armory_v0.1"
+    if "jarvis" in w:
+        return "hey_jarvis_v0.1"
+    if "atlas" in w:
+        return "hey_atlas_v0.1"
+    slug = re.sub(r"[^a-z0-9]+", "_", w).strip("_") or "hey_jarvis"
+    return f"{slug}_v0.1"
+
+
 def _wake_regex(wake_word: str) -> re.Pattern[str]:
     wake_raw = (wake_word or "armory").strip().lower() or "armory"
-    if wake_raw == "armory":
+    if "armory" in wake_raw or "armoury" in wake_raw:
         alts = [
+            "hey armory",
+            "hey armoury",
+            "ok armory",
+            "okay armory",
             "armory",
             "armoury",
             "armorys",
@@ -360,6 +377,8 @@ def _wake_regex(wake_word: str) -> re.Pattern[str]:
             "jarves",
             "jarvish",
         ]
+    elif "atlas" in wake_raw:
+        alts = ["hey atlas", "ok atlas", "okay atlas", "atlas"]
     else:
         alts = [wake_raw]
     joined = "|".join(re.escape(a) for a in alts)
@@ -433,6 +452,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "switch views",
         "buddy mode",
         "undo",
+        "undo last set",
         "back",
         "go back",
         "open the gym",
@@ -2121,10 +2141,16 @@ class RoomVoiceService:
         self._model_error: str | None = None
 
         models_dir = (root_dir / "models") if root_dir is not None else None
+        self._models_dir = models_dir
+        self._custom_wake_spotter = wake_spotter is not None
         self._oww_spotter: Any = (
             wake_spotter
             if wake_spotter is not None
-            else OpenWakeWordSpotter(models_dir=models_dir, threshold=self.cfg.wake_threshold)
+            else OpenWakeWordSpotter(
+                models_dir=models_dir,
+                model_name=resolve_oww_model_name(self.cfg.wake_word),
+                threshold=self.cfg.wake_threshold,
+            )
         )
         self._oww_loading = False
         self._oww_preroll: deque[np.ndarray] = deque(maxlen=12)
@@ -2336,10 +2362,21 @@ class RoomVoiceService:
             dev_changed = next_cfg.device_match != self.cfg.device_match
             model_changed = next_cfg.model_size != self.cfg.model_size
             tts_changed = next_cfg.tts_voice != self.cfg.tts_voice
+            wake_changed = (
+                next_cfg.wake_word != self.cfg.wake_word
+                or next_cfg.wake_engine != self.cfg.wake_engine
+            )
             self.cfg = next_cfg
             self.context_wake_word = next_cfg.wake_word
             self._detector.configure(next_cfg)
-            if self._oww_spotter is not None and hasattr(self._oww_spotter, "threshold"):
+            if wake_changed and not self._custom_wake_spotter:
+                self._oww_spotter = OpenWakeWordSpotter(
+                    models_dir=self._models_dir,
+                    model_name=resolve_oww_model_name(next_cfg.wake_word),
+                    threshold=next_cfg.wake_threshold,
+                )
+                self._oww_loading = False
+            elif self._oww_spotter is not None and hasattr(self._oww_spotter, "threshold"):
                 self._oww_spotter.threshold = next_cfg.wake_threshold
             if dev_changed:
                 self._wasapi_probe_misses = 0
