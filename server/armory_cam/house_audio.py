@@ -54,6 +54,35 @@ def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def compute_proportional_duck_db(
+    current_db: float,
+    *,
+    threshold_db: float = -35.0,
+    max_drop_db: float = 24.0,
+    span_db: float = 30.0,
+    exponent: float = 1.55,
+) -> float:
+    """Compute smooth exponential Denon duck depth (in 0.5 dB steps) proportional to music volume.
+
+    Default curve (`threshold_db = -35.0` = Denon Vol 45, `span_db = 30.0` -> Vol 75, `exponent = 1.55`,
+    `max_drop_db = 24.0`):
+      - Vol <= 45 (-35 dB):  0.0 dB  (quiet ambient -> zero ducking)
+      - Vol 50    (-30 dB):  1.5 dB  -> Vol 48.5
+      - Vol 55    (-25 dB):  4.5 dB  -> Vol 50.5
+      - Vol 60    (-20 dB):  8.0 dB  -> Vol 52.0
+      - Vol 65    (-15 dB): 13.0 dB  -> Vol 52.0
+      - Vol 70    (-10 dB): 18.0 dB  -> Vol 52.0
+      - Vol 75    ( -5 dB): 24.0 dB  -> Vol 51.0
+    """
+    above = float(current_db) - float(threshold_db)
+    if above <= 0.0:
+        return 0.0
+    span = max(1.0, float(span_db))
+    frac = min(1.0, above / span)
+    raw_drop = max(0.0, float(max_drop_db)) * (frac ** max(1.0, float(exponent)))
+    return round(raw_drop * 2.0) / 2.0
+
+
 @dataclass
 class HouseAudioConfig:
     """Configuration for Denon AVR-3313CI loud-only ducking and Fire TV Cube house-speaker mixing."""
@@ -62,8 +91,12 @@ class HouseAudioConfig:
     denon_host: str = "192.168.1.15"
     denon_port: int = 80
     denon_duck_enabled: bool = False  # Strictly opt-in; never ducks music unless loud & enabled
+    denon_duck_mode: str = "fixed"    # "fixed" | "proportional" (exponential growth above threshold)
     denon_duck_threshold_db: float = -20.0
     denon_duck_drop_db: float = 5.0
+    denon_duck_max_drop_db: float = 24.0
+    denon_duck_span_db: float = 30.0
+    denon_duck_exponent: float = 1.55
     denon_duck_floor_db: float = -35.0
     denon_ramp_steps: int = 3
     denon_ramp_step_ms: int = 70
@@ -86,8 +119,12 @@ class HouseAudioConfig:
             "denonHost": self.denon_host,
             "denonPort": int(self.denon_port),
             "denonDuckEnabled": bool(self.denon_duck_enabled),
+            "denonDuckMode": self.denon_duck_mode,
             "denonDuckThresholdDb": round(float(self.denon_duck_threshold_db), 1),
             "denonDuckDropDb": round(float(self.denon_duck_drop_db), 1),
+            "denonDuckMaxDropDb": round(float(self.denon_duck_max_drop_db), 1),
+            "denonDuckSpanDb": round(float(self.denon_duck_span_db), 1),
+            "denonDuckExponent": round(float(self.denon_duck_exponent), 2),
             "denonDuckFloorDb": round(float(self.denon_duck_floor_db), 1),
             "denonRampSteps": int(self.denon_ramp_steps),
             "denonRampStepMs": int(self.denon_ramp_step_ms),
@@ -132,8 +169,12 @@ class HouseAudioConfig:
             denon_host=str(raw.get("denonHost", "192.168.1.15") or "").strip(),
             denon_port=max(1, min(65535, _i("denonPort", 80))),
             denon_duck_enabled=bool(raw.get("denonDuckEnabled", False)),
+            denon_duck_mode=_choice("denonDuckMode", ("fixed", "proportional"), "fixed"),
             denon_duck_threshold_db=_clamp(_f("denonDuckThresholdDb", -20.0), -65.0, 10.0),
             denon_duck_drop_db=_clamp(_f("denonDuckDropDb", 5.0), 0.5, 30.0),
+            denon_duck_max_drop_db=_clamp(_f("denonDuckMaxDropDb", 24.0), 1.0, 35.0),
+            denon_duck_span_db=_clamp(_f("denonDuckSpanDb", 30.0), 5.0, 50.0),
+            denon_duck_exponent=_clamp(_f("denonDuckExponent", 1.55), 1.0, 3.0),
             denon_duck_floor_db=_clamp(_f("denonDuckFloorDb", -35.0), -75.0, 0.0),
             denon_ramp_steps=max(1, min(10, _i("denonRampSteps", 3))),
             denon_ramp_step_ms=max(20, min(300, _i("denonRampStepMs", 70))),
@@ -242,9 +283,12 @@ class DenonAvrClient:
         self._guard_path = (Path(state_dir) / "denon_vol_guard.json") if state_dir is not None else None
         self._lock = threading.RLock()
         self._duck_depth = 0
+        self._wake_duck_active = False
+        self._wake_duck_timer: threading.Timer | None = None
         self._saved_db: float | None = None
         self._ducked_db: float | None = None
         self._last_ramp_db: float | None = None
+        self._last_status_mono: float = 0.0
         self.last_status: dict[str, Any] = {"ok": False, "error": "Not polled yet"}
         self.last_duck_info: dict[str, Any] = {}
 
@@ -329,7 +373,185 @@ class DenonAvrClient:
         except Exception as exc:
             res = {"ok": False, "error": str(exc)}
         self.last_status = res
+        if res.get("ok"):
+            self._last_status_mono = time.monotonic()
         return res
+
+    def get_cached_status(self, max_age_sec: float = 8.0) -> dict[str, Any]:
+        """Return recent Denon status without blocking on HTTP when fresh within `max_age_sec`."""
+        if (
+            self.last_status.get("ok")
+            and self._last_status_mono > 0.0
+            and (time.monotonic() - self._last_status_mono) <= float(max_age_sec)
+        ):
+            return dict(self.last_status)
+        return self.get_status()
+
+    def _effective_drop_db(self, cfg: HouseAudioConfig, current_db: float, drop_db: float | None = None) -> float:
+        if drop_db is not None:
+            return max(0.5, float(drop_db))
+        if cfg.denon_duck_mode == "proportional":
+            return compute_proportional_duck_db(
+                current_db,
+                threshold_db=cfg.denon_duck_threshold_db,
+                max_drop_db=cfg.denon_duck_max_drop_db,
+                span_db=cfg.denon_duck_span_db,
+                exponent=cfg.denon_duck_exponent,
+            )
+        return max(0.5, float(cfg.denon_duck_drop_db))
+
+    def _cancel_wake_timer_locked(self) -> None:
+        t = self._wake_duck_timer
+        self._wake_duck_timer = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _arm_wake_timer_locked(self, hold_sec: float) -> None:
+        self._cancel_wake_timer_locked()
+        sec = max(1.0, float(hold_sec))
+        t = threading.Timer(sec, self.end_wake_duck)
+        t.daemon = True
+        self._wake_duck_timer = t
+        t.start()
+
+    def _restore_if_zero_locked(self) -> dict[str, Any]:
+        cfg_now = self._get_cfg()
+        saved = self._saved_db
+        ducked = self._ducked_db
+        self._saved_db = None
+        self._ducked_db = None
+        res_info: dict[str, Any] = {"restored": False}
+        try:
+            if saved is not None and ducked is not None:
+                st_now = self.get_status()
+                now_db = st_now.get("volumeDb") if st_now.get("ok") else None
+                if st_now.get("power") == "ON" and now_db is not None:
+                    if abs(float(now_db) - ducked) <= 1.5:
+                        restored = self._ramp_volume_retry(
+                            float(now_db),
+                            saved,
+                            cfg_now.denon_ramp_steps,
+                            cfg_now.denon_ramp_step_ms,
+                        )
+                        res_info = {
+                            "ducked": True,
+                            "restored": bool(restored),
+                            "restoredToDb": saved,
+                            "restoreOk": restored,
+                            "at": _utc_iso_now(),
+                        }
+                        self.last_duck_info = res_info
+                    else:
+                        res_info = {
+                            "ducked": True,
+                            "restored": False,
+                            "restoreSkipped": "manual_volume_change",
+                            "nowDb": float(now_db),
+                            "expectedDuckedDb": ducked,
+                            "at": _utc_iso_now(),
+                        }
+                        self.last_duck_info = res_info
+        finally:
+            self.clear_volume_guard()
+        return res_info
+
+    def begin_wake_duck(
+        self,
+        *,
+        max_hold_sec: float = 11.0,
+        use_cache_sec: float = 3.5,
+        drop_db: float | None = None,
+    ) -> dict[str, Any]:
+        """Instantly dip Denon volume (single-step MV) when wake-word triggers, with leak-proof auto-restore."""
+        with self._lock:
+            cfg = self._get_cfg()
+            if self._wake_duck_active:
+                self._arm_wake_timer_locked(max_hold_sec)
+                return {
+                    "ducked": True,
+                    "alreadyActive": True,
+                    "fromDb": self._saved_db,
+                    "toDb": self._ducked_db,
+                }
+            if self._duck_depth > 0:
+                self._duck_depth += 1
+                self._wake_duck_active = True
+                self._arm_wake_timer_locked(max_hold_sec)
+                return {
+                    "ducked": True,
+                    "nested": True,
+                    "fromDb": self._saved_db,
+                    "toDb": self._ducked_db,
+                }
+            if not (cfg.denon_enabled and self._base_url(cfg) and cfg.denon_duck_enabled):
+                return {"ducked": False, "reason": "disabled"}
+
+            st = self.get_cached_status(max_age_sec=use_cache_sec)
+            cur = st.get("volumeDb")
+            if not st.get("ok"):
+                return {"ducked": False, "reason": st.get("error", "unreachable")}
+            if st.get("power") != "ON":
+                return {"ducked": False, "reason": "standby"}
+            if st.get("muted"):
+                return {"ducked": False, "reason": "muted"}
+            if cur is None:
+                return {"ducked": False, "reason": "volume_unknown"}
+            current_db = float(cur)
+            if current_db <= cfg.denon_duck_threshold_db:
+                return {
+                    "ducked": False,
+                    "reason": "below_threshold",
+                    "volumeDb": current_db,
+                    "thresholdDb": cfg.denon_duck_threshold_db,
+                }
+            drop = self._effective_drop_db(cfg, current_db, drop_db=drop_db)
+            if drop < 0.5:
+                return {"ducked": False, "reason": "below_threshold", "volumeDb": current_db}
+            target_db = round(max(cfg.denon_duck_floor_db, current_db - drop) * 2.0) / 2.0
+            if target_db >= current_db - 0.4:
+                return {"ducked": False, "reason": "at_floor", "volumeDb": current_db}
+
+            # Single-step fast drop (~60-100ms on wired LAN) so music dips immediately on "Hey Jarvis"
+            if self._ramp_volume(current_db, target_db, steps=1, step_ms=0):
+                actual_ducked = self._last_ramp_db if self._last_ramp_db is not None else target_db
+                self._saved_db = current_db
+                self._ducked_db = actual_ducked
+                self._duck_depth = 1
+                self._wake_duck_active = True
+                self.save_volume_guard(current_db)
+                self._arm_wake_timer_locked(max_hold_sec)
+                info = {
+                    "ducked": True,
+                    "wakeDuck": True,
+                    "mode": cfg.denon_duck_mode,
+                    "dropDb": round(current_db - actual_ducked, 1),
+                    "fromDb": current_db,
+                    "toDb": actual_ducked,
+                }
+                self.last_duck_info = {**info, "at": _utc_iso_now()}
+                return info
+            return {"ducked": False, "reason": "command_failed"}
+
+    def extend_wake_duck(self, hold_sec: float = 6.0) -> None:
+        """Push out the wake-duck safety deadline (e.g. while Jarvis is speaking readback)."""
+        with self._lock:
+            if self._wake_duck_active:
+                self._arm_wake_timer_locked(hold_sec)
+
+    def end_wake_duck(self) -> dict[str, Any]:
+        """Release wake-word duck hold and smoothly ramp Denon back to pre-duck volume if last holder."""
+        with self._lock:
+            self._cancel_wake_timer_locked()
+            if not self._wake_duck_active:
+                return {"restored": False, "skipped": True}
+            self._wake_duck_active = False
+            self._duck_depth = max(0, self._duck_depth - 1)
+            if self._duck_depth > 0:
+                return {"restored": False, "stillNested": True}
+            return self._restore_if_zero_locked()
 
     def send_command(self, cmd: str) -> dict[str, Any]:
         cfg = self._get_cfg()
@@ -412,21 +634,25 @@ class DenonAvrClient:
                     }
                 else:
                     current_db = float(cur)
-                    drop = max(0.5, float(drop_db if drop_db is not None else cfg.denon_duck_drop_db))
-                    target_db = round(max(cfg.denon_duck_floor_db, current_db - drop) * 2.0) / 2.0
-                    if target_db >= current_db - 0.4:
-                        info = {"ducked": False, "reason": "at_floor", "volumeDb": current_db}
-                    elif self._ramp_volume(current_db, target_db, cfg.denon_ramp_steps, cfg.denon_ramp_step_ms):
-                        actual_ducked = self._last_ramp_db if self._last_ramp_db is not None else target_db
-                        self._saved_db = current_db
-                        self._ducked_db = actual_ducked
-                        self._duck_depth = 1
-                        participating = True
-                        self.save_volume_guard(current_db)
-                        info = {"ducked": True, "fromDb": current_db, "toDb": actual_ducked}
-                        self.last_duck_info = {**info, "at": _utc_iso_now()}
+                    drop = self._effective_drop_db(cfg, current_db, drop_db=drop_db)
+                    if drop < 0.5 and not force:
+                        info = {"ducked": False, "reason": "below_threshold", "volumeDb": current_db}
                     else:
-                        info = {"ducked": False, "reason": "command_failed"}
+                        drop = max(0.5, drop)
+                        target_db = round(max(cfg.denon_duck_floor_db, current_db - drop) * 2.0) / 2.0
+                        if target_db >= current_db - 0.4:
+                            info = {"ducked": False, "reason": "at_floor", "volumeDb": current_db}
+                        elif self._ramp_volume(current_db, target_db, cfg.denon_ramp_steps, cfg.denon_ramp_step_ms):
+                            actual_ducked = self._last_ramp_db if self._last_ramp_db is not None else target_db
+                            self._saved_db = current_db
+                            self._ducked_db = actual_ducked
+                            self._duck_depth = 1
+                            participating = True
+                            self.save_volume_guard(current_db)
+                            info = {"ducked": True, "fromDb": current_db, "toDb": actual_ducked}
+                            self.last_duck_info = {**info, "at": _utc_iso_now()}
+                        else:
+                            info = {"ducked": False, "reason": "command_failed"}
             elif not force and not cfg.denon_duck_enabled:
                 info = {"ducked": False, "reason": "disabled"}
 
@@ -435,41 +661,9 @@ class DenonAvrClient:
         finally:
             if participating:
                 with self._lock:
-                    cfg_now = self._get_cfg()
                     self._duck_depth = max(0, self._duck_depth - 1)
                     if self._duck_depth == 0:
-                        saved = self._saved_db
-                        ducked = self._ducked_db
-                        self._saved_db = None
-                        self._ducked_db = None
-                        try:
-                            if saved is not None and ducked is not None:
-                                st_now = self.get_status()
-                                now_db = st_now.get("volumeDb") if st_now.get("ok") else None
-                                if st_now.get("power") == "ON" and now_db is not None:
-                                    if abs(float(now_db) - ducked) <= 1.0:
-                                        restored = self._ramp_volume_retry(
-                                            float(now_db),
-                                            saved,
-                                            cfg_now.denon_ramp_steps,
-                                            cfg_now.denon_ramp_step_ms,
-                                        )
-                                        self.last_duck_info = {
-                                            "ducked": True,
-                                            "restoredToDb": saved,
-                                            "restoreOk": restored,
-                                            "at": _utc_iso_now(),
-                                        }
-                                    else:
-                                        self.last_duck_info = {
-                                            "ducked": True,
-                                            "restoreSkipped": "manual_volume_change",
-                                            "nowDb": float(now_db),
-                                            "expectedDuckedDb": ducked,
-                                            "at": _utc_iso_now(),
-                                        }
-                        finally:
-                            self.clear_volume_guard()
+                        self._restore_if_zero_locked()
 
 
 def normalize_wav_for_cube(wav_bytes: bytes, target_sr: int = 48_000, target_ch: int = 2) -> bytes:
@@ -1311,6 +1505,15 @@ class HouseAudioManager:
             "totalMs": int(round((t_end - t0) * 1000.0)),
         }
         return {**out, "timing": timing}
+
+    def wake_duck_callbacks(self) -> dict[str, Callable[..., Any]]:
+        """Expose fast wake-duck lifecycle hooks for RoomVoiceService."""
+        return {
+            "begin": self.denon.begin_wake_duck,
+            "end": self.denon.end_wake_duck,
+            "extend": self.denon.extend_wake_duck,
+            "refresh": lambda: self.denon.get_status() if self.denon._duck_depth == 0 else self.denon.last_status,
+        }
 
     def status_dict(self, *, live_probe: bool = True, force_probe: bool = False) -> dict[str, Any]:
         cfg = self.get_config()

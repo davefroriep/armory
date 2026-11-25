@@ -5591,6 +5591,170 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_proportional_denon_ducking_and_jarvis_openwakeword_flow(self) -> None:
+        # 1. Exponential proportional duck curve: 0 dB <= Vol 45 (-35 dB), growing smoothly to ~18.5 dB @ Vol 70 & 24 dB @ Vol 75
+        self.assertEqual(ha.compute_proportional_duck_db(-40.0), 0.0)
+        self.assertEqual(ha.compute_proportional_duck_db(-35.0), 0.0)
+        self.assertEqual(ha.compute_proportional_duck_db(-30.0), 1.5)
+        self.assertEqual(ha.compute_proportional_duck_db(-25.0), 4.5)
+        self.assertEqual(ha.compute_proportional_duck_db(-20.0), 8.0)
+        self.assertEqual(ha.compute_proportional_duck_db(-15.0), 13.0)
+        self.assertEqual(ha.compute_proportional_duck_db(-10.0), 18.0)
+        self.assertEqual(ha.compute_proportional_duck_db(-5.0), 24.0)
+
+        # 2. Fast 1-step begin_wake_duck -> nested duck_context -> smooth restore on end_wake_duck
+        state = {"vol": -10.0, "cmds": []}
+
+        def fake_denon(url: str, _timeout: float) -> tuple[int, bytes]:
+            if "formMainZone_MainZoneXmlStatus.xml" in url:
+                xml = (
+                    f"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect>"
+                    f"<MasterVolume><value>{state['vol']:.1f}</value></MasterVolume>"
+                    f"<Mute><value>off</value></Mute><SurrMode><value>MULTI CH STEREO</value></SurrMode></item>"
+                )
+                return 200, xml.encode("utf-8")
+            if "formiPhoneAppDirect.xml?" in url:
+                cmd = url.split("?", 1)[1]
+                state["cmds"].append(cmd)
+                if cmd.startswith("MV"):
+                    raw = cmd[2:]
+                    val = float(raw[:2]) + (0.5 if len(raw) == 3 and raw[2] == "5" else 0.0)
+                    state["vol"] = val - 80.0
+                return 200, b""
+            return 404, b""
+
+        ha_cfg = ha.HouseAudioConfig(
+            denon_enabled=True,
+            denon_host="192.168.1.15",
+            denon_duck_enabled=True,
+            denon_duck_mode="proportional",
+            denon_duck_threshold_db=-35.0,
+            denon_duck_max_drop_db=24.0,
+            denon_duck_span_db=30.0,
+            denon_duck_exponent=1.55,
+            denon_duck_floor_db=-35.0,
+            denon_ramp_steps=3,
+            denon_ramp_step_ms=0,
+        )
+        denon = ha.DenonAvrClient(lambda: ha_cfg, http_get=fake_denon, sleep_fn=lambda _s: None)
+
+        # Below Vol 45 (-36 dB) -> zero ducking
+        state["vol"] = -36.0
+        r_low = denon.begin_wake_duck()
+        self.assertFalse(r_low["ducked"])
+        self.assertEqual(state["cmds"], [])
+
+        # At Vol 70 (-10 dB) -> single-step instant dip to -28.0 dB (Vol 52.0)
+        state["vol"] = -10.0
+        r_hi = denon.begin_wake_duck(max_hold_sec=30.0, use_cache_sec=0.0)
+        self.assertTrue(r_hi["ducked"])
+        self.assertAlmostEqual(r_hi["dropDb"], 18.0)
+        self.assertAlmostEqual(state["vol"], -28.0)
+        self.assertEqual(len(state["cmds"]), 1)
+
+        # Nested duck_context during TTS readback does not double-duck or prematurely restore
+        with denon.duck_context() as nested:
+            self.assertTrue(nested["ducked"])
+            self.assertTrue(nested["nested"])
+            self.assertAlmostEqual(state["vol"], -28.0)
+        self.assertAlmostEqual(state["vol"], -28.0)
+
+        # Release wake duck -> smooth 3-step restore back to -10.0 dB (MV70)
+        r_end = denon.end_wake_duck()
+        self.assertTrue(r_end["restored"])
+        self.assertAlmostEqual(state["vol"], -10.0)
+        self.assertEqual(state["cmds"][-1], "MV70")
+
+        # 3. Jarvis wake prefix stripping in display_control & room_voice + SSE translation for Armory APK
+        self.assertEqual(dc._strip_wake_prefix("Hey Jarvis, open the gym", wake_word="hey jarvis"), "open the gym")
+        self.assertEqual(dc._strip_wake_prefix("Jarvis, next song", wake_word="hey jarvis"), "next song")
+        self.assertEqual(rv.strip_wake_word("Hey Jarvis, record this.", "hey jarvis"), "record this.")
+        self.assertEqual(rv.strip_wake_word("Hey Jarvis", "hey jarvis"), "")
+        self.assertTrue(rv.matches_wake_word("Hey Jarvis, 225 for 8", "hey jarvis"))
+        p_j, hw_j = rv.build_whisper_prompt("hey jarvis", ["Lat Pulldown"])
+        self.assertTrue(p_j.startswith("Hey Jarvis, record this. Hey Jarvis, done."))
+        self.assertIn("Hey Jarvis", hw_j)
+
+        # 4. Streaming openWakeWord flow: wake -> Denon duck (no chime) -> lone wake keeps armed -> command translates SSE to client wake
+        duck_events: list[str] = []
+
+        class _FakeOwwSpotter:
+            ready = True
+            latest_score = 0.0
+            threshold = 0.38
+            model_name = "hey_jarvis_v0.1"
+
+            def __init__(self) -> None:
+                self.fire_next = False
+
+            def reset(self) -> None:
+                pass
+
+            def push_samples(self, _pcm: np.ndarray, now_mono: float | None = None) -> tuple[bool, float]:
+                if self.fire_next:
+                    self.fire_next = False
+                    self.latest_score = 0.99
+                    return True, 0.99
+                return False, 0.02
+
+        spot = _FakeOwwSpotter()
+        spoken: list[str] = []
+        vcfg = rv.RoomVoiceConfig(wake_word="hey jarvis", wake_engine="openwakeword", wake_threshold=0.38)
+        svc = rv.RoomVoiceService(
+            config=vcfg,
+            speak_fn=lambda txt: (spoken.append(txt), True)[1],
+            allow_hardware_audio=False,
+            wake_spotter=spot,
+            wake_duck_callbacks={
+                "begin": lambda: (duck_events.append("begin"), {"ducked": True, "dropDb": 18.5, "fromDb": -10.0, "toDb": -28.5})[1],
+                "end": lambda: (duck_events.append("end"), {"restored": True})[1],
+                "extend": lambda _s=6.0: duck_events.append("extend"),
+            },
+        )
+        # Pixel APK pushes "armory" context -> must NOT overwrite server's "hey jarvis" wake word
+        svc.set_context(active=True, wake_word="armory", readback=True)
+        self.assertEqual(svc.status_dict()["wakeWord"], "hey jarvis")
+        self.assertEqual(svc._client_wake_word, "armory")
+
+        # Idle audio with no wake -> 0 utterances queued
+        idle_chunk = np.full(rv.VAD_FRAME_SAMPLES * 4, 0.05, dtype=np.float32)
+        svc._ingest_pcm16_frame(idle_chunk, muted=False, now_ms=10_000, now_mono=10.0)
+        self.assertTrue(svc._utt_queue.empty())
+        self.assertEqual(duck_events, [])
+
+        # Wake detected -> arms immediately and calls begin_wake_duck
+        spot.fire_next = True
+        svc._ingest_pcm16_frame(idle_chunk, muted=False, now_ms=11_000, now_mono=11.0)
+        self.assertGreater(svc.armed_until_ms, 11_000)
+        # Wait briefly for wake callback thread
+        for _ in range(30):
+            if "begin" in duck_events:
+                break
+            time.sleep(0.02)
+        self.assertIn("begin", duck_events)
+        self.assertTrue(svc._wake_duck_held)
+
+        # Lone "Hey Jarvis" transcribed during capture -> stays armed + stays ducked!
+        lone = svc._emit_transcript("Hey Jarvis.", latency_ms=120, from_oww=True)
+        self.assertFalse(lone["emitted"])
+        self.assertTrue(lone.get("awaitingCommand"))
+        self.assertTrue(svc._wake_duck_held)
+
+        # Actual command "225 for 8" -> dashboard shows "Hey Jarvis, 225 for 8", SSE emits "Armory, 225 for 8" for Pixel APK!
+        svc.sse_clients = 1
+        em = svc._emit_transcript("225 for 8", latency_ms=280, from_oww=True)
+        self.assertTrue(em["emitted"])
+        self.assertEqual(em["transcript"], "Hey Jarvis, 225 for 8")
+        self.assertEqual(svc._events[-1]["transcript"], "Armory, 225 for 8")
+        self.assertEqual(svc._events[-1]["wakeWord"], "armory")
+
+        # Ack with TTS speech -> speaks confirmation & releases wake duck once finished
+        svc.handle_ack(speech="225 for 8, locked in", text="✓ 225 lb × 8", kind="ok")
+        self.assertEqual(spoken, ["225 for 8, locked in"])
+        self.assertIn("extend", duck_events)
+        self.assertIn("end", duck_events)
+        self.assertFalse(svc._wake_duck_held)
+
 
 if __name__ == "__main__":
     unittest.main()

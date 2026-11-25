@@ -2606,6 +2606,7 @@ class ArmoryCamService:
             house_audio_router=self.house_audio.try_route_voice_pcm,
             local_command_handler=self._handle_local_voice_command,
             on_pcm_chunk=self.room_audio.push_pcm,
+            wake_duck_callbacks=self.house_audio.wake_duck_callbacks(),
         )
         self.pre_roll_sec = DEFAULT_PRE_ROLL_SEC
         if drive_backup_dir is not None:

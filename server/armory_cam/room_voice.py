@@ -201,10 +201,47 @@ def _wake_regex(wake_word: str) -> re.Pattern[str]:
             "armor",
             "armored",
         ]
+    elif "jarvis" in wake_raw:
+        alts = [
+            "hey jarvis",
+            "ok jarvis",
+            "okay jarvis",
+            "hey jarvas",
+            "hey jarvus",
+            "hey jarves",
+            "jarvis",
+            "jarvas",
+            "jarvus",
+            "jarves",
+            "jarvish",
+        ]
     else:
         alts = [wake_raw]
     joined = "|".join(re.escape(a) for a in alts)
     return re.compile(rf"\b(?:hey\s+|ok\s+|okay\s+)?(?:{joined})\b", re.IGNORECASE)
+
+
+def format_wake_display(wake_word: str) -> str:
+    clean = re.sub(r"\s+", " ", (wake_word or "armory").strip())
+    if not clean:
+        return "Armory"
+    return " ".join(w[0].upper() + w[1:] for w in clean.split(" "))
+
+
+def strip_wake_word(text: str, wake_word: str = "armory") -> str:
+    """Strip any leading wake word + punctuation, returning the clean command tail."""
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not raw:
+        return ""
+    pat = _wake_regex(wake_word)
+    # Strip leading occurrences of the wake word (and trailing comma/colon/period right after wake)
+    cur = raw
+    for _ in range(2):
+        m = pat.match(cur)
+        if not m:
+            break
+        cur = cur[m.end():].lstrip(" ,.!?:;—–-")
+    return cur.strip()
 
 
 def matches_wake_word(text: str, wake_word: str = "armory") -> bool:
@@ -231,9 +268,9 @@ def has_command_tail(text: str, wake_word: str = "armory") -> bool:
 def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tuple[str, str]:
     """Build concise Whisper `initial_prompt` + `hotwords` led by wake-word gym commands and current exercises."""
     wake = (wake_word or "armory").strip() or "armory"
-    wake_cap = wake[0].upper() + wake[1:]
+    wake_cap = format_wake_display(wake)
     # Always lead `initial_prompt` with natural punctuated wake+command pairs so Whisper biases
-    # strongly toward the wake word ("Armory") over music rather than substituting show names ("Ryder").
+    # strongly toward the wake word over music rather than substituting show names ("Ryder").
     lead_sentences = (
         f"{wake_cap}, record this. "
         f"{wake_cap}, done. "
@@ -304,6 +341,8 @@ class RoomVoiceConfig:
     listen_mode: str = "workout"  # "workout" | "always"
     model_size: str = "small.en"  # empirically 18/18 (100%) over gym music on GTX 1650 CUDA
     wake_word: str = "armory"
+    wake_engine: str = "whisper"  # "whisper" | "openwakeword"
+    wake_threshold: float = 0.38
     speaker_readback: bool = True
     room_command_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
@@ -322,6 +361,8 @@ class RoomVoiceConfig:
             "listenMode": self.listen_mode,
             "modelSize": self.model_size,
             "wakeWord": self.wake_word,
+            "wakeEngine": self.wake_engine,
+            "wakeThreshold": round(float(self.wake_threshold), 2),
             "speakerReadback": bool(self.speaker_readback),
             "roomCommandReadback": bool(self.room_command_readback),
             "ttsVoice": self.tts_voice,
@@ -342,6 +383,8 @@ class RoomVoiceConfig:
         model_raw = str(raw.get("modelSize", "small.en")).strip()
         model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en") else "small.en"
         wake = str(raw.get("wakeWord") or "armory").strip().lower() or "armory"
+        eng_raw = str(raw.get("wakeEngine", "whisper") or "whisper").strip().lower()
+        wake_engine = "openwakeword" if eng_raw in ("openwakeword", "oww") else "whisper"
         tts_raw = str(raw.get("ttsVoice") or DEFAULT_TTS_VOICE).strip()
         tts_raw = _LEGACY_TTS_VOICE_MAP.get(tts_raw, tts_raw)
         tts_voice = tts_raw if tts_raw in TTS_VOICES else DEFAULT_TTS_VOICE
@@ -354,6 +397,8 @@ class RoomVoiceConfig:
             listen_mode=listen_mode,
             model_size=model_size,
             wake_word=wake,
+            wake_engine=wake_engine,
+            wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.38) or 0.38), 0.15, 0.90),
             speaker_readback=bool(raw.get("speakerReadback", True)),
             room_command_readback=bool(raw.get("roomCommandReadback", True)),
             tts_voice=tts_voice,
@@ -1663,6 +1708,113 @@ class VoiceAbTracker:
             }
 
 
+OWW_FRAME_SAMPLES = 1280  # 80 ms @ 16 kHz (native openWakeWord frame size)
+
+
+class OpenWakeWordSpotter:
+    """Streaming ONNX wake-word spotter (`hey_jarvis_v0.1.onnx`) running at <2% CPU with 0 GPU."""
+
+    def __init__(
+        self,
+        models_dir: Path | None = None,
+        *,
+        model_name: str = "hey_jarvis_v0.1",
+        threshold: float = 0.38,
+        cooldown_sec: float = 1.4,
+        oww_model: Any | None = None,
+    ) -> None:
+        self.models_dir = Path(models_dir) if models_dir is not None else None
+        self.model_name = model_name
+        self.threshold = float(threshold)
+        self.cooldown_sec = float(cooldown_sec)
+        self._model = oww_model
+        self._model_key = model_name
+        self._buf16 = np.zeros(0, dtype=np.float32)
+        self._last_trigger_mono = 0.0
+        self.latest_score = 0.0
+        self.load_error: str | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self._model is not None
+
+    def load(self) -> bool:
+        if self._model is not None:
+            return True
+        candidates: list[Path] = []
+        if self.models_dir is not None:
+            candidates.append(self.models_dir / "openwakeword")
+            candidates.append(self.models_dir)
+        candidates.append(Path(r"S:\ArmoryCam\models\openwakeword"))
+        oww_dir = next((d for d in candidates if (d / f"{self.model_name}.onnx").is_file()), None)
+        if oww_dir is None:
+            self.load_error = f"openWakeWord ONNX model {self.model_name}.onnx not found"
+            return False
+        melspec_p = oww_dir / "melspectrogram.onnx"
+        embed_p = oww_dir / "embedding_model.onnx"
+        wake_p = oww_dir / f"{self.model_name}.onnx"
+        if not (melspec_p.is_file() and embed_p.is_file() and wake_p.is_file()):
+            self.load_error = f"openWakeWord ONNX assets incomplete in {oww_dir}"
+            return False
+        try:
+            from openwakeword.model import Model as OwwModel
+
+            mdl = OwwModel(
+                wakeword_models=[str(wake_p)],
+                inference_framework="onnx",
+                melspec_model_path=str(melspec_p),
+                embedding_model_path=str(embed_p),
+            )
+            keys = list(getattr(mdl, "models", {}).keys())
+            self._model_key = keys[0] if keys else self.model_name
+            self._model = mdl
+            self.load_error = None
+            return True
+        except Exception as exc:
+            self.load_error = str(exc)
+            return False
+
+    def reset(self) -> None:
+        self._buf16 = np.zeros(0, dtype=np.float32)
+        self.latest_score = 0.0
+        if self._model is not None:
+            try:
+                self._model.reset()
+            except Exception:
+                pass
+
+    def push_samples(self, samples_16k: np.ndarray, now_mono: float | None = None) -> tuple[bool, float]:
+        """Ingest 16 kHz float32 audio; returns `(triggered, peak_score)`."""
+        if self._model is None or samples_16k.size == 0:
+            return False, 0.0
+        now_m = time.monotonic() if now_mono is None else float(now_mono)
+        self._buf16 = np.concatenate([self._buf16, samples_16k.astype(np.float32, copy=False)])
+        triggered = False
+        peak = 0.0
+        while self._buf16.size >= OWW_FRAME_SAMPLES:
+            chunk = self._buf16[:OWW_FRAME_SAMPLES]
+            self._buf16 = self._buf16[OWW_FRAME_SAMPLES:]
+            pcm_i16 = np.round(np.clip(chunk, -1.0, 1.0) * 32767.0).astype("<i2")
+            try:
+                preds = self._model.predict(pcm_i16)
+            except Exception:
+                continue
+            score = float(preds.get(self._model_key, 0.0)) if isinstance(preds, dict) else 0.0
+            self.latest_score = score
+            if score > peak:
+                peak = score
+            if not triggered and score >= self.threshold and (now_m - self._last_trigger_mono) >= self.cooldown_sec:
+                triggered = True
+                self._last_trigger_mono = now_m
+                try:
+                    self._model.reset()
+                except Exception:
+                    pass
+                self._buf16 = np.zeros(0, dtype=np.float32)
+                break
+        return triggered, peak
+
+
 class RoomVoiceService:
     """Manages PowerConf S330 audio capture, Whisper ASR, SSE broadcast, and speaker feedback."""
 
@@ -1677,6 +1829,8 @@ class RoomVoiceService:
         house_audio_router: Callable[..., dict[str, Any] | None] | None = None,
         local_command_handler: Callable[[str], dict[str, Any] | None] | None = None,
         on_pcm_chunk: Callable[[np.ndarray, int, float], None] | None = None,
+        wake_duck_callbacks: dict[str, Callable[..., Any]] | None = None,
+        wake_spotter: Any | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
@@ -1691,6 +1845,7 @@ class RoomVoiceService:
         self._house_audio_router = house_audio_router
         self._local_command_handler = local_command_handler
         self._on_pcm_chunk = on_pcm_chunk
+        self._wake_duck_cbs: dict[str, Callable[..., Any]] = dict(wake_duck_callbacks or {})
 
         self.log = logging.getLogger("armory-voice")
         self.lock = threading.RLock()
@@ -1700,7 +1855,7 @@ class RoomVoiceService:
         self._started = False
         self._stop_event = threading.Event()
         self._worker_threads: list[threading.Thread] = []
-        self._utt_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=6)
+        self._utt_queue: queue.Queue[Any] = queue.Queue(maxsize=6)
         self._speaker_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=16)
 
         self._model: Any = None
@@ -1708,6 +1863,19 @@ class RoomVoiceService:
         self._model_device: str = ""
         self._model_loading = False
         self._model_error: str | None = None
+
+        models_dir = (root_dir / "models") if root_dir is not None else None
+        self._oww_spotter: Any = (
+            wake_spotter
+            if wake_spotter is not None
+            else OpenWakeWordSpotter(models_dir=models_dir, threshold=self.cfg.wake_threshold)
+        )
+        self._oww_loading = False
+        self._oww_preroll: deque[np.ndarray] = deque(maxlen=12)
+        self._oww_awaiting_cmd = False
+        self._wake_duck_held = False
+        self._release_wake_duck_on_play_done = False
+        self._wake_duck_release_timer: threading.Timer | None = None
 
         self._stream: sd.InputStream | None = None
         self._stream_sr: int = 48_000
@@ -1724,7 +1892,6 @@ class RoomVoiceService:
             rms_gate=self.cfg.rms_gate,
         )
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
-        models_dir = (root_dir / "models") if root_dir is not None else None
         self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, models_dir=models_dir)
         self._winmm_player = _WinMmSpeakerPlayer() if sys.platform == "win32" else None
         self.ab = VoiceAbTracker(root_dir=root_dir)
@@ -1736,6 +1903,7 @@ class RoomVoiceService:
         self.wallboard_active = False
         self.context_readback = True
         self.context_wake_word = self.cfg.wake_word
+        self._client_wake_word = "armory"
         self.bias_phrases: list[str] = []
         self.test_listen_until_mono = 0.0
         self.last_client_seen_mono = 0.0
@@ -1779,6 +1947,8 @@ class RoomVoiceService:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._cancel_wake_duck_release_timer()
+        self._release_wake_duck_sync()
         with self.lock:
             self._started = False
             self._cond.notify_all()
@@ -1802,6 +1972,106 @@ class RoomVoiceService:
         if self._winmm_player is not None:
             self._winmm_player.stop()
 
+    def _using_oww_spotter(self) -> bool:
+        return bool(
+            self.cfg.wake_engine == "openwakeword"
+            and self._oww_spotter is not None
+            and getattr(self._oww_spotter, "ready", False)
+        )
+
+    def _cancel_wake_duck_release_timer(self) -> None:
+        with self.lock:
+            t = self._wake_duck_release_timer
+            self._wake_duck_release_timer = None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def _schedule_wake_duck_release(self, delay_sec: float = 2.2) -> None:
+        self._cancel_wake_duck_release_timer()
+        with self.lock:
+            if not self._wake_duck_held:
+                return
+            t = threading.Timer(max(0.2, float(delay_sec)), self._release_wake_duck_sync)
+            t.daemon = True
+            self._wake_duck_release_timer = t
+            t.start()
+
+    def _release_wake_duck_sync(self) -> None:
+        self._cancel_wake_duck_release_timer()
+        with self.lock:
+            was_held = self._wake_duck_held
+            self._wake_duck_held = False
+            self._release_wake_duck_on_play_done = False
+            end_fn = self._wake_duck_cbs.get("end")
+        if was_held and callable(end_fn):
+            try:
+                end_fn()
+            except Exception as exc:
+                self.log.debug("Wake duck release error: %s", exc)
+
+    def _release_wake_duck_async(self) -> None:
+        with self.lock:
+            if not self._wake_duck_held:
+                return
+        pool = self._local_cmd_pool
+        if pool is not None and not self._stop_event.is_set():
+            try:
+                pool.submit(self._release_wake_duck_sync)
+                return
+            except Exception:
+                pass
+        threading.Thread(target=self._release_wake_duck_sync, name="armory-wake-unduck", daemon=True).start()
+
+    def _extend_wake_duck(self, hold_sec: float = 6.0) -> None:
+        with self.lock:
+            if not self._wake_duck_held:
+                return
+            ext_fn = self._wake_duck_cbs.get("extend")
+        if callable(ext_fn):
+            try:
+                ext_fn(hold_sec)
+            except Exception:
+                pass
+
+    def _on_oww_wake_detected(self, score: float) -> None:
+        """Triggered off audio-callback thread the instant openWakeWord spots 'Hey Jarvis'."""
+        ducked = False
+        duck_info: dict[str, Any] = {}
+        begin_fn = self._wake_duck_cbs.get("begin")
+        if callable(begin_fn):
+            try:
+                res = begin_fn()
+                if isinstance(res, dict):
+                    duck_info = res
+                    ducked = bool(res.get("ducked"))
+            except Exception as exc:
+                self.log.debug("Wake duck begin error: %s", exc)
+        with self.lock:
+            self._wake_duck_held = ducked
+            self._release_wake_duck_on_play_done = False
+            self._bump_status_locked()
+        if ducked:
+            self.log.info(
+                "Wake word detected (%s score=%.3f) -> Denon duck %.1f dB (%.1f -> %.1f dB)",
+                self.cfg.wake_word,
+                score,
+                float(duck_info.get("dropDb") or 0.0),
+                float(duck_info.get("fromDb") or 0.0),
+                float(duck_info.get("toDb") or 0.0),
+            )
+        else:
+            self.log.info(
+                "Wake word detected (%s score=%.3f) -> Denon not ducked (%s); ready chime",
+                self.cfg.wake_word,
+                score,
+                duck_info.get("reason", "off"),
+            )
+            if self.cfg.speaker_readback and self.context_readback:
+                self.play_ready_chime()
+
     def update_config(self, raw: dict[str, Any]) -> RoomVoiceConfig:
         with self.lock:
             merged = {**self.cfg.to_dict(), **(raw or {})}
@@ -1812,6 +2082,8 @@ class RoomVoiceService:
             self.cfg = next_cfg
             self.context_wake_word = next_cfg.wake_word
             self._detector.configure(next_cfg)
+            if self._oww_spotter is not None and hasattr(self._oww_spotter, "threshold"):
+                self._oww_spotter.threshold = next_cfg.wake_threshold
             if dev_changed:
                 self._wasapi_probe_misses = 0
                 self._host_api_diag_logged = False
@@ -1834,6 +2106,14 @@ class RoomVoiceService:
         return next_cfg
 
     def _ensure_model_loading_locked(self) -> None:
+        if (
+            self.cfg.wake_engine == "openwakeword"
+            and self._oww_spotter is not None
+            and not getattr(self._oww_spotter, "ready", False)
+            and not self._oww_loading
+        ):
+            self._oww_loading = True
+            threading.Thread(target=self._load_oww_worker, name="armory-voice-load-oww", daemon=True).start()
         if self._asr_transcribe_fn is not None:
             return
         want_size = self.cfg.model_size
@@ -1847,6 +2127,28 @@ class RoomVoiceService:
             name=f"armory-voice-load-{want_size}",
             daemon=True,
         ).start()
+
+    def _load_oww_worker(self) -> None:
+        try:
+            t0 = time.perf_counter()
+            ok = bool(self._oww_spotter.load())
+            dt = (time.perf_counter() - t0) * 1000.0
+            with self.lock:
+                self._oww_loading = False
+                self._bump_status_locked()
+            if ok:
+                self.log.info(
+                    "Loaded openWakeWord ONNX (%s, thr=%.2f) in %.0fms",
+                    getattr(self._oww_spotter, "model_name", "hey_jarvis"),
+                    float(getattr(self._oww_spotter, "threshold", 0.38)),
+                    dt,
+                )
+            else:
+                self.log.warning("openWakeWord unavailable (falling back to Whisper wake): %s", getattr(self._oww_spotter, "load_error", "unknown"))
+        except Exception as exc:
+            with self.lock:
+                self._oww_loading = False
+            self.log.warning("openWakeWord load error: %s", exc)
 
     def _load_model_worker(self, model_size: str) -> None:
         try:
@@ -1900,7 +2202,10 @@ class RoomVoiceService:
                 if active:
                     self.last_client_seen_mono = time.monotonic()
             if wake_word is not None and str(wake_word).strip():
-                self.context_wake_word = str(wake_word).strip().lower()
+                clean_client_wake = str(wake_word).strip().lower()
+                self._client_wake_word = clean_client_wake
+                if self.cfg.wake_engine != "openwakeword":
+                    self.context_wake_word = clean_client_wake
             if bias_phrases is not None:
                 self.bias_phrases = [str(x).strip() for x in bias_phrases if str(x).strip()][:36]
             if readback is not None:
@@ -1931,6 +2236,8 @@ class RoomVoiceService:
         self._cond.notify_all()
 
     def _effective_wake_word_locked(self) -> str:
+        if self.cfg.wake_engine == "openwakeword":
+            return (self.cfg.wake_word or "hey jarvis").strip().lower() or "hey jarvis"
         return (self.context_wake_word or self.cfg.wake_word or "armory").strip().lower() or "armory"
 
     def is_ready(self) -> bool:
@@ -1958,6 +2265,10 @@ class RoomVoiceService:
                 "modelSize": self.cfg.model_size,
                 "asrDevice": self._model_device,
                 "wakeWord": self._effective_wake_word_locked(),
+                "wakeEngine": self.cfg.wake_engine,
+                "owwReady": bool(self._oww_spotter is not None and getattr(self._oww_spotter, "ready", False)),
+                "wakeScore": round(float(getattr(self._oww_spotter, "latest_score", 0.0) or 0.0), 3),
+                "wakeDuckHeld": bool(self._wake_duck_held),
                 "device": dev_label,
                 "hostApi": self._stream_host_api or (in_dev["hostApi"] if in_dev else ""),
                 "speaker": out_dev["name"] if out_dev else self.cfg.speaker_match,
@@ -1983,20 +2294,57 @@ class RoomVoiceService:
 
     # ---------- SSE broadcast & ack ----------
 
-    def _emit_transcript(self, transcript: str, latency_ms: int, force_emit: bool = False) -> dict[str, Any]:
+    def _emit_transcript(
+        self,
+        transcript: str,
+        latency_ms: int,
+        force_emit: bool = False,
+        *,
+        from_oww: bool = False,
+    ) -> dict[str, Any]:
         clean = re.sub(r"\s+", " ", transcript or "").strip()
         now_ms = int(time.time() * 1000)
         with self.lock:
             wake = self._effective_wake_word_locked()
+            client_wake = (self._client_wake_word or wake).strip().lower() or wake
             was_armed = now_ms < self.armed_until_ms
             has_wake = matches_wake_word(clean, wake)
-            emitted = bool(clean) and (force_emit or has_wake or was_armed)
+            if from_oww:
+                cmd_tail = strip_wake_word(clean, wake)
+                if not cmd_tail:
+                    # User said lone "Hey Jarvis" and paused; keep armed + Denon ducked waiting for the command!
+                    return {
+                        "id": 0,
+                        "tsMs": now_ms,
+                        "transcript": clean,
+                        "wakeMatched": True,
+                        "emitted": False,
+                        "awaitingCommand": True,
+                        "latencyMs": int(latency_ms),
+                        "ackText": "",
+                    }
+                self.armed_until_ms = 0
+                self._oww_awaiting_cmd = False
+                display_clean = f"{format_wake_display(wake)}, {cmd_tail}"
+                if client_wake != wake and not matches_wake_word(display_clean, client_wake):
+                    sse_clean = f"{format_wake_display(client_wake)}, {cmd_tail}"
+                    sse_wake = client_wake
+                else:
+                    sse_clean = display_clean
+                    sse_wake = wake
+                has_wake = True
+                emitted = True
+            else:
+                display_clean = clean
+                sse_clean = clean
+                sse_wake = wake
+                emitted = bool(clean) and (force_emit or has_wake or was_armed)
             local_handler = self._local_command_handler if emitted else None
 
         local_res: dict[str, Any] | None = None
         if local_handler is not None:
             try:
-                local_res = local_handler(clean)
+                local_res = local_handler(display_clean)
             except Exception as exc:
                 self.log.debug("Local voice command handler error: %s", exc)
                 local_res = None
@@ -2006,12 +2354,13 @@ class RoomVoiceService:
             ack_txt = str(local_res.get("ackText") or speech_txt or "Done").strip()
             with self.lock:
                 self.armed_until_ms = 0
+                self._oww_awaiting_cmd = False
                 self.event_seq += 1
                 ev_id = self.event_seq
                 entry = {
                     "id": ev_id,
                     "tsMs": now_ms,
-                    "transcript": clean,
+                    "transcript": display_clean,
                     "wakeMatched": has_wake,
                     "emitted": True,
                     "localHandled": True,
@@ -2021,11 +2370,18 @@ class RoomVoiceService:
                 self.recent_transcripts.appendleft(entry)
                 do_readback = bool(self.cfg.speaker_readback and self.context_readback and self.cfg.room_command_readback)
             if do_readback and speech_txt:
-                self.speak_confirmation(speech_txt)
+                with self.lock:
+                    if self._wake_duck_held:
+                        self._release_wake_duck_on_play_done = True
+                self._extend_wake_duck(6.0)
+                if not self.speak_confirmation(speech_txt):
+                    self._release_wake_duck_async()
+            else:
+                self._release_wake_duck_async()
             return entry
 
         with self.lock:
-            if emitted:
+            if emitted and not from_oww:
                 if has_wake and not has_command_tail(clean, wake):
                     self.armed_until_ms = now_ms + ARM_WINDOW_MS
                 elif has_wake or was_armed:
@@ -2036,7 +2392,7 @@ class RoomVoiceService:
             entry = {
                 "id": ev_id,
                 "tsMs": now_ms,
-                "transcript": clean,
+                "transcript": display_clean,
                 "wakeMatched": has_wake,
                 "emitted": emitted,
                 "latencyMs": int(latency_ms),
@@ -2049,9 +2405,9 @@ class RoomVoiceService:
                     "type": "transcript",
                     "id": ev_id,
                     "tsMs": now_ms,
-                    "transcript": clean,
-                    "candidates": [clean],
-                    "wakeWord": wake,
+                    "transcript": sse_clean,
+                    "candidates": [sse_clean],
+                    "wakeWord": sse_wake,
                 }
                 self._events.append(evt)
                 self.seq += 1
@@ -2060,11 +2416,16 @@ class RoomVoiceService:
             else:
                 sse_count = self.sse_clients
 
-        if emitted and sse_count == 0 and self.on_fallback_transcript is not None:
-            try:
-                self.on_fallback_transcript(clean)
-            except Exception:
-                pass
+        if emitted:
+            if sse_count > 0:
+                self._schedule_wake_duck_release(2.2)
+            else:
+                if self.on_fallback_transcript is not None:
+                    try:
+                        self.on_fallback_transcript(sse_clean)
+                    except Exception:
+                        pass
+                self._schedule_wake_duck_release(0.5)
         return entry
 
     def inject_transcript(self, transcript: str) -> dict[str, Any]:
@@ -2098,6 +2459,19 @@ class RoomVoiceService:
         spoke = False
         chime_played = False
         clean_speech = str(speech or "").strip()
+        will_play = False
+        if do_readback:
+            if is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
+                will_play = (commit_mode == "chime") or bool(clean_speech)
+            elif clean_speech:
+                will_play = True
+        if will_play:
+            self._cancel_wake_duck_release_timer()
+            with self.lock:
+                if self._wake_duck_held:
+                    self._release_wake_duck_on_play_done = True
+            self._extend_wake_duck(6.0)
+
         if do_readback:
             if is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
                 if commit_mode == "chime":
@@ -2109,6 +2483,12 @@ class RoomVoiceService:
                 spoke = self.speak_confirmation(clean_speech)
             elif armed is True:
                 self.play_ready_chime()
+
+        if not spoke and armed is not True:
+            self._release_wake_duck_async()
+        elif spoke and not self._started:
+            # Synchronous playback already completed when worker thread isn't running
+            self._release_wake_duck_sync()
         return {"ok": True, "spoke": spoke, "chime": bool(chime_played)}
 
     def subscribe_sse(self, after_id: int | None = None):
@@ -2327,6 +2707,12 @@ class RoomVoiceService:
                         self._play_pcm_blocking(cpcm, csr, lead_ms=140, tail_ms=80, target_peak=0.72, kind="chime")
             except Exception as exc:
                 self.log.debug("Speaker worker error: %s", exc)
+            finally:
+                if kind in ("pcm", "tts") and self._speaker_queue.empty():
+                    with self.lock:
+                        should_rel = self._release_wake_duck_on_play_done
+                    if should_rel:
+                        self._release_wake_duck_sync()
 
     def _prewarm_tts_worker(self) -> None:
         voice = self.cfg.tts_voice
@@ -2444,6 +2830,80 @@ class RoomVoiceService:
 
     # ---------- capture & ASR loops ----------
 
+    def _enqueue_utterance(self, item: tuple[np.ndarray, bool]) -> None:
+        try:
+            self._utt_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                _ = self._utt_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._utt_queue.put_nowait(item)
+            except queue.Full:
+                pass
+
+    def _ingest_pcm16_frame(
+        self,
+        pcm16: np.ndarray,
+        *,
+        muted: bool = False,
+        now_ms: int | None = None,
+        now_mono: float | None = None,
+    ) -> None:
+        """Route 16 kHz mono float32 capture frames through openWakeWord (idle) + Silero VAD (armed) or Whisper mode."""
+        if not self._using_oww_spotter():
+            utterances = self._detector.push_samples(pcm16, muted=muted)
+            for utt in utterances:
+                self._enqueue_utterance((utt, False))
+            return
+
+        if muted:
+            self._detector.reset()
+            self._oww_spotter.reset()
+            self._oww_preroll.clear()
+            self._detector.latest_rms = 0.0
+            self._detector.latest_vad = 0.0
+            return
+
+        if pcm16.size == 0:
+            return
+        self._detector.latest_rms = float(np.sqrt(np.mean(pcm16 * pcm16)))
+        cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        cur_mono = time.monotonic() if now_mono is None else float(now_mono)
+
+        if cur_ms < self.armed_until_ms:
+            utterances = self._detector.push_samples(pcm16, muted=False)
+            for utt in utterances:
+                self._enqueue_utterance((utt, True))
+            return
+
+        # Idle in openWakeWord mode: zero Silero VAD & zero Whisper runs until wake-word triggers!
+        self._detector.latest_vad = 0.0
+        self._oww_preroll.append(pcm16.copy())
+        triggered, score = self._oww_spotter.push_samples(pcm16, now_mono=cur_mono)
+        if triggered:
+            self.armed_until_ms = cur_ms + ARM_WINDOW_MS
+            self._oww_awaiting_cmd = True
+            self._detector.reset()
+            # Seed pre-roll with ~320ms trailing audio so one-breath "Hey Jarvis, record this" never clips onset
+            tail_chunks = list(self._oww_preroll)[-10:]
+            self._oww_preroll.clear()
+            if tail_chunks:
+                tail_cat = np.concatenate(tail_chunks).astype(np.float32, copy=False)
+                n_frames = tail_cat.size // VAD_FRAME_SAMPLES
+                for i in range(max(0, n_frames - 10), n_frames):
+                    f512 = tail_cat[i * VAD_FRAME_SAMPLES : (i + 1) * VAD_FRAME_SAMPLES]
+                    self._detector._pre_roll.append(f512.copy())
+            pool = self._local_cmd_pool
+            if pool is not None and not self._stop_event.is_set():
+                try:
+                    pool.submit(self._on_oww_wake_detected, score)
+                    return
+                except Exception:
+                    pass
+            threading.Thread(target=self._on_oww_wake_detected, args=(score,), name="armory-oww-wake", daemon=True).start()
+
     def _open_stream(self, *, force_reinit: bool = False) -> bool:
         with self._audio_lock:
             if self._stream is not None:
@@ -2501,19 +2961,7 @@ class RoomVoiceService:
                         pass
                 pcm16 = resample_to_mono_16k(mono, sr)
                 muted = time.monotonic() < self._mute_until_mono
-                utterances = self._detector.push_samples(pcm16, muted=muted)
-                for utt in utterances:
-                    try:
-                        self._utt_queue.put_nowait(utt)
-                    except queue.Full:
-                        try:
-                            _ = self._utt_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            self._utt_queue.put_nowait(utt)
-                        except queue.Full:
-                            pass
+                self._ingest_pcm16_frame(pcm16, muted=muted)
 
             last_err = ""
             for ch in seen_ch:
@@ -2582,10 +3030,41 @@ class RoomVoiceService:
 
     def _capture_supervisor_loop(self) -> None:
         last_wasapi_probe = time.monotonic()
+        last_denon_refresh = 0.0
         probe_intervals = (30.0, 120.0, 600.0)
         pending_force_reinit = False
         while not self._stop_event.is_set():
             want = self.should_capture_now()
+            now_m = time.monotonic()
+            now_ms = int(time.time() * 1000)
+
+            # Auto-release wake duck if armed window expired with no command spoken
+            if (
+                self._oww_awaiting_cmd
+                and now_ms >= self.armed_until_ms
+                and not self._detector.is_user_speaking()
+            ):
+                self._oww_awaiting_cmd = False
+                self._detector.reset()
+                if self._oww_spotter is not None:
+                    self._oww_spotter.reset()
+                self._release_wake_duck_async()
+                with self.lock:
+                    self._bump_status_locked()
+
+            # Periodically refresh Denon status cache while listening & idle so wake-duck executes in 1 HTTP call
+            if (
+                want
+                and self._using_oww_spotter()
+                and not self._oww_awaiting_cmd
+                and not self._wake_duck_held
+                and (now_m - last_denon_refresh) >= 3.0
+            ):
+                last_denon_refresh = now_m
+                ref_fn = self._wake_duck_cbs.get("refresh")
+                if callable(ref_fn):
+                    threading.Thread(target=ref_fn, name="armory-denon-cache", daemon=True).start()
+
             if want:
                 if self._stream is None:
                     if not self._open_stream(force_reinit=pending_force_reinit):
@@ -2665,11 +3144,15 @@ class RoomVoiceService:
     def _asr_worker_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
-                audio16 = self._utt_queue.get(timeout=0.4)
+                raw_item = self._utt_queue.get(timeout=0.4)
             except queue.Empty:
                 continue
             if self._stop_event.is_set():
                 break
+            if isinstance(raw_item, tuple) and len(raw_item) == 2:
+                audio16, from_oww = raw_item
+            else:
+                audio16, from_oww = raw_item, False
             t0 = time.perf_counter()
             try:
                 text = self._transcribe_utterance(audio16)
@@ -2682,8 +3165,8 @@ class RoomVoiceService:
             pool = self._local_cmd_pool
             if pool is not None:
                 try:
-                    pool.submit(self._emit_transcript, text, dt_ms, False)
+                    pool.submit(self._emit_transcript, text, dt_ms, False, from_oww=from_oww)
                     continue
                 except Exception:
                     pass
-            self._emit_transcript(text, latency_ms=dt_ms, force_emit=False)
+            self._emit_transcript(text, latency_ms=dt_ms, force_emit=False, from_oww=from_oww)
