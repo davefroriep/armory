@@ -5924,6 +5924,83 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_no_app_session_spoken_alerts_and_atlas_voice_auditions(self) -> None:
+        spoken: list[str] = []
+        vcfg = rv.RoomVoiceConfig(wake_word="hey jarvis", wake_engine="openwakeword", speaker_readback=True)
+        svc_v = rv.RoomVoiceService(
+            config=vcfg,
+            speak_fn=lambda txt: (spoken.append(txt), True)[1],
+            on_fallback_transcript=lambda _txt: False,
+            allow_hardware_audio=False,
+        )
+
+        # 1. No phone app connected (sse_clients == 0 and fallback False) -> speaks "App not connected"
+        em_no_app = svc_v._emit_transcript("225 for 8", latency_ms=210, from_oww=True)
+        self.assertTrue(em_no_app["emitted"])
+        self.assertEqual(em_no_app["ackText"], "App not connected")
+        self.assertEqual(spoken, ["App not connected"])
+
+        # 2. Phone app connected (sse_clients == 1) but no active workout session -> speaks "Can't find session"
+        spoken.clear()
+        svc_v.sse_clients = 1
+        svc_v.context_active = False
+        svc_v.wallboard_active = False
+        em_no_sess = svc_v._emit_transcript("record this", latency_ms=190, from_oww=True)
+        self.assertTrue(em_no_sess["emitted"])
+        self.assertEqual(em_no_sess["ackText"], "Can't find session")
+        self.assertEqual(spoken, ["Can't find session"])
+
+        # 3. Active workout session -> does NOT interrupt with no-session alert (waits for phone ack)
+        spoken.clear()
+        svc_v.context_active = True
+        em_ok = svc_v._emit_transcript("225 for 8", latency_ms=180, from_oww=True)
+        self.assertTrue(em_ok["emitted"])
+        self.assertEqual(em_ok["ackText"], "")
+        self.assertEqual(spoken, [])
+
+        # 4. High-tier Atlas voice config validation (Kokoro blends + ElevenLabs + beamSize) & Audition API
+        cfg_el = rv.RoomVoiceConfig.from_dict({
+            "ttsVoice": "elevenlabs:pNInz6obpgDQGcFmaJgB",
+            "modelSize": "medium.en",
+            "beamSize": 3,
+        })
+        self.assertEqual(cfg_el.tts_voice, "elevenlabs:pNInz6obpgDQGcFmaJgB")
+        self.assertEqual(cfg_el.model_size, "medium.en")
+        self.assertEqual(cfg_el.beam_size, 3)
+
+        cfg_blend = rv.RoomVoiceConfig.from_dict({"ttsVoice": "kokoro:onyx_fenrir_epic"})
+        self.assertEqual(cfg_blend.tts_voice, "kokoro:onyx_fenrir_epic")
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_audition_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            page = client.get("/voice-auditions")
+            self.assertEqual(page.status_code, 200)
+            html = page.get_data(as_text=True)
+            self.assertIn("Atlas Voice Audition Booth", html)
+            self.assertIn("/api/voice/auditions", html)
+
+            aud = client.get("/api/voice/auditions").get_json()
+            self.assertTrue(aud["ok"])
+            slugs = {v["slug"] for v in aud["voices"]}
+            self.assertIn("kokoro_am_onyx", slugs)
+            self.assertIn("kokoro_onyx_fenrir_epic", slugs)
+
+            # Cached WAV delivery via /api/voice/auditions/<slug>.wav
+            aud_dir = tmp / "voice_auditions"
+            aud_dir.mkdir(parents=True, exist_ok=True)
+            (aud_dir / "kokoro_am_onyx.wav").write_bytes(b"RIFF" + b"\x00" * 1200)
+            wav_res = client.get("/api/voice/auditions/kokoro_am_onyx.wav")
+            self.assertEqual(wav_res.status_code, 200)
+            self.assertEqual(wav_res.mimetype, "audio/wav")
+            self.assertEqual(client.get("/api/voice/auditions/nonexistent.wav").status_code, 404)
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

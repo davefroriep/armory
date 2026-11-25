@@ -29,6 +29,8 @@ import sys
 import threading
 import time
 from typing import Any, Callable, Sequence
+import urllib.parse
+import urllib.request
 import wave
 
 import numpy as np
@@ -49,13 +51,154 @@ HOST_API_PREFERENCE = (
     "Windows WDM-KS",
 )
 DEFAULT_TTS_VOICE = "kokoro:am_michael"
+KOKORO_BLENDS: dict[str, dict[str, float]] = {
+    "onyx_fenrir_epic": {"am_onyx": 0.55, "am_fenrir": 0.45},
+    "onyx_george_hbo": {"am_onyx": 0.55, "bm_george": 0.45},
+}
+ATLAS_VOICE_CATALOG: tuple[dict[str, str], ...] = (
+    # Local GPU Instant (~70-110 ms, $0, 100% offline)
+    {
+        "id": "kokoro:am_onyx",
+        "slug": "kokoro_am_onyx",
+        "name": "Onyx",
+        "tier": "local",
+        "engine": "Kokoro GPU",
+        "latency": "~80 ms · Offline · Free",
+        "vibe": "Deep commanding baritone — grounded, heavy Atlas presence.",
+    },
+    {
+        "id": "kokoro:am_fenrir",
+        "slug": "kokoro_am_fenrir",
+        "name": "Fenrir",
+        "tier": "local",
+        "engine": "Kokoro GPU",
+        "latency": "~80 ms · Offline · Free",
+        "vibe": "Bold, resonant, slightly punchier power-announcer cadence.",
+    },
+    {
+        "id": "kokoro:onyx_fenrir_epic",
+        "slug": "kokoro_onyx_fenrir_epic",
+        "name": "Onyx + Fenrir Blend",
+        "tier": "local",
+        "engine": "Kokoro GPU Blend",
+        "latency": "~85 ms · Offline · Free",
+        "vibe": "55/45 custom blend — deep Onyx rumble + Fenrir punch.",
+    },
+    {
+        "id": "kokoro:onyx_george_hbo",
+        "slug": "kokoro_onyx_george_hbo",
+        "name": "Onyx + George Blend",
+        "tier": "local",
+        "engine": "Kokoro GPU Blend",
+        "latency": "~85 ms · Offline · Free",
+        "vibe": "55/45 deep baritone with subtle British Jarvis polish.",
+    },
+    {
+        "id": "kokoro:bm_george",
+        "slug": "kokoro_bm_george",
+        "name": "George (UK)",
+        "tier": "local",
+        "engine": "Kokoro GPU",
+        "latency": "~80 ms · Offline · Free",
+        "vibe": "Crisp British AI commander (closest local Jarvis feel).",
+    },
+    {
+        "id": "kokoro:am_adam",
+        "slug": "kokoro_am_adam",
+        "name": "Adam (Local)",
+        "tier": "local",
+        "engine": "Kokoro GPU",
+        "latency": "~80 ms · Offline · Free",
+        "vibe": "Clean, assertive American male voice.",
+    },
+    {
+        "id": "kokoro:am_michael",
+        "slug": "kokoro_am_michael",
+        "name": "Michael (Current)",
+        "tier": "local",
+        "engine": "Kokoro GPU",
+        "latency": "~80 ms · Offline · Free",
+        "vibe": "Your current baseline voice for A/B comparison.",
+    },
+    # ElevenLabs Flash v2.5 Studio HD (~300-450 ms fresh, 0 ms cached locally)
+    {
+        "id": "elevenlabs:pNInz6obpgDQGcFmaJgB",
+        "slug": "el_adam",
+        "name": "Adam Studio",
+        "tier": "elevenlabs",
+        "engine": "ElevenLabs Flash v2.5",
+        "latency": "~350 ms · 0 ms cached",
+        "vibe": "Dominant, firm, ultra-clean studio strength coach.",
+    },
+    {
+        "id": "elevenlabs:nPczCjzI2devNBz1zQrb",
+        "slug": "el_brian",
+        "name": "Brian Studio",
+        "tier": "elevenlabs",
+        "engine": "ElevenLabs Flash v2.5",
+        "latency": "~350 ms · 0 ms cached",
+        "vibe": "Deep, resonant broadcast voice — effortless authority.",
+    },
+    {
+        "id": "elevenlabs:SOYHLrjzK2X1ezoPC6cr",
+        "slug": "el_harry",
+        "name": "Harry Studio",
+        "tier": "elevenlabs",
+        "engine": "ElevenLabs Flash v2.5",
+        "latency": "~350 ms · 0 ms cached",
+        "vibe": "Fierce, intense warrior energy — true Atlas vibe.",
+    },
+    {
+        "id": "elevenlabs:pqHfZKP75CvOlQylNhV4",
+        "slug": "el_bill",
+        "name": "Bill Studio",
+        "tier": "elevenlabs",
+        "engine": "ElevenLabs Flash v2.5",
+        "latency": "~350 ms · 0 ms cached",
+        "vibe": "Mature, gravelly, wise authoritative baritone.",
+    },
+    {
+        "id": "elevenlabs:IKne3meq5aSn9XLyUdCD",
+        "slug": "el_charlie",
+        "name": "Charlie Studio",
+        "tier": "elevenlabs",
+        "engine": "ElevenLabs Flash v2.5",
+        "latency": "~350 ms · 0 ms cached",
+        "vibe": "Deep, confident, natural conversational partner.",
+    },
+    {
+        "id": "elevenlabs:JBFqnCBsd6RMkjVDRZzb",
+        "slug": "el_george",
+        "name": "George Studio (UK)",
+        "tier": "elevenlabs",
+        "engine": "ElevenLabs Flash v2.5",
+        "latency": "~350 ms · 0 ms cached",
+        "vibe": "Warm, rich Hollywood-grade British AI.",
+    },
+)
 TTS_VOICES = (
     "kokoro:am_michael",
     "kokoro:am_onyx",
     "kokoro:am_fenrir",
+    "kokoro:onyx_fenrir_epic",
+    "kokoro:onyx_george_hbo",
+    "kokoro:bm_george",
+    "kokoro:am_adam",
+    "kokoro:am_echo",
+    "kokoro:am_eric",
+    "elevenlabs:pNInz6obpgDQGcFmaJgB",
+    "elevenlabs:nPczCjzI2devNBz1zQrb",
+    "elevenlabs:SOYHLrjzK2X1ezoPC6cr",
+    "elevenlabs:pqHfZKP75CvOlQylNhV4",
+    "elevenlabs:IKne3meq5aSn9XLyUdCD",
+    "elevenlabs:JBFqnCBsd6RMkjVDRZzb",
+    "elevenlabs:onwK4e9ZLuTAKqWW03F9",
     "en-US-AndrewMultilingualNeural",
     "en-US-AvaMultilingualNeural",
 )
+_ELEVENLABS_VOICE_RE = re.compile(r"^elevenlabs:[A-Za-z0-9_-]{6,64}$")
+_ELEVENLABS_LIVE_MODEL = "eleven_flash_v2_5"
+_ELEVENLABS_TIMEOUT_SEC = 5.0
 _LEGACY_TTS_VOICE_MAP = {
     "en-US-AndrewNeural": "en-US-AndrewMultilingualNeural",
     "en-US-AvaNeural": "en-US-AvaMultilingualNeural",
@@ -64,6 +207,8 @@ _LEGACY_TTS_VOICE_MAP = {
 _KOKORO_NEGATIVE_TTL_SEC = 60.0
 _EDGE_TTS_TIMEOUT_SEC = 3.5
 PREWARM_TTS_PHRASES: tuple[str, ...] = (
+    "App not connected",
+    "Can't find session",
     "Armory room mic ready",
     "Armory mic on",
     "Didn't catch that",
@@ -340,6 +485,7 @@ class RoomVoiceConfig:
     speaker_match: str = "PowerConf S330"
     listen_mode: str = "workout"  # "workout" | "always"
     model_size: str = "small.en"  # empirically 18/18 (100%) over gym music on GTX 1650 CUDA
+    beam_size: int = 1
     wake_word: str = "armory"
     wake_engine: str = "whisper"  # "whisper" | "openwakeword"
     wake_threshold: float = 0.38
@@ -360,6 +506,7 @@ class RoomVoiceConfig:
             "speakerMatch": self.speaker_match,
             "listenMode": self.listen_mode,
             "modelSize": self.model_size,
+            "beamSize": int(self.beam_size),
             "wakeWord": self.wake_word,
             "wakeEngine": self.wake_engine,
             "wakeThreshold": round(float(self.wake_threshold), 2),
@@ -381,13 +528,20 @@ class RoomVoiceConfig:
         mode_raw = str(raw.get("listenMode", "workout")).strip().lower()
         listen_mode = "always" if mode_raw == "always" else "workout"
         model_raw = str(raw.get("modelSize", "small.en")).strip()
-        model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en") else "small.en"
+        model_size = model_raw if model_raw in ("tiny.en", "base.en", "small.en", "medium.en", "distil-large-v3") else "small.en"
+        try:
+            beam_size = max(1, min(5, int(raw.get("beamSize", 1) or 1)))
+        except (TypeError, ValueError):
+            beam_size = 1
         wake = str(raw.get("wakeWord") or "armory").strip().lower() or "armory"
         eng_raw = str(raw.get("wakeEngine", "whisper") or "whisper").strip().lower()
         wake_engine = "openwakeword" if eng_raw in ("openwakeword", "oww") else "whisper"
         tts_raw = str(raw.get("ttsVoice") or DEFAULT_TTS_VOICE).strip()
         tts_raw = _LEGACY_TTS_VOICE_MAP.get(tts_raw, tts_raw)
-        tts_voice = tts_raw if tts_raw in TTS_VOICES else DEFAULT_TTS_VOICE
+        if tts_raw in TTS_VOICES or _ELEVENLABS_VOICE_RE.match(tts_raw):
+            tts_voice = tts_raw
+        else:
+            tts_voice = DEFAULT_TTS_VOICE
         commit_raw = str(raw.get("setCommitMode", "voice")).strip().lower()
         set_commit_mode = "chime" if commit_raw == "chime" else "voice"
         return cls(
@@ -396,6 +550,7 @@ class RoomVoiceConfig:
             speaker_match=str(raw.get("speakerMatch", "PowerConf S330") or "").strip(),
             listen_mode=listen_mode,
             model_size=model_size,
+            beam_size=beam_size,
             wake_word=wake,
             wake_engine=wake_engine,
             wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.38) or 0.38), 0.15, 0.90),
@@ -1210,18 +1365,20 @@ def get_shared_kokoro(models_dir: Path | None) -> tuple[Any, str]:
 
 
 class _NeuralTtsSynthesizer:
-    """Kokoro GPU + Microsoft Neural `edge-tts` synthesizer with persistent WAV cache (zero SAPI)."""
+    """Kokoro GPU + ElevenLabs Flash v2.5 + Microsoft Neural `edge-tts` synthesizer with persistent WAV cache."""
 
     def __init__(
         self,
         cache_dir: Path | None = None,
-        max_cache: int = 64,
+        max_cache: int = 96,
         models_dir: Path | None = None,
+        secrets_path: Path | None = None,
     ) -> None:
         self.cache_dir = cache_dir
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.models_dir = Path(models_dir) if models_dir is not None else None
+        self.secrets_path = Path(secrets_path) if secrets_path is not None else None
         self._lock = threading.Lock()
         self._kokoro_lock = threading.Lock()
         self._kokoro: Any = None
@@ -1240,11 +1397,39 @@ class _NeuralTtsSynthesizer:
         return str(voice or "").strip().lower().startswith("kokoro:")
 
     @staticmethod
+    def is_elevenlabs_voice(voice: str) -> bool:
+        return bool(_ELEVENLABS_VOICE_RE.match(str(voice or "").strip()))
+
+    @staticmethod
     def kokoro_speaker_name(voice: str) -> str:
         raw = str(voice or "").strip()
         if ":" in raw:
             raw = raw.split(":", 1)[1].strip()
         return raw or "am_michael"
+
+    @staticmethod
+    def elevenlabs_voice_id(voice: str) -> str:
+        raw = str(voice or "").strip()
+        if ":" in raw:
+            raw = raw.split(":", 1)[1].strip()
+        return raw
+
+    def _load_elevenlabs_key(self) -> str:
+        env_key = str(os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+        candidates: list[Path] = []
+        if self.secrets_path is not None:
+            candidates.append(self.secrets_path)
+        candidates.append(Path(r"S:\ArmoryCam\tts_secrets.json"))
+        for p in candidates:
+            if p.is_file():
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    k = str((raw or {}).get("elevenlabsKey") or "").strip()
+                    if k:
+                        return k
+                except Exception:
+                    pass
+        return env_key
 
     def close(self) -> None:
         with self._kokoro_lock:
@@ -1328,11 +1513,66 @@ class _NeuralTtsSynthesizer:
         kokoro = self._ensure_kokoro()
         speaker = self.kokoro_speaker_name(voice)
         eff_speed = max(0.7, min(1.5, float(speed or 1.0)))
-        pcm, sr = kokoro.create(text, voice=speaker, speed=eff_speed, lang="en-us")
+        voice_arg: Any = speaker
+        if speaker in KOKORO_BLENDS:
+            style_vec = None
+            for base_v, w in KOKORO_BLENDS[speaker].items():
+                vec = kokoro.get_voice_style(base_v) * float(w)
+                style_vec = vec if style_vec is None else (style_vec + vec)
+            if style_vec is not None:
+                voice_arg = style_vec
+        pcm, sr = kokoro.create(text, voice=voice_arg, speed=eff_speed, lang="en-us")
         arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
         if arr.size == 0:
             raise RuntimeError("Empty kokoro-onnx audio")
         return arr, int(sr)
+
+    def _synth_elevenlabs_pcm(self, text: str, voice: str, speed: float = 1.0) -> tuple[np.ndarray, int]:
+        import av
+
+        el_key = self._load_elevenlabs_key()
+        if not el_key:
+            raise RuntimeError("ElevenLabs API key not configured")
+        el_vid = self.elevenlabs_voice_id(voice)
+        url = (
+            f"https://api.elevenlabs.io/v1/text-to-speech/{urllib.parse.quote(el_vid, safe='')}"
+            "?output_format=mp3_44100_128"
+        )
+        eff_speed = max(0.75, min(1.20, float(speed or 1.0)))
+        payload = json.dumps({
+            "text": text,
+            "model_id": _ELEVENLABS_LIVE_MODEL,
+            "voice_settings": {
+                "stability": 0.55,
+                "similarity_boost": 0.80,
+                "speed": round(eff_speed, 2),
+            },
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "xi-api-key": el_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=_ELEVENLABS_TIMEOUT_SEC) as resp:
+            mp3_bytes = resp.read()
+        if not mp3_bytes:
+            raise RuntimeError("Empty ElevenLabs audio")
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=24_000)
+        parts: list[np.ndarray] = []
+        with av.open(io.BytesIO(mp3_bytes), format="mp3") as container:
+            for frame in container.decode(audio=0):
+                for rf in resampler.resample(frame):
+                    parts.append(rf.to_ndarray().reshape(-1))
+            for rf in resampler.resample(None):
+                parts.append(rf.to_ndarray().reshape(-1))
+        if not parts:
+            raise RuntimeError("Decoded 0 ElevenLabs audio frames")
+        return np.concatenate(parts).astype(np.float32), 24_000
 
     @staticmethod
     def _synth_edge_pcm(text: str, voice: str, attempts: int = 2, speed: float = 1.0) -> tuple[np.ndarray, int]:
@@ -1388,11 +1628,27 @@ class _NeuralTtsSynthesizer:
         if not clean:
             return None
         eff_voice = _LEGACY_TTS_VOICE_MAP.get(voice, voice)
-        if eff_voice not in TTS_VOICES and not self.is_kokoro_voice(eff_voice):
+        if (
+            eff_voice not in TTS_VOICES
+            and not self.is_kokoro_voice(eff_voice)
+            and not self.is_elevenlabs_voice(eff_voice)
+        ):
             eff_voice = DEFAULT_TTS_VOICE
         cached = self.get_cached(clean, eff_voice, speed=speed)
         if cached is not None:
             return cached
+        if self.is_elevenlabs_voice(eff_voice):
+            try:
+                pcm, sr = self._synth_elevenlabs_pcm(clean, eff_voice, speed=speed)
+                self._put_cached(clean, eff_voice, pcm, sr, speed=speed)
+                return pcm, sr
+            except Exception:
+                try:
+                    pcm, sr = self._synth_kokoro_pcm(clean, "kokoro:am_onyx", speed=speed)
+                    self._put_cached(clean, "kokoro:am_onyx", pcm, sr, speed=speed)
+                    return pcm, sr
+                except Exception:
+                    return None
         if self.is_kokoro_voice(eff_voice):
             try:
                 pcm, sr = self._synth_kokoro_pcm(clean, eff_voice, speed=speed)
@@ -1892,7 +2148,8 @@ class RoomVoiceService:
             rms_gate=self.cfg.rms_gate,
         )
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
-        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, models_dir=models_dir)
+        secrets_path = (root_dir / "tts_secrets.json") if root_dir is not None else None
+        self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, models_dir=models_dir, secrets_path=secrets_path)
         self._winmm_player = _WinMmSpeakerPlayer() if sys.platform == "win32" else None
         self.ab = VoiceAbTracker(root_dir=root_dir)
 
@@ -2413,19 +2670,48 @@ class RoomVoiceService:
                 self.seq += 1
                 self._cond.notify_all()
                 sse_count = self.sse_clients
+                ctx_active = bool(self.context_active or self.wallboard_active)
+                do_alert = bool(self.cfg.speaker_readback and not force_emit)
             else:
                 sse_count = self.sse_clients
+                ctx_active = bool(self.context_active or self.wallboard_active)
+                do_alert = False
 
         if emitted:
             if sse_count > 0:
-                self._schedule_wake_duck_release(2.2)
+                if not ctx_active and do_alert:
+                    alert_txt = "Can't find session"
+                    with self.lock:
+                        entry["ackText"] = alert_txt
+                        if self._wake_duck_held:
+                            self._release_wake_duck_on_play_done = True
+                    self._extend_wake_duck(5.0)
+                    if not self.speak_confirmation(alert_txt):
+                        self._schedule_wake_duck_release(0.5)
+                    elif not self._started:
+                        self._release_wake_duck_sync()
+                else:
+                    self._schedule_wake_duck_release(2.2)
             else:
+                delivered = False
                 if self.on_fallback_transcript is not None:
                     try:
-                        self.on_fallback_transcript(sse_clean)
+                        delivered = bool(self.on_fallback_transcript(sse_clean))
                     except Exception:
-                        pass
-                self._schedule_wake_duck_release(0.5)
+                        delivered = False
+                if not delivered and do_alert:
+                    alert_txt = "App not connected"
+                    with self.lock:
+                        entry["ackText"] = alert_txt
+                        if self._wake_duck_held:
+                            self._release_wake_duck_on_play_done = True
+                    self._extend_wake_duck(5.0)
+                    if not self.speak_confirmation(alert_txt):
+                        self._schedule_wake_duck_release(0.5)
+                    elif not self._started:
+                        self._release_wake_duck_sync()
+                else:
+                    self._schedule_wake_duck_release(0.5)
         return entry
 
     def inject_transcript(self, transcript: str) -> dict[str, Any]:
@@ -3119,11 +3405,12 @@ class RoomVoiceService:
             return ""
         else:
             prepared = prepare_asr_audio(audio16)
+            eff_beam = max(1, min(5, int(self.cfg.beam_size or 1)))
             segs, _info = model.transcribe(
                 prepared,
                 language="en",
-                beam_size=1,
-                best_of=1,
+                beam_size=eff_beam,
+                best_of=eff_beam,
                 temperature=0.0,
                 condition_on_previous_text=False,
                 vad_filter=False,

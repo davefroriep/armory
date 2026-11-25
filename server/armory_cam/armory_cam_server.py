@@ -47,9 +47,9 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
 try:
-    from .room_voice import RoomVoiceConfig, RoomVoiceService
+    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService
 except ImportError:
-    from room_voice import RoomVoiceConfig, RoomVoiceService
+    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService
 
 try:
     from .room_audio import RoomAudioRecorder
@@ -57,9 +57,9 @@ except ImportError:
     from room_audio import RoomAudioRecorder
 
 try:
-    from .house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
+    from .house_audio import HouseAudioConfig, HouseAudioManager, encode_mono_pcm_to_wav, validate_sfx_filename
 except ImportError:
-    from house_audio import HouseAudioConfig, HouseAudioManager, validate_sfx_filename
+    from house_audio import HouseAudioConfig, HouseAudioManager, encode_mono_pcm_to_wav, validate_sfx_filename
 
 try:
     from .display_control import GymDisplayController, GymDisplaysConfig, parse_display_voice_command
@@ -2961,14 +2961,14 @@ class ArmoryCamService:
             "preRestoreBackup": str(pre_dir) if pre_dir.exists() else "",
         }
 
-    def _forward_voice_to_wallboard_source(self, transcript: str) -> None:
+    def _forward_voice_to_wallboard_source(self, transcript: str) -> bool:
         clean = str(transcript or "").strip()
         if not clean:
-            return
+            return False
         with self.wallboard.cond:
             target_base = self.wallboard.source_url
         if not target_base:
-            return
+            return False
         req = urllib.request.Request(
             f"{target_base}/api/voice",
             data=json.dumps({"transcript": clean}).encode("utf-8"),
@@ -2976,10 +2976,10 @@ class ArmoryCamService:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=2.0):
-                pass
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                return int(getattr(resp, "status", 200)) < 400
         except Exception:
-            pass
+            return False
 
     def effective_wallboard_url(self) -> str:
         with self.lock:
@@ -8670,16 +8670,33 @@ DASHBOARD_HTML = """<!doctype html>
             <div>
               <label>Speaker Voice</label>
               <select id="vxTtsVoice">
-                <option value="kokoro:am_michael">Michael (Local GPU — Fastest)</option>
-                <option value="kokoro:am_onyx">Onyx (Local GPU Deep Male)</option>
-                <option value="kokoro:am_fenrir">Fenrir (Local GPU Bold Male)</option>
-                <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural)</option>
-                <option value="en-US-AvaMultilingualNeural">Ava (Cloud Neural Female)</option>
+                <optgroup label="Local GPU Instant (~80 ms · Offline)">
+                  <option value="kokoro:am_onyx">Onyx (Deep Commanding Baritone)</option>
+                  <option value="kokoro:am_fenrir">Fenrir (Bold Resonant)</option>
+                  <option value="kokoro:onyx_fenrir_epic">Onyx + Fenrir Blend (Atlas)</option>
+                  <option value="kokoro:onyx_george_hbo">Onyx + George Blend (Commander)</option>
+                  <option value="kokoro:bm_george">George (British AI)</option>
+                  <option value="kokoro:am_adam">Adam (Assertive American)</option>
+                  <option value="kokoro:am_michael">Michael (Baseline — Fastest)</option>
+                </optgroup>
+                <optgroup label="ElevenLabs Flash v2.5 Studio HD (~350 ms · 0 ms Cached)">
+                  <option value="elevenlabs:pNInz6obpgDQGcFmaJgB">Adam Studio (Dominant, Firm)</option>
+                  <option value="elevenlabs:nPczCjzI2devNBz1zQrb">Brian Studio (Deep Broadcast)</option>
+                  <option value="elevenlabs:SOYHLrjzK2X1ezoPC6cr">Harry Studio (Fierce Warrior)</option>
+                  <option value="elevenlabs:pqHfZKP75CvOlQylNhV4">Bill Studio (Authoritative Baritone)</option>
+                  <option value="elevenlabs:IKne3meq5aSn9XLyUdCD">Charlie Studio (Deep Confident)</option>
+                  <option value="elevenlabs:JBFqnCBsd6RMkjVDRZzb">George Studio (Warm British)</option>
+                  <option value="elevenlabs:onwK4e9ZLuTAKqWW03F9">Daniel Studio (Steady Broadcaster)</option>
+                </optgroup>
+                <optgroup label="Microsoft Cloud Neural">
+                  <option value="en-US-AndrewMultilingualNeural">Andrew (Cloud Neural)</option>
+                  <option value="en-US-AvaMultilingualNeural">Ava (Cloud Neural Female)</option>
+                </optgroup>
               </select>
             </div>
             <div>
               <label id="vxModelLbl">Whisper Model</label>
-              <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (most accurate)</option></select>
+              <select id="vxModel"><option value="base.en">base.en (~1.2s, balanced)</option><option value="tiny.en">tiny.en (fastest)</option><option value="small.en">small.en (accurate)</option><option value="medium.en">medium.en (deepest)</option></select>
             </div>
             <div>
               <label>VAD Threshold (0.15–0.90)</label>
@@ -8688,7 +8705,8 @@ DASHBOARD_HTML = """<!doctype html>
           </div>
           <div class="ctrl-row" style="margin-top:10px">
             <button class="btn" id="vxSaveBtn" type="button">Save Voice</button>
-            <button class="btn ok" id="vxTestBtn" type="button">Test Mic (60s)</button>
+            <a class="btn ok" id="vxAuditionLink" href="/voice-auditions" target="_blank" style="text-decoration:none">🎧 Audition Atlas Voices</a>
+            <button class="btn sec" id="vxTestBtn" type="button">Test Mic (60s)</button>
             <button class="btn sec" id="vxSpeakBtn" type="button">Test Speaker</button>
             <button class="btn sec" id="vxInjectBtn" type="button">Send &ldquo;Armory check&rdquo;</button>
             <span id="vxOut" style="color:var(--mut);font-size:12px"></span>
@@ -15195,6 +15213,229 @@ def _parse_num(val: Any, default: Any, lo: float, hi: float, *, as_int: bool = F
     return int(round(clamped)) if as_int else clamped
 
 
+_VOICE_AUDITIONS_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atlas Voice Auditions — Armory Hub</title>
+<style>
+  :root{--bg:#0b1220;--card:#111b2e;--card2:#0f172a;--line:#23324d;--fg:#e2e8f0;--mut:#94a3b8;--accent:#38bdf8;--ok:#22c55e;--amber:#f59e0b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding:18px}
+  .wrap{max-width:1120px;margin:0 auto}
+  .top{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+  h1{margin:0;font-size:22px;letter-spacing:-.01em}
+  .sub{color:var(--mut);font-size:13px;margin-top:2px}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:700;background:#1e293b;border:1px solid var(--line);color:#cbd5e1}
+  .pill.ok{background:rgba(34,197,94,.16);border-color:rgba(34,197,94,.5);color:#86efac}
+  .pill.pro{background:rgba(56,189,248,.14);border-color:rgba(56,189,248,.45);color:#7dd3fc}
+  .bar{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:18px}
+  .bar .grow{flex:1 1 320px}
+  label{display:block;font-size:11px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px}
+  input[type=text]{width:100%;background:#09101d;border:1px solid var(--line);border-radius:8px;color:var(--fg);padding:9px 11px;font:14px/1.2 inherit}
+  .sec-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:18px 0 10px}
+  .sec-title h2{margin:0;font-size:16px}
+  .sec-title span{font-size:12px;color:var(--mut)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:12px}
+  .vcard{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:13px 14px;display:flex;flex-direction:column;gap:8px;transition:border-color .15s,box-shadow .15s}
+  .vcard.active{border-color:var(--ok);box-shadow:0 0 0 1px rgba(34,197,94,.35)}
+  .vcard.playing{border-color:var(--accent);box-shadow:0 0 0 1px rgba(56,189,248,.45)}
+  .vhead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .vname{font-size:15px;font-weight:800}
+  .vmeta{font-size:11px;color:var(--mut);display:flex;gap:8px;flex-wrap:wrap}
+  .vvibe{font-size:13px;color:#cbd5e1;min-height:36px}
+  .vbtns{display:flex;gap:7px;flex-wrap:wrap;margin-top:2px}
+  .btn{border:1px solid var(--line);background:#1b2942;color:var(--fg);border-radius:8px;padding:7px 11px;font:600 12px/1.1 inherit;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px}
+  .btn:hover{background:#243554}
+  .btn.pri{background:#0284c7;border-color:#0ea5e9;color:#fff}
+  .btn.pri:hover{background:#0369a1}
+  .btn.ok{background:rgba(34,197,94,.18);border-color:rgba(34,197,94,.55);color:#86efac}
+  .btn:disabled{opacity:.55;cursor:wait}
+  #statusMsg{font-size:12px;color:var(--mut);min-height:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>🎧 Atlas Voice Audition Booth</h1>
+      <div class="sub">Compare instant local GPU Kokoro voices vs. ElevenLabs Flash v2.5 Studio HD voices — tap any sample, then set your favorite live.</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span id="activeBadge" class="pill ok">Loading…</span>
+      <a class="btn" href="/#audio">← Back to Audio &amp; Voice</a>
+    </div>
+  </div>
+
+  <div class="bar">
+    <div class="grow">
+      <label for="phraseIn">Audition Line (default phrase plays instantaneously from pre-rendered WAVs)</label>
+      <input id="phraseIn" type="text" value="Atlas online. 225 for 8, locked in. Recording Rack Cam. App not connected.">
+    </div>
+    <button class="btn" id="resetPhraseBtn" type="button">Reset Line</button>
+    <button class="btn" id="stopBtn" type="button">⏹ Stop Audio</button>
+  </div>
+  <div id="statusMsg"></div>
+
+  <div class="sec-title">
+    <h2>⚡ Local GPU Instant Voices (Kokoro ONNX)</h2>
+    <span>~80 ms generation · $0 forever · 100% offline on GTX 1650</span>
+  </div>
+  <div class="grid" id="localGrid"></div>
+
+  <div class="sec-title">
+    <h2>🎙️ ElevenLabs Flash v2.5 Studio HD Voices</h2>
+    <span>~350 ms fresh · 0 ms on repeat phrases via OptiPlex WAV cache · Uses your live API key</span>
+  </div>
+  <div class="grid" id="elGrid"></div>
+</div>
+<audio id="player" preload="none"></audio>
+<script>
+let catalog = [];
+let activeVoice = '';
+let defaultText = '';
+let playingSlug = '';
+const player = document.getElementById('player');
+const phraseIn = document.getElementById('phraseIn');
+const statusMsg = document.getElementById('statusMsg');
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function updateActiveBadge() {
+  const hit = catalog.find(v => v.id === activeVoice);
+  const el = document.getElementById('activeBadge');
+  el.textContent = hit ? `Live Voice: ${hit.name} (${hit.engine})` : `Live Voice: ${activeVoice || 'unknown'}`;
+}
+
+function renderGrids() {
+  updateActiveBadge();
+  const buildCard = (v) => {
+    const isAct = v.id === activeVoice;
+    const isPlay = v.slug === playingSlug;
+    return `<div class="vcard ${isAct ? 'active' : ''} ${isPlay ? 'playing' : ''}" data-slug="${esc(v.slug)}">
+      <div class="vhead">
+        <div class="vname">${esc(v.name)}</div>
+        <span class="pill ${isAct ? 'ok' : (v.tier === 'elevenlabs' ? 'pro' : '')}">${isAct ? 'LIVE ACTIVE' : esc(v.engine)}</span>
+      </div>
+      <div class="vmeta"><span>${esc(v.latency)}</span></div>
+      <div class="vvibe">${esc(v.vibe)}</div>
+      <div class="vbtns">
+        <button class="btn pri" type="button" data-play="${esc(v.slug)}">${isPlay ? '🔊 Playing…' : '▶ Play Here'}</button>
+        <button class="btn" type="button" data-gym="${esc(v.id)}">📢 Play in Gym</button>
+        <button class="btn ${isAct ? 'ok' : ''}" type="button" data-use="${esc(v.id)}">${isAct ? '✓ Active' : 'Use This Voice'}</button>
+      </div>
+    </div>`;
+  };
+  document.getElementById('localGrid').innerHTML = catalog.filter(v => v.tier === 'local').map(buildCard).join('');
+  const elVoices = catalog.filter(v => v.tier === 'elevenlabs');
+  document.getElementById('elGrid').innerHTML = elVoices.length
+    ? elVoices.map(buildCard).join('')
+    : '<div style="color:var(--mut);font-size:13px">Add an ElevenLabs API key in Show Lab to unlock Studio HD voices.</div>';
+}
+
+async function playSample(slug) {
+  const v = catalog.find(x => x.slug === slug);
+  if (!v) return;
+  const txt = phraseIn.value.trim();
+  const qs = txt && txt !== defaultText ? `?text=${encodeURIComponent(txt)}&t=${Date.now()}` : '';
+  playingSlug = slug;
+  statusMsg.textContent = `Playing ${v.name} (${v.engine})…`;
+  renderGrids();
+  try {
+    player.pause();
+    player.src = `${v.url}${qs}`;
+    await player.play();
+  } catch (err) {
+    playingSlug = '';
+    statusMsg.textContent = `Playback error for ${v.name}: ${err && err.message ? err.message : err}`;
+    renderGrids();
+  }
+}
+
+async function playInGym(voiceId, btn) {
+  const v = catalog.find(x => x.id === voiceId);
+  const txt = phraseIn.value.trim() || defaultText;
+  if (btn) btn.disabled = true;
+  statusMsg.textContent = `Playing ${v ? v.name : voiceId} on gym speakers…`;
+  try {
+    const r = await fetch('/api/voice/auditions/play-gym', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ voiceId, text: txt }),
+    }).then(x => x.json());
+    statusMsg.textContent = r.ok ? `✓ Played ${v ? v.name : voiceId} in gym.` : `✗ ${r.error || 'Gym playback unavailable'}`;
+  } catch {
+    statusMsg.textContent = '✗ Gym playback request failed.';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function setLiveVoice(voiceId, btn) {
+  const v = catalog.find(x => x.id === voiceId);
+  if (btn) btn.disabled = true;
+  statusMsg.textContent = `Setting live voice to ${v ? v.name : voiceId}…`;
+  try {
+    const r = await fetch('/api/voice/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ ttsVoice: voiceId }),
+    }).then(x => x.json());
+    if (r && r.ok) {
+      activeVoice = (r.config && r.config.ttsVoice) || voiceId;
+      statusMsg.textContent = `✓ Live Room Voice set to ${v ? v.name : voiceId}!`;
+      renderGrids();
+    } else {
+      statusMsg.textContent = '✗ Could not save voice.';
+    }
+  } catch {
+    statusMsg.textContent = '✗ Failed updating voice.';
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+player.addEventListener('ended', () => {
+  playingSlug = '';
+  statusMsg.textContent = '';
+  renderGrids();
+});
+document.getElementById('stopBtn').onclick = () => {
+  player.pause();
+  player.currentTime = 0;
+  playingSlug = '';
+  statusMsg.textContent = 'Stopped.';
+  renderGrids();
+};
+document.getElementById('resetPhraseBtn').onclick = () => {
+  phraseIn.value = defaultText;
+};
+document.addEventListener('click', (ev) => {
+  const playBtn = ev.target.closest('[data-play]');
+  if (playBtn) return playSample(playBtn.dataset.play);
+  const gymBtn = ev.target.closest('[data-gym]');
+  if (gymBtn) return playInGym(gymBtn.dataset.gym, gymBtn);
+  const useBtn = ev.target.closest('[data-use]');
+  if (useBtn) return setLiveVoice(useBtn.dataset.use, useBtn);
+});
+
+(async () => {
+  const r = await fetch('/api/voice/auditions').then(x => x.json());
+  catalog = Array.isArray(r.voices) ? r.voices : [];
+  activeVoice = r.activeVoice || '';
+  defaultText = r.defaultText || phraseIn.value;
+  phraseIn.value = defaultText;
+  renderGrids();
+})();
+</script>
+</body>
+</html>
+"""
+
+
 def create_app(service: ArmoryCamService) -> Flask:
     app = Flask("armory-cam")
     app.config["MAX_CONTENT_LENGTH"] = 260 * 1024 * 1024
@@ -15571,6 +15812,83 @@ def create_app(service: ArmoryCamService) -> Flask:
         text = str(body.get("text") or "Armory room mic ready").strip()
         spoke = service.voice.speak_confirmation(text)
         return jsonify({"ok": True, "spoke": spoke, "text": text})
+
+    _AUDITION_DEFAULT_TEXT = "Atlas online. 225 for 8, locked in. Recording Rack Cam. App not connected."
+    _AUDITION_BY_SLUG = {v["slug"]: v for v in ATLAS_VOICE_CATALOG}
+    _AUDITION_BY_ID = {v["id"]: v for v in ATLAS_VOICE_CATALOG}
+
+    @app.get("/voice-auditions")
+    def voice_auditions_page() -> Response:
+        resp = Response(_VOICE_AUDITIONS_HTML, mimetype="text/html; charset=utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/voice/auditions")
+    def api_voice_auditions() -> Response:
+        has_el = bool(service.voice._tts._load_elevenlabs_key())
+        aud_dir = service.root / "voice_auditions"
+        voices_out: list[dict[str, Any]] = []
+        for item in ATLAS_VOICE_CATALOG:
+            if item["tier"] == "elevenlabs" and not has_el:
+                continue
+            wav_p = aud_dir / f"{item['slug']}.wav"
+            voices_out.append({
+                **item,
+                "cached": wav_p.is_file() and wav_p.stat().st_size > 1000,
+                "url": f"/api/voice/auditions/{item['slug']}.wav",
+            })
+        resp = jsonify({
+            "ok": True,
+            "activeVoice": service.voice.cfg.tts_voice,
+            "defaultText": _AUDITION_DEFAULT_TEXT,
+            "hasElevenlabsKey": has_el,
+            "voices": voices_out,
+        })
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/api/voice/auditions/<slug>.wav")
+    def api_voice_audition_wav(slug: str) -> Response:
+        meta = _AUDITION_BY_SLUG.get(str(slug or "").strip())
+        if meta is None:
+            return Response(status=404)
+        custom_text = str(request.args.get("text") or "").strip()
+        use_default = not custom_text or custom_text == _AUDITION_DEFAULT_TEXT
+        aud_dir = service.root / "voice_auditions"
+        wav_p = aud_dir / f"{meta['slug']}.wav"
+        if use_default and wav_p.is_file() and wav_p.stat().st_size > 1000:
+            resp = Response(wav_p.read_bytes(), mimetype="audio/wav")
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
+        phrase = custom_text if custom_text else _AUDITION_DEFAULT_TEXT
+        rendered = service.voice.synthesize_tts_pcm(phrase, voice=meta["id"])
+        if rendered is None:
+            return jsonify({"ok": False, "error": f"Could not synthesize {meta['name']}"}), 500
+        wav_bytes = encode_mono_pcm_to_wav(rendered[0], rendered[1])
+        if use_default:
+            try:
+                aud_dir.mkdir(parents=True, exist_ok=True)
+                tmp_p = wav_p.with_suffix(".wav.tmp")
+                tmp_p.write_bytes(wav_bytes)
+                tmp_p.replace(wav_p)
+            except OSError:
+                pass
+        resp = Response(wav_bytes, mimetype="audio/wav")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/voice/auditions/play-gym")
+    def api_voice_audition_play_gym() -> Response:
+        body = request.get_json(silent=True) or {}
+        voice_id = str(body.get("voiceId") or "").strip()
+        if voice_id not in _AUDITION_BY_ID:
+            return jsonify({"ok": False, "error": "Unknown voice"}), 400
+        phrase = str(body.get("text") or _AUDITION_DEFAULT_TEXT).strip() or _AUDITION_DEFAULT_TEXT
+        rendered = service.voice.synthesize_tts_pcm(phrase, voice=voice_id)
+        if rendered is None:
+            return jsonify({"ok": False, "error": "Synthesis failed"}), 500
+        ok = service.voice._play_pcm_blocking(rendered[0], rendered[1], lead_ms=160, tail_ms=120, target_peak=0.84, kind="tts")
+        return jsonify({"ok": bool(ok), "voiceId": voice_id})
 
     @app.post("/api/voice/inject")
     def api_voice_inject() -> Response:
