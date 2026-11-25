@@ -5755,6 +5755,175 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertIn("end", duck_events)
         self.assertFalse(svc._wake_duck_held)
 
+    def test_dual_stage_listening_vs_speaking_ducking_and_dashboard_api(self) -> None:
+        state = {"vol": -10.0, "cmds": []}
+
+        def fake_denon(url: str, _timeout: float) -> tuple[int, bytes]:
+            if "formMainZone_MainZoneXmlStatus.xml" in url:
+                xml = (
+                    f"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect>"
+                    f"<MasterVolume><value>{state['vol']:.1f}</value></MasterVolume>"
+                    f"<Mute><value>off</value></Mute><SurrMode><value>MULTI CH STEREO</value></SurrMode></item>"
+                )
+                return 200, xml.encode("utf-8")
+            if "formiPhoneAppDirect.xml?" in url:
+                cmd = url.split("?", 1)[1]
+                state["cmds"].append(cmd)
+                if cmd.startswith("MV"):
+                    raw = cmd[2:]
+                    val = float(raw[:2]) + (0.5 if len(raw) == 3 and raw[2] == "5" else 0.0)
+                    state["vol"] = val - 80.0
+                return 200, b""
+            return 404, b""
+
+        ha_cfg = ha.HouseAudioConfig(
+            denon_enabled=True,
+            denon_host="192.168.1.15",
+            denon_duck_enabled=True,
+            denon_duck_mode="proportional",
+            denon_duck_threshold_db=-35.0,  # Vol 45
+            denon_duck_max_drop_db=24.0,
+            denon_duck_span_db=30.0,
+            denon_duck_exponent=1.55,
+            denon_duck_floor_db=-35.0,
+            denon_output_duck_mode="proportional",
+            denon_output_duck_threshold_db=-30.0,  # Vol 50
+            denon_output_duck_max_drop_db=10.0,
+            denon_output_duck_span_db=25.0,
+            denon_output_duck_exponent=1.50,
+            denon_output_duck_floor_db=-35.0,
+            denon_ramp_steps=3,
+            denon_ramp_step_ms=0,
+        )
+        denon = ha.DenonAvrClient(lambda: ha_cfg, http_get=fake_denon, sleep_fn=lambda _s: None)
+
+        # 1. Listening Deep (-18 dB @ Vol 70 -> -28 dB) transitions smoothly to Speaking Mild (-7 dB @ Vol 70 -> -17 dB), then restores to -10 dB
+        r_wake = denon.begin_wake_duck(max_hold_sec=30.0, use_cache_sec=0.0)
+        self.assertTrue(r_wake["ducked"])
+        self.assertEqual(r_wake["stage"], "listen")
+        self.assertAlmostEqual(r_wake["dropDb"], 18.0)
+        self.assertAlmostEqual(state["vol"], -28.0)
+
+        with denon.duck_context(stage="output") as out_ctx:
+            self.assertTrue(out_ctx["ducked"])
+            self.assertTrue(out_ctx["nested"])
+            self.assertAlmostEqual(out_ctx["toDb"], -17.0)
+            self.assertAlmostEqual(state["vol"], -17.0)
+        # Still held at output level until end_wake_duck releases
+        self.assertAlmostEqual(state["vol"], -17.0)
+
+        r_end = denon.end_wake_duck()
+        self.assertTrue(r_end["restored"])
+        self.assertAlmostEqual(state["vol"], -10.0)
+        self.assertEqual(state["cmds"][-1], "MV70")
+
+        # 2. Listening Deep + Speaking Off -> music restores immediately when Jarvis replies, and end_wake_duck avoids redundant MV ramp
+        ha_cfg.denon_output_duck_mode = "off"
+        state["cmds"].clear()
+        r_wake2 = denon.begin_wake_duck(max_hold_sec=30.0, use_cache_sec=0.0)
+        self.assertTrue(r_wake2["ducked"])
+        self.assertAlmostEqual(state["vol"], -28.0)
+        with denon.duck_context(stage="output") as out_off_ctx:
+            self.assertTrue(out_off_ctx["nested"])
+            self.assertAlmostEqual(state["vol"], -10.0)
+        cmds_before_end = len(state["cmds"])
+        r_end2 = denon.end_wake_duck()
+        self.assertTrue(r_end2["restored"])
+        self.assertTrue(r_end2.get("alreadyAtSaved"))
+        self.assertEqual(len(state["cmds"]), cmds_before_end)
+
+        # 3. Listening Off + Speaking Proportional -> wake leaves Denon untouched, standalone output speech still ducks -7 dB & restores
+        ha_cfg.denon_duck_enabled = False
+        ha_cfg.denon_output_duck_mode = "proportional"
+        state["cmds"].clear()
+        r_no_wake = denon.begin_wake_duck(max_hold_sec=30.0, use_cache_sec=0.0)
+        self.assertFalse(r_no_wake["ducked"])
+        self.assertEqual(r_no_wake["reason"], "disabled")
+        self.assertEqual(state["cmds"], [])
+
+        with denon.duck_context(stage="output") as solo_out:
+            self.assertTrue(solo_out["ducked"])
+            self.assertEqual(solo_out["stage"], "output")
+            self.assertAlmostEqual(solo_out["dropDb"], 7.0)
+            self.assertAlmostEqual(state["vol"], -17.0)
+        self.assertAlmostEqual(state["vol"], -10.0)
+
+        # 4. Dashboard HTML + /api/audio/config persistence + /api/audio/denon/test-duck stage support
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_dual_duck_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.house_audio.denon._http_get = fake_denon
+            svc.house_audio.denon._sleep = lambda _s: None
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash_html = client.get("/").get_data(as_text=True)
+            for marker in (
+                "haListenPresets",
+                "haOutPresets",
+                "haListenDuckMode",
+                "haOutDuckMode",
+                "haListenPreview",
+                "haOutPreview",
+                "haTestListenDipBtn",
+                "haTestOutDipBtn",
+                "HA_LISTEN_PRESETS",
+                "HA_OUT_PRESETS",
+                "runDenonStageDip",
+            ):
+                self.assertIn(marker, dash_html)
+
+            save_res = client.post(
+                "/api/audio/config",
+                json={
+                    "denonEnabled": True,
+                    "denonHost": "192.168.1.15",
+                    "denonDuckEnabled": True,
+                    "denonDuckMode": "proportional",
+                    "denonDuckThresholdDb": -35.0,
+                    "denonDuckMaxDropDb": 24.0,
+                    "denonDuckSpanDb": 30.0,
+                    "denonDuckExponent": 1.55,
+                    "denonDuckFloorDb": -35.0,
+                    "denonOutputDuckMode": "proportional",
+                    "denonOutputDuckThresholdDb": -30.0,
+                    "denonOutputDuckMaxDropDb": 10.0,
+                    "denonOutputDuckSpanDb": 25.0,
+                    "denonOutputDuckExponent": 1.50,
+                    "denonOutputDuckFloorDb": -35.0,
+                    "denonRampStepMs": 20,
+                },
+            )
+            self.assertEqual(save_res.status_code, 200)
+            saved_cfg = save_res.get_json()["config"]
+            self.assertEqual(saved_cfg["denonDuckMode"], "proportional")
+            self.assertEqual(saved_cfg["denonOutputDuckMode"], "proportional")
+            self.assertAlmostEqual(saved_cfg["denonOutputDuckMaxDropDb"], 10.0)
+            self.assertAlmostEqual(saved_cfg["denonOutputDuckThresholdDb"], -30.0)
+
+            # Test stage="listen" (force=False) dips -18 dB at Vol 70, stage="output" dips -7 dB
+            state["vol"] = -10.0
+            t_listen = client.post("/api/audio/denon/test-duck", json={"stage": "listen", "force": False, "holdSec": 0.3}).get_json()
+            self.assertTrue(t_listen["ok"], t_listen)
+            self.assertEqual(t_listen["stage"], "listen")
+            self.assertAlmostEqual(t_listen["duck"]["dropDb"], 18.0)
+            self.assertAlmostEqual(state["vol"], -10.0)
+
+            t_out = client.post("/api/audio/denon/test-duck", json={"stage": "output", "force": False, "holdSec": 0.3}).get_json()
+            self.assertTrue(t_out["ok"], t_out)
+            self.assertEqual(t_out["stage"], "output")
+            self.assertAlmostEqual(t_out["duck"]["dropDb"], 7.0)
+            self.assertAlmostEqual(state["vol"], -10.0)
+
+            # Setting Speaking Duck to "off" skips dip when force=False
+            client.post("/api/audio/config", json={"denonOutputDuckMode": "off"})
+            t_off = client.post("/api/audio/denon/test-duck", json={"stage": "output", "force": False, "holdSec": 0.3}).get_json()
+            self.assertFalse(t_off["ok"], t_off)
+            self.assertEqual(t_off["duck"]["reason"], "output_off")
+        finally:
+            svc.stop_background()
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

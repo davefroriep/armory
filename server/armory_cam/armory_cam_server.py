@@ -8432,15 +8432,6 @@ DASHBOARD_HTML = """<!doctype html>
               </select>
             </div>
             <div><label>Denon AVR IP</label><input id="haDenonHost" type="text" value="192.168.1.15" placeholder="192.168.1.15"></div>
-            <div>
-              <label>Loud-Only Denon Duck</label>
-              <select id="haDuckEnabled">
-                <option value="0">Off (Never drop music)</option>
-                <option value="1">Loud-Only (Above threshold)</option>
-              </select>
-            </div>
-            <div><label>Loud Threshold (dB)</label><input id="haDuckThresh" type="number" min="-65" max="10" step="0.5" value="-20.0"></div>
-            <div><label>Gentle Dip (dB)</label><input id="haDuckDrop" type="number" min="0.5" max="30" step="0.5" value="5.0"></div>
             <div><label>Fire TV Cube IP</label><input id="haCubeHost" type="text" placeholder="192.168.1.xxx"></div>
             <div>
               <label>Cube Mixer APK</label>
@@ -8484,6 +8475,71 @@ DASHBOARD_HTML = """<!doctype html>
             </div>
             <div><label>Readback Gain (0.05–1.0)</label><input id="haReadGain" type="number" min="0.05" max="1.0" step="0.05" value="0.85"></div>
             <div><label>SFX Gain (0.05–1.0)</label><input id="haSfxGain" type="number" min="0.05" max="1.0" step="0.05" value="0.90"></div>
+          </div>
+
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--line)">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+              <div style="font-weight:700">Denon Voice Ducking Curves (Listening vs. Speaking)</div>
+              <div style="font-size:11px;color:var(--mut)">Denon Vol = dB + 80 (e.g. Vol 45 = -35 dB · Vol 70 = -10 dB). Pick a preset or dial custom values, then click Save Audio.</div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:12px">
+              <div style="background:rgba(15,23,42,.55);border:1px solid var(--line);border-radius:10px;padding:10px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:8px">
+                  <div style="font-weight:700;font-size:13px">🎙️ Listening Duck <span style="font-weight:400;color:var(--mut);font-size:11px">(on “Hey Jarvis” while you speak)</span></div>
+                  <button class="btn sec" id="haTestListenDipBtn" type="button" style="padding:4px 8px;font-size:11px">Test Dip</button>
+                </div>
+                <div class="ctrl-row" style="gap:6px;margin-bottom:8px" id="haListenPresets">
+                  <button class="btn sec" type="button" data-lpreset="off" style="padding:4px 9px;font-size:11px">Off</button>
+                  <button class="btn sec" type="button" data-lpreset="mild" style="padding:4px 9px;font-size:11px">Mild (-10 dB)</button>
+                  <button class="btn sec" type="button" data-lpreset="balanced" style="padding:4px 9px;font-size:11px">Balanced (-16 dB)</button>
+                  <button class="btn sec" type="button" data-lpreset="deep" style="padding:4px 9px;font-size:11px">Deep (-24 dB)</button>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px">
+                  <div>
+                    <label>Curve Mode</label>
+                    <select id="haListenDuckMode">
+                      <option value="off">Off</option>
+                      <option value="proportional">Proportional (Exp)</option>
+                      <option value="fixed">Fixed Dip</option>
+                    </select>
+                  </div>
+                  <div><label>No Duck &le; Vol</label><input id="haDuckThreshVol" type="number" min="15" max="80" step="1" value="45"></div>
+                  <div><label id="haDuckDropLbl">Max Dip @ 75 (dB)</label><input id="haDuckMaxDrop" type="number" min="1" max="35" step="0.5" value="24.0"></div>
+                  <div><label>Exp Curve (1–3)</label><input id="haDuckExp" type="number" min="1.0" max="3.0" step="0.05" value="1.55"></div>
+                  <div><label>Floor (Min Vol)</label><input id="haDuckFloorVol" type="number" min="15" max="75" step="1" value="45"></div>
+                </div>
+                <div id="haListenPreview" style="margin-top:8px;font-size:11px;color:var(--mut);background:rgba(2,6,23,.5);border-radius:6px;padding:6px 8px;line-height:1.45"></div>
+              </div>
+
+              <div style="background:rgba(15,23,42,.55);border:1px solid var(--line);border-radius:10px;padding:10px">
+                <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:8px">
+                  <div style="font-weight:700;font-size:13px">🔊 Speaking / Output Duck <span style="font-weight:400;color:var(--mut);font-size:11px">(when Jarvis replies)</span></div>
+                  <button class="btn sec" id="haTestOutDipBtn" type="button" style="padding:4px 8px;font-size:11px">Test Dip</button>
+                </div>
+                <div class="ctrl-row" style="gap:6px;margin-bottom:8px" id="haOutPresets">
+                  <button class="btn sec" type="button" data-opreset="off" style="padding:4px 9px;font-size:11px">Off</button>
+                  <button class="btn sec" type="button" data-opreset="mild" style="padding:4px 9px;font-size:11px">Mild (-10 dB)</button>
+                  <button class="btn sec" type="button" data-opreset="balanced" style="padding:4px 9px;font-size:11px">Balanced (-14 dB)</button>
+                  <button class="btn sec" type="button" data-opreset="match" style="padding:4px 9px;font-size:11px">Match Listening</button>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px">
+                  <div>
+                    <label>Curve Mode</label>
+                    <select id="haOutDuckMode">
+                      <option value="match">Match Listening</option>
+                      <option value="off">Off (No Dip)</option>
+                      <option value="proportional">Proportional (Exp)</option>
+                      <option value="fixed">Fixed Dip</option>
+                    </select>
+                  </div>
+                  <div><label>No Duck &le; Vol</label><input id="haOutDuckThreshVol" type="number" min="15" max="80" step="1" value="50"></div>
+                  <div><label id="haOutDuckDropLbl">Max Dip @ 75 (dB)</label><input id="haOutDuckMaxDrop" type="number" min="1" max="35" step="0.5" value="10.0"></div>
+                  <div><label>Exp Curve (1–3)</label><input id="haOutDuckExp" type="number" min="1.0" max="3.0" step="0.05" value="1.50"></div>
+                  <div><label>Floor (Min Vol)</label><input id="haOutDuckFloorVol" type="number" min="15" max="75" step="1" value="45"></div>
+                </div>
+                <div id="haOutPreview" style="margin-top:8px;font-size:11px;color:var(--mut);background:rgba(2,6,23,.5);border-radius:6px;padding:6px 8px;line-height:1.45"></div>
+              </div>
+            </div>
           </div>
           <div class="ctrl-row" style="margin-top:10px">
             <button class="btn" id="haSaveBtn" type="button">Save Audio</button>
@@ -10802,13 +10858,130 @@ function escHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
+const HA_LISTEN_PRESETS = {
+  off:      { mode: 'off',          thrVol: 45, maxDrop: 24.0, exp: 1.55, floorVol: 45 },
+  mild:     { mode: 'proportional', thrVol: 50, maxDrop: 10.0, exp: 1.50, floorVol: 45 },
+  balanced: { mode: 'proportional', thrVol: 45, maxDrop: 16.0, exp: 1.55, floorVol: 45 },
+  deep:     { mode: 'proportional', thrVol: 45, maxDrop: 24.0, exp: 1.55, floorVol: 45 },
+};
+const HA_OUT_PRESETS = {
+  off:      { mode: 'off',          thrVol: 50, maxDrop: 10.0, exp: 1.50, floorVol: 45 },
+  mild:     { mode: 'proportional', thrVol: 50, maxDrop: 10.0, exp: 1.50, floorVol: 45 },
+  balanced: { mode: 'proportional', thrVol: 45, maxDrop: 14.0, exp: 1.55, floorVol: 45 },
+  match:    { mode: 'match',        thrVol: 50, maxDrop: 10.0, exp: 1.50, floorVol: 45 },
+};
+
+function _calcCurveDrop(vol, mode, thrVol, maxDrop, exp, floorVol) {
+  if (mode === 'off') return { drop: 0, target: vol };
+  if (vol < thrVol) return { drop: 0, target: vol };
+  let drop = 0;
+  if (mode === 'fixed') {
+    drop = Math.max(0.5, maxDrop);
+  } else {
+    const span = Math.max(5, 75 - thrVol);
+    const frac = Math.min(1, Math.max(0, (vol - thrVol) / span));
+    drop = Math.round(maxDrop * Math.pow(frac, Math.max(1, exp)) * 2) / 2;
+  }
+  const target = Math.round(Math.max(floorVol, vol - drop) * 2) / 2;
+  const effDrop = Math.round((vol - target) * 2) / 2;
+  return { drop: effDrop, target };
+}
+
+function updateDuckCurvePreviews() {
+  const lMode = $('haListenDuckMode')?.value || 'off';
+  const lThr = Number($('haDuckThreshVol')?.value ?? 45);
+  const lMax = Number($('haDuckMaxDrop')?.value ?? 24);
+  const lExp = Number($('haDuckExp')?.value ?? 1.55);
+  const lFlr = Number($('haDuckFloorVol')?.value ?? 45);
+
+  const lOff = lMode === 'off';
+  if ($('haDuckDropLbl')) $('haDuckDropLbl').textContent = lMode === 'fixed' ? 'Fixed Dip (dB)' : 'Max Dip @ 75 (dB)';
+  ['haDuckThreshVol', 'haDuckMaxDrop', 'haDuckFloorVol'].forEach(id => { if ($(id)) $(id).disabled = lOff; });
+  if ($('haDuckExp')) $('haDuckExp').disabled = lMode !== 'proportional';
+
+  const rungs = [45, 55, 65, 70, 75];
+  if ($('haListenPreview')) {
+    if (lOff) {
+      $('haListenPreview').innerHTML = '<b>Off:</b> Music stays untouched when you say “Hey Jarvis”.';
+    } else {
+      const cells = rungs.map(v => {
+        const r = _calcCurveDrop(v, lMode, lThr, lMax, lExp, lFlr);
+        return `<span style="white-space:nowrap">Vol <b>${v}</b>: ${r.drop > 0 ? `<b style="color:#38bdf8">-${r.drop} dB</b> → ${r.target}` : '0 dB'}</span>`;
+      });
+      $('haListenPreview').innerHTML = cells.join(' &nbsp;·&nbsp; ');
+    }
+  }
+  document.querySelectorAll('#haListenPresets [data-lpreset]').forEach(btn => {
+    const p = HA_LISTEN_PRESETS[btn.dataset.lpreset];
+    const match = p && p.mode === lMode && (p.mode === 'off' || (Math.abs(p.thrVol - lThr) < 0.5 && Math.abs(p.maxDrop - lMax) < 0.5 && Math.abs(p.exp - lExp) < 0.05));
+    btn.classList.toggle('ok', !!match);
+    btn.classList.toggle('sec', !match);
+  });
+
+  const oMode = $('haOutDuckMode')?.value || 'match';
+  const oThr = Number($('haOutDuckThreshVol')?.value ?? 50);
+  const oMax = Number($('haOutDuckMaxDrop')?.value ?? 10);
+  const oExp = Number($('haOutDuckExp')?.value ?? 1.5);
+  const oFlr = Number($('haOutDuckFloorVol')?.value ?? 45);
+
+  const oDisabled = (oMode === 'off' || oMode === 'match');
+  if ($('haOutDuckDropLbl')) $('haOutDuckDropLbl').textContent = oMode === 'fixed' ? 'Fixed Dip (dB)' : 'Max Dip @ 75 (dB)';
+  ['haOutDuckThreshVol', 'haOutDuckMaxDrop', 'haOutDuckFloorVol'].forEach(id => { if ($(id)) $(id).disabled = oDisabled; });
+  if ($('haOutDuckExp')) $('haOutDuckExp').disabled = oMode !== 'proportional';
+
+  if ($('haOutPreview')) {
+    if (oMode === 'off') {
+      $('haOutPreview').innerHTML = '<b>Off:</b> Music restores immediately while Jarvis speaks over the towers.';
+    } else if (oMode === 'match') {
+      if (lOff) {
+        $('haOutPreview').innerHTML = '<b>Match Listening:</b> Listening Duck is Off, so no dip during Jarvis’s reply either.';
+      } else {
+        const cells = rungs.map(v => {
+          const r = _calcCurveDrop(v, lMode, lThr, lMax, lExp, lFlr);
+          return `<span style="white-space:nowrap">Vol <b>${v}</b>: ${r.drop > 0 ? `<b style="color:#4ade80">-${r.drop} dB</b> → ${r.target}` : '0 dB'}</span>`;
+        });
+        $('haOutPreview').innerHTML = `<span style="color:var(--mut)">Holds Listening dip:</span> ` + cells.join(' &nbsp;·&nbsp; ');
+      }
+    } else {
+      const cells = rungs.map(v => {
+        const r = _calcCurveDrop(v, oMode, oThr, oMax, oExp, oFlr);
+        return `<span style="white-space:nowrap">Vol <b>${v}</b>: ${r.drop > 0 ? `<b style="color:#4ade80">-${r.drop} dB</b> → ${r.target}` : '0 dB'}</span>`;
+      });
+      $('haOutPreview').innerHTML = cells.join(' &nbsp;·&nbsp; ');
+    }
+  }
+  document.querySelectorAll('#haOutPresets [data-opreset]').forEach(btn => {
+    const p = HA_OUT_PRESETS[btn.dataset.opreset];
+    const match = p && p.mode === oMode && (p.mode === 'off' || p.mode === 'match' || (Math.abs(p.thrVol - oThr) < 0.5 && Math.abs(p.maxDrop - oMax) < 0.5 && Math.abs(p.exp - oExp) < 0.05));
+    btn.classList.toggle('ok', !!match);
+    btn.classList.toggle('sec', !match);
+  });
+}
+
 function populateHouseAudioInputs(ha) {
   if (!ha) return;
   $('haRoute').value = ha.outputRoute || 's330';
   $('haDenonHost').value = ha.denonHost || '192.168.1.15';
-  $('haDuckEnabled').value = ha.denonDuckEnabled ? '1' : '0';
-  $('haDuckThresh').value = String(ha.denonDuckThresholdDb != null ? ha.denonDuckThresholdDb : -20.0);
-  $('haDuckDrop').value = String(ha.denonDuckDropDb != null ? ha.denonDuckDropDb : 5.0);
+  const lMode = !ha.denonDuckEnabled ? 'off' : (ha.denonDuckMode === 'proportional' ? 'proportional' : 'fixed');
+  if ($('haListenDuckMode')) $('haListenDuckMode').value = lMode;
+  const lThrDb = ha.denonDuckThresholdDb != null ? Number(ha.denonDuckThresholdDb) : -35.0;
+  if ($('haDuckThreshVol')) $('haDuckThreshVol').value = String(Math.round(lThrDb + 80));
+  const lDropVal = lMode === 'fixed' ? (ha.denonDuckDropDb != null ? ha.denonDuckDropDb : 5.0) : (ha.denonDuckMaxDropDb != null ? ha.denonDuckMaxDropDb : 24.0);
+  if ($('haDuckMaxDrop')) $('haDuckMaxDrop').value = String(lDropVal);
+  if ($('haDuckExp')) $('haDuckExp').value = String(ha.denonDuckExponent != null ? ha.denonDuckExponent : 1.55);
+  const lFlrDb = ha.denonDuckFloorDb != null ? Number(ha.denonDuckFloorDb) : -35.0;
+  if ($('haDuckFloorVol')) $('haDuckFloorVol').value = String(Math.round(lFlrDb + 80));
+
+  const oMode = ha.denonOutputDuckMode || 'match';
+  if ($('haOutDuckMode')) $('haOutDuckMode').value = oMode;
+  const oThrDb = ha.denonOutputDuckThresholdDb != null ? Number(ha.denonOutputDuckThresholdDb) : -30.0;
+  if ($('haOutDuckThreshVol')) $('haOutDuckThreshVol').value = String(Math.round(oThrDb + 80));
+  const oDropVal = oMode === 'fixed' ? (ha.denonOutputDuckDropDb != null ? ha.denonOutputDuckDropDb : 5.0) : (ha.denonOutputDuckMaxDropDb != null ? ha.denonOutputDuckMaxDropDb : 12.0);
+  if ($('haOutDuckMaxDrop')) $('haOutDuckMaxDrop').value = String(oDropVal);
+  if ($('haOutDuckExp')) $('haOutDuckExp').value = String(ha.denonOutputDuckExponent != null ? ha.denonOutputDuckExponent : 1.50);
+  const oFlrDb = ha.denonOutputDuckFloorDb != null ? Number(ha.denonOutputDuckFloorDb) : -35.0;
+  if ($('haOutDuckFloorVol')) $('haOutDuckFloorVol').value = String(Math.round(oFlrDb + 80));
+
   $('haCubeHost').value = ha.cubeHost || '';
   $('haCubeEnabled').value = ha.cubeEnabled ? '1' : '0';
   $('haReadMode').value = ha.readbackMode || 'overlay';
@@ -10817,6 +10990,7 @@ function populateHouseAudioInputs(ha) {
   $('haUsage').value = ha.cubeUsage || 'media';
   $('haReadGain').value = String(ha.readbackGain != null ? ha.readbackGain : 0.85);
   $('haSfxGain').value = String(ha.sfxGain != null ? ha.sfxGain : 0.90);
+  updateDuckCurvePreviews();
 }
 
 function renderAudioMatrix(mx) {
@@ -10870,9 +11044,15 @@ function syncHouseAudioUI(ha) {
   const msgEl = $('haMsg');
   if (msgEl) {
     const cCfg = ha.config || {};
+    const lThrV = Math.round((cCfg.denonDuckThresholdDb != null ? Number(cCfg.denonDuckThresholdDb) : -35) + 80);
+    const lDesc = !cCfg.denonDuckEnabled ? 'OFF' : (cCfg.denonDuckMode === 'proportional' ? `Exp >Vol ${lThrV} (max -${cCfg.denonDuckMaxDropDb ?? 24} dB)` : `Fixed >Vol ${lThrV} (-${cCfg.denonDuckDropDb ?? 5} dB)`);
+    const oModeC = cCfg.denonOutputDuckMode || 'match';
+    const oThrV = Math.round((cCfg.denonOutputDuckThresholdDb != null ? Number(cCfg.denonOutputDuckThresholdDb) : -30) + 80);
+    const oDesc = oModeC === 'match' ? 'Match Listen' : (oModeC === 'off' ? 'OFF' : (oModeC === 'proportional' ? `Exp >Vol ${oThrV} (max -${cCfg.denonOutputDuckMaxDropDb ?? 12} dB)` : `Fixed -${cCfg.denonOutputDuckDropDb ?? 5} dB`));
     const parts = [
       `Active Route: <b>${escHtml((ha.activeRoute || 's330').toUpperCase())}</b>`,
-      `Ducking: <b>${cCfg.denonDuckEnabled ? `Loud-Only (&ge; ${cCfg.denonDuckThresholdDb} dB, -${cCfg.denonDuckDropDb} dB)` : 'OFF'}</b>`,
+      `Listen Duck: <b>${escHtml(lDesc)}</b>`,
+      `Speak Duck: <b>${escHtml(oDesc)}</b>`,
     ];
     if (d.ok) {
       parts.push(`Surround: <b>${escHtml(d.surround || 'Unknown')}</b>`);
@@ -10919,12 +11099,36 @@ async function pollAudioStatus() {
 }
 
 async function saveHouseAudioConfig(triggerBtn) {
+  const lMode = $('haListenDuckMode')?.value || 'off';
+  const lThrVol = Number($('haDuckThreshVol')?.value ?? 45);
+  const lDropVal = Number($('haDuckMaxDrop')?.value ?? 24);
+  const lExp = Number($('haDuckExp')?.value ?? 1.55);
+  const lFloorVol = Number($('haDuckFloorVol')?.value ?? 45);
+
+  const oMode = $('haOutDuckMode')?.value || 'match';
+  const oThrVol = Number($('haOutDuckThreshVol')?.value ?? 50);
+  const oDropVal = Number($('haOutDuckMaxDrop')?.value ?? 10);
+  const oExp = Number($('haOutDuckExp')?.value ?? 1.50);
+  const oFloorVol = Number($('haOutDuckFloorVol')?.value ?? 45);
+
   const body = {
     outputRoute: $('haRoute').value || 's330',
     denonHost: $('haDenonHost').value.trim() || '192.168.1.15',
-    denonDuckEnabled: $('haDuckEnabled').value === '1',
-    denonDuckThresholdDb: Number($('haDuckThresh').value),
-    denonDuckDropDb: Number($('haDuckDrop').value) || 5.0,
+    denonDuckEnabled: lMode !== 'off',
+    denonDuckMode: lMode === 'fixed' ? 'fixed' : 'proportional',
+    denonDuckThresholdDb: lThrVol - 80,
+    denonDuckDropDb: lMode === 'fixed' ? lDropVal : 5.0,
+    denonDuckMaxDropDb: lMode === 'proportional' ? lDropVal : (cfg?.houseAudio?.denonDuckMaxDropDb ?? 24.0),
+    denonDuckSpanDb: Math.max(5, 75 - lThrVol),
+    denonDuckExponent: lExp,
+    denonDuckFloorDb: lFloorVol - 80,
+    denonOutputDuckMode: oMode,
+    denonOutputDuckThresholdDb: oThrVol - 80,
+    denonOutputDuckDropDb: oMode === 'fixed' ? oDropVal : 5.0,
+    denonOutputDuckMaxDropDb: oMode === 'proportional' ? oDropVal : (cfg?.houseAudio?.denonOutputDuckMaxDropDb ?? 10.0),
+    denonOutputDuckSpanDb: Math.max(5, 75 - oThrVol),
+    denonOutputDuckExponent: oExp,
+    denonOutputDuckFloorDb: oFloorVol - 80,
     cubeHost: $('haCubeHost').value.trim(),
     cubeEnabled: $('haCubeEnabled').value === '1',
     readbackMode: $('haReadMode').value || 'overlay',
@@ -11241,17 +11445,91 @@ $('vxAbResetBtn').onclick = async () => {
   await pollVoiceAb();
 };
 $('haSaveBtn').onclick = () => saveHouseAudioConfig($('haSaveBtn'));
-$('haDenonDipBtn').onclick = async () => {
+
+function _applyDuckPreset(stage, key) {
+  const preset = stage === 'listen' ? HA_LISTEN_PRESETS[key] : HA_OUT_PRESETS[key];
+  if (!preset) return;
+  if (stage === 'listen') {
+    if ($('haListenDuckMode')) $('haListenDuckMode').value = preset.mode;
+    if (preset.mode !== 'off') {
+      if ($('haDuckThreshVol')) $('haDuckThreshVol').value = String(preset.thrVol);
+      if ($('haDuckMaxDrop')) $('haDuckMaxDrop').value = String(preset.maxDrop);
+      if ($('haDuckExp')) $('haDuckExp').value = String(preset.exp);
+      if ($('haDuckFloorVol')) $('haDuckFloorVol').value = String(preset.floorVol);
+    }
+  } else {
+    if ($('haOutDuckMode')) $('haOutDuckMode').value = preset.mode;
+    if (preset.mode !== 'off' && preset.mode !== 'match') {
+      if ($('haOutDuckThreshVol')) $('haOutDuckThreshVol').value = String(preset.thrVol);
+      if ($('haOutDuckMaxDrop')) $('haOutDuckMaxDrop').value = String(preset.maxDrop);
+      if ($('haOutDuckExp')) $('haOutDuckExp').value = String(preset.exp);
+      if ($('haOutDuckFloorVol')) $('haOutDuckFloorVol').value = String(preset.floorVol);
+    }
+  }
+  updateDuckCurvePreviews();
+  if ($('haOut')) $('haOut').textContent = 'Preset staged — click Save Audio (or Test Dip) to apply.';
+}
+
+document.querySelectorAll('#haListenPresets [data-lpreset]').forEach(btn => {
+  btn.addEventListener('click', () => _applyDuckPreset('listen', btn.dataset.lpreset));
+});
+document.querySelectorAll('#haOutPresets [data-opreset]').forEach(btn => {
+  btn.addEventListener('click', () => _applyDuckPreset('output', btn.dataset.opreset));
+});
+[
+  'haListenDuckMode', 'haDuckThreshVol', 'haDuckMaxDrop', 'haDuckExp', 'haDuckFloorVol',
+  'haOutDuckMode', 'haOutDuckThreshVol', 'haOutDuckMaxDrop', 'haOutDuckExp', 'haOutDuckFloorVol',
+].forEach(id => {
+  const el = $(id);
+  if (!el) return;
+  const onEdit = () => {
+    updateDuckCurvePreviews();
+    if ($('haOut')) $('haOut').textContent = 'Curve edited — click Save Audio (or Test Dip) to apply.';
+  };
+  el.addEventListener('input', onEdit);
+  el.addEventListener('change', onEdit);
+});
+
+async function runDenonStageDip(stage, force, triggerBtn) {
+  const lbl = stage === 'listen' ? 'Listening' : 'Speaking';
   await saveHouseAudioConfig();
-  $('haOut').textContent = 'Testing gentle Denon dip…';
+  if (triggerBtn) setBtnFeedback(triggerBtn, 'saving', 'Dipping…');
+  $('haOut').textContent = `Testing ${lbl.toLowerCase()} Denon dip…`;
   try {
-    const r = await fetch('/api/audio/denon/test-duck', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ holdSec: 1.4 }) }).then(x => x.json());
-    $('haOut').textContent = r.ok ? `✓ Dipped ${r.duck.fromDb} -> ${r.duck.toDb} dB & restored` : `Skipped (${(r.duck && r.duck.reason) || 'offline'})`;
+    const r = await fetch('/api/audio/denon/test-duck', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ holdSec: 1.4, stage, force }),
+    }).then(x => x.json());
+    if (r.ok && r.duck) {
+      const fromVol = Math.round((Number(r.duck.fromDb) + 80) * 10) / 10;
+      const toVol = Math.round((Number(r.duck.toDb) + 80) * 10) / 10;
+      const drop = r.duck.dropDb != null ? Number(r.duck.dropDb) : Math.round((fromVol - toVol) * 10) / 10;
+      $('haOut').textContent = `✓ ${lbl} dip: -${drop} dB (Vol ${fromVol} → ${toVol}) & restored`;
+      if (triggerBtn) setBtnFeedback(triggerBtn, 'saved', `✓ -${drop} dB`, 2000);
+    } else {
+      const rsn = (r.duck && r.duck.reason) || 'offline';
+      const friendly = {
+        standby: 'Denon is in standby (turn Denon ON to preview dip)',
+        disabled: `${lbl} duck is Off (0 dB dip)`,
+        output_off: 'Speaking duck is Off (0 dB dip)',
+        below_threshold: `Current Vol is below ${lbl.toLowerCase()} threshold (0 dB dip)`,
+        at_floor: 'Already at/below floor volume (0 dB dip)',
+        muted: 'Denon is muted',
+      }[rsn] || `Skipped (${rsn})`;
+      $('haOut').textContent = `${lbl} dip: ${friendly}`;
+      if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '0 dB', 2000);
+    }
     await pollAudioStatus();
   } catch {
-    $('haOut').textContent = 'Denon dip request failed';
+    $('haOut').textContent = `${lbl} Denon dip request failed`;
+    if (triggerBtn) setBtnFeedback(triggerBtn, 'save-err', '✗ Failed', 2000);
   }
-};
+}
+
+if ($('haTestListenDipBtn')) $('haTestListenDipBtn').onclick = () => runDenonStageDip('listen', false, $('haTestListenDipBtn'));
+if ($('haTestOutDipBtn')) $('haTestOutDipBtn').onclick = () => runDenonStageDip('output', false, $('haTestOutDipBtn'));
+$('haDenonDipBtn').onclick = () => runDenonStageDip('listen', true, $('haDenonDipBtn'));
 $('haCubeProbeBtn').onclick = async () => {
   await saveHouseAudioConfig();
   $('haOut').textContent = 'Probing Cube ADB & surround settings…';
@@ -15368,13 +15646,16 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         hold_sec = float(_parse_num(body.get("holdSec"), 1.2, 0.3, 5.0))
         drop_raw = body.get("dropDb")
-        drop_db = _parse_num(drop_raw, None, 1.0, 25.0) if drop_raw is not None else None
-        with service.house_audio.denon.duck_context(drop_db=drop_db, force=True) as duck_info:
+        drop_db = _parse_num(drop_raw, None, 1.0, 30.0) if drop_raw is not None else None
+        stage = "listen" if str(body.get("stage") or "").strip().lower() == "listen" else "output"
+        force_flag = bool(body.get("force", True))
+        with service.house_audio.denon.duck_context(drop_db=drop_db, force=force_flag, stage=stage) as duck_info:
             if duck_info.get("ducked"):
                 service.house_audio.denon._sleep(hold_sec)
         service.house_audio.invalidate_probe_cache()
         return jsonify({
             "ok": bool(duck_info.get("ducked")),
+            "stage": stage,
             "duck": duck_info,
             "denon": service.house_audio.denon.get_status(),
         })
