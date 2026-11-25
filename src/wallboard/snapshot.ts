@@ -1,5 +1,5 @@
 import { recoveryLimitBpm } from '../domain/gate';
-import { PHASE1_PLAN, type LocalTodayItem } from '../domain/plan';
+import { applyPlanOverrides, planById, type LocalTodayItem } from '../domain/plan';
 import { sessionStats } from '../lifts/calc';
 import { peekNextTargetSet, resolveTargetSet, type CursorRef, type SetPointer } from '../lifts/cursor';
 import { canLog, labels, prevSetFor, secondsSinceLastSet, supersetGroups } from '../lifts/logic';
@@ -194,7 +194,7 @@ export interface WallboardState {
 
 export interface WallboardBuildInput {
   now: number;
-  settings: Pick<Settings, 'hrMax' | 'recoveryHrPct' | 'voiceEnabled' | 'voiceWakeWord' | 'queue'> & { voiceRoomEnabled?: boolean };
+  settings: Pick<Settings, 'hrMax' | 'recoveryHrPct' | 'voiceEnabled' | 'voiceWakeWord' | 'queue'> & { voiceRoomEnabled?: boolean; planStepOverrides?: Settings['planStepOverrides'] };
   unit: 'lb' | 'kg';
   hr: { bpm: number; fresh: boolean; recentPoints: { at: number; hr: number }[] };
   voice: { listening: boolean; armed: boolean; banner: WallboardVoiceBanner | null; cursor: CursorRef | null };
@@ -531,7 +531,8 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     }
     const curPtr = resolveTargetSet(s.exs, inp.voice.cursor);
     const nxtPtr = peekNextTargetSet(s.exs, curPtr);
-    const planWeek = PHASE1_PLAN.steps[st.queue.stepIndex]?.week ?? 2;
+    const plan = applyPlanOverrides(planById(st.queue.planId), st.planStepOverrides);
+    const planWeek = plan.steps[st.queue.stepIndex]?.week ?? 2;
     const stage = buildLiftStage(s, labs, groups, curPtr, inp, planWeek, u);
     const stats = sessionStats(s, inp.exOf);
     const setsTotal = s.exs.reduce((n, se) => n + se.sets.length, 0);
@@ -668,8 +669,9 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
   }
 
   const d = new Date(now);
-  const step = PHASE1_PLAN.steps[st.queue.stepIndex];
-  const weekLabel = step ? `Wk ${step.week} · Step ${step.index + 1}/${PHASE1_PLAN.steps.length}` : 'Phase 1 Complete';
+  const plan = applyPlanOverrides(planById(st.queue.planId), st.planStepOverrides);
+  const step = plan.steps[st.queue.stepIndex];
+  const weekLabel = step ? `Wk ${step.week} · Step ${step.index + 1}/${plan.steps.length}` : 'Phase 1 Complete';
   const todayItems = inp.todayItems.map((it) => {
     let preview = it.slot.description || '';
     if (it.equipment === 'strength') {

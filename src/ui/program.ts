@@ -1,5 +1,5 @@
 import {
-  PHASE1_PLAN, WEEK_THEMES, extraKey, parseExtraKey, parseSlotKey, parseYmd, projectPlan, slotKey,
+  WEEK_THEMES, extraKey, parseExtraKey, parseSlotKey, parseYmd, projectPlan, slotKey,
   type ProjectedStep,
 } from '../domain/plan';
 import { addDays, calendar, localDate } from '../intervals/calendar';
@@ -7,7 +7,7 @@ import { matchRoutineByTitle } from '../lifts/seed';
 import { liftSettings } from '../lifts/settings';
 import { lifts } from '../lifts/store';
 import { allMeta } from '../store/db';
-import { getSettings, settingsChanged, updateSettings } from '../store/settings';
+import { activePlan, getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import { revFooter, topbar, wireChips } from './chrome';
 import {
@@ -75,7 +75,7 @@ export function currentZoomLookup(): ZoomLookup {
 
 /** Shifts the rolling queue to `stepIndex` after user confirmation. */
 export async function shiftScheduleToStep(stepIndex: number): Promise<boolean> {
-  const step = PHASE1_PLAN.steps[stepIndex];
+  const step = activePlan().steps[stepIndex];
   if (!step) return false;
   const ok = await confirmSheet(
     `Shift schedule to Wk ${step.week} · Day ${step.day}?`,
@@ -93,7 +93,7 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
   const [metas] = await Promise.all([allMeta(), lifts.ready]);
   const s = getSettings();
   const today = localDate();
-  const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+  const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
   const p = proj[stepIndex];
   if (!p) return;
 
@@ -234,7 +234,7 @@ export async function launchDayZoomSlot(planSlot: string): Promise<void> {
 
   const parsed = parseSlotKey(planSlot);
   if (!parsed) return;
-  const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+  const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
   const p = proj[parsed.stepIndex];
   const slot = p?.step.slots[parsed.slotIndex];
   if (!p || !slot) return;
@@ -266,7 +266,7 @@ export async function launchDayZoomWorkout(ymd: string): Promise<void> {
   await lifts.ready;
   const s = getSettings();
   const today = localDate();
-  const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+  const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
   const res = resolveDayZoom({ ymd, today, proj, extras: s.queue.extras, restDay: s.restDay });
   const routines = lifts.sortedRoutines();
 
@@ -338,14 +338,15 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
       if (dead) return;
       const s = getSettings();
       const today = localDate();
-      const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
-      const curIdx = Math.min(s.queue.stepIndex, PHASE1_PLAN.steps.length - 1);
-      const activeWeek = PHASE1_PLAN.steps[curIdx]?.week ?? 1;
+      const plan = activePlan();
+      const proj = projectPlan(plan, s.queue, today, s.restDay);
+      const curIdx = Math.min(s.queue.stepIndex, plan.steps.length - 1);
+      const activeWeek = plan.steps[curIdx]?.week ?? 1;
       const w = selectedWeek >= 1 && selectedWeek <= 4 ? selectedWeek : activeWeek;
       selectedWeek = w;
 
       const doneCount = proj.filter((p) => p.slotStates.some((st) => st === 'done')).length;
-      const total = PHASE1_PLAN.steps.length;
+      const total = plan.steps.length;
       const pct = Math.round((doneCount / total) * 100);
 
       const weekTabs = [1, 2, 3, 4].map((wk) => {

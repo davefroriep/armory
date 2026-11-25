@@ -1,9 +1,9 @@
 import { Emitter } from '../emitter';
 import {
-  planById, isPlanExternalId, parseExtraKey, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
+  isPlanExternalId, parseExtraKey, parseSlotKey, reconcileQueue, slotKey, todayItemsFromQueue,
   type ExtraWorkout, type ExtraWorkoutItem, type LocalTodayItem, type PlanStep, type QueueState, type RollingPlan,
 } from '../domain/plan';
-import { getSettings, settingsChanged, updateSettings } from '../store/settings';
+import { activePlan, getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { createManualActivity, deleteEvent, fetchActivities, fetchEvents, hasKey, syncAthleteFtp } from './api';
 
 export type TodayItem = LocalTodayItem;
@@ -44,7 +44,7 @@ class Calendar {
   private markingSlots = new Set<string>();
 
   private plan(q: QueueState = getSettings().queue): RollingPlan {
-    return planById(q.planId);
+    return activePlan(q.planId);
   }
 
   constructor() {

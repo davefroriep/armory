@@ -1,7 +1,10 @@
 import { Emitter } from '../emitter';
 import type { MetroMode } from '../domain/pacer';
 import type { RecoveryMode } from '../domain/gate';
-import { defaultQueueState, type QueueState } from '../domain/plan';
+import {
+  applyPlanOverrides, defaultQueueState, planById,
+  type PlanStepOverride, type QueueState, type RollingPlan,
+} from '../domain/plan';
 import type { CustomVoiceAliases, VoiceAliasSlot } from '../lifts/voiceParser';
 
 export interface Settings {
@@ -83,9 +86,18 @@ export interface Settings {
   gymCamBuddyMode: boolean;
   /** Current position in the rolling training queue. */
   queue: QueueState;
+  /** Remote Coach Patch feed URL (GitHub raw JSON — zero secrets, zero-APK programming & target sync). */
+  coachSyncUrl: string;
+  /** Patch IDs already applied once on this device so local phone edits are never overwritten later. */
+  appliedCoachPatches: string[];
+  /** Epoch ms of last successful coach-patch check. */
+  coachSyncLastMs: number | null;
+  /** Declarative per-step overrides applied on top of the active RollingPlan without rebuilding the APK. */
+  planStepOverrides: Record<number, PlanStepOverride>;
 }
 
 const KEY = 'armory.settings.v1';
+export const DEFAULT_COACH_SYNC_URL = 'https://raw.githubusercontent.com/davefroriep/armory/main/config/coach-patch.json';
 export const ROOM_VOICE_MIG_KEY = 'armory.mig.room_voice_default.v1';
 export const TIMED_RECOVERY_MIG_KEY = 'armory.mig.timed_recovery_default.v1';
 export const METRO_TIMING_MIG_KEY = 'armory.mig.metro_timing_3_10.v1';
@@ -138,6 +150,10 @@ export const DEFAULTS: Settings = {
   gymCamAutoPr: true,
   gymCamBuddyMode: false,
   queue: defaultQueueState(),
+  coachSyncUrl: DEFAULT_COACH_SYNC_URL,
+  appliedCoachPatches: [],
+  coachSyncLastMs: null,
+  planStepOverrides: {},
 };
 
 function sanitizeAliases(raw: unknown): CustomVoiceAliases {
@@ -176,6 +192,27 @@ function sanitizeProgramTargets(raw: unknown): Record<string, number> {
   const out: Record<string, number> = {};
   for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof v === 'number' && Number.isFinite(v) && v > 0) out[k] = Math.round(v);
+  }
+  return out;
+}
+
+function sanitizeAppliedPatches(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.filter((x): x is string => typeof x === 'string' && x.trim().length > 0).map((x) => x.trim()))];
+}
+
+function sanitizePlanStepOverrides(raw: unknown): Record<number, PlanStepOverride> {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out: Record<number, PlanStepOverride> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const idx = Number(k);
+    if (!Number.isInteger(idx) || idx < 0 || !v || typeof v !== 'object') continue;
+    const rec = v as Partial<PlanStepOverride>;
+    if (!Array.isArray(rec.slots) || rec.slots.length === 0) continue;
+    out[idx] = {
+      ...(typeof rec.title === 'string' && rec.title.trim() ? { title: rec.title.trim() } : {}),
+      slots: rec.slots,
+    };
   }
   return out;
 }
@@ -238,6 +275,10 @@ function load(): Settings {
       voiceCustomAliases: sanitizeAliases(parsed.voiceCustomAliases),
       programTargets: sanitizeProgramTargets(parsed.programTargets),
       queue: q,
+      coachSyncUrl: typeof parsed.coachSyncUrl === 'string' && parsed.coachSyncUrl.trim() ? parsed.coachSyncUrl.trim() : DEFAULTS.coachSyncUrl,
+      appliedCoachPatches: sanitizeAppliedPatches(parsed.appliedCoachPatches),
+      coachSyncLastMs: typeof parsed.coachSyncLastMs === 'number' && Number.isFinite(parsed.coachSyncLastMs) ? parsed.coachSyncLastMs : null,
+      planStepOverrides: sanitizePlanStepOverrides(parsed.planStepOverrides),
     };
     if (typeof localStorage === 'undefined') return base;
     const afterVoice = migrateRoomVoiceDefault(base, localStorage).settings;
@@ -252,6 +293,12 @@ let current = load();
 export const settingsChanged = new Emitter<Settings>();
 
 export const getSettings = (): Settings => current;
+
+/** Resolves the active RollingPlan with any remote Coach Patch step overrides applied. */
+export function activePlan(planId?: string | null): RollingPlan {
+  const s = current;
+  return applyPlanOverrides(planById(planId ?? s.queue.planId), s.planStepOverrides);
+}
 
 export function updateSettings(patch: Partial<Settings>): Settings {
   current = { ...current, ...patch };

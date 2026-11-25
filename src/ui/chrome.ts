@@ -1,7 +1,7 @@
 import { $, ICON, esc, hms } from './dom';
 import { chipView, linkStatus, type ChipKind } from '../ble/sources';
 import { bikeFrame, hrBeat, hrFresh, live } from '../ble/telemetry';
-import { PHASE1_PLAN, fmtWeekSpan, nextEquipmentSlot, parseExtraKey, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
+import { fmtWeekSpan, nextEquipmentSlot, parseExtraKey, parseYmd, projectPlan, type WeekDayCell } from '../domain/plan';
 import { programById } from '../domain/programs';
 import { addDays, calendar, localDate, type TodayItem } from '../intervals/calendar';
 import { active } from '../lifts/active';
@@ -9,7 +9,7 @@ import { isSessionPaused, isSessionStarted } from '../lifts/logic';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { lifts } from '../lifts/store';
 import { REV, REV_STAMP } from '../rev';
-import { getSettings } from '../store/settings';
+import { activePlan, getSettings } from '../store/settings';
 import { EQUIPMENT_LABEL, type Equipment } from '../types';
 import type { TodayCompletedItem } from './dayZoom';
 import { openBikeSheet } from './bikeSheet';
@@ -234,10 +234,11 @@ export function machineDock(scheduled: Set<Equipment>): string {
 /** Local-first TODAY bar pinned above the scrollable Day Zoom card. */
 export function programHeroCard(items: TodayItem[], completedToday: TodayCompletedItem[] = []): string {
   const s = getSettings();
+  const plan = activePlan();
   const cur = calendar.currentStep();
   const up = calendar.upcomingStep();
-  const wk = cur?.week ?? PHASE1_PLAN.steps[Math.min(s.queue.stepIndex, PHASE1_PLAN.steps.length - 1)]?.week ?? 1;
-  const stepNum = Math.min(s.queue.stepIndex + 1, PHASE1_PLAN.steps.length);
+  const wk = cur?.week ?? plan.steps[Math.min(s.queue.stepIndex, plan.steps.length - 1)]?.week ?? 1;
+  const stepNum = Math.min(s.queue.stepIndex + 1, plan.steps.length);
   const completedRows = completedToday.map((c) => `<button class="cal-item cal-compact cal-done-btn" type="button" data-today-zoom>
     <span class="cal-link">
       <span class="cal-ico sm done ${c.equipment}">${ICON[c.equipment]}</span>
@@ -260,7 +261,7 @@ export function programHeroCard(items: TodayItem[], completedToday: TodayComplet
     body = `<div class="cal-empty"><b>Rest · Nothing scheduled</b></div>`;
   }
   return `<section class="card cal prog-hero">
-    <div class="card-h"><button class="today-snap" type="button" data-snap-today aria-label="Jump calendar to today"><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${PHASE1_PLAN.steps.length}</button><a class="prog-link" href="#/program?w=${wk}">Full Program ›</a></div>
+    <div class="card-h"><button class="today-snap" type="button" data-snap-today aria-label="Jump calendar to today"><b class="today-pill">TODAY</b> · WK ${wk} · ${stepNum}/${plan.steps.length}</button><a class="prog-link" href="#/program?w=${wk}">Full Program ›</a></div>
     ${body}${foot}
   </section>`;
 }
@@ -269,7 +270,7 @@ export function programHeroCard(items: TodayItem[], completedToday: TodayComplet
 export function equipmentProgramCard(eq: Equipment, items: TodayItem[], actionMode: 'link' | 'strength' = 'link'): string {
   const s = getSettings();
   const today = localDate();
-  const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+  const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
   const nextSlot = nextEquipmentSlot(proj, eq);
   const wk = calendar.currentStep()?.week ?? nextSlot?.p.step.week ?? 1;
 
@@ -298,7 +299,7 @@ export function calendarCard(items: TodayItem[], showUnmatched: boolean): string
   }
   const cur = calendar.currentStep();
   const up = calendar.upcomingStep();
-  const pill = cur && showUnmatched ? `<span class="cal-pill">STEP ${cur.index + 1}/${PHASE1_PLAN.steps.length}</span>` : '';
+  const pill = cur && showUnmatched ? `<span class="cal-pill">STEP ${cur.index + 1}/${activePlan().steps.length}</span>` : '';
   let body = '';
   let foot = '';
   if (items.length === 0) {

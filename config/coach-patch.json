@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "patches": [
+    {
+      "id": "2026-11-25-z5-targets-v1",
+      "label": "Updated AirBike Z5 targets (4x4: 56, 5x3: 57, 60/30: 59 RPM)",
+      "programTargets": {
+        "n4x4": 56,
+        "v5x3": 57,
+        "b6030": 59
+      }
+    }
+  ]
+}

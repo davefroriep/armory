@@ -6,9 +6,9 @@ import { hasKey, syncAthleteFtp, testConnection } from '../intervals/api';
 import { calendar } from '../intervals/calendar';
 import { audio } from '../audio/audio';
 import { recoveryLimitBpm } from '../domain/gate';
-import { PHASE1_PLAN } from '../domain/plan';
 import { scaleSpinTargetsForFtp } from '../domain/programs';
-import { getSettings, settingsChanged, updateSettings } from '../store/settings';
+import { syncCoachPatches } from '../store/coachPatch';
+import { activePlan, getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { liftSettings, toDisplay, fmtNum, fromDisplay } from '../lifts/settings';
 import { lifts } from '../lifts/store';
 import { gymCam, gymCamConfigLinkState } from '../lifts/gymCam';
@@ -120,8 +120,10 @@ export function settingsScreen(root: HTMLElement): () => void {
     <section class="card">
       <div class="line"><span>Rest day<small>Excluded from projected dates &amp; shown as Rest</small></span><select class="lf-input sel" id="restDay"><option value="0">Sunday</option><option value="1">Monday</option><option value="2">Tuesday</option><option value="3">Wednesday</option><option value="4">Thursday</option><option value="5">Friday</option><option value="6">Saturday</option><option value="none">None — every day</option></select></div>
       <div class="hint" id="planStepInfo"></div>
+      <div class="hint" id="coachSyncInfo"></div>
       <div class="row">
         <a class="btn sm primary" href="#/program">Open Full Program ›</a>
+        <button class="btn sm" id="coachSync">Check coach updates</button>
         <button class="btn sm" id="stepPrev">← Prev</button>
         <button class="btn sm" id="stepNext">Next →</button>
         <button class="btn sm" id="stepSync">Sync Activities</button>
@@ -186,10 +188,17 @@ export function settingsScreen(root: HTMLElement): () => void {
       bwEl.value = cur.weightKg ? fmtNum(toDisplay(cur.weightKg, liftSettings().unit)) : '';
     }
     $<HTMLSelectElement>('#restDay', root).value = cur.restDay == null ? 'none' : String(cur.restDay);
-    const step = PHASE1_PLAN.steps[cur.queue.stepIndex];
+    const plan = activePlan();
+    const step = plan.steps[cur.queue.stepIndex];
     $('#planStepInfo', root).innerHTML = step
-      ? `Current: <b>Step ${step.index + 1}/${PHASE1_PLAN.steps.length}</b> · ${esc(step.title)} (local schedule)`
+      ? `Current: <b>Step ${step.index + 1}/${plan.steps.length}</b> · ${esc(step.title)} (local schedule)`
       : '<b>Phase 1 complete!</b>';
+    const coachEl = root.querySelector<HTMLElement>('#coachSyncInfo');
+    if (coachEl) {
+      const cnt = cur.appliedCoachPatches?.length ?? 0;
+      const last = cur.coachSyncLastMs ? new Date(cur.coachSyncLastMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'never';
+      coachEl.textContent = `Coach sync (zero-APK): ${cnt} patch${cnt === 1 ? '' : 'es'} applied · Last checked ${last}`;
+    }
 
     const wbTog = $<HTMLElement>('#wbTog', root);
     wbTog.classList.toggle('on', cur.wallboardEnabled);
@@ -377,6 +386,15 @@ export function settingsScreen(root: HTMLElement): () => void {
         else sim.stop();
         ensureSensors({ bike: false });
       }
+    }
+    if (t.closest('#coachSync')) {
+      const coachEl = root.querySelector<HTMLElement>('#coachSyncInfo');
+      if (coachEl) coachEl.textContent = 'Checking for coach updates…';
+      void syncCoachPatches({ force: true }).then((res) => {
+        if (!res.ok) toast(res.offline ? 'Offline — could not reach coach feed' : `Coach sync failed (${res.error ?? 'error'})`);
+        else if (res.appliedCount === 0) toast('Already up to date');
+        paintFtpBox();
+      });
     }
     if (t.closest('#stepPrev')) void calendar.setStep(getSettings().queue.stepIndex - 1);
     if (t.closest('#stepNext')) void calendar.setStep(getSettings().queue.stepIndex + 1);

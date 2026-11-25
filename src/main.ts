@@ -16,6 +16,7 @@ import { initSetupLinks } from './setup';
 import { calendar } from './intervals/calendar';
 import { forceCloseApp, isNative } from './native/service';
 import { ensureDailyBackup, initAutoBackup } from './store/backup';
+import { syncCoachPatches } from './store/coachPatch';
 import { kickSensors, releaseBike } from './ble/sources';
 import { consumeBackInterceptor, parentHash } from './nav';
 import { syncModalInert, wireModalBackdrop } from './ui/dom';
@@ -127,7 +128,12 @@ voice.init();
 voice.toasted.on(({ msg, kind }) => toast(msg, kind ? { kind } : {}));
 initWallboardSync();
 // Coming back to the app (or the phone waking up) retries a stalled sensor link immediately.
-document.addEventListener('visibilitychange', () => { if (!document.hidden) kickSensors(); });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    kickSensors();
+    void syncCoachPatches({ silent: true });
+  }
+});
 window.addEventListener('hashchange', route);
 if (isNative()) {
   void App.addListener('appStateChange', ({ isActive }) => {
@@ -135,6 +141,7 @@ if (isNative()) {
       kickSensors();
       calendar.checkDayRollover(true);
       ensureDailyBackup();
+      void syncCoachPatches({ silent: true });
       void wallboard.refreshStatus();
       wallboard.pushNow();
     }
@@ -161,6 +168,9 @@ if (isNative()) {
   });
 }
 route();
+
+// Silently check for zero-APK Coach Patch updates (targets, routines, schedule) in the background.
+void syncCoachPatches({ silent: true });
 
 // Retry any workouts that were saved while offline / before the API key was set.
 const retry = () => { void retryPending().catch(() => {}); };

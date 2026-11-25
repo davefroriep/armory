@@ -365,6 +365,31 @@ export function planById(planId?: string | null): RollingPlan {
   return (planId && PLANS[planId]) || PHASE1_PLAN;
 }
 
+export interface PlanStepOverride {
+  title?: string;
+  slots: PlanSlot[];
+}
+
+/** Returns a RollingPlan with any remote coach step overrides applied immutably. */
+export function applyPlanOverrides(
+  plan: RollingPlan,
+  overrides?: Record<number, PlanStepOverride> | null,
+): RollingPlan {
+  if (!overrides || Object.keys(overrides).length === 0) return plan;
+  let changed = false;
+  const steps = plan.steps.map((st) => {
+    const ov = overrides[st.index];
+    if (!ov || !Array.isArray(ov.slots) || ov.slots.length === 0) return st;
+    changed = true;
+    return {
+      ...st,
+      ...(typeof ov.title === 'string' && ov.title.trim() ? { title: ov.title.trim() } : {}),
+      slots: ov.slots.map((sl) => ({ ...sl })),
+    };
+  });
+  return changed ? { ...plan, steps } : plan;
+}
+
 /**
  * Pure rolling-queue reconciliation: matches external completed activities (e.g. MyWhoosh rides) against
  * the local queue, absorbs skipped/early/carried-over slots, and advances `stepIndex` cleanly.

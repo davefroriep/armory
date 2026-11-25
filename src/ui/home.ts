@@ -1,11 +1,11 @@
 import { ensureSensors } from '../ble/sources';
-import { PHASE1_PLAN, buildWeekGlimpse, dayOfWeek, projectPlan, shiftYmd } from '../domain/plan';
+import { buildWeekGlimpse, dayOfWeek, projectPlan, shiftYmd } from '../domain/plan';
 import { calendar, localDate } from '../intervals/calendar';
 import { pendingCount, retryPending, syncWorkout, discard } from '../workout/sync';
 import { allMeta, getSamples, putMeta } from '../store/db';
 import { BACKUP_DIR_LABEL, lastBackupStatus, runBackupNow } from '../store/backup';
 import { isNative } from '../native/service';
-import { getSettings, settingsChanged } from '../store/settings';
+import { activePlan, getSettings, settingsChanged } from '../store/settings';
 import { summarize } from '../workout/summary';
 import type { Equipment, WorkoutMeta } from '../types';
 import { lifts } from '../lifts/store';
@@ -38,7 +38,7 @@ export function homeScreen(root: HTMLElement): () => void {
       if (selectedYmd === lastToday) selectedYmd = today;
       lastToday = today;
     }
-    const proj = projectPlan(PHASE1_PLAN, s.queue, today, s.restDay);
+    const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
     const todayEquipment = calendar.items.map((i) => i.equipment);
     const lookup = currentZoomLookup();
     const completedToday = todayCompletedItems(dayLogsByDate.get(today), lookup, { today, proj, extras: s.queue.extras });
