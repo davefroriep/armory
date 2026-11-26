@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PHASE1_PLAN, applyPlanOverrides } from '../src/domain/plan';
-import { applyCoachPatches, type CoachPatchDeps, type CoachPatchFeed } from '../src/store/coachPatch';
+import { applyCoachPatches, type CoachAttachVideo, type CoachPatchDeps, type CoachPatchFeed } from '../src/store/coachPatch';
 import { DEFAULTS, type Settings } from '../src/store/settings';
 import type { Routine } from '../src/lifts/types';
 
@@ -15,6 +15,7 @@ function makeHarness(initial?: Partial<Settings>) {
   };
   const routines = new Map<string, Routine>();
   const cams = new Map<string, string[]>();
+  const attached: CoachAttachVideo[] = [];
   const deps: CoachPatchDeps = {
     getSettings: () => state,
     updateSettings: (patch) => {
@@ -25,8 +26,9 @@ function makeHarness(initial?: Partial<Settings>) {
     nowMs: () => 1_795_600_000_000,
     upsertRoutine: async (r) => { routines.set(r.id, r); },
     updateExerciseCams: async (exId, list) => { cams.set(exId, list); },
+    attachVideo: async (v) => { attached.push(v); },
   };
-  return { deps, getState: () => state, routines, cams };
+  return { deps, getState: () => state, routines, cams, attached };
 }
 
 describe('Remote Coach Patch Sync (zero-APK config & programming)', () => {
@@ -93,6 +95,38 @@ describe('Remote Coach Patch Sync (zero-APK config & programming)', () => {
     const r2 = await applyCoachPatches(feed, h.deps);
     expect(r2.applied).toHaveLength(0);
     expect(h.getState().programTargets.n4x4).toBe(58);
+  });
+
+  it('attaches recovered Gym Cam clips once via attachVideos and ignores duplicates on re-sync', async () => {
+    const h = makeHarness();
+    const feed: CoachPatchFeed = {
+      schema: 1,
+      patches: [
+        {
+          id: '2026-11-26-bench-set3-clip-v1',
+          label: 'Attached Barbell Bench Press Set 3 clip',
+          attachVideos: [
+            {
+              id: 'vid_test_1',
+              sessionId: 'sess_1',
+              exId: 'barbell-bench-press',
+              setId: 'set_3',
+              camera: 'Rack Cam',
+              fileName: 'Barbell_Bench_Press_140248_abc123.mp4',
+              lanUrl: 'http://192.168.1.152:8766/clips/2026-11-26/Barbell_Bench_Press_140248_abc123.mp4',
+              durationSec: 50,
+            },
+          ],
+        },
+      ],
+    };
+    const r1 = await applyCoachPatches(feed, h.deps);
+    expect(r1.applied).toHaveLength(1);
+    expect(h.attached).toHaveLength(1);
+    expect(h.attached[0].setId).toBe('set_3');
+    const r2 = await applyCoachPatches(feed, h.deps);
+    expect(r2.applied).toHaveLength(0);
+    expect(h.attached).toHaveLength(1);
   });
 
   it('skips expired patches without applying and clamps out-of-range targets', async () => {

@@ -2,7 +2,7 @@ import type { ExtraWorkout, PlanStepOverride } from '../domain/plan';
 import { clampProgramTarget, programById } from '../domain/programs';
 import { normalizeCamList } from '../lifts/logic';
 import { lifts } from '../lifts/store';
-import type { ExRow, Routine } from '../lifts/types';
+import type { ExRow, LiftSet, Routine, VideoMeta } from '../lifts/types';
 import { toast } from '../ui/lifts/kit';
 import { DEFAULT_COACH_SYNC_URL, getSettings, updateSettings, type Settings } from './settings';
 
@@ -10,6 +10,24 @@ export type CoachPatchableSettings = Partial<Pick<
   Settings,
   'ftp' | 'hrMax' | 'recoveryMode' | 'recoveryHrPct' | 'restDay' | 'wallboardRelayEnabled' | 'gymCamEnabled' | 'voiceRoomEnabled'
 >>;
+
+export interface CoachAttachVideo {
+  id: string;
+  sessionId: string;
+  exId: string;
+  setId: string;
+  lanUrl: string;
+  camera?: string;
+  fileName?: string;
+  durationSec?: number;
+  bytes?: number;
+  clipStartMs?: number;
+  clipEndMs?: number;
+  hasAudio?: boolean;
+  uri?: string;
+  thumb?: string;
+  ms?: number;
+}
 
 export interface CoachPatch {
   /** Globally unique patch id (e.g. "2026-11-25-z5-targets-v1"). Applied at most once per device. */
@@ -30,6 +48,8 @@ export interface CoachPatch {
   extras?: ExtraWorkout[];
   /** Declarative per-step overrides applied on top of the active RollingPlan. */
   planStepOverrides?: Record<number, PlanStepOverride>;
+  /** Attach recovered or server-cut Gym Cam clips onto existing sets by `(sessionId, setId)`. */
+  attachVideos?: CoachAttachVideo[];
 }
 
 export interface CoachPatchFeed {
@@ -44,6 +64,7 @@ export interface CoachPatchDeps {
   nowMs: () => number;
   upsertRoutine: (r: Routine) => Promise<void>;
   updateExerciseCams: (exId: string, cams: string[]) => Promise<void>;
+  attachVideo?: (v: CoachAttachVideo) => Promise<void>;
 }
 
 export interface CoachApplyResult {
@@ -84,6 +105,42 @@ const defaultDeps: CoachPatchDeps = {
     const next: ExRow = { ...(prev ?? { id: exId }), cams: [...cams] };
     delete next.camPref;
     await lifts.saveRow(next);
+  },
+  attachVideo: async (v) => {
+    await lifts.ready;
+    const s = lifts.sessions.get(v.sessionId);
+    if (!s) return;
+    let targetSet: LiftSet | undefined;
+    for (const se of s.exs) {
+      const hit = se.sets.find((st) => st.id === v.setId);
+      if (hit) { targetSet = hit; break; }
+    }
+    if (!targetSet) return;
+    const meta: VideoMeta = {
+      id: v.id,
+      sessionId: v.sessionId,
+      exId: v.exId,
+      setId: v.setId,
+      ms: v.ms ?? Date.now(),
+      mime: 'video/mp4',
+      bytes: v.bytes ?? 0,
+      thumb: v.thumb ?? '',
+      linkOnly: true,
+      source: 'gymcam',
+      camera: v.camera || 'Rack Cam',
+      lanUrl: v.lanUrl,
+      ...(v.fileName ? { fileName: v.fileName } : {}),
+      ...(v.durationSec ? { durationSec: v.durationSec } : {}),
+      ...(v.clipStartMs != null ? { clipStartMs: v.clipStartMs } : {}),
+      ...(v.clipEndMs != null ? { clipEndMs: v.clipEndMs } : {}),
+      ...(v.hasAudio !== undefined ? { hasAudio: !!v.hasAudio } : {}),
+      ...(v.uri ? { uri: v.uri } : {}),
+    };
+    await lifts.addVideo(meta);
+    if (!(targetSet.vids ?? []).includes(meta.id)) {
+      targetSet.vids = [...(targetSet.vids ?? []), meta.id];
+      lifts.saveSession(s, true);
+    }
   },
 };
 
@@ -196,6 +253,13 @@ export async function applyCoachPatches(
         if (exId && cams.length > 0) {
           await deps.updateExerciseCams(exId, cams);
         }
+      }
+    }
+
+    if (Array.isArray(p.attachVideos) && deps.attachVideo) {
+      for (const vid of p.attachVideos) {
+        if (!vid?.id || !vid?.sessionId || !vid?.exId || !vid?.setId || !vid?.lanUrl) continue;
+        await deps.attachVideo(vid);
       }
     }
 
