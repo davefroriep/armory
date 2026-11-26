@@ -6406,6 +6406,78 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_rolling_led_banding_detection_and_deflicker_filter(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_led_deflicker_"))
+        try:
+            ff = shutil.which("ffmpeg") or r"C:\Users\davef\Tools\ffmpeg\bin\ffmpeg.exe"
+            self.assertTrue(Path(ff).exists(), f"ffmpeg not found at {ff}")
+            w, h, fps, n_frames = 320, 180, 25.0, 100
+
+            def write_synth_mp4(path: Path, band_amp: float) -> None:
+                cmd = [
+                    ff, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", "25", "-i", "pipe:0",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p", str(path),
+                ]
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                assert proc.stdin is not None
+                yy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
+                xx = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :]
+                base = (85.0 + 45.0 * xx + 25.0 * np.sin(2.0 * np.pi * yy)).astype(np.float32)
+                for t in range(n_frames):
+                    frame_y = base.copy()
+                    # Add a moving "lifter" vertical bar on the left 18% to prove zero false trigger
+                    cx = int(40 + 18 * np.sin(2.0 * np.pi * t / 40.0))
+                    frame_y[30:160, cx:cx + 28] = 175.0
+                    if band_amp > 0.0:
+                        # 5.00 Hz rolling wave with 3 cycles per frame height
+                        wave = band_amp * np.sin(2.0 * np.pi * (3.0 * yy - 5.0 * (t / fps)))
+                        frame_y = frame_y + wave
+                    u8 = np.clip(frame_y, 0.0, 255.0).astype(np.uint8)
+                    bgr = np.repeat(u8[:, :, None], 3, axis=2)
+                    proc.stdin.write(bgr.tobytes())
+                proc.stdin.close()
+                if proc.stderr is not None:
+                    proc.stderr.read()
+                    proc.stderr.close()
+                rc = proc.wait(timeout=30)
+                self.assertEqual(rc, 0)
+
+            # 1. Clean 25 fps clip with moving subject must skip filtering (0 re-encode cost)
+            clean_mp4 = tmp / "clean.mp4"
+            write_synth_mp4(clean_mp4, band_amp=0.0)
+            clean_mtime = clean_mp4.stat().st_mtime_ns
+            res_clean = ac.deflicker_rolling_led_mp4(clean_mp4, ff)
+            self.assertFalse(res_clean["filtered"])
+            self.assertLess(res_clean["before"]["amp5Med"], 0.2)
+            self.assertEqual(clean_mp4.stat().st_mtime_ns, clean_mtime)
+
+            # 2. Banded 25 fps clip (±6 luma @ 5.00 Hz, 3 cyc/H) triggers filter and drops >= 75%
+            banded_mp4 = tmp / "banded.mp4"
+            write_synth_mp4(banded_mp4, band_amp=6.0)
+            before = ac.measure_rolling_led_banding(banded_mp4)
+            self.assertGreater(before["amp5Med"], 4.0)
+            self.assertGreater(before["ledP2p"], 9.0)
+
+            res_band = ac.deflicker_rolling_led_mp4(banded_mp4, ff)
+            self.assertTrue(res_band["filtered"], f"Expected filter to run: {res_band}")
+            self.assertEqual(res_band["kFrames"], 5)
+            self.assertEqual(res_band["framesWritten"], n_frames)
+
+            after = ac.measure_rolling_led_banding(banded_mp4)
+            self.assertLess(after["amp5Med"], before["amp5Med"] * 0.25)
+            self.assertLess(after["ledP2p"], before["ledP2p"] * 0.25)
+
+            cap = cv2.VideoCapture(str(banded_mp4))
+            try:
+                self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), w)
+                self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), h)
+                self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), n_frames)
+            finally:
+                cap.release()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

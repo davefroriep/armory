@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import base64
 import bisect
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 import ctypes
 from dataclasses import dataclass, field, replace
@@ -1698,6 +1698,231 @@ def extract_video_thumb(video_path: Path) -> str:
         return encode_thumb_data_url(frm) if ok and frm is not None else ""
     finally:
         cap.release()
+
+
+def measure_rolling_led_banding(video_path: Path, max_frames: int = 75) -> dict[str, float]:
+    """Scan a short middle slice of an MP4/TS clip for 5 Hz US-AC LED rolling-shutter banding.
+
+    Uses per-scanline horizontal medians (ignoring localized lifters or TVs) and temporal FFT
+    around the 5 Hz beat frequency (|120 Hz - 5*25 fps| = 5.0 Hz). Fast (~60 ms for 75 frames).
+    """
+    empty = {"frames": 0.0, "fps": 0.0, "fPeakHz": 0.0, "amp5Med": 0.0, "ledP2p": 0.0}
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return empty
+    try:
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+        if not (12.0 <= fps <= 120.0):
+            fps = 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total > max_frames + 4:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, (total - max_frames) // 2)
+        rows: list[np.ndarray] = []
+        while len(rows) < max_frames:
+            ok, frm = cap.read()
+            if not ok or frm is None:
+                break
+            small = cv2.resize(frm, (160, 90), interpolation=cv2.INTER_AREA)
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            rows.append(np.median(gray, axis=1))
+    finally:
+        cap.release()
+
+    n = len(rows)
+    if n < 25:
+        return {**empty, "frames": float(n), "fps": round(fps, 3)}
+    mat = np.stack(rows, axis=0)  # (N, 90)
+    dev = mat - np.median(mat, axis=0, keepdims=True)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fps)
+    spec = np.abs(np.fft.rfft(dev, axis=0)) * (2.0 / n)
+    idx5 = np.where((freqs >= 4.2) & (freqs <= 5.8))[0]
+    if len(idx5) == 0:
+        return {**empty, "frames": float(n), "fps": round(fps, 3)}
+    bin_energy = spec[idx5].mean(axis=1)
+    best_idx = int(idx5[int(np.argmax(bin_energy))])
+    f_peak = float(freqs[best_idx])
+    amp5_med = float(np.median(spec[best_idx]))
+    t = np.arange(n, dtype=np.float32)
+    ph = np.exp(-2j * np.pi * f_peak * t / fps)[:, None]
+    c5 = (2.0 / n) * (dev * ph).sum(axis=0)
+    wave = np.real(c5[None, :] * np.exp(2j * np.pi * f_peak * t[:, None] / fps))
+    led_p2p = float(np.percentile(wave, 98) - np.percentile(wave, 2))
+    return {
+        "frames": float(n),
+        "fps": round(fps, 3),
+        "fPeakHz": round(f_peak, 3),
+        "amp5Med": round(amp5_med, 4),
+        "ledP2p": round(led_p2p, 3),
+    }
+
+
+def deflicker_rolling_led_mp4(
+    mp4_path: Path,
+    ffmpeg_bin: str,
+    *,
+    min_amp5: float = 0.45,
+    min_p2p: float = 2.2,
+    timeout_sec: int = 120,
+) -> dict[str, Any]:
+    """Automatically remove 5 Hz rolling-shutter LED horizontal bands with zero motion blur.
+
+    Zero re-encode cost when the clip is already clean (returns immediately after a ~60 ms pre-scan).
+    When triggered, performs a single-pass streaming exact-period row-median Y-channel notch filter
+    directly in YUV420p (preserving chroma and sharpness) and atomically replaces `mp4_path`.
+    """
+    metrics = measure_rolling_led_banding(mp4_path)
+    amp5 = float(metrics.get("amp5Med", 0.0))
+    p2p = float(metrics.get("ledP2p", 0.0))
+    fps = float(metrics.get("fps", 25.0))
+    f_peak = float(metrics.get("fPeakHz", 5.0)) or 5.0
+    if amp5 < min_amp5 or p2p < min_p2p or fps < 12.0:
+        return {"filtered": False, "before": metrics}
+
+    k = max(3, min(12, int(round(fps / f_peak))))
+    half = k // 2
+    cap = cv2.VideoCapture(str(mp4_path))
+    if not cap.isOpened():
+        return {"filtered": False, "before": metrics, "error": "open_failed"}
+
+    tmp_out = mp4_path.with_name(f".{mp4_path.stem}.deflicker_{uuid.uuid4().hex[:6]}.mp4")
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        ok, first_bgr = cap.read()
+        if not ok or first_bgr is None:
+            return {"filtered": False, "before": metrics, "error": "empty_video"}
+        h, w = first_bgr.shape[:2]
+        if w < 16 or h < 16 or (w % 2) != 0 or (h % 2) != 0:
+            return {"filtered": False, "before": metrics, "error": "odd_dims"}
+
+        ky = max(5, int(round(h * 0.03)) | 1)
+        col_step = 4 if w >= 320 else 1
+        cmd = [
+            ffmpeg_bin,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-s",
+            f"{w}x{h}",
+            "-r",
+            f"{fps:.6f}",
+            "-i",
+            "pipe:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "superfast",
+            "-g",
+            "15",
+            "-keyint_min",
+            "15",
+            "-sc_threshold",
+            "0",
+            "-bf",
+            "0",
+            "-crf",
+            "25",
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-movflags",
+            "+faststart",
+            str(tmp_out),
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        assert proc.stdin is not None and proc.stderr is not None
+
+        def emit_frame(yuv_buf: np.ndarray, rmed: np.ndarray, baseline: np.ndarray) -> None:
+            band = (rmed - baseline).astype(np.float32)
+            band = cv2.GaussianBlur(band.reshape(-1, 1), (1, ky), 0).ravel()
+            np.clip(band, -20.0, 20.0, out=band)
+            y_plane = yuv_buf[:h, :]
+            y_corr = np.clip(y_plane.astype(np.float32) - band[:, None], 0.0, 255.0).astype(np.uint8)
+            out_yuv = yuv_buf.copy()
+            out_yuv[:h, :] = y_corr
+            assert proc is not None and proc.stdin is not None
+            proc.stdin.write(out_yuv.tobytes())
+
+        buf: deque[tuple[np.ndarray, np.ndarray]] = deque()
+        rmed_sum = np.zeros(h, dtype=np.float64)
+        last_full_baseline: np.ndarray | None = None
+        written = 0
+        leading_flushed = False
+
+        def push_bgr(bgr: np.ndarray) -> None:
+            nonlocal leading_flushed, written, last_full_baseline
+            yuv = cv2.cvtColor(bgr, cv2.COLOR_BGR2YUV_I420)
+            rmed = np.median(yuv[:h, ::col_step], axis=1).astype(np.float32)
+            buf.append((yuv, rmed))
+            rmed_sum[:] += rmed
+            if len(buf) == k:
+                baseline = (rmed_sum / float(k)).astype(np.float32)
+                last_full_baseline = baseline
+                if not leading_flushed:
+                    for idx in range(half + 1):
+                        emit_frame(buf[idx][0], buf[idx][1], baseline)
+                        written += 1
+                    leading_flushed = True
+                else:
+                    emit_frame(buf[half][0], buf[half][1], baseline)
+                    written += 1
+                _, old_rmed = buf.popleft()
+                rmed_sum[:] -= old_rmed
+
+        push_bgr(first_bgr)
+        while True:
+            ok, frm = cap.read()
+            if not ok or frm is None:
+                break
+            if frm.shape[0] != h or frm.shape[1] != w:
+                frm = cv2.resize(frm, (w, h), interpolation=cv2.INTER_AREA)
+            push_bgr(frm)
+        cap.release()
+
+        # Drain remaining buffered tail frames using the final exact-period k-frame baseline
+        if buf:
+            baseline = (
+                last_full_baseline
+                if last_full_baseline is not None
+                else (rmed_sum / float(len(buf))).astype(np.float32)
+            )
+            start_idx = half if leading_flushed else 0
+            for idx in range(start_idx, len(buf)):
+                emit_frame(buf[idx][0], buf[idx][1], baseline)
+                written += 1
+
+        proc.stdin.close()
+        err_bytes = proc.stderr.read()
+        proc.stderr.close()
+        rc = proc.wait(timeout=timeout_sec)
+        if rc != 0 or not tmp_out.is_file() or tmp_out.stat().st_size < 1000:
+            return {
+                "filtered": False,
+                "before": metrics,
+                "error": err_bytes.decode("utf-8", "replace").strip() or f"ffmpeg_rc_{rc}",
+            }
+        tmp_out.replace(mp4_path)
+        return {
+            "filtered": True,
+            "kFrames": k,
+            "framesWritten": written,
+            "before": metrics,
+        }
+    except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        return {"filtered": False, "before": metrics, "error": str(exc)}
+    finally:
+        cap.release()
+        tmp_out.unlink(missing_ok=True)
 
 
 def cluster_motion_bursts(
@@ -6059,6 +6284,7 @@ class ArmoryCamService:
         include_audio: bool = False,
         audio_path: Path | None = None,
         fast_defish: bool = False,
+        deflicker: bool | None = None,
     ) -> bool:
         if not segs:
             return False
@@ -6141,6 +6367,21 @@ class ArmoryCamService:
                 self.log.warning("FFmpeg clip failed: %s", res.stderr.strip())
                 tmp_vid.unlink(missing_ok=True)
                 return False
+
+            do_deflicker = (not fast_defish) if deflicker is None else bool(deflicker)
+            if do_deflicker:
+                df_res = deflicker_rolling_led_mp4(tmp_vid, self.ffmpeg, timeout_sec=enc_timeout)
+                if df_res.get("filtered"):
+                    b = df_res.get("before") or {}
+                    self.log.info(
+                        "LED deflicker applied to %s (k=%s, amp5=%.2f, p2p=%.2f)",
+                        out_path.name,
+                        df_res.get("kFrames"),
+                        float(b.get("amp5Med", 0.0)),
+                        float(b.get("ledP2p", 0.0)),
+                    )
+                elif df_res.get("error"):
+                    self.log.warning("LED deflicker skipped (%s): %s", out_path.name, df_res["error"])
 
             if include_audio and audio_path is not None and audio_path.is_file():
                 mux_cmd = [
