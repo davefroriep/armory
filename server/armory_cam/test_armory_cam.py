@@ -1606,9 +1606,36 @@ class ArmoryCamTests(unittest.TestCase):
             svc._started = True
             cfg_now = client.get("/api/config").get_json()
             cfg_now["cameras"][0]["crop"] = [0.0, 0.1, 0.9, 0.95]
+            cfg_now["cameras"][0]["tilt"] = 1.5
+            cfg_now["cameras"][0]["exclusions"] = [[[0.35, 0.30], [0.55, 0.30], [0.55, 0.70], [0.35, 0.70]]]
             self.assertEqual(client.post("/api/config", json={"cameras": cfg_now["cameras"]}).status_code, 200)
             time.sleep(0.15)
             self.assertEqual(ref_path.read_bytes(), orig_bytes)
+
+            # Combined rotation (+2.5 deg CW scene) + shift (+24px down) stays confident via ORB-RANSAC
+            M_comb = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -2.5, 1.0)
+            M_comb[1, 2] += 24.0
+            shifted_rot = cv2.warpAffine(base, M_comb, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            _push_live(shifted_rot)
+            r_comb = client.get("/api/bump/live?camera=rack_cam").get_json()
+            self.assertTrue(r_comb["ok"] and r_comb["confident"], r_comb)
+            self.assertGreater(r_comb["dyPx"], 16.0, r_comb)
+            self.assertGreater(r_comb["dAngle"], 1.8, r_comb)
+            self.assertEqual(r_comb["guide"]["pitch"], "down", r_comb)
+            self.assertEqual(r_comb["guide"]["roll"], "cw", r_comb)
+
+            # POST /api/bump/adapt_views auto-shifts crops, tilts, and mirror masks + updates baseline
+            r_adapt = client.post("/api/bump/adapt_views", json={"camera": "rack_cam"})
+            self.assertEqual(r_adapt.status_code, 200, r_adapt.get_json())
+            ad = r_adapt.get_json()
+            self.assertTrue(ad["ok"] and ad["baselineSaved"], ad)
+            v0 = ad["views"][0]
+            self.assertAlmostEqual(v0["newTilt"], 1.5 - ad["dAngle"], delta=0.2)
+            self.assertEqual(v0["newCrop"][0], 0.0)  # preserves x0=0.0 edge pin!
+            self.assertEqual(v0["exclusionsUpdated"], 1)
+            # After adapting, live alignment against refreshed baseline is locked!
+            r_post = client.get("/api/bump/live?camera=rack_cam").get_json()
+            self.assertTrue(r_post["aligned"], r_post)
             svc._started = False
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

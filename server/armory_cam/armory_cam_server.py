@@ -1278,6 +1278,99 @@ def _bump_edge_map(gray_small: np.ndarray) -> np.ndarray:
     return mag - float(np.mean(mag))
 
 
+_CLAHE_ALIGN = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+
+
+def estimate_rigid_alignment_orb(
+    ref_gray: np.ndarray,
+    cur_bgr: np.ndarray,
+    *,
+    work_size: tuple[int, int] = BUMP_LIVE_SIZE,
+    nfeatures: int = 850,
+    ref_width: float | None = None,
+) -> dict[str, Any] | None:
+    """Rotation- & occlusion-tolerant CLAHE+ORB+RANSAC rigid alignment (~18ms @ 640x360, ~60ms @ 960x540)."""
+    if ref_gray is None or ref_gray.size == 0 or cur_bgr is None or cur_bgr.size == 0:
+        return None
+    ww, wh = int(work_size[0]), int(work_size[1])
+    g_ref = cv2.cvtColor(ref_gray, cv2.COLOR_BGR2GRAY) if ref_gray.ndim == 3 else ref_gray
+    g_cur = cv2.cvtColor(cur_bgr, cv2.COLOR_BGR2GRAY) if cur_bgr.ndim == 3 else cur_bgr
+    if g_ref.shape != (wh, ww):
+        g_ref = cv2.resize(g_ref, (ww, wh), interpolation=cv2.INTER_AREA)
+    if g_cur.shape != (wh, ww):
+        g_cur = cv2.resize(g_cur, (ww, wh), interpolation=cv2.INTER_AREA)
+    if float(np.std(g_cur)) < 6.0 or float(np.std(g_ref)) < 6.0:
+        return None
+
+    r_eq = _CLAHE_ALIGN.apply(g_ref)
+    c_eq = _CLAHE_ALIGN.apply(g_cur)
+    mask = np.full((wh, ww), 255, dtype=np.uint8)
+    mask[: max(24, int(round(wh * 0.075))), : max(140, int(round(ww * 0.27)))] = 0
+
+    orb = cv2.ORB_create(nfeatures=int(nfeatures), fastThreshold=12)
+    kp1, des1 = orb.detectAndCompute(r_eq, mask)
+    kp2, des2 = orb.detectAndCompute(c_eq, mask)
+    if des1 is None or des2 is None or len(kp1) < 12 or len(kp2) < 12:
+        return None
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING)
+    knn = bf.knnMatch(des1, des2, k=2)
+    good = [pair[0] for pair in knn if len(pair) == 2 and pair[0].distance < 0.78 * pair[1].distance]
+    if len(good) < 8:
+        return None
+
+    pts1 = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    pts2 = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+    mat, inliers = cv2.estimateAffinePartial2D(
+        pts1,
+        pts2,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=max(3.0, ww / 240.0),
+        maxIters=2000,
+    )
+    if mat is None or inliers is None:
+        return None
+    n_inliers = int(inliers.sum())
+    zoom = math.hypot(float(mat[0, 0]), float(mat[1, 0]))
+    if n_inliers < 10 or not (0.93 <= zoom <= 1.07):
+        return None
+
+    cx, cy = ww / 2.0, wh / 2.0
+    nx = float(mat[0, 0]) * cx + float(mat[0, 1]) * cy + float(mat[0, 2])
+    ny = float(mat[1, 0]) * cx + float(mat[1, 1]) * cy + float(mat[1, 2])
+    target_w = float(ref_width) if (ref_width is not None and ref_width > 0) else float(cur_bgr.shape[1])
+    scale = target_w / float(ww)
+    dx_px = (nx - cx) * scale
+    dy_px = (ny - cy) * scale
+    shift_px = math.hypot(dx_px, dy_px)
+    d_angle = math.degrees(math.atan2(float(mat[1, 0]), float(mat[0, 0])))
+    # Normalize matrix to BUMP_OVERLAY_SIZE (960x540) pixel coords for downstream view adaptation
+    sx = BUMP_OVERLAY_SIZE[0] / float(ww)
+    sy = BUMP_OVERLAY_SIZE[1] / float(wh)
+    mat_960 = np.array(
+        [
+            [float(mat[0, 0]), float(mat[0, 1]) * (sx / sy), float(mat[0, 2]) * sx],
+            [float(mat[1, 0]) * (sy / sx), float(mat[1, 1]), float(mat[1, 2]) * sy],
+        ],
+        dtype=np.float64,
+    )
+    # Map inlier strength to an intuitive 0.15..0.99 match confidence score
+    resp = min(0.99, 0.18 + 0.81 * min(1.0, n_inliers / 160.0))
+    return {
+        "ok": True,
+        "method": "orb",
+        "dxPx": round(dx_px, 1),
+        "dyPx": round(dy_px, 1),
+        "shiftPx": round(shift_px, 1),
+        "dAngle": round(d_angle, 2),
+        "response": round(resp, 3),
+        "inliers": n_inliers,
+        "goodMatches": len(good),
+        "zoom": round(zoom, 4),
+        "matrix960": mat_960,
+    }
+
+
 def detect_camera_bump(
     ref_gray_small: np.ndarray,
     cur_bgr: np.ndarray,
@@ -1285,7 +1378,7 @@ def detect_camera_bump(
     high_res: bool = False,
     ref_width: float | None = None,
 ) -> dict[str, Any]:
-    """Lightweight phase-correlation camera bump check (~1.2 ms bg, ~3 ms live high-res, lighting invariant)."""
+    """Camera bump & live realign estimator: 1.2ms phaseCorrelate in bg; rotation-proof ORB+RANSAC + 320p fallback in live mode."""
     if ref_gray_small is None or ref_gray_small.size == 0 or cur_bgr is None or cur_bgr.size == 0:
         return {
             "ok": False,
@@ -1299,11 +1392,38 @@ def detect_camera_bump(
             "aligned": False,
             "close": False,
         }
-    use_hi = bool(high_res and ref_gray_small.shape[1] >= BUMP_LIVE_SIZE[0] and cur_bgr.shape[1] >= BUMP_LIVE_SIZE[0])
-    work_size = BUMP_LIVE_SIZE if use_hi else BUMP_REF_SIZE
-    hann_full = _HANN_LIVE_FULL if use_hi else _HANN_FULL
-    hann_half = _HANN_LIVE_HALF if use_hi else _HANN_HALF
 
+    if high_res:
+        orb_res = estimate_rigid_alignment_orb(
+            ref_gray_small,
+            cur_bgr,
+            work_size=BUMP_LIVE_SIZE,
+            nfeatures=850,
+            ref_width=ref_width,
+        )
+        if orb_res is not None:
+            shift_px = float(orb_res["shiftPx"])
+            d_angle = float(orb_res["dAngle"])
+            bumped = bool(shift_px >= BUMP_PX_THRESHOLD or abs(d_angle) >= BUMP_DEG_THRESHOLD)
+            aligned = bool(shift_px <= BUMP_ALIGNED_PX and abs(d_angle) <= BUMP_ALIGNED_DEG)
+            close = bool((not aligned) and shift_px <= BUMP_CLOSE_PX and abs(d_angle) <= BUMP_CLOSE_DEG)
+            return {
+                "ok": True,
+                "method": "orb",
+                "bumped": bumped,
+                "dxPx": orb_res["dxPx"],
+                "dyPx": orb_res["dyPx"],
+                "shiftPx": orb_res["shiftPx"],
+                "dAngle": orb_res["dAngle"],
+                "response": orb_res["response"],
+                "inliers": orb_res["inliers"],
+                "confident": True,
+                "aligned": aligned,
+                "close": close,
+            }
+
+    # Always run phase correlation at robust 320x180 (coarse edges tolerate 2-3 deg roll & cross-lighting far better than 640x360)
+    work_size = BUMP_REF_SIZE
     if ref_gray_small.shape != (work_size[1], work_size[0]):
         ref_small = cv2.resize(ref_gray_small, work_size, interpolation=cv2.INTER_AREA)
     else:
@@ -1328,7 +1448,7 @@ def detect_camera_bump(
 
     e_ref = _bump_edge_map(ref_small)
     e_cur = _bump_edge_map(cur_small)
-    (dx_s, dy_s), resp = cv2.phaseCorrelate(e_ref, e_cur, hann_full)
+    (dx_s, dy_s), resp = cv2.phaseCorrelate(e_ref, e_cur, _HANN_FULL)
     target_w = float(ref_width) if (ref_width is not None and ref_width > 0) else float(cur_bgr.shape[1])
     scale = max(target_w / float(work_size[0]), 1.0)
     dx_px = float(dx_s) * scale
@@ -1336,19 +1456,20 @@ def detect_camera_bump(
     shift_px = math.hypot(dx_px, dy_px)
 
     half_w = work_size[0] // 2
-    (_, dy_l), resp_l = cv2.phaseCorrelate(e_ref[:, :half_w], e_cur[:, :half_w], hann_half)
-    (_, dy_r), resp_r = cv2.phaseCorrelate(e_ref[:, half_w:], e_cur[:, half_w:], hann_half)
+    (_, dy_l), resp_l = cv2.phaseCorrelate(e_ref[:, :half_w], e_cur[:, :half_w], _HANN_HALF)
+    (_, dy_r), resp_r = cv2.phaseCorrelate(e_ref[:, half_w:], e_cur[:, half_w:], _HANN_HALF)
     d_angle = (
         math.degrees(math.atan2(float(dy_r - dy_l), float(half_w)))
-        if (resp_l >= 0.12 and resp_r >= 0.12)
+        if (resp_l >= 0.10 and resp_r >= 0.10)
         else 0.0
     )
-    confident = bool(resp >= 0.12)
+    confident = bool(resp >= 0.10)
     bumped = bool(resp >= 0.10 and (shift_px >= BUMP_PX_THRESHOLD or abs(d_angle) >= BUMP_DEG_THRESHOLD))
     aligned = bool(confident and shift_px <= BUMP_ALIGNED_PX and abs(d_angle) <= BUMP_ALIGNED_DEG)
     close = bool(confident and not aligned and shift_px <= BUMP_CLOSE_PX and abs(d_angle) <= BUMP_CLOSE_DEG)
     return {
         "ok": True,
+        "method": "phase",
         "bumped": bumped,
         "dxPx": round(dx_px, 1),
         "dyPx": round(dy_px, 1),
@@ -7191,6 +7312,24 @@ class ArmoryCamService:
         except Exception as exc:
             self.log.debug("Failed saving bump state: %s", exc)
 
+    def _bump_ref_candidates(self, phys_slug: str) -> list[tuple[Path, np.ndarray]]:
+        """Load primary (`<slug>.png`) and optional opposite-lighting (`<slug>_alt.png`) bump baselines."""
+        out: list[tuple[Path, np.ndarray]] = []
+        for fname in (f"{phys_slug}.png", f"{phys_slug}_alt.png"):
+            p = self.bump_refs_root / fname
+            if p.is_file():
+                im = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+                if im is not None and im.size > 0:
+                    out.append((p, im))
+        return out
+
+    @staticmethod
+    def _is_ir_frame(bgr: np.ndarray) -> bool:
+        if bgr is None or bgr.ndim != 3 or bgr.shape[2] < 3:
+            return True
+        small = cv2.resize(bgr, (160, 90), interpolation=cv2.INTER_AREA)
+        return float(np.mean(np.abs(small[:, :, 0].astype(np.float32) - small[:, :, 2].astype(np.float32)))) < 2.2
+
     def capture_bump_baseline(self, camera_name: str | None = None) -> dict[str, Any]:
         """Save crisp 960x540 grayscale baseline PNGs into `bump_refs/<slug>.png` for bump alerts & realign HUD."""
         with self.lock:
@@ -7210,7 +7349,13 @@ class ArmoryCamService:
             gray = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2GRAY) if raw_bgr.ndim == 3 else raw_bgr
             small = cv2.resize(gray, BUMP_OVERLAY_SIZE, interpolation=cv2.INTER_AREA)
             out_p = self.bump_refs_root / f"{phys.slug}.png"
+            alt_p = self.bump_refs_root / f"{phys.slug}_alt.png"
             if cv2.imwrite(str(out_p), small):
+                try:
+                    if alt_p.is_file():
+                        alt_p.unlink()
+                except OSError:
+                    pass
                 with self.lock:
                     self._bump_strikes[phys.slug] = 0
                     self._bump_last_ntfy.pop(phys.slug, None)
@@ -7223,7 +7368,7 @@ class ArmoryCamService:
         return {"ok": bool(saved), "saved": saved, "refDims": list(BUMP_OVERLAY_SIZE)}
 
     def live_bump_alignment(self, camera_name: str) -> dict[str, Any]:
-        """Real-time alignment telemetry for the Realign Cam HUD (~3 ms phase correlation vs saved baseline)."""
+        """Real-time alignment telemetry for the Realign Cam HUD (rotation-proof ORB+RANSAC + 320p fallback)."""
         with self.lock:
             target = self._find_camera(camera_name)
             if not target:
@@ -7231,8 +7376,8 @@ class ArmoryCamService:
             phys = self._source_camera(target)
             segs = list(self.ring_segments.get(phys.slug, []))
 
-        ref_path = self.bump_refs_root / f"{phys.slug}.png"
-        if not ref_path.is_file():
+        cands = self._bump_ref_candidates(phys.slug)
+        if not cands:
             return {
                 "ok": True,
                 "slug": phys.slug,
@@ -7250,10 +7395,8 @@ class ArmoryCamService:
                 "guide": {"pitch": "ok", "yaw": "ok", "roll": "ok", "pitchPx": 0.0, "yawPx": 0.0, "rollDeg": 0.0},
             }
 
-        ref_gray = cv2.imread(str(ref_path), cv2.IMREAD_GRAYSCALE)
-        if ref_gray is None:
-            return {"ok": False, "error": "Baseline image unreadable"}
-        ref_mtime_ms = int(ref_path.stat().st_mtime * 1000)
+        primary_path, primary_gray = cands[0]
+        ref_mtime_ms = int(primary_path.stat().st_mtime * 1000)
         cur_bgr = self._get_raw_frame_bgr(phys.slug, prefer_live=True)
         if cur_bgr is None:
             return {
@@ -7261,13 +7404,23 @@ class ArmoryCamService:
                 "slug": phys.slug,
                 "name": phys.name,
                 "hasRef": True,
-                "refDims": [int(ref_gray.shape[1]), int(ref_gray.shape[0])],
+                "refDims": [int(primary_gray.shape[1]), int(primary_gray.shape[0])],
                 "refUpdatedMs": ref_mtime_ms,
                 "error": "No live frame available",
             }
 
         native_w = float(self._probe_segment_dims(segs[-1].path)[0]) if (segs and segs[-1].path.exists()) else float(cur_bgr.shape[1])
-        res = detect_camera_bump(ref_gray, cur_bgr, high_res=True, ref_width=native_w)
+        best_res: dict[str, Any] | None = None
+        for _rp, r_gray in cands:
+            cand_res = detect_camera_bump(r_gray, cur_bgr, high_res=True, ref_width=native_w)
+            if best_res is None:
+                best_res = cand_res
+            else:
+                b_key = (bool(best_res.get("confident")), best_res.get("method") == "orb", float(best_res.get("response", 0.0)))
+                c_key = (bool(cand_res.get("confident")), cand_res.get("method") == "orb", float(cand_res.get("response", 0.0)))
+                if c_key > b_key:
+                    best_res = cand_res
+        res = best_res or {"ok": False, "confident": False}
         dx_px = float(res.get("dxPx", 0.0))
         dy_px = float(res.get("dyPx", 0.0))
         d_ang = float(res.get("dAngle", 0.0))
@@ -7284,7 +7437,7 @@ class ArmoryCamService:
             "slug": phys.slug,
             "name": phys.name,
             "hasRef": True,
-            "refDims": [int(ref_gray.shape[1]), int(ref_gray.shape[0])],
+            "refDims": [int(primary_gray.shape[1]), int(primary_gray.shape[0])],
             "refUpdatedMs": ref_mtime_ms,
             "guide": {
                 "pitch": pitch,
@@ -7294,6 +7447,151 @@ class ArmoryCamService:
                 "yawPx": round(abs(dx_px), 1),
                 "rollDeg": round(abs(d_ang), 2),
             },
+        }
+
+    def adapt_views_to_current_framing(self, camera_name: str) -> dict[str, Any]:
+        """Auto-shift all crops, tilts, and mirror masks on `camera_name` to match its new position, then save baseline."""
+        with self.lock:
+            target = self._find_camera(camera_name)
+            if not target:
+                return {"ok": False, "error": f"Unknown camera: {camera_name}"}
+            phys = self._source_camera(target)
+            segs = list(self.ring_segments.get(phys.slug, []))
+
+        cands = self._bump_ref_candidates(phys.slug)
+        if not cands:
+            return {"ok": False, "error": "No saved baseline reference to measure shift from"}
+
+        cur_bgr = self._get_raw_frame_bgr(phys.slug, prefer_live=True)
+        if cur_bgr is None:
+            return {"ok": False, "error": "No live frame available"}
+        native_w = float(self._probe_segment_dims(segs[-1].path)[0]) if (segs and segs[-1].path.exists()) else float(cur_bgr.shape[1])
+
+        # High-precision 960x540 ORB+RANSAC across primary & optional alt lighting baselines
+        best_orb: dict[str, Any] | None = None
+        for _rp, r_gray in cands:
+            cand = estimate_rigid_alignment_orb(
+                r_gray,
+                cur_bgr,
+                work_size=BUMP_OVERLAY_SIZE,
+                nfeatures=1500,
+                ref_width=native_w,
+            )
+            if cand is not None and (best_orb is None or cand["inliers"] > best_orb["inliers"]):
+                best_orb = cand
+
+        w960, h540 = BUMP_OVERLAY_SIZE
+        if best_orb is not None:
+            mat_960 = best_orb["matrix960"]
+            dx_px = float(best_orb["dxPx"])
+            dy_px = float(best_orb["dyPx"])
+            d_ang = float(best_orb["dAngle"])
+            inliers = int(best_orb["inliers"])
+            method = "orb"
+        else:
+            # Fallback: build rigid matrix from 320x180 phase correlation
+            ph = detect_camera_bump(cands[0][1], cur_bgr, high_res=False, ref_width=native_w)
+            if not ph.get("confident"):
+                return {"ok": False, "error": "Camera view unclear or obstructed — step back and retry"}
+            dx_px = float(ph["dxPx"])
+            dy_px = float(ph["dyPx"])
+            d_ang = float(ph["dAngle"])
+            scale_to_960 = w960 / max(native_w, 1.0)
+            rot_m = cv2.getRotationMatrix2D((w960 / 2.0, h540 / 2.0), -d_ang, 1.0)
+            rot_m[0, 2] += dx_px * scale_to_960
+            rot_m[1, 2] += dy_px * scale_to_960
+            mat_960 = rot_m.astype(np.float64)
+            inliers = 0
+            method = "phase"
+
+        mat_3 = np.vstack([mat_960, [0.0, 0.0, 1.0]])
+        updated_views: list[dict[str, Any]] = []
+
+        with self.lock:
+            views = self._views_for_source(phys.slug, enabled_only=False)
+            for v in views:
+                old_crop = list(v.crop)
+                old_tilt = float(v.tilt)
+                old_excl = [[[pt[0], pt[1]] for pt in q] for q in v.exclusions]
+                new_tilt = normalize_tilt(old_tilt - d_ang)
+
+                r_old, old_fw, old_fh = view_transform_matrix(w960, h540, rotate=v.rotate, tilt=old_tilt)
+                r_new, new_fw, new_fh = view_transform_matrix(w960, h540, rotate=v.rotate, tilt=new_tilt)
+                comp = r_new @ mat_3 @ np.linalg.inv(r_old)
+
+                def _map_norm(u: float, vv: float) -> tuple[float, float]:
+                    vec = comp @ np.array([u * old_fw, vv * old_fh, 1.0], dtype=np.float64)
+                    return (
+                        max(0.0, min(1.0, float(vec[0]) / float(new_fw))),
+                        max(0.0, min(1.0, float(vec[1]) / float(new_fh))),
+                    )
+
+                # Shift crop box via its center in exact tilted-view coordinates while preserving dimensions
+                if tuple(old_crop) != (0.0, 0.0, 1.0, 1.0):
+                    cx = (old_crop[0] + old_crop[2]) / 2.0
+                    cy = (old_crop[1] + old_crop[3]) / 2.0
+                    cw = old_crop[2] - old_crop[0]
+                    ch = old_crop[3] - old_crop[1]
+                    ncx, ncy = _map_norm(cx, cy)
+                    nx0 = max(0.0, min(1.0 - cw, ncx - cw / 2.0))
+                    ny0 = max(0.0, min(1.0 - ch, ncy - ch / 2.0))
+                    # Preserve edge-pinned x0=0.0 (e.g. Fly Machine Cam) if still flush with left edge
+                    if old_crop[0] <= 0.001 and nx0 <= 0.018:
+                        nx0 = 0.0
+                    nx1 = min(1.0, nx0 + cw)
+                    ny1 = min(1.0, ny0 + ch)
+                    v.crop = normalize_crop((round(nx0, 4), round(ny0, 4), round(nx1, 4), round(ny1, 4)))
+                v.tilt = new_tilt
+
+                if v.exclusions:
+                    shifted_excls = []
+                    for q in v.exclusions:
+                        pts = [
+                            (round(nu, 4), round(nv, 4))
+                            for nu, nv in (_map_norm(pt[0], pt[1]) for pt in q)
+                        ]
+                        shifted_excls.append(pts)
+                    v.exclusions = normalize_exclusions(shifted_excls)
+
+                updated_views.append(
+                    {
+                        "name": v.name,
+                        "slug": v.slug,
+                        "oldCrop": old_crop,
+                        "newCrop": list(v.crop),
+                        "oldTilt": old_tilt,
+                        "newTilt": float(v.tilt),
+                        "exclusionsUpdated": len(old_excl),
+                    }
+                )
+            self.save_config()
+
+        # Refresh 960x540 baseline to current live frame (clears cooldown & stale alt ref)
+        base_res = self.capture_bump_baseline(phys.slug)
+        if self._started:
+            self._trigger_preview_refresh_async()
+        self.log.info(
+            "Auto-adapted %d view(s) on %s (dx=%+.1fpx, dy=%+.1fpx, roll=%+.2fdeg, method=%s, inliers=%d)",
+            len(updated_views),
+            phys.name,
+            dx_px,
+            dy_px,
+            d_ang,
+            method,
+            inliers,
+        )
+        return {
+            "ok": True,
+            "slug": phys.slug,
+            "name": phys.name,
+            "method": method,
+            "inliers": inliers,
+            "dxPx": round(dx_px, 1),
+            "dyPx": round(dy_px, 1),
+            "shiftPx": round(math.hypot(dx_px, dy_px), 1),
+            "dAngle": round(d_ang, 2),
+            "views": updated_views,
+            "baselineSaved": bool(base_res.get("ok")),
         }
 
     def get_bump_overlay_png(self, camera_name: str, mode: str = "edges", color: str = "cyan") -> tuple[bytes | None, str]:
@@ -7368,11 +7666,32 @@ class ArmoryCamService:
             if ref_gray is None or cur_bgr is None:
                 continue
 
-            res = detect_camera_bump(ref_gray, cur_bgr)
-            if not res.get("ok"):
+            cands = self._bump_ref_candidates(phys.slug)
+            res: dict[str, Any] | None = None
+            for _rp, rg in cands:
+                cand_r = detect_camera_bump(rg, cur_bgr)
+                if res is None or (bool(cand_r.get("ok")), float(cand_r.get("response", 0.0))) > (
+                    bool(res.get("ok")),
+                    float(res.get("response", 0.0)),
+                ):
+                    res = cand_r
+            if not res or not res.get("ok"):
                 continue
             if not res.get("bumped"):
                 self._bump_strikes[phys.slug] = 0
+                # Lazily capture opposite-lighting companion baseline (<slug>_alt.png) once aligned in a new lighting mode
+                alt_path = self.bump_refs_root / f"{phys.slug}_alt.png"
+                if (
+                    not alt_path.is_file()
+                    and float(res.get("shiftPx", 99.0)) <= 4.0
+                    and abs(float(res.get("dAngle", 99.0))) <= 0.35
+                    and 0.12 <= float(res.get("response", 0.0)) < 0.32
+                ):
+                    try:
+                        g_cur = cv2.cvtColor(cur_bgr, cv2.COLOR_BGR2GRAY) if cur_bgr.ndim == 3 else cur_bgr
+                        cv2.imwrite(str(alt_path), cv2.resize(g_cur, BUMP_OVERLAY_SIZE, interpolation=cv2.INTER_AREA))
+                    except Exception:
+                        pass
                 continue
 
             strikes = self._bump_strikes.get(phys.slug, 0) + 1
@@ -9293,7 +9612,8 @@ DASHBOARD_HTML = """<!doctype html>
       <button class="btn sec sm on" id="raCropsBtn" type="button" title="Show virtual view crops and mirror exclusion masks">Crops &amp; Masks</button>
     </div>
     <div class="ra-ctrl-grp" style="margin-left:auto">
-      <button class="btn sec sm" id="raAcceptBtn" type="button" title="Save current camera position as the new alignment baseline">Accept New Framing</button>
+      <button class="btn ok sm" id="raAdaptBtn" type="button" title="Automatically shift all crops, tilts, and mirror masks to match this camera position and save new baseline">✨ Auto-Shift Crops &amp; Masks</button>
+      <button class="btn sec sm" id="raAcceptBtn" type="button" title="Save current camera position as the new alignment baseline without moving crops/masks">Accept Only</button>
     </div>
   </div>
 </div>
@@ -9404,6 +9724,8 @@ const raState = {
   chimeOn: true,
   wasLocked: false,
   lastChimeAt: 0,
+  missStreak: 0,
+  lastGood: null,
   pollTimer: null,
   blinkTimer: null,
   pollAbort: null,
@@ -11985,23 +12307,36 @@ function updateRealignHud(d) {
   const respPct = Math.round((Number(d.response) || 0) * 100);
   const refDimTxt = Array.isArray(d.refDims) ? `${d.refDims[0]}×${d.refDims[1]}` : '320×180';
   const refDateTxt = d.refUpdatedMs ? new Date(d.refUpdatedMs).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
-  const dx = Number(d.dxPx || 0);
-  const dy = Number(d.dyPx || 0);
-  const sh = Number(d.shiftPx || 0);
-  const ang = Number(d.dAngle || 0);
-  if (metrics) {
-    metrics.textContent = `Shift ${sh.toFixed(1)} px (dx ${dx >= 0 ? '+' : ''}${dx.toFixed(1)}, dy ${dy >= 0 ? '+' : ''}${dy.toFixed(1)}) · Roll ${ang >= 0 ? '+' : ''}${ang.toFixed(2)}° · Match ${respPct}% · Ref ${refDimTxt}${refDateTxt ? ' (' + refDateTxt + ')' : ''}`;
-  }
+  const adaptBtn = $('raAdaptBtn');
+
   if (!d.confident) {
+    raState.missStreak = (raState.missStreak || 0) + 1;
+    // Hysteresis: hold the last good readout across up to 2 transient misses (~0.8s) so HUD never spazzes
+    if (raState.lastGood && raState.missStreak < 3) {
+      return;
+    }
     if (stage) stage.className = 'ra-stage';
     if (pill) { pill.className = 'ra-pill hold'; pill.textContent = 'HOLD STEADY'; }
     if (lockBadge) lockBadge.hidden = true;
     if (holdBadge) holdBadge.hidden = false;
+    if (adaptBtn) adaptBtn.disabled = true;
     ['raArrUp', 'raArrDown', 'raArrLeft', 'raArrRight', 'raArrRoll'].forEach(id => setEdge(id, false, false));
     if (chips) chips.innerHTML = '<span class="ra-chip hold">✋ Step back / hold steady — view obstructed or moving</span>';
+    if (metrics) metrics.textContent = `Match ${respPct}% · Ref ${refDimTxt}${refDateTxt ? ' (' + refDateTxt + ')' : ''}`;
     raState.wasLocked = false;
     return;
   }
+  raState.missStreak = 0;
+  raState.lastGood = d;
+  const dx = Number(d.dxPx || 0);
+  const dy = Number(d.dyPx || 0);
+  const sh = Number(d.shiftPx || 0);
+  const ang = Number(d.dAngle || 0);
+  const mTxt = d.method === 'orb' && d.inliers ? `ORB ${d.inliers}pts` : `Match ${respPct}%`;
+  if (metrics) {
+    metrics.textContent = `Shift ${sh.toFixed(1)} px (dx ${dx >= 0 ? '+' : ''}${dx.toFixed(1)}, dy ${dy >= 0 ? '+' : ''}${dy.toFixed(1)}) · Roll ${ang >= 0 ? '+' : ''}${ang.toFixed(2)}° · ${mTxt} · Ref ${refDimTxt}${refDateTxt ? ' (' + refDateTxt + ')' : ''}`;
+  }
+  if (adaptBtn) adaptBtn.disabled = false;
   if (holdBadge) holdBadge.hidden = true;
   if (d.aligned) {
     if (stage) stage.className = 'ra-stage locked';
@@ -12079,6 +12414,8 @@ function openRealignModal(camSlugOrName) {
   raState.open = true;
   raState.slug = matched.slug;
   raState.wasLocked = false;
+  raState.missStreak = 0;
+  raState.lastGood = null;
   if (raState.pollTimer) { clearTimeout(raState.pollTimer); raState.pollTimer = null; }
   if (raState.pollAbort) { try { raState.pollAbort.abort(); } catch {} raState.pollAbort = null; }
   const sel = $('raCamSel');
@@ -12168,6 +12505,44 @@ function wireRealignModal() {
       $('raChimeBtn').classList.toggle('on', raState.chimeOn);
       $('raChimeBtn').textContent = raState.chimeOn ? '🔊 Chime' : '🔇 Muted';
       if (raState.chimeOn) { raState.lastChimeAt = 0; playRealignLockChime(); }
+    };
+  }
+  if ($('raAdaptBtn')) {
+    $('raAdaptBtn').onclick = async () => {
+      if (!raState.slug) return;
+      const views = (cfg?.cameras || []).filter(c => sourceSlugOf(c) === raState.slug);
+      const vNames = views.map(v => v.name).join(', ') || raState.slug;
+      const lg = raState.lastGood;
+      const deltaTxt = lg ? `Shift ${Number(lg.shiftPx || 0).toFixed(1)} px, Roll ${Number(lg.dAngle || 0) >= 0 ? '+' : ''}${Number(lg.dAngle || 0).toFixed(2)}°` : 'measured shift';
+      if (!window.confirm(`Auto-shift crops, tilts, and mirror masks for: ${vNames}\n(${deltaTxt}) and save this position as the new baseline?`)) return;
+      const btn = $('raAdaptBtn');
+      setBtnFeedback(btn, 'saving', 'Adapting…');
+      try {
+        const r = await fetch('/api/bump/adapt_views', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ camera: raState.slug }),
+        }).then(x => x.json());
+        if (!r || !r.ok) throw new Error((r && r.error) || 'Failed');
+        const freshCfg = await fetch('/api/config').then(x => x.json());
+        if (freshCfg && Array.isArray(freshCfg.cameras)) {
+          freshCfg.cameras.forEach(c => { c.exclusions = (Array.isArray(c.exclusions) ? c.exclusions : []).map(normQuad).filter(Boolean); });
+          cfg.cameras = freshCfg.cameras;
+          renderCameras();
+        }
+        setBtnFeedback(btn, 'saved', '✓ Views Shifted', 2400);
+        showToast(`✓ Shifted ${(r.views || []).length} view(s) & saved 960×540 baseline`, 'ok');
+        raState.wasLocked = false;
+        raState.missStreak = 0;
+        raState.lastGood = null;
+        renderRealignCrops();
+        refreshRealignOverlay(true);
+        if (raState.pollTimer) { clearTimeout(raState.pollTimer); raState.pollTimer = null; }
+        pollRealignLive();
+      } catch (err) {
+        setBtnFeedback(btn, 'save-err', '✗ Failed', 2500);
+        showToast(`✗ Auto-shift failed: ${err.message || err}`, 'err');
+      }
     };
   }
   if ($('raAcceptBtn')) {
@@ -16447,6 +16822,15 @@ def create_app(service: ArmoryCamService) -> Flask:
         body = request.get_json(silent=True) or {}
         cam_name = str(body.get("camera") or "").strip() or None
         res = service.capture_bump_baseline(cam_name)
+        return jsonify(res), (200 if res.get("ok") else 400)
+
+    @app.post("/api/bump/adapt_views")
+    def api_bump_adapt_views() -> Response:
+        body = request.get_json(silent=True) or {}
+        cam_name = str(body.get("camera") or "").strip()
+        if not cam_name:
+            return jsonify({"ok": False, "error": "Missing camera parameter"}), 400
+        res = service.adapt_views_to_current_framing(cam_name)
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.get("/api/status")
