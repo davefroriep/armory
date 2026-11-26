@@ -150,7 +150,7 @@ def adversarial_phrases_for(phrase: str) -> list[str]:
         "cemetery",
     ]
     if "armory" in clean:
-        base.extend([
+        armory_adv = [
             "hey army",
             "army",
             "hey harmony",
@@ -163,8 +163,6 @@ def adversarial_phrases_for(phrase: str) -> list[str]:
             "summary",
             "hey emory",
             "emory",
-            "hey amory",
-            "amory",
             "hey armor",
             "armor",
             "hey armored",
@@ -194,9 +192,21 @@ def adversarial_phrases_for(phrase: str) -> list[str]:
             "hey aubrey",
             "hey audrey",
             "hey atlas",
-            "armory",
-            "the armory",
-        ])
+        ]
+        if clean != "armory":
+            # Only treat bare "armory" / "the armory" / "amory" as negatives when training multi-word "hey armory"
+            armory_adv.extend(["hey amory", "amory", "armory", "the armory"])
+        else:
+            # Extra 3-syllable confusables for bare "armory" (never include "the armory" or "hey armory" as negatives!)
+            armory_adv.extend([
+                "arming", "armies", "armed", "armor plate", "barbell", "arnold", "armani",
+                "artillery", "archery", "bakery", "brewery", "calvary", "cavalry", "chancery",
+                "creamery", "drapery", "finery", "forgery", "grocery", "imagery", "jewelry",
+                "lottery", "machinery", "memory card", "nursery", "pottery", "robbery",
+                "scenery", "slavery", "surgery", "winery", "i'm ready", "are we", "all righty",
+                "harming", "alarming", "charming", "farming", "warming", "swarmy",
+            ])
+        base.extend(armory_adv)
     elif "atlas" in clean:
         base.extend([
             "hey at last",
@@ -426,21 +436,39 @@ def augment_clip(
 
 
 def mine_gym_backgrounds(max_segments: int = 180) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Mine real gym audio (loud music + room noise) from non-held-out dates (2026-11-21/22/24/25).
+    """Mine real gym audio (loud music + room noise) from non-held-out windows.
 
-    Strictly skips `2026-11-23` so it stays 100% unseen for blind final evaluation.
+    Strictly holds out all three primary benchmark workouts so zero test audio leaks into negatives:
+      - 2026-11-23 (entire day — Vol 51 Armory workout)
+      - 2026-11-24 19:50-21:35 (Vol 69 90-min Armory workout)
+      - 2026-11-25 18:20-19:55 (Vol 69 Lower 1 Hey Jarvis / Hey Armory workout)
     """
     tapes_root = ROOT_DIR / "audio_tapes"
     loud_beds: list[np.ndarray] = []
     ambient_beds: list[np.ndarray] = []
     rng = random.Random(42)
 
+    def _is_held_out(day: str, p: Path) -> bool:
+        parts = p.stem.split("_")
+        if len(parts) != 3:
+            return False
+        try:
+            dt = datetime.fromtimestamp(int(parts[1]) / 1000.0)
+        except Exception:
+            return False
+        hhmm = dt.hour * 100 + dt.minute
+        if day == "2026-11-24" and 1950 <= hhmm <= 2135:
+            return True
+        if day == "2026-11-25" and 1820 <= hhmm <= 1955:
+            return True
+        return False
+
     candidate_files: list[Path] = []
     for day in ("2026-11-21", "2026-11-22", "2026-11-24", "2026-11-25"):
         d = tapes_root / day
         if not d.is_dir():
             continue
-        files = sorted(d.glob("aud_*.m4a"))
+        files = [p for p in sorted(d.glob("aud_*.m4a")) if not _is_held_out(day, p)]
         if len(files) > 220:
             step = max(1, len(files) // 220)
             files = files[::step]

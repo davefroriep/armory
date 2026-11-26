@@ -8695,6 +8695,7 @@ DASHBOARD_HTML = """<!doctype html>
               <select id="vxWakeWord">
                 <option value="hey jarvis">Hey Jarvis (Built-in ONNX)</option>
                 <option value="hey armory">Hey Armory (Custom ONNX)</option>
+                <option value="armory">Armory (Custom Bare ONNX)</option>
               </select>
             </div>
             <div>

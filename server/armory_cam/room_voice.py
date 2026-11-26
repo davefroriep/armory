@@ -325,8 +325,10 @@ def normalize_wake_text(text: str) -> str:
 
 
 def resolve_oww_model_name(wake_word: str) -> str:
-    """Map configured wake phrase (e.g. 'hey armory', 'hey jarvis', 'hey atlas') to its ONNX model stem."""
+    """Map configured wake phrase (e.g. 'armory', 'hey armory', 'hey jarvis', 'hey atlas') to its ONNX model stem."""
     w = re.sub(r"\s+", " ", (wake_word or "hey jarvis").strip().lower())
+    if w in ("armory", "armoury"):
+        return "armory_v0.1"
     if "armory" in w or "armoury" in w:
         return "hey_armory_v0.1"
     if "jarvis" in w:
