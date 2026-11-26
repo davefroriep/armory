@@ -332,6 +332,24 @@ def normalize_wake_text(text: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def wake_phrase_slug(phrase: str) -> str:
+    """Normalize a wake phrase (e.g. 'hey atlas') into its file/folder slug ('hey_atlas')."""
+    return re.sub(r"[^a-z0-9]+", "_", str(phrase or "").strip().lower()).strip("_") or "hey_armory"
+
+
+def encode_pcm16_wav_bytes(pcm: np.ndarray, sr: int = SAMPLE_RATE_16K) -> bytes:
+    """Encode 1D float32 audio into 16 kHz mono 16-bit PCM WAV bytes."""
+    arr = np.asarray(pcm, dtype=np.float32).reshape(-1)
+    pcm16 = np.clip(np.round(arr * 32767.0), -32768, 32767).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sr))
+        wf.writeframes(pcm16.tobytes())
+    return buf.getvalue()
+
+
 def resolve_oww_model_name(wake_word: str) -> str:
     """Map configured wake phrase (e.g. 'armory', 'hey armory', 'hey jarvis', 'hey atlas') to its ONNX model stem."""
     w = re.sub(r"\s+", " ", (wake_word or "hey jarvis").strip().lower())
@@ -525,6 +543,9 @@ class RoomVoiceConfig:
     rescue_threshold: float = 0.10  # Two-Tier Silent Rescue Gate: 0.10..wake_threshold checks Whisper w/o ducking (0=off)
     aec_enabled: bool = True
     aec_device_match: str = "Line In"
+    aec_res_over_sub: float = 1.00
+    aec_res_g_min: float = 0.20
+    aec_vad_threshold: float = 0.42
     speaker_readback: bool = True
     room_command_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
@@ -549,6 +570,9 @@ class RoomVoiceConfig:
             "rescueThreshold": round(float(self.rescue_threshold), 2),
             "aecEnabled": bool(self.aec_enabled),
             "aecDeviceMatch": self.aec_device_match,
+            "aecResOverSub": round(float(self.aec_res_over_sub), 2),
+            "aecResGMin": round(float(self.aec_res_g_min), 2),
+            "aecVadThreshold": round(float(self.aec_vad_threshold), 2),
             "speakerReadback": bool(self.speaker_readback),
             "roomCommandReadback": bool(self.room_command_readback),
             "ttsVoice": self.tts_voice,
@@ -596,6 +620,9 @@ class RoomVoiceConfig:
             rescue_threshold=_clamp(float(raw.get("rescueThreshold", 0.10) if raw.get("rescueThreshold") is not None else 0.10), 0.0, 0.40),
             aec_enabled=bool(raw.get("aecEnabled", True)),
             aec_device_match=str(raw.get("aecDeviceMatch", "Line In") or "").strip(),
+            aec_res_over_sub=_clamp(float(raw.get("aecResOverSub", 1.00) if raw.get("aecResOverSub") is not None else 1.00), 0.60, 2.00),
+            aec_res_g_min=_clamp(float(raw.get("aecResGMin", 0.20) if raw.get("aecResGMin") is not None else 0.20), 0.04, 0.50),
+            aec_vad_threshold=_clamp(float(raw.get("aecVadThreshold", 0.42) if raw.get("aecVadThreshold") is not None else 0.42), 0.20, 0.85),
             speaker_readback=bool(raw.get("speakerReadback", True)),
             room_command_readback=bool(raw.get("roomCommandReadback", True)),
             tts_voice=tts_voice,
@@ -2205,6 +2232,7 @@ class RoomVoiceService:
         house_audio_router: Callable[..., dict[str, Any] | None] | None = None,
         local_command_handler: Callable[[str], dict[str, Any] | None] | None = None,
         on_pcm_chunk: Callable[[np.ndarray, int, float], None] | None = None,
+        on_aec_ref_chunk: Callable[[np.ndarray, int, float], None] | None = None,
         wake_duck_callbacks: dict[str, Callable[..., Any]] | None = None,
         wake_spotter: Any | None = None,
         show_active_fn: Callable[[], bool] | None = None,
@@ -2223,6 +2251,7 @@ class RoomVoiceService:
         self._house_audio_router = house_audio_router
         self._local_command_handler = local_command_handler
         self._on_pcm_chunk = on_pcm_chunk
+        self._on_aec_ref_chunk = on_aec_ref_chunk
         self._wake_duck_cbs: dict[str, Callable[..., Any]] = dict(wake_duck_callbacks or {})
         self._show_active_fn = show_active_fn
 
@@ -2270,7 +2299,13 @@ class RoomVoiceService:
         self._stream: sd.InputStream | None = None
         self._aec_stream: sd.InputStream | None = None
         self._aec: LineInAecProcessor = (
-            aec_processor if aec_processor is not None else LineInAecProcessor(enabled=self.cfg.aec_enabled)
+            aec_processor
+            if aec_processor is not None
+            else LineInAecProcessor(
+                enabled=self.cfg.aec_enabled,
+                res_over_sub=self.cfg.aec_res_over_sub,
+                res_g_min=self.cfg.aec_res_g_min,
+            )
         )
         self._stream_sr: int = 48_000
         self._stream_dev_name: str = ""
@@ -2286,7 +2321,7 @@ class RoomVoiceService:
             rms_gate=self.cfg.rms_gate,
         )
         self._aec_vad_detector = UtteranceDetector(
-            vad_threshold=0.42,
+            vad_threshold=self.cfg.aec_vad_threshold,
             min_speech_ms=160,
             end_silence_ms=420,
             max_utterance_sec=4.5,
@@ -2294,6 +2329,8 @@ class RoomVoiceService:
         )
         self._last_emitted_norm: str = ""
         self._last_emitted_mono: float = 0.0
+        self._event_log_lock = threading.Lock()
+        self._event_log_path: Path | None = (root_dir / "logs" / "voice_events.jsonl") if root_dir is not None else None
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
         secrets_path = (root_dir / "tts_secrets.json") if root_dir is not None else None
         self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, models_dir=models_dir, secrets_path=secrets_path)
@@ -2315,6 +2352,25 @@ class RoomVoiceService:
         self._mute_until_mono = 0.0
         self._last_spoken_text: str = ""
         self._last_spoken_mono: float = 0.0
+
+        self._enroll_active: bool = False
+        self._enroll_phrase: str = ""
+        self._enroll_slug: str = ""
+        self._enroll_dir: Path | None = None
+        self._enroll_target_reps: int = 20
+        self._enroll_session_count: int = 0
+        self._enroll_last_event: str = ""
+        self._enroll_last_file: str = ""
+        self._enroll_started_ms: int = 0
+        self._enroll_last_capture_mono: float = 0.0
+        self._enroll_seq: int = 0
+        self._enroll_detector = UtteranceDetector(
+            vad_threshold=0.38,
+            min_speech_ms=160,
+            end_silence_ms=420,
+            max_utterance_sec=2.6,
+            rms_gate=0.0025,
+        )
 
         self.seq = 0
         self.event_seq = int(time.time() * 1000)
@@ -2510,6 +2566,49 @@ class RoomVoiceService:
             )
             if self.cfg.speaker_readback and self.context_readback:
                 self.play_ready_chime()
+        self._log_voice_event(
+            "wake_tier1",
+            {
+                "wakeWord": self.cfg.wake_word,
+                "score": round(float(score), 3),
+                "threshold": round(float(self.cfg.wake_threshold), 2),
+                "ducked": bool(ducked),
+                "dropDb": round(float(duck_info.get("dropDb") or 0.0), 1),
+                "fromDb": duck_info.get("fromDb"),
+                "toDb": duck_info.get("toDb"),
+                "reason": str(duck_info.get("reason") or ""),
+            },
+        )
+
+    def _log_voice_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Append one structured telemetry JSON line to `logs/voice_events.jsonl` for overnight audits."""
+        path = self._event_log_path
+        if path is None:
+            return
+        try:
+            aec_st = self._aec.status_dict() if self._aec is not None else {}
+            row = {
+                **payload,
+                "tsMs": int(time.time() * 1000),
+                "kind": str(kind),
+                "aecActive": bool(aec_st.get("active", False)),
+                "erleDb": float(aec_st.get("erleDb", 0.0) or 0.0),
+                "lineInDb": float(aec_st.get("lineInDb", -99.0) or -99.0),
+            }
+            line = json.dumps(row, separators=(",", ":")) + "\n"
+            with self._event_log_lock:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_file() and path.stat().st_size > 10 * 1024 * 1024:
+                    bak = path.with_suffix(".jsonl.1")
+                    try:
+                        bak.unlink(missing_ok=True)
+                        path.replace(bak)
+                    except OSError:
+                        pass
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+        except Exception:
+            pass
 
     def update_config(self, raw: dict[str, Any]) -> RoomVoiceConfig:
         with self.lock:
@@ -2528,6 +2627,11 @@ class RoomVoiceService:
             )
             self.cfg = next_cfg
             self._aec.enabled = bool(next_cfg.aec_enabled)
+            if hasattr(self._aec, "_res_over_sub"):
+                self._aec._res_over_sub = float(next_cfg.aec_res_over_sub)
+            if hasattr(self._aec, "_res_g_min"):
+                self._aec._res_g_min = float(next_cfg.aec_res_g_min)
+            self._aec_vad_detector.vad_threshold = float(next_cfg.aec_vad_threshold)
             self.context_wake_word = next_cfg.wake_word
             self._detector.configure(next_cfg)
             if wake_changed and not self._custom_wake_spotter:
@@ -2631,6 +2735,8 @@ class RoomVoiceService:
     def should_capture_now(self, now_mono: float | None = None) -> bool:
         now = time.monotonic() if now_mono is None else now_mono
         with self.lock:
+            if self._enroll_active:
+                return True
             if not self.cfg.enabled:
                 return False
             if self.cfg.listen_mode == "always":
@@ -2666,7 +2772,13 @@ class RoomVoiceService:
             if readback is not None:
                 self.context_readback = bool(readback)
             self._bump_status_locked()
-            return self.status_dict()
+            res_st = self.status_dict()
+        if active is not None:
+            self._log_voice_event(
+                "context",
+                {"active": bool(self.context_active), "wallboardActive": bool(self.wallboard_active)},
+            )
+        return res_st
 
     def set_wallboard_active(self, active: bool) -> None:
         with self.lock:
@@ -2682,6 +2794,172 @@ class RoomVoiceService:
             sec = max(0.0, min(600.0, float(seconds)))
             self.test_listen_until_mono = time.monotonic() + sec if sec > 0 else 0.0
             if sec > 0 and self._started:
+                self._ensure_model_loading_locked()
+            self._bump_status_locked()
+            return self.status_dict()
+
+    @staticmethod
+    def _enroll_prompt_for_rep(rep_idx: int, phrase: str) -> str:
+        disp = format_wake_display(phrase)
+        if rep_idx < 4:
+            cue = "Normal voice · center of gym"
+        elif rep_idx < 8:
+            cue = "Standing by Power Rack · normal pace"
+        elif rep_idx < 12:
+            cue = "Standing by Smith Machine · slightly farther"
+        elif rep_idx < 16:
+            cue = "Projected / louder (like music is playing)"
+        else:
+            cue = "Quick / slightly breathless mid-set delivery"
+        return f"Say \"{disp}\" only — {cue} (rep {rep_idx + 1})"
+
+    def start_wake_enrollment(self, phrase: str, target_reps: int = 20) -> dict[str, Any]:
+        clean = re.sub(r"\s+", " ", str(phrase or "").strip().lower())
+        if not clean:
+            raise ValueError("Wake phrase is required")
+        slug = wake_phrase_slug(clean)
+        base_root = self._root_dir if self._root_dir is not None else Path(r"S:\ArmoryCam")
+        enroll_dir = base_root / "oww_training" / slug / "user_positives"
+        enroll_dir.mkdir(parents=True, exist_ok=True)
+        reps = max(1, min(60, int(target_reps or 20)))
+        with self.lock:
+            self._enroll_active = True
+            self._enroll_phrase = clean
+            self._enroll_slug = slug
+            self._enroll_dir = enroll_dir
+            self._enroll_target_reps = reps
+            self._enroll_session_count = 0
+            self._enroll_seq = 0
+            self._enroll_last_file = ""
+            self._enroll_started_ms = int(time.time() * 1000)
+            self._enroll_last_capture_mono = 0.0
+            self._enroll_last_event = f"Mic armed — say \"{format_wake_display(clean)}\" after each chime"
+            self.armed_until_ms = 0
+            self._oww_awaiting_cmd = False
+            self._rescue_active = False
+            self._rescue_chunks.clear()
+            self._rescue_post_samples = 0
+            self._enroll_detector.reset()
+            self._bump_status_locked()
+            return self.wake_enrollment_status()
+
+    def stop_wake_enrollment(self) -> dict[str, Any]:
+        with self.lock:
+            was_active = self._enroll_active
+            self._enroll_active = False
+            self._enroll_detector.reset()
+            if self._oww_spotter is not None and hasattr(self._oww_spotter, "reset"):
+                try:
+                    self._oww_spotter.reset()
+                except Exception:
+                    pass
+            if was_active and not self._enroll_last_event.startswith("Completed"):
+                self._enroll_last_event = f"Stopped ({self._enroll_session_count}/{self._enroll_target_reps} captured this session)"
+            self._bump_status_locked()
+            return self.wake_enrollment_status()
+
+    def wake_enrollment_status(self) -> dict[str, Any]:
+        with self.lock:
+            phrase = self._enroll_phrase or self.cfg.wake_word
+            cnt = int(self._enroll_session_count)
+            tgt = int(self._enroll_target_reps)
+            prompt = (
+                self._enroll_prompt_for_rep(min(cnt, max(0, tgt - 1)), phrase)
+                if self._enroll_active
+                else (self._enroll_last_event or f"Ready to record {tgt} reps of \"{format_wake_display(phrase)}\"")
+            )
+            return {
+                "active": bool(self._enroll_active),
+                "phrase": phrase,
+                "slug": self._enroll_slug or wake_phrase_slug(phrase),
+                "sessionCaptured": cnt,
+                "targetReps": tgt,
+                "prompt": prompt,
+                "lastEvent": self._enroll_last_event,
+                "lastFile": self._enroll_last_file,
+                "startedMs": self._enroll_started_ms,
+                "rms": round(float(self._detector.latest_rms), 5),
+                "vad": round(float(self._detector.latest_vad), 3),
+                "listening": bool(self.listening),
+                "micError": self.last_error,
+            }
+
+    def _handle_enrolled_utterance(self, utt: np.ndarray) -> None:
+        arr = np.asarray(utt, dtype=np.float32).reshape(-1)
+        if arr.size == 0:
+            return
+        peak = float(np.max(np.abs(arr)))
+        if peak < 0.015:
+            with self.lock:
+                self._enroll_last_event = "Too quiet — speak closer or louder toward S330"
+            return
+        pad = int(0.080 * SAMPLE_RATE_16K)
+        nz = np.flatnonzero(np.abs(arr) >= peak * 0.025)
+        if nz.size == 0:
+            return
+        s = max(0, int(nz[0]) - pad)
+        e = min(arr.size, int(nz[-1]) + pad)
+        trimmed = arr[s:e].copy()
+        dur = float(trimmed.size) / float(SAMPLE_RATE_16K)
+        if dur < 0.25:
+            with self.lock:
+                self._enroll_last_event = f"Too short ({dur:.2f}s) — say full wake phrase"
+            return
+        if dur > 2.45:
+            with self.lock:
+                self._enroll_last_event = f"Too long ({dur:.2f}s) — say ONLY the wake phrase"
+            return
+
+        completed_target = False
+        with self.lock:
+            if not self._enroll_active or self._enroll_dir is None:
+                return
+            enroll_dir = self._enroll_dir
+            self._enroll_seq += 1
+            seq = self._enroll_seq
+            ts = int(time.time() * 1000)
+            fname = f"dave_{ts}_{seq:02d}.wav"
+            out_path = enroll_dir / fname
+            tmp_path = enroll_dir / f".{fname}.tmp"
+
+        wav_bytes = encode_pcm16_wav_bytes(trimmed, SAMPLE_RATE_16K)
+        enroll_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_bytes(wav_bytes)
+        tmp_path.replace(out_path)
+
+        with self.lock:
+            self._enroll_session_count += 1
+            n = self._enroll_session_count
+            tgt = self._enroll_target_reps
+            self._enroll_last_file = fname
+            self._enroll_last_capture_mono = time.monotonic()
+            self._mute_until_mono = max(self._mute_until_mono, time.monotonic() + 0.55)
+            self._enroll_detector.reset()
+            if n >= tgt:
+                self._enroll_active = False
+                completed_target = True
+                self._enroll_last_event = f"Completed {n}/{tgt} reps! Ready to Train & Deploy."
+            else:
+                self._enroll_last_event = f"Saved rep {n}/{tgt} ({dur:.2f}s)"
+            self._bump_status_locked()
+
+        if completed_target:
+            self.play_commit_chime()
+        else:
+            self.play_ready_chime()
+
+    def reload_oww_model(self, phrase: str | None = None) -> dict[str, Any]:
+        with self.lock:
+            target = re.sub(r"\s+", " ", str(phrase or self.cfg.wake_word).strip().lower()) or self.cfg.wake_word
+            if self._custom_wake_spotter:
+                return self.status_dict()
+            self._oww_spotter = OpenWakeWordSpotter(
+                models_dir=self._models_dir,
+                model_name=resolve_oww_model_name(target),
+                threshold=self.cfg.wake_threshold,
+            )
+            self._oww_loading = False
+            if self._started and self.cfg.enabled and self.cfg.wake_engine == "openwakeword":
                 self._ensure_model_loading_locked()
             self._bump_status_locked()
             return self.status_dict()
@@ -2743,6 +3021,7 @@ class RoomVoiceService:
                 "config": self.cfg.to_dict(),
                 "recent": list(self.recent_transcripts),
                 "abSummary": self.ab.summary_dict(),
+                "enrollmentActive": bool(self._enroll_active),
             }
             if devs_snap is not None:
                 out["devices"] = devs_snap
@@ -2773,6 +3052,17 @@ class RoomVoiceService:
                 cmd_tail = strip_wake_word(clean, wake) if has_wake else ""
                 tail_words = re.findall(r"[a-z0-9]+", cmd_tail.lower())
                 if not has_wake or not cmd_tail or not tail_words or len(tail_words) > 9 or is_hallucination(cmd_tail):
+                    self._log_voice_event(
+                        "utterance",
+                        {
+                            "tier": "tier2_rescue",
+                            "emitted": False,
+                            "rescueDropped": True,
+                            "transcript": clean,
+                            "latencyMs": int(latency_ms),
+                            "rescueScore": round(float(rescue_score), 3),
+                        },
+                    )
                     return {
                         "id": 0,
                         "tsMs": now_ms,
@@ -2838,6 +3128,17 @@ class RoomVoiceService:
                     and norm_cmd == self._last_emitted_norm
                     and (now_mono_dedup - self._last_emitted_mono) < 3.0
                 ):
+                    self._log_voice_event(
+                        "utterance",
+                        {
+                            "tier": ("tier2_rescue" if from_rescue else "tier1_oww"),
+                            "emitted": False,
+                            "dedupDropped": True,
+                            "transcript": display_clean,
+                            "latencyMs": int(latency_ms),
+                            "rescueScore": round(float(rescue_score), 3) if from_rescue else 0.0,
+                        },
+                    )
                     return {
                         "id": 0,
                         "tsMs": now_ms,
@@ -2870,6 +3171,16 @@ class RoomVoiceService:
 
         if show_running and not (isinstance(local_res, dict) and local_res.get("handled")):
             self._release_wake_duck_async()
+            self._log_voice_event(
+                "utterance",
+                {
+                    "tier": ("tier2_rescue" if from_rescue else ("tier1_oww" if from_oww else "whisper")),
+                    "emitted": False,
+                    "suppressedDuringShow": True,
+                    "transcript": display_clean,
+                    "latencyMs": int(latency_ms),
+                },
+            )
             return {
                 "id": 0,
                 "tsMs": now_ms,
@@ -2910,6 +3221,18 @@ class RoomVoiceService:
                     self._release_wake_duck_async()
             else:
                 self._release_wake_duck_async()
+            self._log_voice_event(
+                "utterance",
+                {
+                    "tier": ("tier2_rescue" if from_rescue else ("tier1_oww" if from_oww else "whisper")),
+                    "emitted": True,
+                    "localHandled": True,
+                    "transcript": display_clean,
+                    "ackText": ack_txt,
+                    "latencyMs": int(latency_ms),
+                    "rescueScore": round(float(rescue_score), 3) if from_rescue else 0.0,
+                },
+            )
             return entry
 
         with self.lock:
@@ -2988,6 +3311,19 @@ class RoomVoiceService:
                         self._release_wake_duck_sync()
                 else:
                     self._schedule_wake_duck_release(0.5)
+        self._log_voice_event(
+            "utterance",
+            {
+                "tier": ("tier2_rescue" if from_rescue else ("tier1_oww" if from_oww else "whisper")),
+                "emitted": bool(emitted),
+                "localHandled": False,
+                "wakeMatched": bool(has_wake),
+                "transcript": display_clean,
+                "ackText": str(entry.get("ackText") or ""),
+                "latencyMs": int(latency_ms),
+                "rescueScore": round(float(rescue_score), 3) if from_rescue else 0.0,
+            },
+        )
         return entry
 
     def inject_transcript(self, transcript: str) -> dict[str, Any]:
@@ -3051,6 +3387,17 @@ class RoomVoiceService:
         elif spoke and not self._started:
             # Synchronous playback already completed when worker thread isn't running
             self._release_wake_duck_sync()
+        self._log_voice_event(
+            "ack",
+            {
+                "armed": armed,
+                "ackKind": str(kind or ""),
+                "text": str(text or ""),
+                "speech": clean_speech,
+                "spoke": bool(spoke),
+                "chime": bool(chime_played),
+            },
+        )
         return {"ok": True, "spoke": spoke, "chime": bool(chime_played)}
 
     def subscribe_sse(self, after_id: int | None = None, max_replay_age_ms: int = 12_000):
@@ -3448,6 +3795,26 @@ class RoomVoiceService:
             lin_16k, vad_clean_16k, aec_active = pcm16, pcm16, False
         vad_in = np.clip(vad_clean_16k * 3.0, -0.98, 0.98).astype(np.float32) if aec_active else None
 
+        if self._enroll_active:
+            self._detector.latest_rms = float(np.sqrt(np.mean(lin_16k * lin_16k)))
+            utterances = self._enroll_detector.push_samples(lin_16k, muted=muted, vad_samples_16k=vad_in)
+            self._detector.latest_vad = float(self._enroll_detector.latest_vad)
+            for utt in utterances:
+                pool = self._local_cmd_pool
+                if pool is not None and not self._stop_event.is_set():
+                    try:
+                        pool.submit(self._handle_enrolled_utterance, utt)
+                        continue
+                    except Exception:
+                        pass
+                threading.Thread(
+                    target=self._handle_enrolled_utterance,
+                    args=(utt,),
+                    name="armory-wake-enroll",
+                    daemon=True,
+                ).start()
+            return
+
         if not self._using_oww_spotter():
             utterances = self._detector.push_samples(lin_16k, muted=muted, vad_samples_16k=vad_in)
             for utt in utterances:
@@ -3666,6 +4033,11 @@ class RoomVoiceService:
             if self._stop_event.is_set():
                 return
             mono = indata.mean(axis=1) if indata.ndim > 1 and indata.shape[1] > 1 else indata.reshape(-1)
+            if self._on_aec_ref_chunk is not None:
+                try:
+                    self._on_aec_ref_chunk(mono.copy(), aec_sr, time.time())
+                except Exception:
+                    pass
             ref16 = resample_to_mono_16k(mono, aec_sr)
             self._aec.push_ref_samples(ref16)
 

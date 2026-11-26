@@ -6933,6 +6933,340 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_room_audio_sync_offset_and_ref_archiver(self) -> None:
+        from room_audio import RoomAudioRecorder
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_sync_ref_test_"))
+        try:
+            # 1. Default -570 ms audioSyncOffsetMs persists & can be reverted to 0 via config API
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            self.assertEqual(svc.audio_sync_offset_ms, -570)
+            self.assertEqual(svc.room_audio.sync_offset_ms, -570)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            res = client.post("/api/config", json={"audioSyncOffsetMs": 0})
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(svc.audio_sync_offset_ms, 0)
+            self.assertEqual(svc.room_audio.sync_offset_ms, 0)
+            svc_reload = ac.ArmoryCamService(root_dir=tmp)
+            self.assertEqual(svc_reload.audio_sync_offset_ms, 0)
+
+            # 2. push_ref_pcm is strictly music-gated: silence writes nothing, music writes ref_*.m4a
+            rec = RoomAudioRecorder(tmp, ffmpeg_bin=svc.ffmpeg, segment_sec=5.0, sync_offset_ms=-570)
+            t0 = 1_795_700_000.0
+            silent = np.zeros(16_000, dtype=np.float32)
+            rec.push_ref_pcm(silent, 16_000, wall_end_s=t0 + 1.0)
+            rec.flush_now(blocking=True)
+            self.assertEqual(list((tmp / "audio_tapes").rglob("ref_*.m4a")), [])
+
+            tone = (0.08 * np.sin(2.0 * np.pi * 440.0 * np.arange(16_000, dtype=np.float32) / 16_000.0)).astype(np.float32)
+            rec.push_ref_pcm(tone, 16_000, wall_end_s=t0 + 2.0)
+            rec.push_ref_pcm(tone, 16_000, wall_end_s=t0 + 3.0)
+            rec.flush_now(blocking=True)
+            ref_files = list((tmp / "audio_tapes").rglob("ref_*.m4a"))
+            self.assertGreaterEqual(len(ref_files), 1)
+
+            # 3. 14-day retention prune deletes expired ref_*.m4a alongside aud_*.m4a
+            rec.prune(now_s=t0 + 16 * 86_400, retention_days=14)
+            self.assertEqual(list((tmp / "audio_tapes").rglob("ref_*.m4a")), [])
+
+            # 4. extract_window_m4a shifts request window by sync_offset_ms when apply_sync_offset=True
+            seen_windows: list[tuple[int, int]] = []
+            orig_find = rec._find_disk_segments
+
+            def _spy_find(s_ms: int, e_ms: int):
+                seen_windows.append((s_ms, e_ms))
+                return orig_find(s_ms, e_ms)
+
+            rec._find_disk_segments = _spy_find  # type: ignore[method-assign]
+            rec.extract_window_m4a(1_795_700_000_000, 1_795_700_010_000, tmp / "x1.m4a", apply_sync_offset=True)
+            rec.extract_window_m4a(1_795_700_000_000, 1_795_700_010_000, tmp / "x2.m4a", apply_sync_offset=False)
+            # Negative sync_offset_ms (-570) shifts audio EARLIER by seeking +570 ms forward in the tape
+            self.assertEqual(seen_windows[0], (1_795_700_000_000 + 570, 1_795_700_010_000 + 570))
+            self.assertEqual(seen_windows[1], (1_795_700_000_000, 1_795_700_010_000))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_voice_event_telemetry_and_aec_tuning_config(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_voice_evlog_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # Persist AEC tuning parameters & verify live processor propagation
+            r_cfg = client.post(
+                "/api/voice/config",
+                json={"aecResOverSub": 1.15, "aecResGMin": 0.16, "aecVadThreshold": 0.38},
+            )
+            self.assertEqual(r_cfg.status_code, 200)
+            cfg_out = r_cfg.get_json()["config"]
+            self.assertAlmostEqual(cfg_out["aecResOverSub"], 1.15, places=2)
+            self.assertAlmostEqual(cfg_out["aecResGMin"], 0.16, places=2)
+            self.assertAlmostEqual(cfg_out["aecVadThreshold"], 0.38, places=2)
+            self.assertAlmostEqual(svc.voice._aec._res_over_sub, 1.15, places=2)
+            self.assertAlmostEqual(svc.voice._aec._res_g_min, 0.16, places=2)
+            self.assertAlmostEqual(svc.voice._aec_vad_detector.vad_threshold, 0.38, places=2)
+
+            # Exercise context, wake_tier1, utterance (emitted + rescueDropped + dedupDropped), and ack
+            svc.voice.set_context(active=True, wake_word="hey armory", readback=False)
+            svc.voice._on_oww_wake_detected(0.74)
+            svc.voice.sse_clients = 1
+            e1 = svc.voice._emit_transcript("Hey Armory, 225 for 8", latency_ms=110, from_oww=True)
+            e_dup = svc.voice._emit_transcript("Hey Armory, 225 for 8", latency_ms=120, from_rescue=True, rescue_score=0.99)
+            e_drop = svc.voice._emit_transcript("random lyric", latency_ms=90, from_rescue=True, rescue_score=0.14)
+            svc.voice.handle_ack(armed=False, text="225 x 8", speech="225 for 8, check", kind="ok")
+            self.assertTrue(e1["emitted"])
+            self.assertTrue(e_dup.get("dedupDropped"))
+            self.assertTrue(e_drop.get("rescueDropped"))
+
+            log_path = tmp / "logs" / "voice_events.jsonl"
+            self.assertTrue(log_path.is_file())
+            rows = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+            kinds = [r["kind"] for r in rows]
+            self.assertIn("context", kinds)
+            self.assertIn("wake_tier1", kinds)
+            self.assertIn("utterance", kinds)
+            self.assertIn("ack", kinds)
+            utt_rows = [r for r in rows if r["kind"] == "utterance"]
+            self.assertTrue(any(r.get("emitted") and r.get("tier") == "tier1_oww" for r in utt_rows))
+            self.assertTrue(any(r.get("dedupDropped") for r in utt_rows))
+            self.assertTrue(any(r.get("rescueDropped") for r in utt_rows))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_nightly_voice_audit_detection_matching_and_rollback(self) -> None:
+        import nightly_voice_audit as nva
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_nightly_audit_"))
+        try:
+            # 1. Rest day detection returns empty list
+            self.assertEqual(nva.detect_workout_windows("2026-11-20", root_dir=tmp, backup_path=None), [])
+
+            # 2. Workout detection merges backup session + clips + voice_events cleanly
+            d_start, _ = nva._day_bounds_ms("2026-11-26")
+            s0 = d_start + 13 * 3600_000
+            backup_p = tmp / "backup.json"
+            backup_p.write_text(
+                json.dumps(
+                    {
+                        "sessions": [
+                            {"id": "s1", "name": "Upper 1", "status": "done", "startMs": s0, "endMs": s0 + 40 * 60_000, "exs": []},
+                            # Unclosed active session with a set timestamp should cap near last set, not run all day
+                            {
+                                "id": "s2",
+                                "name": "Upper 1 Finish",
+                                "status": "active",
+                                "startMs": s0 + 3 * 3600_000,
+                                "exs": [{"sets": [{"doneAt": s0 + 3 * 3600_000 + 15 * 60_000}]}],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            wins = nva.detect_workout_windows("2026-11-26", root_dir=tmp, backup_path=backup_p)
+            self.assertEqual(len(wins), 2)
+            self.assertAlmostEqual(wins[0].duration_sec, 44 * 60.0, delta=5.0)
+            self.assertAlmostEqual(wins[1].duration_sec, 20 * 60.0, delta=5.0)
+
+            # 3. Wake-phrase extraction accepts gym commands & phonetic near-misses, rejects rock lyrics
+            self.assertEqual(nva.extract_wake_phrase_hits("Hey Armory, 225 for 8")[0], True)
+            self.assertEqual(nva.extract_wake_phrase_hits("Hey Armery, record this")[0], True)
+            self.assertEqual(nva.extract_wake_phrase_hits("Hey Harmony, done")[0], True)
+            self.assertEqual(nva.extract_wake_phrase_hits("We will, we will rock you")[0], False)
+            self.assertEqual(nva.extract_wake_phrase_hits("Hey there Delilah what's it like in New York")[0], False)
+
+            # 4. 1-to-1 live event matching classifies Tier-1, Tier-2, Missed, False Duck, False Emit
+            cmds = [
+                nva.SpokenCommand(10.0, s0 + 10_000, "13:00:10", "Hey Armory, done", "done", -25.0, -40.0, -38.0, 15.0, True),
+                nva.SpokenCommand(30.0, s0 + 30_000, "13:00:30", "Hey Armory, record this", "record this", -22.0, -30.0, -35.0, 8.0, True),
+                nva.SpokenCommand(50.0, s0 + 50_000, "13:00:50", "Hey Armory, 225 for 8", "225 for 8", -28.0, -24.0, -32.0, -4.0, True),
+            ]
+            evs = [
+                {"tsMs": s0 + 10_400, "kind": "wake_tier1", "score": 0.82},
+                {"tsMs": s0 + 11_800, "kind": "utterance", "tier": "tier1_oww", "emitted": True, "transcript": "Hey Armory, done"},
+                {"tsMs": s0 + 32_100, "kind": "utterance", "tier": "tier2_rescue", "emitted": True, "transcript": "Hey Armory, record this"},
+                {"tsMs": s0 + 90_000, "kind": "wake_tier1", "score": 0.41},  # false duck
+            ]
+            sc = nva.match_live_events(cmds, evs)
+            self.assertEqual(sc["totalCommands"], 3)
+            self.assertEqual(sc["landed"], 2)
+            self.assertEqual(sc["tier1Hits"], 1)
+            self.assertEqual(sc["tier2Hits"], 1)
+            self.assertEqual(sc["missed"], 1)
+            self.assertEqual(sc["falseDucks"], 1)
+            self.assertEqual(sc["falseEmits"], 0)
+            self.assertEqual(cmds[0].status, "TIER-1 DUCKED")
+            self.assertEqual(cmds[1].status, "TIER-2 RESCUED")
+            self.assertEqual(cmds[2].status, "MISSED")
+
+            # 5. Safe auto-apply guardrails + config backup & 1-command rollback round-trip
+            base_cfg = rv.RoomVoiceConfig(wake_threshold=0.38, aec_res_over_sub=1.00, aec_res_g_min=0.20, aec_vad_threshold=0.42).to_dict()
+            c_base = nva.CandidateResult("base", "hey armory", "hey_armory_v0.1", 0.38, 0.10, 1.00, 0.20, 0.42, 8, 6, 4, 2, 2, 0, 0, 90.0, is_baseline=True, auto_apply_eligible=True)
+            c_bad = nva.CandidateResult("bad_false", "hey armory", "hey_armory_v0.1", 0.30, 0.10, 1.00, 0.20, 0.42, 8, 8, 8, 0, 0, 1, 0, 80.0, is_baseline=False, auto_apply_eligible=True)
+            c_alt = nva.CandidateResult("alt_wake", "armory", "armory_v0.1", 0.38, 0.10, 1.00, 0.20, 0.42, 8, 8, 8, 0, 0, 0, 0, 130.0, is_baseline=False, auto_apply_eligible=False)
+            c_win = nva.CandidateResult("win", "hey armory", "hey_armory_v0.1", 0.34, 0.10, 1.15, 0.20, 0.36, 8, 8, 7, 1, 0, 0, 0, 126.25, is_baseline=False, auto_apply_eligible=True)
+            picked, delta, _why = nva.select_safe_auto_apply(c_base, [c_alt, c_win, c_base, c_bad], base_cfg)
+            self.assertIsNotNone(picked)
+            self.assertEqual(picked.label, "win")
+            self.assertEqual(delta["wakeThreshold"], 0.34)
+            self.assertEqual(delta["aecResOverSub"], 1.15)
+            self.assertEqual(delta["aecVadThreshold"], 0.36)
+
+            # Persist initial config.json, apply safe tuning (offline fallback), then rollback!
+            (tmp / "config.json").write_text(json.dumps({"voice": base_cfg}, indent=2), encoding="utf-8")
+            applied = nva.apply_safe_tuning(
+                tmp,
+                "http://127.0.0.1:1",  # unreachable port forces config.json fallback cleanly
+                target_date="2026-11-26",
+                previous_cfg=base_cfg,
+                delta=delta,
+                reason="Unit test improvement",
+            )
+            self.assertTrue(applied["applied"])
+            self.assertTrue(Path(applied["rollbackFile"]).is_file())
+            after_apply = json.loads((tmp / "config.json").read_text(encoding="utf-8"))["voice"]
+            self.assertAlmostEqual(after_apply["wakeThreshold"], 0.34, places=2)
+            self.assertAlmostEqual(after_apply["aecResOverSub"], 1.15, places=2)
+
+            rb = nva.rollback_voice_config(root_dir=tmp, server_url="http://127.0.0.1:1")
+            self.assertTrue(rb["ok"])
+            after_rb = json.loads((tmp / "config.json").read_text(encoding="utf-8"))["voice"]
+            self.assertAlmostEqual(after_rb["wakeThreshold"], 0.38, places=2)
+            self.assertAlmostEqual(after_rb["aecResOverSub"], 1.00, places=2)
+            self.assertAlmostEqual(after_rb["aecVadThreshold"], 0.42, places=2)
+
+            # 6. Pending morning notification rest-day no-op + dry-run read
+            self.assertFalse(nva.deliver_pending_notification(root_dir=tmp)["sent"])
+            pend = tmp / "audits" / "pending_morning_notify.json"
+            pend.write_text(json.dumps({"title": "Test", "message": "Hello"}), encoding="utf-8")
+            dry = nva.deliver_pending_notification(root_dir=tmp, dry_run=True)
+            self.assertTrue(dry["dryRun"])
+            self.assertEqual(dry["payload"]["title"], "Test")
+            self.assertTrue(pend.is_file())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    def test_wake_enrollment_capture_validation_and_auto_stop(self) -> None:
+        import numpy as np
+        import room_voice as rv
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_wake_enroll_"))
+        try:
+            class _SpySpotter:
+                ready = True
+                latest_score = 0.0
+                def __init__(self) -> None:
+                    self.calls = 0
+                def push_samples(self, _s, now_mono=None):
+                    self.calls += 1
+                    return False, 0.0
+                def reset(self) -> None:
+                    pass
+
+            spy = _SpySpotter()
+            vcfg = rv.RoomVoiceConfig(
+                enabled=True,
+                listen_mode="workout",
+                wake_word="hey atlas",
+                wake_engine="openwakeword",
+                speaker_readback=False,
+            )
+            svc = rv.RoomVoiceService(
+                config=vcfg,
+                allow_hardware_audio=False,
+                root_dir=tmp,
+                wake_spotter=spy,
+            )
+            self.assertFalse(svc.should_capture_now())
+            st0 = svc.start_wake_enrollment("hey atlas", target_reps=2)
+            self.assertTrue(st0["active"])
+            self.assertEqual(st0["slug"], "hey_atlas")
+            self.assertTrue(svc.should_capture_now())
+
+            # During enrollment, OWW spotter is bypassed and never receives frames
+            frame = np.zeros(512, dtype=np.float32)
+            with mock.patch.object(svc._enroll_detector, "push_samples", return_value=[]):
+                svc._ingest_pcm16_frame(frame, now_ms=10_000, now_mono=10.0)
+            self.assertEqual(spy.calls, 0)
+
+            # Too-quiet clip is rejected
+            svc._handle_enrolled_utterance(np.ones(12_000, dtype=np.float32) * 0.002)
+            self.assertEqual(svc.wake_enrollment_status()["sessionCaptured"], 0)
+
+            # Too-short clip is rejected
+            svc._handle_enrolled_utterance(np.ones(2_000, dtype=np.float32) * 0.2)
+            self.assertEqual(svc.wake_enrollment_status()["sessionCaptured"], 0)
+
+            # Two valid 0.7s speech bursts save 16kHz WAVs and auto-stop at target_reps=2
+            good_pcm = np.sin(2.0 * np.pi * 220.0 * (np.arange(11_200, dtype=np.float32) / 16_000.0)) * 0.35
+            svc._handle_enrolled_utterance(good_pcm)
+            st1 = svc.wake_enrollment_status()
+            self.assertEqual(st1["sessionCaptured"], 1)
+            self.assertTrue(st1["active"])
+
+            svc._handle_enrolled_utterance(good_pcm)
+            st2 = svc.wake_enrollment_status()
+            self.assertEqual(st2["sessionCaptured"], 2)
+            self.assertFalse(st2["active"])
+            wavs = list((tmp / "oww_training" / "hey_atlas" / "user_positives").glob("*.wav"))
+            self.assertEqual(len(wavs), 2)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_wake_studio_rest_endpoints_and_atlas_activation(self) -> None:
+        import numpy as np
+        import room_voice as rv
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_wake_studio_"))
+        try:
+            oww_dir = tmp / "models" / "openwakeword"
+            oww_dir.mkdir(parents=True, exist_ok=True)
+            (oww_dir / "hey_atlas_v0.1.onnx").write_bytes(b"fake-onnx")
+            udir = tmp / "oww_training" / "hey_atlas" / "user_positives"
+            udir.mkdir(parents=True, exist_ok=True)
+            clip_wav = rv.encode_pcm16_wav_bytes(np.ones(8000, dtype=np.float32) * 0.2, 16000)
+            (udir / "dave_01.wav").write_bytes(clip_wav)
+
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            html = client.get("/").get_data(as_text=True)
+            self.assertIn('value="hey atlas"', html)
+            self.assertIn("wakeStudioCard", html)
+
+            r0 = client.get("/api/voice/wake-studio").get_json()
+            self.assertTrue(r0["ok"])
+            atlas = next(w for w in r0["words"] if w["slug"] == "hey_atlas")
+            self.assertTrue(atlas["modelExists"])
+            self.assertEqual(atlas["clipCount"], 1)
+
+            r_enr = client.post("/api/voice/wake-studio/enroll", json={"action": "start", "phrase": "hey atlas", "targetReps": 20}).get_json()
+            self.assertTrue(r_enr["enrollment"]["active"])
+            r_stop = client.post("/api/voice/wake-studio/enroll", json={"action": "stop"}).get_json()
+            self.assertFalse(r_stop["enrollment"]["active"])
+
+            r_wav = client.get("/api/voice/wake-studio/clip/hey_atlas/dave_01.wav")
+            self.assertEqual(r_wav.status_code, 200)
+            self.assertEqual(r_wav.mimetype, "audio/wav")
+
+            self.assertEqual(client.get("/api/voice/wake-studio/clip/hey_atlas/..%5Cconfig.json").status_code, 404)
+
+            r_del = client.delete("/api/voice/wake-studio/clip/hey_atlas/dave_01.wav").get_json()
+            self.assertTrue(r_del["ok"])
+            self.assertEqual(next(w for w in r_del["studio"]["words"] if w["slug"] == "hey_atlas")["clipCount"], 0)
+
+            r_act = client.post("/api/voice/wake-studio/activate", json={"phrase": "hey atlas"}).get_json()
+            self.assertTrue(r_act["ok"])
+            self.assertEqual(r_act["config"]["wakeWord"], "hey atlas")
+            self.assertEqual(svc.voice.cfg.wake_word, "hey atlas")
+            self.assertEqual(svc.voice._oww_spotter.model_name, "hey_atlas_v0.1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

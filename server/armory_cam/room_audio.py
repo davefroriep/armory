@@ -22,7 +22,7 @@ import wave
 import numpy as np
 
 
-_SEG_NAME_RE = re.compile(r"^aud_(\d+)_(\d+)\.m4a$")
+_SEG_NAME_RE = re.compile(r"^(aud|ref)_(\d+)_(\d+)\.m4a$")
 
 
 class RoomAudioRecorder:
@@ -36,6 +36,8 @@ class RoomAudioRecorder:
         retention_days: int = 14,
         bitrate: str = "96k",
         ram_tail_sec: float = 35.0,
+        sync_offset_ms: int = 0,
+        ref_active_rms: float = 0.00025,
     ) -> None:
         self.root = Path(root_dir).resolve()
         self.audio_tapes_root = self.root / "audio_tapes"
@@ -48,6 +50,8 @@ class RoomAudioRecorder:
         self.retention_days = max(1, int(retention_days))
         self.bitrate = str(bitrate or "96k")
         self.ram_tail_ms = max(10_000, int(round(ram_tail_sec * 1000.0)))
+        self.sync_offset_ms = max(-3000, min(3000, int(sync_offset_ms)))
+        self.ref_active_rms = float(ref_active_rms)
         self.log = logging.getLogger("armory-room-audio")
 
         self._lock = threading.Lock()
@@ -58,7 +62,15 @@ class RoomAudioRecorder:
         self._cur_sr: int = 0
         self._cur_samples: int = 0
 
-        self._write_q: queue.Queue[tuple[int, int, int, bytes] | None] = queue.Queue(maxsize=24)
+        # Secondary paired Denon Line-In reference archiver (writes ref_*.m4a ONLY when music is playing)
+        self._ref_chunks: list[bytes] = []
+        self._ref_start_ms: int = 0
+        self._ref_end_ms: int = 0
+        self._ref_sr: int = 0
+        self._ref_samples: int = 0
+        self._ref_hold_until_ms: int = 0
+
+        self._write_q: queue.Queue[tuple[int, int, int, bytes, str] | None] = queue.Queue(maxsize=48)
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._started = False
@@ -88,7 +100,7 @@ class RoomAudioRecorder:
         if w is not None:
             w.join(timeout=3.0)
 
-    def _enqueue_locked(self, block: tuple[int, int, int, bytes]) -> None:
+    def _enqueue_locked(self, block: tuple[int, int, int, bytes, str]) -> None:
         if not self._started:
             return
         try:
@@ -103,18 +115,67 @@ class RoomAudioRecorder:
             except queue.Full:
                 pass
 
-    def _pop_pending_locked(self) -> tuple[int, int, int, bytes] | None:
+    def _pop_pending_locked(self) -> tuple[int, int, int, bytes, str] | None:
         if not self._cur_chunks or self._cur_samples <= 0 or self._cur_sr <= 0:
             self._cur_chunks.clear()
             self._cur_samples = 0
             return None
         raw = b"".join(self._cur_chunks)
-        block = (self._cur_start_ms, self._cur_end_ms, self._cur_sr, raw)
+        block = (self._cur_start_ms, self._cur_end_ms, self._cur_sr, raw, "aud")
         self._cur_chunks.clear()
         self._cur_samples = 0
         self._cur_start_ms = 0
         self._cur_end_ms = 0
         return block
+
+    def _pop_pending_ref_locked(self) -> tuple[int, int, int, bytes, str] | None:
+        if not self._ref_chunks or self._ref_samples <= 0 or self._ref_sr <= 0:
+            self._ref_chunks.clear()
+            self._ref_samples = 0
+            return None
+        raw = b"".join(self._ref_chunks)
+        block = (self._ref_start_ms, self._ref_end_ms, self._ref_sr, raw, "ref")
+        self._ref_chunks.clear()
+        self._ref_samples = 0
+        self._ref_start_ms = 0
+        self._ref_end_ms = 0
+        return block
+
+    def push_ref_pcm(self, mono_f32: np.ndarray, sr: int, wall_end_s: float | None = None) -> None:
+        """Archive paired Denon Line-In mono PCM (`ref_*.m4a`) ONLY while music is actively playing."""
+        arr = np.asarray(mono_f32, dtype=np.float32).reshape(-1)
+        if arr.size == 0 or sr <= 0:
+            return
+        now_s = time.time() if wall_end_s is None else float(wall_end_s)
+        end_ms = int(round(now_s * 1000.0))
+        dur_ms = max(1, int(round((arr.size * 1000.0) / float(sr))))
+        start_ms = end_ms - dur_ms
+        rms = float(np.sqrt(np.mean(arr * arr)))
+
+        completed: tuple[int, int, int, bytes, str] | None = None
+        with self._lock:
+            if rms >= self.ref_active_rms:
+                self._ref_hold_until_ms = end_ms + 3_000
+            if end_ms > self._ref_hold_until_ms:
+                if self._ref_chunks:
+                    completed = self._pop_pending_ref_locked()
+                    if completed is not None:
+                        self._enqueue_locked(completed)
+                return
+
+            pcm_i16 = np.round(np.clip(arr, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+            if self._ref_chunks and (self._ref_sr != int(sr) or abs(start_ms - self._ref_end_ms) > 1500):
+                completed = self._pop_pending_ref_locked()
+            if not self._ref_chunks:
+                self._ref_start_ms = start_ms
+                self._ref_sr = int(sr)
+            self._ref_end_ms = end_ms
+            self._ref_samples += int(arr.size)
+            self._ref_chunks.append(pcm_i16)
+            if completed is None and (self._ref_samples / float(self._ref_sr)) >= self.segment_sec:
+                completed = self._pop_pending_ref_locked()
+            if completed is not None:
+                self._enqueue_locked(completed)
 
     def push_pcm(self, mono_f32: np.ndarray, sr: int, wall_end_s: float | None = None) -> None:
         """Append mono float32 microphone samples into the RAM tail & 10s disk segmenter."""
@@ -154,23 +215,35 @@ class RoomAudioRecorder:
         """Flush any buffered samples cleanly to disk (optionally synchronously)."""
         with self._lock:
             block = self._pop_pending_locked()
-        if block is None:
-            return None
-        if blocking:
-            return self._write_block_to_disk(block)
-        with self._lock:
-            self._enqueue_locked(block)
-        return None
+            ref_block = self._pop_pending_ref_locked()
+        out_p: Path | None = None
+        if block is not None:
+            if blocking:
+                out_p = self._write_block_to_disk(block)
+            else:
+                with self._lock:
+                    self._enqueue_locked(block)
+        if ref_block is not None:
+            if blocking:
+                self._write_block_to_disk(ref_block)
+            else:
+                with self._lock:
+                    self._enqueue_locked(ref_block)
+        return out_p
 
-    def _write_block_to_disk(self, block: tuple[int, int, int, bytes]) -> Path | None:
-        start_ms, end_ms, sr, pcm_bytes = block
+    def _write_block_to_disk(self, block: tuple[int, int, int, bytes] | tuple[int, int, int, bytes, str]) -> Path | None:
+        if len(block) >= 5:
+            start_ms, end_ms, sr, pcm_bytes, prefix = block[0], block[1], block[2], block[3], block[4]
+        else:
+            start_ms, end_ms, sr, pcm_bytes = block[0], block[1], block[2], block[3]
+            prefix = "aud"
         if not pcm_bytes or end_ms <= start_ms or sr <= 0:
             return None
         day_str = datetime.fromtimestamp(start_ms / 1000.0).strftime("%Y-%m-%d")
         day_dir = self.audio_tapes_root / day_str
         day_dir.mkdir(parents=True, exist_ok=True)
-        out_path = day_dir / f"aud_{start_ms}_{end_ms}.m4a"
-        tmp_path = day_dir / f".tmp_{start_ms}_{end_ms}_{uuid.uuid4().hex[:6]}.m4a"
+        out_path = day_dir / f"{prefix}_{start_ms}_{end_ms}.m4a"
+        tmp_path = day_dir / f".tmp_{prefix}_{start_ms}_{end_ms}_{uuid.uuid4().hex[:6]}.m4a"
         cmd = [
             self.ffmpeg,
             "-y",
@@ -228,10 +301,10 @@ class RoomAudioRecorder:
             if day_dir.is_dir():
                 for p in day_dir.glob("aud_*.m4a"):
                     m = _SEG_NAME_RE.match(p.name)
-                    if not m:
+                    if not m or m.group(1) != "aud":
                         continue
-                    s_ms = int(m.group(1))
-                    e_ms = int(m.group(2))
+                    s_ms = int(m.group(2))
+                    e_ms = int(m.group(3))
                     if e_ms > start_ms and s_ms < end_ms and p.stat().st_size > 128:
                         out.append((s_ms, e_ms, p))
             cur += timedelta(days=1)
@@ -264,10 +337,23 @@ class RoomAudioRecorder:
                 return True
         return False
 
-    def extract_window_m4a(self, start_ms: int, end_ms: int, out_path: Path) -> bool:
-        """Extract wall-clock aligned `[start_ms, end_ms]` PowerConf S330 AAC audio to `out_path`."""
-        s_ms = int(start_ms)
-        e_ms = max(s_ms + 500, int(end_ms))
+    def extract_window_m4a(
+        self,
+        start_ms: int,
+        end_ms: int,
+        out_path: Path,
+        *,
+        apply_sync_offset: bool = True,
+    ) -> bool:
+        """Extract wall-clock aligned `[start_ms, end_ms]` PowerConf S330 AAC audio to `out_path`.
+
+        Sign convention matches FFmpeg/VLC: negative `sync_offset_ms` (e.g. `-570`) shifts
+        audio EARLIER relative to video by seeking forward (`start_ms - sync_offset_ms`) in
+        the audio tape, compensating for RTSP video buffer lead vs room mic latency.
+        """
+        offset = int(self.sync_offset_ms) if apply_sync_offset else 0
+        s_ms = int(start_ms) - offset
+        e_ms = max(s_ms + 500, int(end_ms) - offset)
         dur_sec = max(0.5, (e_ms - s_ms) / 1000.0)
 
         disk_segs = self._find_disk_segments(s_ms, e_ms)
@@ -366,14 +452,15 @@ class RoomAudioRecorder:
         cutoff_s = float(now_s) - (days * 86_400)
         cutoff_ms = int(cutoff_s * 1000.0)
         if self.audio_tapes_root.exists():
-            for p in list(self.audio_tapes_root.rglob("aud_*.m4a")):
-                try:
-                    m = _SEG_NAME_RE.match(p.name)
-                    expired = (int(m.group(2)) < cutoff_ms) if m else (p.stat().st_mtime < cutoff_s)
-                    if expired:
-                        p.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            for pat in ("aud_*.m4a", "ref_*.m4a"):
+                for p in list(self.audio_tapes_root.rglob(pat)):
+                    try:
+                        m = _SEG_NAME_RE.match(p.name)
+                        expired = (int(m.group(3)) < cutoff_ms) if m else (p.stat().st_mtime < cutoff_s)
+                        if expired:
+                            p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             for p in list(self.audio_tapes_root.rglob(".tmp_*")):
                 try:
                     if p.stat().st_mtime < float(now_s) - 300:

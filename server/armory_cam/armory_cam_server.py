@@ -40,6 +40,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import wave
 
 import cv2
 from flask import Flask, Response, jsonify, request
@@ -48,9 +49,9 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
 try:
-    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word
+    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word, wake_phrase_slug
 except ImportError:
-    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word
+    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word, wake_phrase_slug
 
 try:
     from .room_audio import RoomAudioRecorder
@@ -3070,6 +3071,295 @@ class WallboardRelay:
             }
 
 
+WAKE_STUDIO_CATALOG: tuple[dict[str, str], ...] = (
+    {"phrase": "hey atlas", "slug": "hey_atlas", "label": "Hey Atlas", "kind": "custom"},
+    {"phrase": "hey armory", "slug": "hey_armory", "label": "Hey Armory", "kind": "custom"},
+    {"phrase": "armory", "slug": "armory", "label": "Armory (Bare)", "kind": "custom"},
+    {"phrase": "hey jarvis", "slug": "hey_jarvis", "label": "Hey Jarvis", "kind": "stock"},
+)
+_WAKE_CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\.wav$", re.IGNORECASE)
+
+
+class WakeWordTrainerManager:
+    """Manages Dave's personal S330 wake-word recordings and custom openWakeWord ONNX training."""
+
+    def __init__(self, root_dir: Path) -> None:
+        self.root = Path(root_dir)
+        self.models_dir = self.root / "models" / "openwakeword"
+        self.train_root = self.root / "oww_training"
+        self.lock = threading.Lock()
+        self._running = False
+        self._phrase = ""
+        self._slug = ""
+        self._stage = "Idle"
+        self._progress_pct = 0
+        self._started_ms = 0
+        self._finished_ms = 0
+        self._exit_code: int | None = None
+        self._error: str | None = None
+        self._logs: deque[str] = deque(maxlen=80)
+
+    @staticmethod
+    def resolve_entry(phrase_or_slug: str) -> dict[str, str] | None:
+        q = re.sub(r"\s+", " ", str(phrase_or_slug or "").strip().lower())
+        q_slug = wake_phrase_slug(q) if q else ""
+        for item in WAKE_STUDIO_CATALOG:
+            if q == item["phrase"] or q_slug == item["slug"]:
+                return dict(item)
+        return None
+
+    @staticmethod
+    def _clip_info(slug: str, wav_path: Path) -> dict[str, Any]:
+        dur = 0.0
+        try:
+            with wave.open(str(wav_path), "rb") as wf:
+                sr = max(1, int(wf.getframerate() or 16000))
+                dur = round(float(wf.getnframes()) / float(sr), 2)
+        except Exception:
+            pass
+        try:
+            st = wav_path.stat()
+            size_b = int(st.st_size)
+            ts_ms = int(st.st_mtime * 1000)
+        except OSError:
+            size_b = 0
+            ts_ms = 0
+        return {
+            "name": wav_path.name,
+            "durationSec": dur,
+            "sizeBytes": size_b,
+            "tsMs": ts_ms,
+            "url": f"/api/voice/wake-studio/clip/{slug}/{urllib.parse.quote(wav_path.name)}",
+        }
+
+    def user_dir_for(self, slug: str) -> Path:
+        return self.train_root / slug / "user_positives"
+
+    def studio_state(self, voice_svc: RoomVoiceService) -> dict[str, Any]:
+        words: list[dict[str, Any]] = []
+        active_phrase = str(voice_svc.cfg.wake_word or "").strip().lower()
+        for item in WAKE_STUDIO_CATALOG:
+            slug = item["slug"]
+            onnx_p = self.models_dir / f"{slug}_v0.1.onnx"
+            stock_p = self.models_dir / f"{slug}_v0.1.stock.onnx"
+            tdir = self.train_root / slug
+            udir = tdir / "user_positives"
+            clips: list[dict[str, Any]] = []
+            if udir.is_dir():
+                wavs = sorted(
+                    [p for p in udir.iterdir() if p.is_file() and _WAKE_CLIP_NAME_RE.match(p.name)],
+                    key=lambda p: (p.stat().st_mtime, p.name),
+                    reverse=True,
+                )
+                clips = [self._clip_info(slug, p) for p in wavs]
+            metrics: dict[str, Any] | None = None
+            mp = tdir / "metrics.json"
+            if mp.is_file():
+                try:
+                    metrics = json.loads(mp.read_text(encoding="utf-8"))
+                except Exception:
+                    metrics = None
+            words.append({
+                **item,
+                "active": active_phrase == item["phrase"],
+                "modelExists": onnx_p.is_file(),
+                "modelSizeKb": round(onnx_p.stat().st_size / 1024.0, 1) if onnx_p.is_file() else 0.0,
+                "hasStockBackup": stock_p.is_file(),
+                "synthCached": (tdir / "synth_pos_features.npy").is_file(),
+                "clipCount": len(clips),
+                "clips": clips,
+                "metrics": metrics,
+            })
+
+        with self.lock:
+            training = {
+                "running": bool(self._running),
+                "phrase": self._phrase,
+                "slug": self._slug,
+                "stage": self._stage,
+                "progressPct": int(self._progress_pct),
+                "startedMs": int(self._started_ms),
+                "finishedMs": int(self._finished_ms),
+                "exitCode": self._exit_code,
+                "error": self._error,
+                "logs": list(self._logs),
+            }
+
+        return {
+            "activePhrase": active_phrase,
+            "wakeEngine": voice_svc.cfg.wake_engine,
+            "owwReady": bool(voice_svc._oww_spotter is not None and getattr(voice_svc._oww_spotter, "ready", False)),
+            "enrollment": voice_svc.wake_enrollment_status(),
+            "training": training,
+            "words": words,
+        }
+
+    def delete_clip(self, slug: str, filename: str) -> bool:
+        entry = self.resolve_entry(slug)
+        if entry is None or not _WAKE_CLIP_NAME_RE.match(str(filename or "")):
+            return False
+        target = self.user_dir_for(entry["slug"]) / Path(filename).name
+        if not target.is_file():
+            return False
+        target.unlink()
+        return True
+
+    def clear_clips(self, slug: str) -> int:
+        entry = self.resolve_entry(slug)
+        if entry is None:
+            return 0
+        udir = self.user_dir_for(entry["slug"])
+        if not udir.is_dir():
+            return 0
+        removed = 0
+        for p in list(udir.iterdir()):
+            if p.is_file() and _WAKE_CLIP_NAME_RE.match(p.name):
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
+
+    def restore_stock(self, phrase_or_slug: str, voice_svc: RoomVoiceService | None = None) -> tuple[bool, str]:
+        entry = self.resolve_entry(phrase_or_slug)
+        if entry is None:
+            return False, "Unknown wake word"
+        slug = entry["slug"]
+        stock_p = self.models_dir / f"{slug}_v0.1.stock.onnx"
+        onnx_p = self.models_dir / f"{slug}_v0.1.onnx"
+        if not stock_p.is_file():
+            return False, "No stock backup found"
+        shutil.copy2(stock_p, onnx_p)
+        if voice_svc is not None and str(voice_svc.cfg.wake_word or "").strip().lower() == entry["phrase"]:
+            voice_svc.reload_oww_model(entry["phrase"])
+        return True, f"Restored stock {entry['label']}"
+
+    def start_training(
+        self,
+        phrase_or_slug: str,
+        *,
+        force_full: bool = False,
+        voice_svc: RoomVoiceService | None = None,
+    ) -> tuple[bool, str]:
+        entry = self.resolve_entry(phrase_or_slug)
+        if entry is None:
+            return False, "Unsupported wake word"
+        if voice_svc is not None:
+            voice_svc.stop_wake_enrollment()
+        phrase = entry["phrase"]
+        slug = entry["slug"]
+        synth_cached = (self.train_root / slug / "synth_pos_features.npy").is_file()
+        retrain_only = bool(synth_cached and not force_full)
+
+        with self.lock:
+            if self._running:
+                return False, f"Already training '{self._phrase}'"
+            self._running = True
+            self._phrase = phrase
+            self._slug = slug
+            self._stage = "Retraining ONNX w/ your clips…" if retrain_only else "Synthesizing dataset & training…"
+            self._progress_pct = 5
+            self._started_ms = int(time.time() * 1000)
+            self._finished_ms = 0
+            self._exit_code = None
+            self._error = None
+            self._logs.clear()
+
+        if slug == "hey_jarvis":
+            onnx_p = self.models_dir / "hey_jarvis_v0.1.onnx"
+            stock_p = self.models_dir / "hey_jarvis_v0.1.stock.onnx"
+            if onnx_p.is_file() and not stock_p.is_file():
+                try:
+                    self.models_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(onnx_p, stock_p)
+                except OSError:
+                    pass
+
+        threading.Thread(
+            target=self._run_worker,
+            args=(phrase, slug, retrain_only, voice_svc),
+            name=f"armory-oww-train-{slug}",
+            daemon=True,
+        ).start()
+        return True, f"Training started for {entry['label']}"
+
+    def _run_worker(
+        self,
+        phrase: str,
+        slug: str,
+        retrain_only: bool,
+        voice_svc: RoomVoiceService | None,
+    ) -> None:
+        script_p = Path(__file__).resolve().parent / "train_wake_word.py"
+        cmd = [sys.executable, str(script_p), "--phrase", phrase]
+        if retrain_only:
+            cmd.append("--retrain-only")
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        rc = 1
+        err_msg: str | None = None
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                with self.lock:
+                    self._logs.append(line)
+                    if "[1/4]" in line:
+                        self._stage, self._progress_pct = "Loading Kokoro voices…", 10
+                    elif "[2/4]" in line:
+                        self._stage, self._progress_pct = "Mining gym music backgrounds…", 20
+                    elif "[3/4]" in line:
+                        self._stage, self._progress_pct = "Synthesizing speakers & confusables…", 32
+                    elif "[4/4]" in line:
+                        self._stage, self._progress_pct = "Extracting ONNX embeddings…", 48
+                    elif line.startswith("Training "):
+                        self._stage, self._progress_pct = "Training wake MLP…", 55
+                    elif "step " in line and "/" in line:
+                        m_st = re.search(r"step\s+(\d+)/(\d+)", line)
+                        if m_st:
+                            cur_s = int(m_st.group(1))
+                            tot_s = max(1, int(m_st.group(2)))
+                            self._stage = f"Training MLP ({cur_s}/{tot_s})"
+                            self._progress_pct = min(90, 55 + int(35.0 * cur_s / tot_s))
+                    elif "Exported ONNX:" in line:
+                        self._stage, self._progress_pct = "Exported ONNX model", 92
+                    elif "BLIND GYM STRESS TEST" in line:
+                        self._stage, self._progress_pct = "Running blind gym rock stress test…", 96
+            rc = proc.wait()
+            if rc != 0:
+                err_msg = f"Trainer exited with code {rc}"
+        except Exception as exc:
+            err_msg = str(exc)
+            with self.lock:
+                self._logs.append(f"ERROR: {err_msg}")
+
+        if rc == 0 and voice_svc is not None:
+            if str(voice_svc.cfg.wake_word or "").strip().lower() == phrase:
+                voice_svc.reload_oww_model(phrase)
+
+        with self.lock:
+            self._running = False
+            self._finished_ms = int(time.time() * 1000)
+            self._exit_code = int(rc)
+            self._error = err_msg
+            if rc == 0:
+                self._stage = "Complete — ONNX deployed!"
+                self._progress_pct = 100
+            else:
+                self._stage = f"Failed (code {rc})"
+
+
 class ArmoryCamService:
     """Core DVR manager: config persistence, FFmpeg RTSP ring capture, motion indexing & clip cutting."""
 
@@ -3145,10 +3435,12 @@ class ArmoryCamService:
         self.lock = threading.RLock()
         self.port = DEFAULT_PORT
         self.retention_days = DEFAULT_RETENTION_DAYS
+        self.audio_sync_offset_ms = -570
         self.room_audio = RoomAudioRecorder(
             self.root,
             ffmpeg_bin=self.ffmpeg,
             retention_days=self.retention_days,
+            sync_offset_ms=self.audio_sync_offset_ms,
         )
         self.voice_cfg = RoomVoiceConfig()
         self.voice = RoomVoiceService(
@@ -3159,9 +3451,11 @@ class ArmoryCamService:
             house_audio_router=self.house_audio.try_route_voice_pcm,
             local_command_handler=self._handle_local_voice_command,
             on_pcm_chunk=self.room_audio.push_pcm,
+            on_aec_ref_chunk=self.room_audio.push_ref_pcm,
             wake_duck_callbacks=self.house_audio.wake_duck_callbacks(),
             show_active_fn=self.shows.is_active,
         )
+        self.wake_trainer = WakeWordTrainerManager(self.root)
         self.pre_roll_sec = DEFAULT_PRE_ROLL_SEC
         if drive_backup_dir is not None:
             self.drive_backup_dir = str(drive_backup_dir).strip()
@@ -3373,6 +3667,10 @@ class ArmoryCamService:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
             self.port = int(raw.get("port", DEFAULT_PORT))
             self.retention_days = max(1, int(raw.get("retentionDays", DEFAULT_RETENTION_DAYS)))
+            self.room_audio.retention_days = self.retention_days
+            if "audioSyncOffsetMs" in raw and raw.get("audioSyncOffsetMs") is not None:
+                self.audio_sync_offset_ms = max(-3000, min(3000, int(raw.get("audioSyncOffsetMs"))))
+            self.room_audio.sync_offset_ms = self.audio_sync_offset_ms
             self.pre_roll_sec = max(30, int(raw.get("preRollSec", DEFAULT_PRE_ROLL_SEC)))
             if "driveBackupDir" in raw:
                 self.drive_backup_dir = str(raw.get("driveBackupDir") or "").strip()
@@ -3396,6 +3694,7 @@ class ArmoryCamService:
         payload = {
             "port": self.port,
             "retentionDays": self.retention_days,
+            "audioSyncOffsetMs": self.audio_sync_offset_ms,
             "preRollSec": self.pre_roll_sec,
             "driveBackupDir": self.drive_backup_dir,
             "bumpAlertNtfy": self.bump_alert_ntfy,
@@ -3587,6 +3886,9 @@ class ArmoryCamService:
             if "retentionDays" in raw:
                 self.retention_days = max(1, min(90, int(raw["retentionDays"])))
                 self.room_audio.retention_days = self.retention_days
+            if "audioSyncOffsetMs" in raw and raw["audioSyncOffsetMs"] is not None:
+                self.audio_sync_offset_ms = max(-3000, min(3000, int(raw["audioSyncOffsetMs"])))
+                self.room_audio.sync_offset_ms = self.audio_sync_offset_ms
             if "preRollSec" in raw:
                 self.pre_roll_sec = max(30, min(600, int(raw["preRollSec"])))
             drive_changed = False
@@ -8817,6 +9119,20 @@ DASHBOARD_HTML = """<!doctype html>
   .ra-ctrls input[type=range]{width:92px;accent-color:var(--blue)}
   .ra-swatch{width:22px;height:22px;border-radius:999px;border:2px solid transparent;cursor:pointer;padding:0}
   .ra-swatch.on{border-color:#fff;box-shadow:0 0 0 2px rgba(255,255,255,.35)}
+  .ws-pills{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;margin-bottom:12px}
+  .ws-pill{background:#0e151f;border:1px solid var(--line);border-radius:10px;padding:9px 11px;text-align:left;cursor:pointer;color:var(--fg);display:flex;flex-direction:column;gap:3px;transition:border-color .15s,background-color .15s}
+  .ws-pill:hover{border-color:#3b82f6;background:#131d2b}
+  .ws-pill.on{border-color:var(--blue);background:rgba(30,155,255,.14);box-shadow:0 0 0 1px rgba(30,155,255,.35)}
+  .ws-pill-top{display:flex;justify-content:space-between;align-items:center;gap:6px;font-weight:800;font-size:13px}
+  .ws-pill-sub{font-size:11px;color:var(--mut);display:flex;justify-content:space-between;gap:6px}
+  .ws-prompt{background:#0b111a;border:1px solid #26364d;border-radius:10px;padding:12px 14px;margin:10px 0}
+  .ws-prompt.rec{border-color:#22c55e;background:rgba(22,163,74,.10);box-shadow:0 0 0 1px rgba(34,197,94,.3)}
+  .ws-prog-wrap{width:100%;height:8px;border-radius:999px;background:#0b1017;border:1px solid var(--line);overflow:hidden;margin:6px 0}
+  .ws-prog-bar{height:100%;width:0%;background:linear-gradient(90deg,#0ea5e9,#22c55e);transition:width .25s ease}
+  .ws-log{font:11px/1.4 ui-monospace,Consolas,monospace;color:#93c5fd;background:#080c12;border:1px solid var(--line);border-radius:8px;padding:8px;max-height:140px;overflow-y:auto;white-space:pre-wrap;margin-top:6px}
+  .ws-clips{max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:9px;background:#0b1017;margin-top:8px}
+  .ws-clip-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border-top:1px solid rgba(255,255,255,.05);font-size:12px}
+  .ws-clip-row:first-child{border-top:0}
   @media (max-width:640px){
     .realign-modal{padding:8px;gap:8px;justify-content:flex-start}
     .ra-top{gap:6px}
@@ -9455,7 +9771,7 @@ DASHBOARD_HTML = """<!doctype html>
               <div><label>Armory Lights ON URL (Matter Bridge / HTTP)</label><input id="fxLightsOnUrl" type="text" placeholder="http://127.0.0.1:8787/api/armory-lights?on=1"></div>
               <div><label>Armory Lights OFF URL (Matter Bridge / HTTP)</label><input id="fxLightsOffUrl" type="text" placeholder="http://127.0.0.1:8787/api/armory-lights?on=0"></div>
               <div><label>Lights Lead Time (0–5s, sync offset)</label><input id="fxLightsLeadSec" type="number" min="0" max="5" step="0.1" value="0"></div>
-              <div><label>Smart Fogger v3.1 IP / Host</label><input id="fxTheaterHost" type="text" placeholder="smart-fogger.local or 192.168.1.xxx"></div>
+              <div><label>Smart Fogger v3.1 IP / Host</label><input id="fxTheaterHost" type="text" placeholder="fx.local or 192.168.1.xxx"></div>
               <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
               <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
               <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
@@ -9911,6 +10227,7 @@ DASHBOARD_HTML = """<!doctype html>
               <label>Wake Word (Streaming ONNX)</label>
               <select id="vxWakeWord">
                 <option value="hey jarvis">Hey Jarvis (Built-in ONNX)</option>
+                <option value="hey atlas">Hey Atlas (Custom ONNX)</option>
                 <option value="hey armory">Hey Armory (Custom ONNX)</option>
                 <option value="armory">Armory (Custom Bare ONNX)</option>
               </select>
@@ -9969,6 +10286,58 @@ DASHBOARD_HTML = """<!doctype html>
             <div id="vxAbRuns" style="margin-top:8px"></div>
             <div id="vxAbTrials" style="margin-top:8px"></div>
           </details>
+        </div>
+
+        <div class="card" id="wakeStudioCard">
+          <h2>
+            <span>Custom Wake Word Studio (S330 Voice Enrollment &amp; ONNX Trainer)</span>
+            <span id="wsStatusPill" class="pill">READY</span>
+          </h2>
+          <div style="color:var(--mut);font-size:12px;margin-bottom:10px">Record ~20 natural reps of your voice through the PowerConf S330 across gym positions, then train &amp; hot-deploy your personalized ONNX wake model in ~45s.</div>
+          <div id="wsWordPills" class="ws-pills"></div>
+          <div id="wsWordMeta" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--mut);padding:8px 10px;background:#0e151f;border:1px solid var(--line);border-radius:9px">
+            <span id="wsMetricsTxt">Loading wake model telemetry…</span>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+              <button class="btn ok sm" id="wsActivateBtn" type="button">Set Active Wake Word</button>
+              <button class="btn sec sm" id="wsRestoreStockBtn" type="button" hidden>Restore Stock Jarvis</button>
+            </div>
+          </div>
+          <div id="wsPromptBox" class="ws-prompt">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+              <strong id="wsPromptTitle" style="font-size:14px">Guided 20-Rep Hands-Free Capture</strong>
+              <span id="wsRepCounter" class="pill">0 / 20 reps</span>
+            </div>
+            <div id="wsPromptCue" style="font-size:13px;color:#e2e8f0;margin-top:4px">Pick a wake word above and click Start Guided Capture.</div>
+            <div class="mbar-wrap" style="margin:8px 0 4px"><div id="wsMeter" class="mbar-fill"></div></div>
+            <div id="wsLastEvent" style="font-size:11.5px;color:var(--mut)">Say only the wake phrase after each chime — training mixes in gym rock &amp; command tails automatically.</div>
+          </div>
+          <div class="ctrl-row" style="margin-top:8px">
+            <button class="btn" id="wsEnrollBtn" type="button">🎙️ Start Guided Capture (20 Reps)</button>
+            <button class="btn sec" id="wsDelLastBtn" type="button">↶ Delete Last</button>
+            <button class="btn ok" id="wsTrainBtn" type="button">⚡ Train &amp; Deploy Model</button>
+            <label style="display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--mut);margin:0;cursor:pointer">
+              <input id="wsForceFull" type="checkbox" style="width:auto"> Force Full Synth
+            </label>
+            <button class="btn red sm" id="wsClearBtn" type="button">Clear All Reps</button>
+          </div>
+          <div id="wsTrainBox" style="margin-top:10px" hidden>
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px">
+              <strong id="wsTrainStage">Idle</strong>
+              <span id="wsTrainPct" style="font-variant-numeric:tabular-nums">0%</span>
+            </div>
+            <div class="ws-prog-wrap"><div id="wsTrainBar" class="ws-prog-bar"></div></div>
+            <pre id="wsTrainLog" class="ws-log"></pre>
+          </div>
+          <div style="margin-top:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px;color:var(--mut)">
+              <strong id="wsClipsHdr" style="color:var(--fg)">Recorded Voice Clips (0)</strong>
+              <span>16 kHz mono WAV · saved in S:\\ArmoryCam\\oww_training\\</span>
+            </div>
+            <div id="wsClipsList" class="ws-clips">
+              <div style="padding:10px;font-size:12px;color:var(--mut)">No personal S330 clips recorded yet for this phrase.</div>
+            </div>
+          </div>
+          <audio id="wsClipAudio" hidden></audio>
         </div>
       </section>
 
@@ -13237,6 +13606,227 @@ $('vxAbResetBtn').onclick = async () => {
   $('vxOut').textContent = 'Cleared passive workout A/B trials';
   await pollVoiceAb();
 };
+
+const wsState = { data: null, selectedPhrase: 'hey atlas', timer: null };
+
+function _wsSelectedWord() {
+  const words = (wsState.data && Array.isArray(wsState.data.words)) ? wsState.data.words : [];
+  return words.find(w => w.phrase === wsState.selectedPhrase) || words[0] || null;
+}
+
+function _wsSchedulePoll(fastMs) {
+  if (wsState.timer) { clearTimeout(wsState.timer); wsState.timer = null; }
+  if (!fastMs || activePage !== 'audio') return;
+  wsState.timer = setTimeout(() => { pollWakeStudio(); }, fastMs);
+}
+
+function renderWakeStudio(st) {
+  if (!st || !Array.isArray(st.words)) return;
+  wsState.data = st;
+  const enr = st.enrollment || {};
+  const trn = st.training || {};
+  if (enr.active && enr.phrase) wsState.selectedPhrase = enr.phrase;
+  else if (!st.words.some(w => w.phrase === wsState.selectedPhrase)) wsState.selectedPhrase = st.activePhrase || 'hey atlas';
+  const word = _wsSelectedWord();
+
+  const pillsEl = $('wsWordPills');
+  if (pillsEl) {
+    pillsEl.innerHTML = st.words.map(w => {
+      const sel = word && w.phrase === word.phrase;
+      const badge = w.modelExists ? (w.kind === 'stock' && !w.hasStockBackup ? 'Stock ✓' : 'ONNX ✓') : 'Untrained';
+      const liveTag = w.active ? '<span style="color:#4ade80;font-size:11px">★ LIVE</span>' : `<span style="color:var(--mut);font-size:11px">${badge}</span>`;
+      return `<button type="button" class="ws-pill${sel ? ' on' : ''}" data-wsphrase="${escHtml(w.phrase)}">` +
+        `<div class="ws-pill-top"><span>${escHtml(w.label)}</span>${liveTag}</div>` +
+        `<div class="ws-pill-sub"><span>${Number(w.clipCount || 0)} S330 reps</span><span>${w.modelExists ? w.modelSizeKb + ' KB' : 'Needs train'}</span></div>` +
+        `</button>`;
+    }).join('');
+    pillsEl.querySelectorAll('[data-wsphrase]').forEach(btn => {
+      btn.onclick = () => { wsState.selectedPhrase = btn.dataset.wsphrase; renderWakeStudio(wsState.data); };
+    });
+  }
+
+  const statusPill = $('wsStatusPill');
+  if (statusPill) {
+    if (trn.running) { statusPill.textContent = `TRAINING ${Number(trn.progressPct || 0)}%`; statusPill.className = 'pill live'; }
+    else if (enr.active) { statusPill.textContent = `LISTENING ${Number(enr.sessionCaptured || 0)}/${Number(enr.targetReps || 20)}`; statusPill.className = 'pill ok'; }
+    else if (word && word.active) { statusPill.textContent = 'ACTIVE'; statusPill.className = 'pill ok'; }
+    else { statusPill.textContent = 'READY'; statusPill.className = 'pill'; }
+  }
+
+  const metaEl = $('wsMetricsTxt');
+  if (metaEl && word) {
+    const m = word.metrics;
+    const parts = [`Model: <b>${word.modelExists ? `${word.slug}_v0.1.onnx (${word.modelSizeKb} KB)` : 'Not trained yet'}</b>`];
+    if (m) {
+      if (m.unseenRecallAt038 != null) parts.push(`Recall @0.38: <b>${(Number(m.unseenRecallAt038) * 100).toFixed(1)}%</b>`);
+      if (m.val10hFphAt038 != null) parts.push(`False Alarms: <b>${Number(m.val10hFphAt038).toFixed(2)}/hr</b>`);
+      if (m.userFilesCount != null) parts.push(`Baked Reps: <b>${m.userFilesCount}</b> (${m.userClipsUsed || 0} aug)`);
+      if (m.trainedAt) parts.push(`Trained: <b>${escHtml(String(m.trainedAt).replace('T', ' ').slice(0, 16))}</b>`);
+    } else if (word.kind === 'stock' && !word.hasStockBackup) {
+      parts.push('Stock openWakeWord pretrained ONNX');
+    }
+    metaEl.innerHTML = parts.join(' &nbsp;·&nbsp; ');
+  }
+
+  const actBtn = $('wsActivateBtn');
+  if (actBtn && word) {
+    actBtn.disabled = !word.modelExists || !!word.active;
+    actBtn.textContent = word.active ? '✓ Active Wake Word' : (word.modelExists ? `Use "${word.label}"` : 'Train Model First');
+  }
+  const restBtn = $('wsRestoreStockBtn');
+  if (restBtn && word) {
+    restBtn.hidden = !(word.slug === 'hey_jarvis' && word.hasStockBackup);
+  }
+
+  const pBox = $('wsPromptBox');
+  if (pBox) pBox.classList.toggle('rec', !!enr.active);
+  if ($('wsPromptTitle') && word) {
+    $('wsPromptTitle').textContent = enr.active ? `Recording "${word.label}" on PowerConf S330…` : `Guided 20-Rep Capture — ${word.label}`;
+  }
+  if ($('wsRepCounter') && word) {
+    $('wsRepCounter').textContent = enr.active
+      ? `${Number(enr.sessionCaptured || 0)} / ${Number(enr.targetReps || 20)} session (${Number(word.clipCount || 0)} total)`
+      : `${Number(word.clipCount || 0)} saved reps`;
+  }
+  if ($('wsPromptCue')) {
+    $('wsPromptCue').textContent = enr.active
+      ? (enr.prompt || 'Speak clearly toward PowerConf S330…')
+      : `Click Start Guided Capture, then say "${word ? word.label : 'Hey Atlas'}" 20 times at your natural gym pace (chime between reps).`;
+  }
+  if ($('wsLastEvent')) {
+    $('wsLastEvent').textContent = enr.lastEvent || 'Say only the wake phrase after each chime — training mixes in gym rock & command tails automatically.';
+  }
+  if ($('wsMeter')) {
+    const pct = clamp((Number(enr.rms || 0) / 0.08) * 100, 0, 100);
+    $('wsMeter').style.width = pct.toFixed(1) + '%';
+    $('wsMeter').classList.toggle('hot', Number(enr.vad || 0) >= 0.38);
+  }
+
+  const enrBtn = $('wsEnrollBtn');
+  if (enrBtn) {
+    enrBtn.textContent = enr.active ? '⏹ Stop Capture' : '🎙️ Start Guided Capture (20 Reps)';
+    enrBtn.className = enr.active ? 'btn red' : 'btn';
+    enrBtn.disabled = !!trn.running;
+  }
+  const trainBtn = $('wsTrainBtn');
+  if (trainBtn && word) {
+    trainBtn.disabled = !!trn.running;
+    trainBtn.textContent = trn.running ? `Training (${Number(trn.progressPct || 0)}%)…` : (word.synthCached ? '⚡ Train & Deploy (~45s)' : '⚡ Full Synth & Train (~3m)');
+  }
+  if ($('wsDelLastBtn')) $('wsDelLastBtn').disabled = !word || !word.clips || !word.clips.length || !!trn.running;
+  if ($('wsClearBtn')) $('wsClearBtn').disabled = !word || !word.clips || !word.clips.length || !!trn.running;
+
+  const tBox = $('wsTrainBox');
+  if (tBox) {
+    const showTrain = !!trn.running || (Array.isArray(trn.logs) && trn.logs.length > 0);
+    tBox.hidden = !showTrain;
+    if (showTrain) {
+      if ($('wsTrainStage')) $('wsTrainStage').textContent = trn.stage || 'Idle';
+      if ($('wsTrainPct')) $('wsTrainPct').textContent = `${Number(trn.progressPct || 0)}%`;
+      if ($('wsTrainBar')) $('wsTrainBar').style.width = `${clamp(Number(trn.progressPct || 0), 0, 100)}%`;
+      if ($('wsTrainLog')) {
+        $('wsTrainLog').textContent = (trn.logs || []).slice(-18).join('\\n');
+        $('wsTrainLog').scrollTop = $('wsTrainLog').scrollHeight;
+      }
+    }
+  }
+
+  if ($('wsClipsHdr') && word) $('wsClipsHdr').textContent = `Recorded Voice Clips — ${word.label} (${Number(word.clipCount || 0)})`;
+  const listEl = $('wsClipsList');
+  if (listEl && word) {
+    const clips = Array.isArray(word.clips) ? word.clips : [];
+    if (!clips.length) {
+      listEl.innerHTML = '<div style="padding:10px;font-size:12px;color:var(--mut)">No personal S330 clips recorded yet for this phrase.</div>';
+    } else {
+      listEl.innerHTML = clips.map(c => {
+        const ts = c.tsMs ? new Date(c.tsMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+        return `<div class="ws-clip-row">` +
+          `<span><code>${escHtml(c.name)}</code> · <b>${Number(c.durationSec || 0).toFixed(2)}s</b> · <span style="color:var(--mut)">${escHtml(ts)}</span></span>` +
+          `<span style="display:flex;gap:5px"><button class="btn sec sm" type="button" data-wsplay="${escHtml(c.url)}">▶</button><button class="btn red sm" type="button" data-wsdel="${escHtml(word.slug)}|${escHtml(c.name)}">✕</button></span>` +
+          `</div>`;
+      }).join('');
+      listEl.querySelectorAll('[data-wsplay]').forEach(b => {
+        b.onclick = () => {
+          const au = $('wsClipAudio');
+          if (!au) return;
+          au.src = b.dataset.wsplay + '?t=' + Date.now();
+          au.play().catch(() => {});
+        };
+      });
+      listEl.querySelectorAll('[data-wsdel]').forEach(b => {
+        b.onclick = async () => {
+          const [sl, fn] = b.dataset.wsdel.split('|');
+          const r = await fetch(`/api/voice/wake-studio/clip/${encodeURIComponent(sl)}/${encodeURIComponent(fn)}`, { method: 'DELETE' }).then(x => x.json());
+          if (r && r.studio) renderWakeStudio(r.studio);
+        };
+      });
+    }
+  }
+
+  if (enr.active) _wsSchedulePoll(350);
+  else if (trn.running) _wsSchedulePoll(1000);
+  else _wsSchedulePoll(0);
+}
+
+async function pollWakeStudio() {
+  try {
+    const r = await fetch('/api/voice/wake-studio', { cache: 'no-store' }).then(x => x.json());
+    if (r && r.ok) renderWakeStudio(r);
+  } catch {}
+}
+
+if ($('wsEnrollBtn')) {
+  $('wsEnrollBtn').onclick = async () => {
+    const enr = wsState.data && wsState.data.enrollment;
+    const stop = !!(enr && enr.active);
+    const body = stop ? { action: 'stop' } : { action: 'start', phrase: wsState.selectedPhrase, targetReps: 20 };
+    const r = await fetch('/api/voice/wake-studio/enroll', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    if (r && r.studio) renderWakeStudio(r.studio);
+  };
+}
+if ($('wsDelLastBtn')) {
+  $('wsDelLastBtn').onclick = async () => {
+    const w = _wsSelectedWord();
+    if (!w || !w.clips || !w.clips.length) return;
+    const c = w.clips[0];
+    const r = await fetch(`/api/voice/wake-studio/clip/${encodeURIComponent(w.slug)}/${encodeURIComponent(c.name)}`, { method: 'DELETE' }).then(x => x.json());
+    if (r && r.studio) renderWakeStudio(r.studio);
+  };
+}
+if ($('wsClearBtn')) {
+  $('wsClearBtn').onclick = async () => {
+    const w = _wsSelectedWord();
+    if (!w) return;
+    const r = await fetch('/api/voice/wake-studio/clips/clear', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ slug: w.slug }) }).then(x => x.json());
+    if (r && r.studio) renderWakeStudio(r.studio);
+  };
+}
+if ($('wsTrainBtn')) {
+  $('wsTrainBtn').onclick = async () => {
+    const forceFull = !!($('wsForceFull') && $('wsForceFull').checked);
+    const r = await fetch('/api/voice/wake-studio/train', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ phrase: wsState.selectedPhrase, forceFull }) }).then(x => x.json());
+    if (r && r.studio) renderWakeStudio(r.studio);
+    if (!r.ok) showToast(r.error || 'Could not start training', 'err');
+  };
+}
+if ($('wsActivateBtn')) {
+  $('wsActivateBtn').onclick = async () => {
+    const r = await fetch('/api/voice/wake-studio/activate', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ phrase: wsState.selectedPhrase }) }).then(x => x.json());
+    if (r && r.ok) {
+      if ($('vxWakeWord') && r.config && r.config.wakeWord) $('vxWakeWord').value = r.config.wakeWord;
+      if (cfg && r.config) cfg.voice = r.config;
+      if (r.studio) renderWakeStudio(r.studio);
+      showToast(`✓ Active wake word set to "${wsState.selectedPhrase}"`, 'ok');
+    }
+  };
+}
+if ($('wsRestoreStockBtn')) {
+  $('wsRestoreStockBtn').onclick = async () => {
+    const r = await fetch('/api/voice/wake-studio/restore-stock', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ phrase: 'hey jarvis' }) }).then(x => x.json());
+    if (r && r.studio) renderWakeStudio(r.studio);
+    if (r && r.ok) showToast('✓ Restored stock Hey Jarvis ONNX', 'ok');
+  };
+}
 $('haSaveBtn').onclick = () => saveHouseAudioConfig($('haSaveBtn'));
 
 function _applyDuckPreset(stage, key) {
@@ -14908,6 +15498,9 @@ function navigatePage(pageId, pushHash = true) {
     stopTapePlayback(false);
     stopTapeScanPoll();
   }
+  if (prevPage === 'audio' && next !== 'audio' && typeof _wsSchedulePoll === 'function') {
+    _wsSchedulePoll(0);
+  }
   activePage = next;
   document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
     btn.classList.toggle('on', btn.dataset.nav === next);
@@ -14935,6 +15528,7 @@ function navigatePage(pageId, pushHash = true) {
     pollVoiceStatus();
     pollAudioStatus();
     pollVoiceAb();
+    pollWakeStudio();
   } else if (next === 'gym') {
     pollAudioStatus();
   } else if (next === 'overview') {
@@ -17659,6 +18253,86 @@ def create_app(service: ArmoryCamService) -> Flask:
         text = str(body.get("text") or "Armory room mic ready").strip()
         spoke = service.voice.speak_confirmation(text)
         return jsonify({"ok": True, "spoke": spoke, "text": text})
+
+    @app.get("/api/voice/wake-studio")
+    def api_voice_wake_studio() -> Response:
+        resp = jsonify({"ok": True, **service.wake_trainer.studio_state(service.voice)})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/voice/wake-studio/enroll")
+    def api_voice_wake_studio_enroll() -> Response:
+        body = request.get_json(silent=True) or {}
+        action = str(body.get("action") or "start").strip().lower()
+        if action == "stop":
+            enr = service.voice.stop_wake_enrollment()
+            return jsonify({"ok": True, "enrollment": enr, "studio": service.wake_trainer.studio_state(service.voice)})
+        entry = WakeWordTrainerManager.resolve_entry(str(body.get("phrase") or ""))
+        if entry is None:
+            return jsonify({"ok": False, "error": "Unsupported wake word"}), 400
+        target_reps = int(_parse_num(body.get("targetReps"), 20, 1, 60))
+        enr = service.voice.start_wake_enrollment(entry["phrase"], target_reps=target_reps)
+        return jsonify({"ok": True, "enrollment": enr, "studio": service.wake_trainer.studio_state(service.voice)})
+
+    @app.get("/api/voice/wake-studio/clip/<slug>/<filename>")
+    def api_voice_wake_studio_clip_get(slug: str, filename: str) -> Response:
+        entry = WakeWordTrainerManager.resolve_entry(slug)
+        if entry is None or not _WAKE_CLIP_NAME_RE.match(str(filename or "")):
+            return Response(status=404)
+        wav_p = service.wake_trainer.user_dir_for(entry["slug"]) / Path(filename).name
+        if not wav_p.is_file():
+            return Response(status=404)
+        resp = Response(wav_p.read_bytes(), mimetype="audio/wav")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.delete("/api/voice/wake-studio/clip/<slug>/<filename>")
+    def api_voice_wake_studio_clip_del(slug: str, filename: str) -> Response:
+        if not service.wake_trainer.delete_clip(slug, filename):
+            return jsonify({"ok": False, "error": "Clip not found"}), 404
+        return jsonify({"ok": True, "studio": service.wake_trainer.studio_state(service.voice)})
+
+    @app.post("/api/voice/wake-studio/clips/clear")
+    def api_voice_wake_studio_clips_clear() -> Response:
+        body = request.get_json(silent=True) or {}
+        entry = WakeWordTrainerManager.resolve_entry(str(body.get("slug") or body.get("phrase") or ""))
+        if entry is None:
+            return jsonify({"ok": False, "error": "Unsupported wake word"}), 400
+        removed = service.wake_trainer.clear_clips(entry["slug"])
+        return jsonify({"ok": True, "removed": removed, "studio": service.wake_trainer.studio_state(service.voice)})
+
+    @app.post("/api/voice/wake-studio/train")
+    def api_voice_wake_studio_train() -> Response:
+        body = request.get_json(silent=True) or {}
+        phrase = str(body.get("phrase") or "").strip()
+        force_full = bool(body.get("forceFull", False))
+        ok, msg = service.wake_trainer.start_training(phrase, force_full=force_full, voice_svc=service.voice)
+        if not ok:
+            code = 409 if "Already training" in msg else 400
+            return jsonify({"ok": False, "error": msg, "studio": service.wake_trainer.studio_state(service.voice)}), code
+        return jsonify({"ok": True, "message": msg, "studio": service.wake_trainer.studio_state(service.voice)}), 202
+
+    @app.post("/api/voice/wake-studio/restore-stock")
+    def api_voice_wake_studio_restore() -> Response:
+        body = request.get_json(silent=True) or {}
+        phrase = str(body.get("phrase") or "hey jarvis").strip()
+        ok, msg = service.wake_trainer.restore_stock(phrase, voice_svc=service.voice)
+        if not ok:
+            return jsonify({"ok": False, "error": msg}), 400
+        return jsonify({"ok": True, "message": msg, "studio": service.wake_trainer.studio_state(service.voice)})
+
+    @app.post("/api/voice/wake-studio/activate")
+    def api_voice_wake_studio_activate() -> Response:
+        body = request.get_json(silent=True) or {}
+        entry = WakeWordTrainerManager.resolve_entry(str(body.get("phrase") or ""))
+        if entry is None:
+            return jsonify({"ok": False, "error": "Unsupported wake word"}), 400
+        with service.lock:
+            service.voice_cfg = service.voice.update_config({"wakeWord": entry["phrase"], "wakeEngine": "openwakeword"})
+            service.save_config()
+            cfg_dict = service.voice_cfg.to_dict()
+        service.voice.reload_oww_model(entry["phrase"])
+        return jsonify({"ok": True, "config": cfg_dict, "studio": service.wake_trainer.studio_state(service.voice)})
 
     _AUDITION_DEFAULT_TEXT = "Atlas online. 225 for 8, locked in. Recording Rack Cam. App not connected."
     _AUDITION_BY_SLUG = {v["slug"]: v for v in ATLAS_VOICE_CATALOG}
