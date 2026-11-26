@@ -168,9 +168,10 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
       var item = list[i] || {};
       var at = Number(item.atSec || 0);
       var dur = Math.max(0.08, Number(item.durSec || 0.2));
+      var gap = Math.max(0.08, Number(item.offSec || 0.22));
       var cnt = Math.max(1, Math.min(6, Number(item.count || 1)));
       for (var k = 0; k < cnt; k++){
-        var t0 = at + k * (dur + 0.15);
+        var t0 = at + k * (dur + gap);
         out.push({ t0: t0, t1: t0 + dur });
       }
     }
@@ -391,9 +392,10 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
       var item = list[i] || {};
       var at = Number(item.atSec || 0);
       var dur = Math.max(0.08, Number(item.durSec || 0.2));
+      var gap = Math.max(0.08, Number(item.offSec || 0.22));
       var cnt = Math.max(1, Math.min(6, Number(item.count || 1)));
       for (var k = 0; k < cnt; k++){
-        var t0 = at + k * (dur + 0.15);
+        var t0 = at + k * (dur + gap);
         out.push({ t0: t0, t1: t0 + dur });
       }
     }

@@ -6402,6 +6402,33 @@ class ShowDirectorTests(unittest.TestCase):
             # With lightsLeadSec=1.2, cue at 3.0s should fire around ~1.8s (well before full preview ends)
             self.assertLess(wk_lights[1][0], 2.6)
 
+            # 4. Syncopated/dark-room flashes: endOn=False returns to OFF and auto-restores ON at show end;
+            #    lightFlash=False skips relay while keeping screenFlash for TV syncopation
+            svc.shows.update_fx_hooks({"lightsLeadSec": 0.0})
+            hits.clear()
+            sim_now[0] = 0.0
+            svc.shows.update_show(
+                "pr",
+                {
+                    "lightsOut": True,
+                    "lightsFlashCount": 0,
+                    "songDurationSec": 3.5,
+                    "fxCues": [
+                        {"id": "tv_only", "target": "intro", "atSec": 0.6, "type": "flash", "count": 1, "durationSec": 0.2, "lightFlash": False, "screenFlash": True},
+                        {"id": "bolt_1", "target": "intro", "atSec": 1.0, "type": "flash", "count": 2, "durationSec": 0.2, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True},
+                    ],
+                },
+                rebuild=True,
+            )
+            res_sync = svc.shows.fire_show("pr", async_run=False)
+            self.assertTrue(res_sync["ok"])
+            sync_lights = [u for _, u in hits if "armory-lights" in u]
+            # Expected sequence: initial OFF, flash1 ON/OFF, flash2 ON/OFF, end-of-show safety restore ON
+            self.assertEqual(
+                [u.endswith("on=1") for u in sync_lights],
+                [False, True, False, True, False, True],
+            )
+
             svc.stop_background()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)

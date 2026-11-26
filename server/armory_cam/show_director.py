@@ -563,6 +563,11 @@ def _normalize_fx_cues(raw_list: Any) -> list[dict[str, Any]]:
         seen_ids.add(cid)
         zone_raw = str(item.get("zone") or "all").strip().lower()
         zone = zone_raw if zone_raw in VALID_FX_ZONES else "all"
+        try:
+            off_raw = item.get("offSec", 0.22)
+            off_sec = round(_clamp(float(0.22 if off_raw is None or off_raw == "" else off_raw), 0.1, 5.0), 2)
+        except (TypeError, ValueError):
+            off_sec = 0.22
         out.append({
             "id": cid,
             "target": target,
@@ -570,6 +575,9 @@ def _normalize_fx_cues(raw_list: Any) -> list[dict[str, Any]]:
             "type": fx_type,
             "count": cnt,
             "durationSec": dur,
+            "offSec": off_sec,
+            "endOn": bool(item.get("endOn", True)),
+            "lightFlash": bool(item.get("lightFlash", True)),
             "screenFlash": bool(item.get("screenFlash", True)),
             "zone": zone,
         })
@@ -5274,6 +5282,7 @@ class ShowDirector:
                 flash_events.append({
                     "atSec": round(show_t, 2),
                     "durSec": float(fc.get("durationSec") or 0.2),
+                    "offSec": float(fc.get("offSec") or 0.22),
                     "count": int(fc.get("count") or 1),
                 })
 
@@ -5701,17 +5710,34 @@ class ShowDirector:
                     cnt_fx = int(payload.get("count") or 1)
                     zone_fx = str(payload.get("zone") or "all")
                     if fx_type == "flash":
-                        self._flash_lights(
-                            cnt_fx,
-                            cancel_ev=cancel_ev,
-                            show_id=spec.id,
-                            end_on=True,
-                            on_sec=max(0.1, min(2.0, dur_fx)),
-                            off_sec=0.14,
-                            tag_prefix="FLASH · CUSTOM",
-                            zone=zone_fx,
-                        )
-                        sim_clock += cnt_fx * max(0.1, min(2.0, dur_fx)) + max(0, cnt_fx - 1) * 0.14
+                        end_on_fx = bool(payload.get("endOn", True))
+                        off_fx = max(0.1, min(5.0, float(payload.get("offSec") or 0.22)))
+                        if payload.get("lightFlash", True):
+                            self._flash_lights(
+                                cnt_fx,
+                                cancel_ev=cancel_ev,
+                                show_id=spec.id,
+                                end_on=end_on_fx,
+                                on_sec=max(0.1, min(2.0, dur_fx)),
+                                off_sec=off_fx,
+                                tag_prefix="FLASH · CUSTOM",
+                                zone=zone_fx,
+                            )
+                            if zone_fx == "all":
+                                if end_on_fx:
+                                    lights_restored = True
+                                else:
+                                    lights_turned_off = True
+                                    lights_restored = False
+                            sim_clock += cnt_fx * max(0.1, min(2.0, dur_fx)) + (cnt_fx if not end_on_fx else max(0, cnt_fx - 1)) * off_fx
+                        else:
+                            self._emit_cue(
+                                "flash",
+                                "(TV FLASH · SYNCOPATED)",
+                                show_id=spec.id,
+                                duration_ms=int(max(120, dur_fx * 1000)),
+                                zone=zone_fx,
+                            )
                     elif fx_type == "lights_off":
                         self._fire_lights_state(
                             False, zone=zone_fx, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
@@ -6055,17 +6081,26 @@ class ShowDirector:
                     cnt_fx = int(fc.get("count") or 1)
                     zone_fx = str(fc.get("zone") or "all")
                     if fx_type == "flash":
-                        self._flash_lights(
-                            cnt_fx,
-                            cancel_ev=cancel_ev,
-                            show_id=spec.id,
-                            end_on=True,
-                            on_sec=max(0.1, min(2.0, dur_fx)),
-                            off_sec=0.14,
-                            tag_prefix="FLASH · CUSTOM",
-                            zone=zone_fx,
-                        )
-                        cur_t += cnt_fx * max(0.1, min(2.0, dur_fx)) + max(0, cnt_fx - 1) * 0.14
+                        end_on_fx = bool(fc.get("endOn", True))
+                        off_fx = max(0.1, min(5.0, float(fc.get("offSec") or 0.22)))
+                        if fc.get("lightFlash", True):
+                            self._flash_lights(
+                                cnt_fx,
+                                cancel_ev=cancel_ev,
+                                show_id=spec.id,
+                                end_on=end_on_fx,
+                                on_sec=max(0.1, min(2.0, dur_fx)),
+                                off_sec=off_fx,
+                                tag_prefix="FLASH · CUSTOM",
+                                zone=zone_fx,
+                            )
+                            if zone_fx == "all":
+                                if end_on_fx:
+                                    lights_restored = True
+                                else:
+                                    lights_turned_off = True
+                                    lights_restored = False
+                            cur_t += cnt_fx * max(0.1, min(2.0, dur_fx)) + (cnt_fx if not end_on_fx else max(0, cnt_fx - 1)) * off_fx
                     elif fx_type == "lights_off":
                         self._fire_lights_state(
                             False, zone=zone_fx, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
