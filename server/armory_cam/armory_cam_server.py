@@ -140,7 +140,7 @@ try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { t
 WALLBOARD_STAGE_OVERLAY_SNIPPET = """
 <div id="armoryShowStage" style="display:none;position:fixed;inset:0;z-index:999999;background:#000;overflow:hidden">
   <video id="armoryStageVid" playsinline muted preload="auto" style="width:100%;height:100%;object-fit:contain;background:#000"></video>
-  <div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:radial-gradient(circle,rgba(255,255,255,0.92) 0%,rgba(220,238,255,0.68) 65%,rgba(180,218,255,0.45) 100%);mix-blend-mode:screen;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
+  <div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:#fff;opacity:0;display:none;z-index:10"></div>
 </div>
 <script>
 (function(){
@@ -154,6 +154,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
   var clockOffsetMs = 0;
   var curRunId = 0;
   var readyAcked = false;
+  var playingAcked = false;
   var startTimer = null;
   var safetyTimer = null;
   var syncIv = null;
@@ -180,7 +181,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
 
   function clearFlash(){
     if (flashRaf){ cancelAnimationFrame(flashRaf); flashRaf = null; }
-    if (flashEl) flashEl.style.opacity = '0';
+    if (flashEl){ flashEl.style.opacity = '0'; flashEl.style.display = 'none'; }
   }
 
   function tickFlash(){
@@ -193,7 +194,10 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     for (var i = 0; i < flashWindows.length; i++){
       if (t >= flashWindows[i].t0 && t < flashWindows[i].t1){ lit = true; break; }
     }
-    if (flashEl) flashEl.style.opacity = lit ? '0.58' : '0';
+    if (flashEl){
+      flashEl.style.display = lit ? 'block' : 'none';
+      flashEl.style.opacity = lit ? '0.45' : '0';
+    }
     flashRaf = requestAnimationFrame(tickFlash);
   }
 
@@ -364,7 +368,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
 </style></head>
 <body>
 <video id="stVid" playsinline preload="auto"></video>
-<div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:radial-gradient(circle,rgba(255,255,255,0.92) 0%,rgba(220,238,255,0.68) 65%,rgba(180,218,255,0.45) 100%);mix-blend-mode:screen;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
+<div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:#fff;opacity:0;display:none;z-index:10"></div>
 <script>
 (function(){
   var q = new URLSearchParams(location.search);
@@ -378,6 +382,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
   var clockOffsetMs = 0;
   var curRunId = 0;
   var readyAcked = false;
+  var playingAcked = false;
   var startTimer = null;
   var safetyTimer = null;
   var syncIv = null;
@@ -404,7 +409,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
 
   function clearFlash(){
     if (flashRaf){ cancelAnimationFrame(flashRaf); flashRaf = null; }
-    if (flashEl) flashEl.style.opacity = '0';
+    if (flashEl){ flashEl.style.opacity = '0'; flashEl.style.display = 'none'; }
   }
 
   function tickFlash(){
@@ -417,7 +422,10 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     for (var i = 0; i < flashWindows.length; i++){
       if (t >= flashWindows[i].t0 && t < flashWindows[i].t1){ lit = true; break; }
     }
-    if (flashEl) flashEl.style.opacity = lit ? '0.58' : '0';
+    if (flashEl){
+      flashEl.style.display = lit ? 'block' : 'none';
+      flashEl.style.opacity = lit ? '0.45' : '0';
+    }
     flashRaf = requestAnimationFrame(tickFlash);
   }
 
@@ -462,9 +470,11 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     flashWindows = [];
     curRunId = 0;
     readyAcked = false;
+    playingAcked = false;
     activeStartMs = 0;
     vid.oncanplay = null;
     vid.onloadeddata = null;
+    vid.onplaying = null;
     vid.onended = null;
     vid.onerror = null;
     try { vid.pause(); vid.playbackRate = 1.0; vid.removeAttribute('src'); vid.load(); } catch(e){}
@@ -474,6 +484,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     clearPlayTimers();
     curRunId = Number(ev.runId || 0);
     readyAcked = false;
+    playingAcked = false;
     activeStartMs = 0;
     flashWindows = buildFlashWindows(ev.flashEvents);
     vid.muted = !useAudio;
@@ -486,9 +497,15 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
       readyAcked = true;
       postAck('ready', curRunId);
     };
-    var fallbackT = setTimeout(sendReady, 2600);
+    var fallbackT = setTimeout(sendReady, 4000);
     vid.oncanplay = function(){ clearTimeout(fallbackT); sendReady(); };
     vid.onloadeddata = function(){ try { vid.currentTime = 0; } catch(e){} };
+    vid.onplaying = function(){
+      if (!playingAcked && curRunId) {
+        playingAcked = true;
+        postAck('playing', curRunId);
+      }
+    };
     vid.onended = function(){
       var rid = curRunId;
       stopStage();
@@ -2297,6 +2314,8 @@ class FireTvAdbController:
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
                 **_subprocess_no_window_kwargs(),
             )
@@ -3133,6 +3152,7 @@ class ArmoryCamService:
             local_command_handler=self._handle_local_voice_command,
             on_pcm_chunk=self.room_audio.push_pcm,
             wake_duck_callbacks=self.house_audio.wake_duck_callbacks(),
+            show_active_fn=self.shows.is_active,
         )
         self.pre_roll_sec = DEFAULT_PRE_ROLL_SEC
         if drive_backup_dir is not None:

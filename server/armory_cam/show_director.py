@@ -3146,6 +3146,10 @@ class ShowDirector:
             subs = list(self._event_subs)
         self._fanout_event_locked(evt, subs)
 
+    def is_active(self) -> bool:
+        with self._lock:
+            return bool(self._active_state.get("active"))
+
     def record_stage_ack(self, *, role: str, run_id: int, state: str) -> dict[str, Any]:
         clean_role = re.sub(r"[^a-z0-9_-]+", "", str(role or "").strip().lower())
         clean_state = re.sub(r"[^a-z0-9_-]+", "", str(state or "").strip().lower())
@@ -5645,18 +5649,13 @@ class ShowDirector:
             if cancel_ev.is_set():
                 return {"ok": False, "canceled": True}
 
-            # 4.5 Fire Lights Out + Theater FX + Fog Machine right as TVs finish staging (so fog builds ~2s before play, never 15s early)
-            lights_turned_off, theater_started = self._trigger_pre_show_fx(
-                spec, fx, scene_dur_ms=mm_scene_dur_ms, out_res=out_res
-            )
-
-            # 5. Wait for Cube & Wallboard stages to finish buffering + settle HDMI/HDCP switches cleanly
+            # 5. Wait for Cube & Wallboard stages to finish buffering FIRST (while room is still lit & quiet!)
             roles_to_wait: list[str] = []
             if cube_stage_launched:
                 roles_to_wait.append("cube")
             if prestage.get("wallboard", {}).get("ok") or self.has_stage_client("wallboard"):
                 roles_to_wait.append("wallboard")
-            ack_timeout = 0.05 if self._has_custom_sleep else 5.5
+            ack_timeout = 0.05 if self._has_custom_sleep else 8.0
             out_res["stageReady"] = self._wait_for_stage_acks(
                 run_id, roles_to_wait, target_states=("ready",), cancel_ev=cancel_ev, timeout_sec=ack_timeout
             )
@@ -5671,6 +5670,14 @@ class ShowDirector:
                 if rem_settle > 0.0 and self._wait_cancelable(cancel_ev, rem_settle):
                     return {"ok": False, "canceled": True}
 
+            # 5.5 Fire Lights Out + Theater FX + Fog Machine right before playback (~1.6s fog head-start, never 10-15s dead silence)
+            lights_turned_off, theater_started = self._trigger_pre_show_fx(
+                spec, fx, scene_dur_ms=mm_scene_dur_ms, out_res=out_res
+            )
+            if (lights_turned_off or theater_started) and not self._has_custom_sleep:
+                if self._wait_cancelable(cancel_ev, 1.6):
+                    return {"ok": False, "canceled": True}
+
             # 6. Ramp Denon to MV70, then fire clock-synced `stage_play` across stage screens!
             if self.house_audio is not None and has_baseline and prev_db is not None:
                 save_guard = getattr(self.house_audio.denon, "save_volume_guard", None)
@@ -5680,7 +5687,7 @@ class ShowDirector:
                 current_db = target_db
                 denon_raised = True
 
-            lead_sec = 0.0 if self._has_custom_sleep else 0.55
+            lead_sec = 0.0 if self._has_custom_sleep else 0.45
             start_at_ms = int(time.time() * 1000) + int(round(lead_sec * 1000))
             with self._lock:
                 self._active_state["phase"] = "playing"
@@ -5705,6 +5712,18 @@ class ShowDirector:
 
             if lead_sec > 0.0 and self._wait_cancelable(cancel_ev, lead_sec):
                 return {"ok": False, "canceled": True}
+
+            # Lock server light/FX clock to actual Cube video playback start (`playing` ack) so lights never run 2-3s early!
+            if cube_stage_launched and not self._has_custom_sleep:
+                self._wait_for_stage_acks(
+                    run_id,
+                    ["cube"],
+                    target_states=("playing", "ended"),
+                    cancel_ev=cancel_ev,
+                    timeout_sec=2.5,
+                )
+                if cancel_ev.is_set():
+                    return {"ok": False, "canceled": True}
 
             play_t0 = time.monotonic()
             sim_clock = 0.0

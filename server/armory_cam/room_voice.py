@@ -2172,6 +2172,7 @@ class RoomVoiceService:
         on_pcm_chunk: Callable[[np.ndarray, int, float], None] | None = None,
         wake_duck_callbacks: dict[str, Callable[..., Any]] | None = None,
         wake_spotter: Any | None = None,
+        show_active_fn: Callable[[], bool] | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
@@ -2187,6 +2188,7 @@ class RoomVoiceService:
         self._local_command_handler = local_command_handler
         self._on_pcm_chunk = on_pcm_chunk
         self._wake_duck_cbs: dict[str, Callable[..., Any]] = dict(wake_duck_callbacks or {})
+        self._show_active_fn = show_active_fn
 
         self.log = logging.getLogger("armory-voice")
         self.lock = threading.RLock()
@@ -2389,8 +2391,22 @@ class RoomVoiceService:
             except Exception:
                 pass
 
+    def _is_show_active(self) -> bool:
+        fn = self._show_active_fn
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return False
+        return False
+
     def _on_oww_wake_detected(self, score: float) -> None:
         """Triggered off audio-callback thread the instant openWakeWord spots wake phrase."""
+        # Never duck Denon, chime, or arm the phone pill while a live Show Director show is playing
+        # (prevents shows saying "Welcome to The Armory" from self-triggering and ducking their own music!).
+        if self._is_show_active():
+            self.log.debug("Wake word suppressed during active show (score=%.3f)", score)
+            return
         # Immediately flash the Pixel & Wallboard pill TEAL (armed) via SSE before Denon HTTP completes!
         now_ms = int(time.time() * 1000)
         with self.lock:
@@ -2761,13 +2777,33 @@ class RoomVoiceService:
                 emitted = bool(clean) and (force_emit or has_wake or was_armed)
             local_handler = self._local_command_handler if emitted else None
 
+        show_running = self._is_show_active()
         local_res: dict[str, Any] | None = None
         if local_handler is not None:
             try:
-                local_res = local_handler(display_clean)
+                if show_running:
+                    # While a show is active, only allow an explicit stop command; ignore show self-speech!
+                    cand = local_handler(display_clean) if re.search(r"\b(?:stop|kill|cancel|abort|end|enough)\b", display_clean.lower()) else None
+                    if isinstance(cand, dict) and cand.get("handled") and cand.get("action") == "stop":
+                        local_res = cand
+                else:
+                    local_res = local_handler(display_clean)
             except Exception as exc:
                 self.log.debug("Local voice command handler error: %s", exc)
                 local_res = None
+
+        if show_running and not (isinstance(local_res, dict) and local_res.get("handled")):
+            self._release_wake_duck_async()
+            return {
+                "id": 0,
+                "tsMs": now_ms,
+                "transcript": display_clean,
+                "wakeMatched": False,
+                "emitted": False,
+                "suppressedDuringShow": True,
+                "latencyMs": int(latency_ms),
+                "ackText": "",
+            }
 
         if isinstance(local_res, dict) and local_res.get("handled"):
             speech_txt = str(local_res.get("speech") or "").strip()

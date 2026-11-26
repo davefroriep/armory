@@ -6480,6 +6480,38 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(len(bolts), 3)
             self.assertTrue(all(c.get("lightFlash") is True and c.get("screenFlash") is False for c in bolts))
 
+            # Stage HTML must NEVER use mix-blend-mode (breaks Fire TV Cube Chromium hardware <video> overlay)
+            # and must emit `playing` ack so overhead lights lock to real HDMI playback start
+            self.assertNotIn("mix-blend-mode", ac.STAGE_PAGE_HTML)
+            self.assertNotIn("mix-blend-mode", ac.WALLBOARD_STAGE_OVERLAY_SNIPPET)
+            self.assertIn("postAck('playing'", ac.STAGE_PAGE_HTML)
+
+            # Active show suppresses self-triggered wake-word Denon ducking & "App not connected" while keeping "stop"
+            duck_calls: list[str] = []
+            spoken_show: list[str] = []
+            stopped_show: list[bool] = []
+            v_show = rv.RoomVoiceService(
+                config=rv.RoomVoiceConfig(wake_word="hey armory", wake_engine="openwakeword", speaker_readback=True),
+                speak_fn=lambda txt: (spoken_show.append(txt), True)[1],
+                wake_duck_callbacks={"begin": lambda: (duck_calls.append("begin"), {"ducked": True})[1]},
+                local_command_handler=lambda txt: (
+                    (stopped_show.append(True), {"handled": True, "action": "stop", "speech": "Show stopped"})[1]
+                    if "stop" in txt.lower() else None
+                ),
+                show_active_fn=lambda: True,
+                allow_hardware_audio=False,
+            )
+            v_show._on_oww_wake_detected(0.96)
+            self.assertEqual(duck_calls, [])
+            sup = v_show._emit_transcript("Hey Armory, Welcome to the Armory", latency_ms=120, from_oww=True)
+            self.assertFalse(sup["emitted"])
+            self.assertTrue(sup.get("suppressedDuringShow"))
+            self.assertEqual(spoken_show, [])
+            stp = v_show._emit_transcript("Hey Armory, stop", latency_ms=120, from_oww=True)
+            self.assertTrue(stp["emitted"])
+            self.assertTrue(stp.get("localHandled"))
+            self.assertEqual(stopped_show, [True])
+
             # 1. .local mDNS resolver caches IPv4 and preserves Host header
             fake_info = [(2, 1, 6, "", ("192.168.1.21", 80))]
             with mock.patch("socket.getaddrinfo", return_value=fake_info) as m_ga:
