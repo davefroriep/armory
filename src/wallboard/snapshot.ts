@@ -1,5 +1,7 @@
 import { recoveryLimitBpm } from '../domain/gate';
-import { applyPlanOverrides, planById, type LocalTodayItem } from '../domain/plan';
+import {
+  applyPlanOverrides, dayOfWeek, extraKey, parseYmd, planById, projectPlan, shiftYmd, type LocalTodayItem,
+} from '../domain/plan';
 import { sessionStats } from '../lifts/calc';
 import { peekNextTargetSet, resolveTargetSet, type CursorRef, type SetPointer } from '../lifts/cursor';
 import { canLog, labels, prevSetFor, secondsSinceLastSet, supersetGroups } from '../lifts/logic';
@@ -7,9 +9,9 @@ import { MUSCLE_LABEL } from '../lifts/muscles';
 import { resolvePrescription, type CoachPrescription } from '../lifts/prescriptions';
 import { matchRoutineByTitle } from '../lifts/seed';
 import { fmtKg } from '../lifts/settings';
-import { condenseSets, fmtVolume, setText } from '../lifts/summary';
+import { condenseSets, fmtDuration, fmtVolume, setText } from '../lifts/summary';
 import type { Exercise, LiftSession, LiftSet, Routine, SessionEx } from '../lifts/types';
-import { EQUIPMENT_LABEL } from '../types';
+import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
 import { hrDropStats, hrZone } from '../ui/hr';
 import type { Settings } from '../store/settings';
 
@@ -134,6 +136,20 @@ export interface WallboardReplayState {
   viewCount?: number;
 }
 
+export interface WallboardCameraState {
+  recording: boolean;
+  saving: boolean;
+  guest: boolean;
+  cameras: string[];
+  startedAtMs?: number;
+}
+
+export interface WallboardStandbyCompletedItem {
+  title: string;
+  equipmentLabel: string;
+  summary: string;
+}
+
 export interface WallboardState {
   ts: number;
   mode: 'lift' | 'cardio' | 'standby';
@@ -145,6 +161,7 @@ export interface WallboardState {
     wakeWord: string;
     banner: WallboardVoiceBanner | null;
   };
+  camera?: WallboardCameraState;
   replay?: WallboardReplayState | null;
   lift?: {
     title: string;
@@ -189,15 +206,24 @@ export interface WallboardState {
     timeLabel: string;
     weekLabel: string;
     todayItems: { title: string; equipmentLabel: string; carried: boolean; preview: string }[];
+    completedItems?: WallboardStandbyCompletedItem[];
+    nextUp?: { title: string; dateLabel: string } | null;
+    isRestDay?: boolean;
+    scheduleSynced?: boolean;
   };
 }
 
 export interface WallboardBuildInput {
   now: number;
-  settings: Pick<Settings, 'hrMax' | 'recoveryHrPct' | 'voiceEnabled' | 'voiceWakeWord' | 'queue'> & { voiceRoomEnabled?: boolean; planStepOverrides?: Settings['planStepOverrides'] };
+  settings: Pick<Settings, 'hrMax' | 'recoveryHrPct' | 'voiceEnabled' | 'voiceWakeWord' | 'queue'> & {
+    voiceRoomEnabled?: boolean;
+    planStepOverrides?: Settings['planStepOverrides'];
+    restDay?: number | null;
+  };
   unit: 'lb' | 'kg';
   hr: { bpm: number; fresh: boolean; recentPoints: { at: number; hr: number }[] };
   voice: { listening: boolean; armed: boolean; banner: WallboardVoiceBanner | null; cursor: CursorRef | null };
+  camera?: WallboardCameraState | null;
   cardioSnap: WallboardCardioSnapshot | null;
   holdSnap: ActiveHoldSnapshot | null;
   replaySnap?: WallboardReplayState | null;
@@ -205,11 +231,25 @@ export interface WallboardBuildInput {
   elapsedSec: number;
   rest: { endMs: number; totalSec: number; label: string } | null;
   todayItems: LocalTodayItem[];
+  finishedTodayLifts?: LiftSession[];
+  finishedTodayCardio?: WorkoutMeta[];
   routines: Routine[];
   exOf: (exId: string) => Exercise;
   noteOf?: (exId: string) => string;
   e1rmOf?: (exId: string) => number | null;
   prevOf: (se: SessionEx) => SessionEx | null;
+}
+
+function localYmd(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function fmtStandbyUpcomingDate(ymd: string, todayYmd: string): string {
+  if (ymd === todayYmd) return 'Today';
+  if (ymd === shiftYmd(todayYmd, 1)) return 'Tomorrow';
+  const { y, m, d } = parseYmd(ymd);
+  return new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 function formatWeightReps(wKg: number | null, r: number | null, type: Exercise['type'], u: 'lb' | 'kg'): { weightText: string; repsText: string } {
@@ -509,6 +549,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
   };
 
   const activeReplay = inp.replaySnap && inp.replaySnap.expiresAtMs > now ? inp.replaySnap : undefined;
+  const activeCamera = inp.camera && (inp.camera.recording || inp.camera.saving) ? { ...inp.camera } : undefined;
 
   if (inp.cardioSnap) {
     return {
@@ -516,6 +557,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
       mode: 'cardio',
       hr,
       voice: voiceState,
+      ...(activeCamera ? { camera: activeCamera } : {}),
       ...(activeReplay ? { replay: activeReplay } : {}),
       cardio: { ...inp.cardioSnap },
     };
@@ -641,6 +683,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
       mode: 'lift',
       hr,
       voice: voiceState,
+      ...(activeCamera ? { camera: activeCamera } : {}),
       ...(activeReplay ? { replay: activeReplay } : {}),
       lift: {
         title: s.name,
@@ -669,9 +712,13 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
   }
 
   const d = new Date(now);
+  const todayYmd = localYmd(now);
+  const restDay = st.restDay !== undefined ? st.restDay : null;
+  const isRestDay = restDay != null && dayOfWeek(todayYmd) === restDay;
   const plan = applyPlanOverrides(planById(st.queue.planId), st.planStepOverrides);
   const step = plan.steps[st.queue.stepIndex];
   const weekLabel = step ? `Wk ${step.week} · Step ${step.index + 1}/${plan.steps.length}` : 'Phase 1 Complete';
+  const proj = projectPlan(plan, st.queue, todayYmd, restDay);
   const todayItems = inp.todayItems.map((it) => {
     let preview = it.slot.description || '';
     if (it.equipment === 'strength') {
@@ -688,17 +735,97 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     };
   });
 
+  const liftsDoneToday = (inp.finishedTodayLifts ?? [])
+    .filter((x) => x.status === 'done' && localYmd(x.startMs) === todayYmd)
+    .sort((a, b) => a.startMs - b.startMs);
+  const cardioDoneToday = (inp.finishedTodayCardio ?? [])
+    .filter((m) => m.status === 'saved' && m.equipment !== 'strength' && localYmd(m.startEpochMs) === todayYmd)
+    .sort((a, b) => a.startEpochMs - b.startEpochMs);
+  const doneEqs = new Set<Equipment>();
+  const completedItems: WallboardStandbyCompletedItem[] = [];
+
+  for (const ls of liftsDoneToday) {
+    doneEqs.add('strength');
+    const stStats = sessionStats(ls, inp.exOf);
+    const summary = [
+      fmtDuration(stStats.durationSec),
+      `${stStats.sets} sets`,
+      stStats.volumeKg > 0 ? fmtVolume(stStats.volumeKg, u) : '',
+    ].filter(Boolean).join(' · ');
+    completedItems.push({ title: ls.name, equipmentLabel: 'Strength', summary });
+  }
+  for (const cm of cardioDoneToday) {
+    doneEqs.add(cm.equipment);
+    const summary = [
+      `${Math.max(1, Math.round(cm.seconds / 60))} min`,
+      cm.avgW > 0 ? `${Math.round(cm.avgW)} W` : '',
+      cm.avgHr > 0 ? `${Math.round(cm.avgHr)} bpm` : '',
+    ].filter(Boolean).join(' · ');
+    completedItems.push({
+      title: cm.name,
+      equipmentLabel: EQUIPMENT_LABEL[cm.equipment] ?? cm.equipment,
+      summary,
+    });
+  }
+  for (const p of proj) {
+    p.step.slots.forEach((slot, si) => {
+      const onToday = p.slotDates[si] === todayYmd || (p.slotDates[si] == null && p.date === todayYmd);
+      if (p.slotStates[si] === 'done' && onToday && !doneEqs.has(slot.equipment)) {
+        doneEqs.add(slot.equipment);
+        completedItems.push({
+          title: slot.name,
+          equipmentLabel: EQUIPMENT_LABEL[slot.equipment] ?? slot.equipment,
+          summary: `${Math.max(1, Math.round(slot.seconds / 60))} min`,
+        });
+      }
+    });
+  }
+  for (const x of st.queue.extras ?? []) {
+    if (x.doneDate === todayYmd) {
+      const k = extraKey(x.id);
+      const hasLocal = liftsDoneToday.some((ls) => ls.planSlot === k || ls.name === x.name)
+        || cardioDoneToday.some((cm) => cm.planSlot === k || cm.name === x.name);
+      if (!hasLocal) {
+        completedItems.push({
+          title: x.name,
+          equipmentLabel: EQUIPMENT_LABEL[x.equipment] ?? x.equipment,
+          summary: `${Math.max(1, Math.round(x.seconds / 60))} min`,
+        });
+      }
+    }
+  }
+
+  let nextUp: { title: string; dateLabel: string } | null = null;
+  if (step && st.queue.stagedDate && st.queue.stagedDate > todayYmd) {
+    nextUp = {
+      title: step.title.replace(/^Wk \d+ · /, ''),
+      dateLabel: fmtStandbyUpcomingDate(st.queue.stagedDate, todayYmd),
+    };
+  } else {
+    const nextProj = proj.find((p) => p.date != null && p.date > todayYmd && p.slotStates.some((ss) => ss === 'pending'));
+    if (nextProj?.date) {
+      nextUp = {
+        title: nextProj.step.title.replace(/^Wk \d+ · /, ''),
+        dateLabel: fmtStandbyUpcomingDate(nextProj.date, todayYmd),
+      };
+    }
+  }
+
   return {
     ts: now,
     mode: 'standby',
     hr,
     voice: voiceState,
+    ...(activeCamera ? { camera: activeCamera } : {}),
     ...(activeReplay ? { replay: activeReplay } : {}),
     standby: {
       dateLabel: d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }),
       timeLabel: d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
       weekLabel,
       todayItems,
+      completedItems,
+      nextUp,
+      isRestDay,
     },
   };
 }

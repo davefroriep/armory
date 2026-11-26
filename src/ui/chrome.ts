@@ -60,7 +60,7 @@ export function mountTopResume(root: HTMLElement): () => void {
       strip = document.createElement('a');
       strip.className = 'top-resume';
       strip.href = '#/strength/session';
-      strip.innerHTML = '<i class="rec-dot"></i><b></b><span></span><em>Resume ›</em>';
+      strip.innerHTML = '<i class="rec-dot"></i><b></b><span></span><em>Resume Workout ›</em>';
     }
     const nameEl = strip.children[1] as HTMLElement;
     const clockEl = strip.children[2] as HTMLElement;

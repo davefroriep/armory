@@ -2344,19 +2344,36 @@ class WallboardRelay:
             and isinstance(obj.get("ymd"), str)
             and isinstance(obj.get("todayItems"), list)
         ):
-            return {
+            rec: dict[str, Any] = {
                 "ymd": obj["ymd"],
                 "weekLabel": str(obj.get("weekLabel") or ""),
                 "todayItems": list(obj["todayItems"]),
+                "completedItems": list(obj.get("completedItems") or []) if isinstance(obj.get("completedItems"), list) else [],
+                "nextUp": dict(obj["nextUp"]) if isinstance(obj.get("nextUp"), dict) else None,
             }
+            if isinstance(obj.get("isRestDay"), bool):
+                rec["isRestDay"] = obj["isRestDay"]
+            return rec
         return None
 
-    def _save_standby_schedule(self, ymd: str, week_label: str, today_items: list[Any]) -> dict[str, Any]:
-        rec = {
+    def _save_standby_schedule(
+        self,
+        ymd: str,
+        week_label: str,
+        today_items: list[Any],
+        completed_items: list[Any] | None = None,
+        next_up: dict[str, Any] | None = None,
+        is_rest_day: bool | None = None,
+    ) -> dict[str, Any]:
+        rec: dict[str, Any] = {
             "ymd": ymd,
             "weekLabel": week_label,
             "todayItems": list(today_items),
+            "completedItems": list(completed_items or []),
+            "nextUp": dict(next_up) if isinstance(next_up, dict) else None,
         }
+        if isinstance(is_rest_day, bool):
+            rec["isRestDay"] = is_rest_day
         tmp = self.standby_cache_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(rec, indent=2), encoding="utf-8")
         tmp.replace(self.standby_cache_path)
@@ -2427,6 +2444,9 @@ class WallboardRelay:
                 "timeLabel": f"{hour12}:{dt.strftime('%M %p')}",
                 "weekLabel": str(saved.get("weekLabel") or "") if synced and saved else "",
                 "todayItems": list(saved.get("todayItems") or []) if synced and saved else [],
+                "completedItems": list(saved.get("completedItems") or []) if synced and saved else [],
+                "nextUp": dict(saved["nextUp"]) if synced and saved and isinstance(saved.get("nextUp"), dict) else None,
+                **({"isRestDay": bool(saved["isRestDay"])} if synced and saved and isinstance(saved.get("isRestDay"), bool) else {}),
                 "scheduleSynced": synced,
             },
         }
@@ -2460,6 +2480,9 @@ class WallboardRelay:
                     ymd,
                     str(sb.get("weekLabel") or ""),
                     list(sb.get("todayItems") or []),
+                    list(sb.get("completedItems") or []) if isinstance(sb.get("completedItems"), list) else [],
+                    dict(sb["nextUp"]) if isinstance(sb.get("nextUp"), dict) else None,
+                    sb.get("isRestDay") if isinstance(sb.get("isRestDay"), bool) else None,
                 )
                 sb["scheduleSynced"] = True
                 payload["standby"] = sb

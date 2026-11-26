@@ -1010,6 +1010,108 @@ describe('Wave 2 Wallboard & Voice bounds hardening', () => {
     expect(WALLBOARD_HTML).toContain('PHONE PAUSED');
   });
 
+  it('populates Standby completedItems & nextUp instead of Rest Day after finishing today, and includes camera REC halo state', () => {
+    const now = new Date(2026, 10, 25, 19, 40, 0).getTime(); // Wed Nov 25, 2026 (restDay = 0 Sun)
+    const doneLower1: LiftSession = {
+      id: 'done_l1',
+      name: 'Lower 1',
+      routineId: 'day-lower-1',
+      eventId: null,
+      startMs: new Date(2026, 10, 25, 18, 35, 0).getTime(),
+      endMs: new Date(2026, 10, 25, 19, 32, 0).getTime(),
+      status: 'done',
+      started: true,
+      exs: [
+        { uid: 'sq', exId: 'low-bar-squat', sets: [mkSet(225, 8, { done: true }), mkSet(225, 8, { done: true })] },
+      ],
+      rpe: 8,
+      bwKg: 88.5,
+    };
+    const settings = {
+      hrMax: 180,
+      recoveryHrPct: 72,
+      voiceEnabled: false,
+      voiceWakeWord: 'armory',
+      restDay: 0,
+      queue: {
+        ...defaultQueueState(),
+        stepIndex: 1,
+        stagedDate: '2026-11-26',
+      },
+    };
+    const sbDone = buildWallboardSnapshot({
+      now,
+      settings,
+      unit: 'lb',
+      hr: { bpm: 0, fresh: false, recentPoints: [] },
+      voice: { listening: false, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: undefined,
+      elapsedSec: 0,
+      rest: null,
+      todayItems: [],
+      finishedTodayLifts: [doneLower1],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(sbDone.mode).toBe('standby');
+    expect(sbDone.standby!.isRestDay).toBe(false);
+    expect(sbDone.standby!.completedItems).toHaveLength(1);
+    expect(sbDone.standby!.completedItems![0].title).toBe('Lower 1');
+    expect(sbDone.standby!.completedItems![0].equipmentLabel).toBe('Strength');
+    expect(sbDone.standby!.completedItems![0].summary).toContain('2 sets');
+    expect(sbDone.standby!.nextUp).toEqual({ title: 'Day 2 — Upper 1 + Z5 #1', dateLabel: 'Tomorrow' });
+
+    // True Sunday rest day sets isRestDay: true and empty completedItems
+    const sunNow = new Date(2026, 10, 29, 10, 0, 0).getTime(); // Sun Nov 29, 2026
+    const sbRest = buildWallboardSnapshot({
+      now: sunNow,
+      settings,
+      unit: 'lb',
+      hr: { bpm: 0, fresh: false, recentPoints: [] },
+      voice: { listening: false, armed: false, banner: null, cursor: null },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: undefined,
+      elapsedSec: 0,
+      rest: null,
+      todayItems: [],
+      finishedTodayLifts: [doneLower1],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(sbRest.standby!.isRestDay).toBe(true);
+    expect(sbRest.standby!.completedItems).toHaveLength(0);
+
+    // Active camera recording passes through camera state & WALLBOARD_HTML includes rec-halo + TODAY COMPLETE
+    const sessRec: LiftSession = { ...doneLower1, id: 'act_rec', status: 'active', endMs: null };
+    const wbRec = buildWallboardSnapshot({
+      now,
+      settings,
+      unit: 'lb',
+      hr: { bpm: 124, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: null },
+      camera: { recording: true, saving: false, guest: false, cameras: ['Smith'], startedAtMs: now - 5000 },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: sessRec,
+      elapsedSec: 120,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(wbRec.camera).toEqual({ recording: true, saving: false, guest: false, cameras: ['Smith'], startedAtMs: now - 5000 });
+    expect(WALLBOARD_HTML).toContain('id="recHalo"');
+    expect(WALLBOARD_HTML).toContain("document.body.classList.toggle('cam-rec', isCamRec)");
+    expect(WALLBOARD_HTML).toContain('TODAY COMPLETE');
+    expect(WALLBOARD_HTML).toContain('✓ DONE');
+  });
+
   it('rejects extreme out-of-range numeric voice arguments and noisy armed-mode tails', () => {
     expect(parseVoiceTranscript('armory 5000 for 8')).toBeNull();
     expect(parseVoiceTranscript('armory 225 for 999')).toBeNull();

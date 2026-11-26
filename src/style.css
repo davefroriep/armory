@@ -332,7 +332,7 @@ a.metro { text-decoration: none; }
 /* ---------- native home app shell (locked calendar + today docks + scrollable middle + bottom 4-icon dock) ---------- */
 .screen.home-app { min-height: 0; height: 100vh; height: 100dvh; max-height: 100dvh; overflow: hidden; }
 .screen.home-app .bar { position: relative; flex: none; min-height: calc(46px + var(--sat)); padding: calc(6px + var(--sat)) 14px 6px; }
-.screen.home-app .top-resume { position: relative; top: 0 !important; flex: none; padding: 7px 14px; }
+.screen.home-app .top-resume { position: relative; top: 0 !important; flex: none; padding: 10px 14px; min-height: 52px; }
 .home-today-dock { flex: none; padding: 5px 14px 6px; background: var(--bg); border-bottom: 1px solid var(--line); max-height: 24dvh; overflow-y: auto; overscroll-behavior-y: contain; }
 .cal-dock { flex: none; padding: 4px 14px 6px; background: var(--bg); border-bottom: 1px solid var(--line); touch-action: pan-y; overflow: hidden; }
 .wk-bar-h { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; min-height: 22px; }
@@ -497,7 +497,7 @@ a.metro { text-decoration: none; }
 .sh-rest small { color: var(--mut); font-size: .78rem; line-height: 1.4; }
 
 /* ---------- unified top resume bar + live HR sheet ---------- */
-.rec-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); flex: none; }
+.rec-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--red); box-shadow: 0 0 10px var(--red); flex: none; }
 .rec-dot.paused { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 .top-resume {
   position: sticky;
@@ -505,16 +505,31 @@ a.metro { text-decoration: none; }
   z-index: 24;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 9px 16px;
-  background: rgba(15, 42, 64, .96);
+  gap: 10px;
+  min-height: 54px;
+  padding: 11px 16px;
+  background: linear-gradient(180deg, rgba(16, 48, 76, .98), rgba(11, 33, 54, .98));
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
-  border-bottom: 1px solid rgba(30, 155, 255, .45);
+  border-bottom: 1.5px solid rgba(56, 189, 248, .55);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, .35);
 }
-.top-resume b { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: .88rem; }
-.top-resume span { font-size: .82rem; font-weight: 800; font-variant-numeric: tabular-nums; color: #93c5fd; }
-.top-resume em { font-style: normal; font-size: .78rem; font-weight: 800; color: var(--blue); }
+.top-resume:active { filter: brightness(1.08); }
+.top-resume b { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 1.02rem; font-weight: 800; color: #fff; }
+.top-resume span { font-size: .92rem; font-weight: 800; font-variant-numeric: tabular-nums; color: #bae6fd; white-space: nowrap; flex: none; }
+.top-resume em {
+  font-style: normal;
+  font-size: .88rem;
+  font-weight: 900;
+  letter-spacing: .01em;
+  color: #05111d;
+  background: var(--blue);
+  padding: 8px 13px;
+  border-radius: 10px;
+  white-space: nowrap;
+  flex: none;
+  box-shadow: 0 2px 10px rgba(30, 155, 255, .38);
+}
 
 [data-chip="hr"], [data-chip="bike"] { cursor: pointer; }
 .hr-sheet { text-align: left; max-height: 92dvh; overflow-y: auto; align-items: stretch; padding: 20px 18px calc(20px + var(--sab)); }

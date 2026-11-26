@@ -2,6 +2,7 @@ import { bikeFrame, hrBeat, linkStatus } from '../ble/telemetry';
 import { Emitter } from '../emitter';
 import { calendar } from '../intervals/calendar';
 import { active } from '../lifts/active';
+import { gymCam } from '../lifts/gymCam';
 import { lifts } from '../lifts/store';
 import { voice } from '../lifts/voice';
 import {
@@ -11,7 +12,7 @@ import {
 import { getSettings, settingsChanged, updateSettings } from '../store/settings';
 import { WALLBOARD_HTML } from './page';
 import { isWallboardWorkoutActive } from './snapshot';
-import { buildWallboardState, wallboardSnapChanged, type WallboardState } from './state';
+import { buildWallboardState, refreshWallboardCardioCache, wallboardSnapChanged, type WallboardState } from './state';
 
 export { isWallboardWorkoutActive };
 
@@ -58,17 +59,24 @@ class WallboardController {
     const immediate = (): void => this.schedulePush(true);
     const throttled = (): void => this.schedulePush(false);
 
-    lifts.changed.on(immediate);
+    lifts.changed.on(() => {
+      void refreshWallboardCardioCache();
+      immediate();
+    });
     voice.changed.on(immediate);
+    gymCam.changed.on(immediate);
     active.restChanged.on(immediate);
-    calendar.changed.on(immediate);
+    calendar.changed.on(() => {
+      void refreshWallboardCardioCache();
+      immediate();
+    });
     linkStatus.on(immediate);
     hrBeat.on(throttled);
     bikeFrame.on(throttled);
     active.tick.on(throttled);
     wallboardSnapChanged.on(() => {
       const s = buildWallboardState();
-      const key = `${s.mode}|${s.cardio?.phase ?? ''}|${s.cardio?.paused ?? ''}|${s.replay?.url ?? ''}|${s.replay?.startedAtMs ?? ''}|${s.lift?.hold?.active ?? ''}`;
+      const key = `${s.mode}|${s.cardio?.phase ?? ''}|${s.cardio?.paused ?? ''}|${s.replay?.url ?? ''}|${s.replay?.startedAtMs ?? ''}|${s.lift?.hold?.active ?? ''}|${s.camera?.recording ?? ''}|${s.camera?.saving ?? ''}|${s.standby?.completedItems?.length ?? ''}`;
       if (key !== this.lastSnapKey) {
         this.lastSnapKey = key;
         immediate();
@@ -81,6 +89,7 @@ class WallboardController {
       immediate();
     });
 
+    void refreshWallboardCardioCache();
     void this.syncFromSettings();
     this.schedulePush(true);
   }
@@ -336,7 +345,14 @@ class WallboardController {
         if (!this.desiredOn) this.stopHeartbeat();
         void this.pushRelaySleep(next, next.mode === 'standby' ? 'workout_finished' : 'workout_paused', 30);
       } else if (next.mode === 'standby' && next.standby) {
-        const sig = JSON.stringify({ d: next.standby.dateLabel, w: next.standby.weekLabel, i: next.standby.todayItems });
+        const sig = JSON.stringify({
+          d: next.standby.dateLabel,
+          w: next.standby.weekLabel,
+          i: next.standby.todayItems,
+          c: next.standby.completedItems ?? [],
+          n: next.standby.nextUp ?? null,
+          r: !!next.standby.isRestDay,
+        });
         if (!this.relayBusy && now >= this.relayBackoffUntil
           && (sig !== this.lastStandbySig || (forceRelay && now - this.lastStandbyPushMs >= 5000))) {
           void this.pushRelayStandby(next, sig, now);

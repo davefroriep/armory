@@ -58,8 +58,8 @@ export const WALLBOARD_HTML = `<!doctype html>
   .vtoast { display:inline-flex; align-items:center; max-width:100%; padding:5px 14px; border-radius:999px; font-size:clamp(12px,1.4vw,17px); font-weight:800; letter-spacing:.02em; line-height:1.15; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; background:rgba(34,197,94,.18); border:1.5px solid var(--green); color:#dcfce7; }
   .vtoast.info { background:rgba(56,189,248,.18); border-color:var(--blue); color:#e0f2fe; }
   .vtoast.warn { background:rgba(245,158,11,.18); border-color:var(--amber); color:#fef3c7; }
-  .grid { flex:1; min-height:0; display:grid; grid-template-columns:1.28fr 1fr; gap:clamp(12px,1.6vw,22px); }
-  .col { display:flex; flex-direction:column; gap:clamp(10px,1.4vh,16px); min-height:0; }
+  .grid { flex:1; min-height:0; display:grid; grid-template-columns:minmax(0,1.28fr) minmax(0,1fr); gap:clamp(12px,1.6vw,22px); }
+  .col { display:flex; flex-direction:column; gap:clamp(10px,1.4vh,16px); min-height:0; min-width:0; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:18px; padding:clamp(14px,1.8vh,22px); overflow:hidden; }
   .hero { flex:1; display:flex; flex-direction:column; justify-content:space-between; min-height:0; position:relative; }
   .cur-body { min-height:0; overflow:hidden; }
@@ -186,9 +186,26 @@ export const WALLBOARD_HTML = `<!doctype html>
   .ex-ss .ex-row.cur { background:rgba(56,189,248,.16); }
   .ex-ss .ex-row em { color:var(--ss); }
   .standby-big { font-size:clamp(54px,8vw,112px); font-weight:900; font-variant-numeric:tabular-nums; letter-spacing:-.03em; }
+  .kicker.done { color:#86efac; }
   .sb-item { padding:14px 16px; border-radius:14px; background:var(--card2); border:1px solid var(--line); }
+  .sb-item.done { background:rgba(34,197,94,.11); border-color:rgba(34,197,94,.45); }
+  .sb-row { display:flex; align-items:center; justify-content:space-between; gap:14px; }
+  .sb-row > div { min-width:0; }
+  .sb-done-pill { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:999px; background:rgba(34,197,94,.22); border:1.5px solid var(--green); color:#bbf7d0; font-size:clamp(13px,1.45vw,19px); font-weight:900; letter-spacing:.06em; white-space:nowrap; flex-shrink:0; }
+  .sb-next { display:flex; align-items:center; gap:12px; padding:11px 16px; border-radius:12px; background:rgba(7,11,18,.55); border:1px solid var(--line); margin-top:auto; }
+  .sb-next em { font-style:normal; font-size:clamp(11px,1.1vw,14px); font-weight:800; letter-spacing:.1em; color:var(--blue); text-transform:uppercase; flex-shrink:0; }
+  .sb-next b { font-size:clamp(15px,1.65vw,22px); font-weight:800; color:var(--txt); flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sb-next span { font-size:clamp(13px,1.35vw,17px); font-weight:700; color:var(--mut); white-space:nowrap; flex-shrink:0; }
   .sb-item b { font-size:clamp(18px,2.2vw,28px); display:block; margin-bottom:4px; }
   .sb-item span { font-size:clamp(13px,1.5vw,19px); color:var(--mut); }
+  .rec-halo { position:fixed; inset:0; z-index:40; pointer-events:none; opacity:0; transition:opacity .22s ease; box-shadow:inset 0 0 0 5px rgba(239,68,68,.94), inset 0 0 38px 6px rgba(239,68,68,.58), inset 0 0 115px 12px rgba(185,28,28,.34); }
+  body.cam-rec .rec-halo { opacity:1; animation:recHaloPulse 2.2s ease-in-out infinite; }
+  @keyframes recHaloPulse { 0%,100% { opacity:1; } 50% { opacity:.74; } }
+  .rec-pill { display:inline-flex; align-items:center; gap:8px; padding:6px 14px; border-radius:999px; border:1.5px solid rgba(239,68,68,.88); background:rgba(127,29,29,.45); color:#fecaca; font-size:clamp(12px,1.3vw,16px); font-weight:800; letter-spacing:.08em; text-transform:uppercase; box-shadow:0 0 18px rgba(239,68,68,.38); }
+  .rec-pill .dot { background:#ef4444; box-shadow:0 0 10px #ef4444; animation:recDotBlink 1.4s ease-in-out infinite; }
+  .rec-pill.saving { border-color:rgba(245,158,11,.78); background:rgba(120,53,15,.38); color:#fde68a; box-shadow:none; }
+  .rec-pill.saving .dot { background:var(--amber); box-shadow:none; animation:none; }
+  @keyframes recDotBlink { 0%,100% { opacity:1; } 50% { opacity:.35; } }
   .ptt { position:fixed; right:16px; bottom:16px; border:1px solid var(--line); background:var(--card2); color:var(--txt); padding:10px 16px; border-radius:999px; font-weight:700; cursor:pointer; opacity:.85; }
   .ptt.on { background:rgba(34,211,238,.25); border-color:var(--cyan); color:#fff; }
   .stale-banner { display:none; position:fixed; top:14px; right:18px; z-index:45; padding:7px 14px; border-radius:999px; background:rgba(245,158,11,.22); border:1.5px solid var(--amber); color:#fef3c7; font-size:clamp(12px,1.25vw,16px); font-weight:800; letter-spacing:.04em; box-shadow:0 4px 18px rgba(0,0,0,.45); }
@@ -250,6 +267,7 @@ export const WALLBOARD_HTML = `<!doctype html>
 <div class="wrap" id="app">
   <div class="top"><div class="brand"><b>ARMORY FIT</b><span class="pill">Connecting…</span></div><div class="top-mid"></div><div class="top-r"><div class="clk" id="clk">--:--</div></div></div>
 </div>
+<div class="rec-halo" id="recHalo" aria-hidden="true"></div>
 <div class="stale-banner" id="staleBanner"></div>
 <div class="wb-replay" id="wbReplay" hidden>
   <video id="wbRepVid" playsinline muted></video>
@@ -403,6 +421,20 @@ function render(st) {
   const micCls = v.armed ? 'mic armed' : v.listening ? 'mic on' : 'mic';
   const micLbl = v.armed ? 'LISTENING…' : v.listening ? '“' + esc((v.wakeWord || 'armory').toUpperCase()) + ' …”' : 'MIC OFF';
   const micBadge = st.mode === 'lift' ? '<div class="' + micCls + '"><i class="dot"></i><span>' + micLbl + '</span></div>' : '';
+  const cam = st.camera || {};
+  const isCamRec = !!cam.recording;
+  const isCamSaving = !!cam.saving;
+  document.body.classList.toggle('cam-rec', isCamRec);
+  const camList = Array.isArray(cam.cameras) ? cam.cameras.filter(Boolean) : [];
+  let recBadge = '';
+  if (isCamRec) {
+    const camTxt = cam.guest
+      ? (camList.length ? 'GUEST REC · ' + camList.join(' + ') : 'GUEST REC')
+      : (camList.length > 1 ? 'REC · ' + camList.length + ' CAMS' : camList.length === 1 ? 'REC · ' + camList[0] : 'REC');
+    recBadge = '<div class="rec-pill"><i class="dot"></i><span>' + esc(camTxt) + '</span></div>';
+  } else if (isCamSaving) {
+    recBadge = '<div class="rec-pill saving"><i class="dot"></i><span>' + (cam.guest ? 'SAVING GUEST…' : 'SAVING CLIP…') + '</span></div>';
+  }
   const banner = st.mode === 'lift' && v.banner ? '<div class="vtoast ' + esc(v.banner.kind) + '">' + esc(v.banner.text) + '</div>' : '';
 
   const hr = st.hr || {};
@@ -550,16 +582,27 @@ function render(st) {
       + '<section class="card"><div class="kicker">SESSION TOTALS</div><div class="cur-head"><span class="cur-name">' + Math.round(k.kcal || 0) + ' kcal</span><span class="cur-meta">Z5 Bank: ' + mmss(k.z5Sec || 0) + '</span></div></section></div></div>';
   } else if (st.standby) {
     const sb = st.standby;
-    const items = (sb.todayItems && sb.todayItems.length)
-      ? sb.todayItems.map((it) => '<div class="sb-item"><b>' + esc(it.title) + (it.carried ? ' · Carry-over' : '') + '</b><span>' + esc(it.equipmentLabel) + (it.preview ? ' · ' + esc(it.preview) : '') + '</span></div>').join('')
+    const comp = Array.isArray(sb.completedItems) ? sb.completedItems : [];
+    const pend = Array.isArray(sb.todayItems) ? sb.todayItems : [];
+    const doneRows = comp.map((c) => '<div class="sb-item done"><div class="sb-row"><div><b>' + esc(c.title) + '</b><span>' + esc([c.equipmentLabel, c.summary].filter(Boolean).join(' · ')) + '</span></div><span class="sb-done-pill">✓ DONE</span></div></div>').join('');
+    const pendRows = pend.map((it) => '<div class="sb-item"><b>' + esc(it.title) + (it.carried ? ' · Carry-over' : '') + '</b><span>' + esc(it.equipmentLabel) + (it.preview ? ' · ' + esc(it.preview) : '') + '</span></div>').join('');
+    const nextRow = (pend.length === 0 && sb.nextUp && sb.nextUp.title)
+      ? '<div class="sb-next"><em>UP NEXT</em><b>' + esc(sb.nextUp.title) + '</b><span>' + esc(sb.nextUp.dateLabel || '') + '</span></div>'
+      : '';
+    const allDoneToday = pend.length === 0 && comp.length > 0;
+    const schedKicker = allDoneToday ? 'TODAY COMPLETE' : 'TODAY ON THE SCHEDULE';
+    const items = (doneRows || pendRows)
+      ? (doneRows + pendRows + nextRow)
       : (sb.scheduleSynced === false
         ? '<div class="sb-item"><b>—</b></div>'
-        : '<div class="sb-item"><b>Rest Day</b></div>');
+        : sb.isRestDay === false
+          ? ('<div class="sb-item"><b>All Caught Up</b></div>' + nextRow)
+          : ('<div class="sb-item"><b>Rest Day</b></div>' + nextRow));
     main = '<div class="grid"><div class="col"><section class="card hero"><div class="kicker">THE ARMORY · ' + esc(sb.dateLabel) + '</div><div class="standby-big">' + esc(sb.timeLabel || nowStr) + '</div>' + (sb.weekLabel ? '<div class="cur-meta">' + esc(sb.weekLabel) + '</div>' : '') + '</section></div>'
-      + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker">TODAY ON THE SCHEDULE</div>' + items + '</section></div></div>';
+      + '<div class="col">' + hrHtml + '<section class="card" style="flex:1;display:flex;flex-direction:column;gap:10px"><div class="kicker' + (allDoneToday ? ' done' : '') + '">' + schedKicker + '</div>' + items + '</section></div></div>';
   }
 
-  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + sincePill + '</div><div class="top-mid">' + banner + '</div><div class="top-r">' + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + main;
+  app.innerHTML = '<div class="top"><div class="brand"><b>ARMORY FIT</b>' + modePill + sincePill + '</div><div class="top-mid">' + banner + '</div><div class="top-r">' + recBadge + micBadge + '<div class="clk">' + esc(nowStr) + '</div></div></div>' + main;
 }
 
 window.addEventListener('message', (ev) => {
