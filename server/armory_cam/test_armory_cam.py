@@ -5722,17 +5722,22 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertTrue(svc._utt_queue.empty())
         self.assertEqual(duck_events, [])
 
-        # Wake detected -> arms immediately and calls begin_wake_duck
+        # Wake detected even during speaker-mute (barge-in) -> arms, clears mute, begins unbroken utterance, emits teal-pill SSE arm event
+        svc.sse_clients = 1
+        svc._mute_until_mono = 999999.0
         spot.fire_next = True
-        svc._ingest_pcm16_frame(idle_chunk, muted=False, now_ms=11_000, now_mono=11.0)
+        svc._ingest_pcm16_frame(idle_chunk, muted=True, now_ms=11_000, now_mono=11.0)
         self.assertGreater(svc.armed_until_ms, 11_000)
+        self.assertEqual(svc._mute_until_mono, 0.0)
+        self.assertTrue(svc._detector._in_speech)
         # Wait briefly for wake callback thread
         for _ in range(30):
-            if "begin" in duck_events:
+            if "begin" in duck_events and any(e.get("transcript") == "Armory" for e in svc._events):
                 break
             time.sleep(0.02)
         self.assertIn("begin", duck_events)
         self.assertTrue(svc._wake_duck_held)
+        self.assertTrue(any(e.get("transcript") == "Armory" for e in svc._events))
 
         # Lone "Hey Jarvis" transcribed during capture -> stays armed + stays ducked!
         lone = svc._emit_transcript("Hey Jarvis.", latency_ms=120, from_oww=True)

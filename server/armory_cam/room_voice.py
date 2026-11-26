@@ -1186,6 +1186,7 @@ class UtteranceDetector:
         self._silence_streak = 0
         self._speech_frames = 0
         self._idle_frames = 0
+        self._active_max_frames = 0
         self._collected: list[np.ndarray] = []
         self.latest_rms = 0.0
         self.latest_vad = 0.0
@@ -1209,8 +1210,34 @@ class UtteranceDetector:
         self._silence_streak = 0
         self._speech_frames = 0
         self._idle_frames = 0
+        self._active_max_frames = 0
         self._collected.clear()
         self.vad.reset()
+
+    def begin_armed_utterance(
+        self,
+        preroll_16k: np.ndarray,
+        *,
+        preroll_sec: float = 1.2,
+        max_post_sec: float = 2.6,
+    ) -> None:
+        """Start an active utterance seeded with unbroken pre-wake audio so short 1-word commands never clip."""
+        self.reset()
+        arr = np.asarray(preroll_16k, dtype=np.float32).reshape(-1)
+        max_pre_samples = int(round(max(0.2, float(preroll_sec)) * SAMPLE_RATE_16K))
+        if arr.size > max_pre_samples:
+            arr = arr[-max_pre_samples:]
+        n_frames = arr.size // VAD_FRAME_SAMPLES
+        for i in range(n_frames):
+            f512 = arr[i * VAD_FRAME_SAMPLES : (i + 1) * VAD_FRAME_SAMPLES]
+            self._collected.append(f512.copy())
+        self._in_speech = True
+        self._speech_frames = max(self.min_speech_frames, 8)
+        self._silence_streak = 0
+        self._onset_streak = 0
+        self._idle_frames = 0
+        post_frames = max(25, int(round((float(max_post_sec) * 1000.0) / 32.0)))
+        self._active_max_frames = len(self._collected) + post_frames
 
     def push_samples(self, samples_16k: np.ndarray, muted: bool = False) -> list[np.ndarray]:
         """Ingest 16 kHz mono float32 samples; returns zero or more completed utterance arrays."""
@@ -1268,7 +1295,8 @@ class UtteranceDetector:
                 else:
                     self._silence_streak += 1
 
-                if self._silence_streak >= self.end_silence_frames or len(self._collected) >= self.max_frames:
+                eff_max_frames = self._active_max_frames if self._active_max_frames > 0 else self.max_frames
+                if self._silence_streak >= self.end_silence_frames or len(self._collected) >= eff_max_frames:
                     clean_silence_end = self._silence_streak >= self.end_silence_frames
                     if self._speech_frames >= self.min_speech_frames:
                         completed.append(np.concatenate(self._collected).astype(np.float32))
@@ -1287,6 +1315,7 @@ class UtteranceDetector:
                     self._silence_streak = 0
                     self._speech_frames = 0
                     self._idle_frames = 0
+                    self._active_max_frames = 0
 
         return completed
 
@@ -2153,7 +2182,7 @@ class RoomVoiceService:
             )
         )
         self._oww_loading = False
-        self._oww_preroll: deque[np.ndarray] = deque(maxlen=12)
+        self._oww_preroll: deque[np.ndarray] = deque(maxlen=48)
         self._oww_awaiting_cmd = False
         self._wake_duck_held = False
         self._release_wake_duck_on_play_done = False
@@ -2320,7 +2349,28 @@ class RoomVoiceService:
                 pass
 
     def _on_oww_wake_detected(self, score: float) -> None:
-        """Triggered off audio-callback thread the instant openWakeWord spots 'Hey Jarvis'."""
+        """Triggered off audio-callback thread the instant openWakeWord spots wake phrase."""
+        # Immediately flash the Pixel & Wallboard pill TEAL (armed) via SSE before Denon HTTP completes!
+        now_ms = int(time.time() * 1000)
+        with self.lock:
+            if self.sse_clients > 0:
+                wake = self._effective_wake_word_locked()
+                client_wake = (self._client_wake_word or wake).strip().lower() or wake
+                arm_text = format_wake_display(client_wake)
+                self.event_seq += 1
+                ev_id = self.event_seq
+                evt = {
+                    "type": "transcript",
+                    "id": ev_id,
+                    "tsMs": now_ms,
+                    "transcript": arm_text,
+                    "candidates": [arm_text],
+                    "wakeWord": client_wake,
+                }
+                self._events.append(evt)
+                self.seq += 1
+                self._cond.notify_all()
+
         ducked = False
         duck_info: dict[str, Any] = {}
         begin_fn = self._wake_duck_cbs.get("begin")
@@ -2804,7 +2854,7 @@ class RoomVoiceService:
                     spoke = self.speak_confirmation(clean_speech, speed=1.10)
             elif clean_speech:
                 spoke = self.speak_confirmation(clean_speech)
-            elif armed is True:
+            elif armed is True and not (self._using_oww_spotter() and self._wake_duck_held):
                 self.play_ready_chime()
 
         if not spoke and armed is not True:
@@ -3181,14 +3231,6 @@ class RoomVoiceService:
                 self._enqueue_utterance((utt, False))
             return
 
-        if muted:
-            self._detector.reset()
-            self._oww_spotter.reset()
-            self._oww_preroll.clear()
-            self._detector.latest_rms = 0.0
-            self._detector.latest_vad = 0.0
-            return
-
         if pcm16.size == 0:
             return
         self._detector.latest_rms = float(np.sqrt(np.mean(pcm16 * pcm16)))
@@ -3196,28 +3238,28 @@ class RoomVoiceService:
         cur_mono = time.monotonic() if now_mono is None else float(now_mono)
 
         if cur_ms < self.armed_until_ms:
+            if muted:
+                return
             utterances = self._detector.push_samples(pcm16, muted=False)
             for utt in utterances:
                 self._enqueue_utterance((utt, True))
             return
 
-        # Idle in openWakeWord mode: zero Silero VAD & zero Whisper runs until wake-word triggers!
+        # Idle in openWakeWord mode: NEVER mute openWakeWord during confirmation/error replies so
+        # immediate user retries ("Hey Jarvis, done") are never locked out!
         self._detector.latest_vad = 0.0
         self._oww_preroll.append(pcm16.copy())
         triggered, score = self._oww_spotter.push_samples(pcm16, now_mono=cur_mono)
         if triggered:
+            self._mute_until_mono = 0.0
             self.armed_until_ms = cur_ms + ARM_WINDOW_MS
             self._oww_awaiting_cmd = True
-            self._detector.reset()
-            # Seed pre-roll with ~320ms trailing audio so one-breath "Hey Jarvis, record this" never clips onset
-            tail_chunks = list(self._oww_preroll)[-10:]
+            # Seed an immediately-active utterance with the FULL unbroken 1.2s pre-roll so one-breath
+            # short commands ("Hey Jarvis, done") are NEVER sliced mid-word or dropped by minSpeechMs!
+            pre_chunks = list(self._oww_preroll)
             self._oww_preroll.clear()
-            if tail_chunks:
-                tail_cat = np.concatenate(tail_chunks).astype(np.float32, copy=False)
-                n_frames = tail_cat.size // VAD_FRAME_SAMPLES
-                for i in range(max(0, n_frames - 10), n_frames):
-                    f512 = tail_cat[i * VAD_FRAME_SAMPLES : (i + 1) * VAD_FRAME_SAMPLES]
-                    self._detector._pre_roll.append(f512.copy())
+            pre_cat = np.concatenate(pre_chunks).astype(np.float32, copy=False) if pre_chunks else np.zeros(0, dtype=np.float32)
+            self._detector.begin_armed_utterance(pre_cat, preroll_sec=1.2, max_post_sec=2.6)
             pool = self._local_cmd_pool
             if pool is not None and not self._stop_event.is_set():
                 try:
