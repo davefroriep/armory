@@ -424,6 +424,103 @@ class ArmoryCamTests(unittest.TestCase):
             )
             self.assertIsNone(res_after_wake)
             self.assertTrue(adb.tv_awake_requested)
+
+            # 9. Regression: explicit "close the gym" (display_off) stays asleep across phone heartbeats until
+            # explicit "open the gym" (force=True) or workout finish (workoutActive=False)
+            cmds.clear()
+            slp_close = svc._sleep_wallboard_sync()
+            self.assertTrue(slp_close["ok"])
+            self.assertFalse(adb.tv_awake_requested)
+            self.assertTrue(adb.manual_sleep_active)
+            cmds.clear()
+            self.assertEqual(
+                client.post(
+                    "/api/wallboard/state",
+                    json={"state": snap_lift, "workoutActive": True},
+                ).status_code,
+                200,
+            )
+            _time.sleep(0.08)
+            self.assertFalse(adb.tv_awake_requested)
+            self.assertFalse(any("KEYCODE_WAKEUP" in " ".join(c) for c in cmds))
+            # Non-forced /api/wallboard/wake is also suppressed while manual_sleep_active is latched
+            wk_sup = client.post(
+                "/api/wallboard/wake",
+                json={"state": snap_lift, "force": False, "sync": True},
+            ).get_json()
+            self.assertTrue(wk_sup["adb"]["skipped"])
+            self.assertFalse(adb.tv_awake_requested)
+            # Explicit open_gym clears the latch and wakes immediately
+            wk_open2 = svc._wake_wallboard_sync(force=True)
+            self.assertTrue(wk_open2["ok"])
+            self.assertTrue(adb.tv_awake_requested)
+            self.assertFalse(adb.manual_sleep_active)
+            # Re-latch close_gym, then finish workout (workoutActive=False) -> latch clears and next workout wakes
+            svc._sleep_wallboard_sync()
+            self.assertTrue(adb.manual_sleep_active)
+            self.assertEqual(
+                client.post("/api/wallboard/state", json={"state": {"mode": "standby"}, "workoutActive": False}).status_code,
+                200,
+            )
+            self.assertFalse(adb.manual_sleep_active)
+            cmds.clear()
+            self.assertEqual(
+                client.post("/api/wallboard/state", json={"state": snap_lift, "workoutActive": True}).status_code,
+                200,
+            )
+            for _ in range(40):
+                if adb.tv_awake_requested:
+                    break
+                _time.sleep(0.02)
+            self.assertTrue(adb.tv_awake_requested)
+            self.assertTrue(any("KEYCODE_WAKEUP" in " ".join(c) for c in cmds))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_find_segments_fills_restart_gap_from_ring_and_motion_tape(self) -> None:
+        from datetime import datetime as _dt
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_gap_test_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            # Existing workout session dir has segments up to 14:01:00, then server restarted (active_session_id=None)
+            sess_dir = tmp / "tapes" / "sess_gap" / "rack_cam"
+            sess_dir.mkdir(parents=True, exist_ok=True)
+            (sess_dir / "seg_20261126_140058.ts").write_bytes(b"old1")
+            (sess_dir / "seg_20261126_140100.ts").write_bytes(b"old2")
+            # 24/7 motion tape captured 14:02:50..14:02:58 during the restart gap
+            motion_dir = tmp / "tapes" / "motion_2026-11-26" / "rack_cam"
+            motion_dir.mkdir(parents=True, exist_ok=True)
+            for sec in (50, 52, 54, 56, 58):
+                (motion_dir / f"seg_20261126_1402{sec:02d}.ts").write_bytes(b"mot")
+            # Live ring buffer holds the newest segment at 14:03:00
+            ring_dir = tmp / "ring" / "rack_cam"
+            ring_dir.mkdir(parents=True, exist_ok=True)
+            ring_p = ring_dir / "seg_20261126_140300.ts"
+            ring_p.write_bytes(b"ring")
+            t_start = int(_dt(2026, 11, 26, 14, 2, 50).timestamp() * 1000)
+            t_ring = int(_dt(2026, 11, 26, 14, 3, 0).timestamp() * 1000)
+            t_end = int(_dt(2026, 11, 26, 14, 3, 2).timestamp() * 1000)
+            with svc.lock:
+                svc.active_session_id = None
+                svc.ring_segments["rack_cam"].append(
+                    ac.SegmentInfo(
+                        path=ring_p,
+                        start_ms=t_ring,
+                        end_ms=t_ring + 2000,
+                        energy=1.5,
+                        camera="Rack Cam",
+                    )
+                )
+
+            segs = svc.find_segments("Rack Cam", "sess_gap", t_start, t_end, source_filter="all")
+            names = [s.path.name for s in segs]
+            self.assertIn("seg_20261126_140250.ts", names)
+            self.assertIn("seg_20261126_140258.ts", names)
+            self.assertIn("seg_20261126_140300.ts", names)
+            # Strict workout-only source_filter must NOT bleed motion/ring segments
+            strict_segs = svc.find_segments("Rack Cam", "sess_gap", t_start, t_end, source_filter="workout")
+            self.assertEqual(strict_segs, [])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

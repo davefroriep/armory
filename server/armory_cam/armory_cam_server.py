@@ -2301,6 +2301,7 @@ class FireTvAdbController:
         self.last_error = ""
         self.last_wake_ms = 0
         self.tv_awake_requested = False
+        self.manual_sleep_active = False
         self.pending_sleep_at_ms: int | None = None
         self.pending_sleep_reason = ""
         self._wake_in_flight = False
@@ -2523,6 +2524,8 @@ class FireTvAdbController:
             self.pending_sleep_at_ms = None
             self.pending_sleep_reason = ""
             self._sleep_retry_count = 0
+            if force:
+                self.manual_sleep_active = False
             ser = self.serial(cfg)
             if not cfg.enabled or not ser:
                 self.adb_state = "disabled" if not cfg.enabled else "unconfigured"
@@ -2618,6 +2621,7 @@ class FireTvAdbController:
 
                     with self.state_lock:
                         self.tv_awake_requested = True
+                        self.manual_sleep_active = False
                         self.last_wake_ms = int(time.time() * 1000)
                         self.adb_state = "awake"
                         self.last_action = f"wake -> {cfg.display_client}"
@@ -2653,6 +2657,7 @@ class FireTvAdbController:
             }
 
     def sleep_now(self, cfg: WallboardConfig, reason: str = "", *, only_if_pending: bool = False) -> dict[str, Any]:
+        is_manual_sleep = reason in ("display_off", "manual")
         with self.op_lock:
             with self.state_lock:
                 if only_if_pending and self.pending_sleep_at_ms is None and not self.tv_awake_requested:
@@ -2663,6 +2668,8 @@ class FireTvAdbController:
                         "serial": self.serial(cfg),
                         "message": "Sleep canceled by active workout",
                     }
+                if is_manual_sleep:
+                    self.manual_sleep_active = True
                 ser = self.serial(cfg)
                 if not ser:
                     self.pending_sleep_at_ms = None
@@ -2776,6 +2783,7 @@ class FireTvAdbController:
                 "adbPort": cfg.adb_port,
                 "fireTvModel": self.last_model,
                 "tvAwake": self.tv_awake_requested,
+                "manualSleepActive": self.manual_sleep_active,
                 "lastAction": self.last_action,
                 "lastError": self.last_error,
                 "pendingSleepSec": pending_sec,
@@ -5199,7 +5207,92 @@ class ArmoryCamService:
             inferred_names.update(self._scan_ring_disk_segments(media_slug, slug, canon_name, by_key))
 
         ordered = self._reconcile_inferred_segments(sorted(by_key.values(), key=lambda s: s.start_ms), inferred_names)
-        return [s for s in ordered if s.end_ms >= start_ms - 2500 and s.start_ms <= end_ms + 2500]
+        matched = [s for s in ordered if s.end_ms >= start_ms - 2500 and s.start_ms <= end_ms + 2500]
+        sf = self._normalize_source_filter(source_filter)
+        is_day_query = str(session_id or "").startswith("__day__:")
+        needs_gap_fill = (
+            bool(session_id)
+            and not is_day_query
+            and sf == "all"
+            and (
+                not matched
+                or matched[0].start_ms > start_ms + 4000
+                or matched[-1].end_ms < end_ms - 4000
+            )
+        )
+        if needs_gap_fill:
+            added_fallback = False
+            if not include_ring:
+                with self.lock:
+                    for info in self.ring_segments.get(slug, []):
+                        if info.path.exists() and info.path.name not in by_key:
+                            by_key[info.path.name] = replace(info, kind="l", session_id="")
+                            added_fallback = True
+                    if media_slug != slug:
+                        for info in self.ring_segments.get(media_slug, []):
+                            if info.path.exists() and info.path.name not in by_key:
+                                by_key[info.path.name] = SegmentInfo(
+                                    path=info.path,
+                                    start_ms=info.start_ms,
+                                    end_ms=info.end_ms,
+                                    energy=0.0,
+                                    camera=canon_name,
+                                    kind="l",
+                                    session_id="",
+                                )
+                                added_fallback = True
+                ring_inf = self._scan_ring_disk_segments(media_slug, slug, canon_name, by_key)
+                if ring_inf:
+                    inferred_names.update(ring_inf)
+                    added_fallback = True
+
+            day_ids: list[str] = []
+            for ts_ms in (start_ms, end_ms):
+                if ts_ms > 0:
+                    try:
+                        m_id = f"motion_{datetime.fromtimestamp(ts_ms / 1000.0).strftime('%Y-%m-%d')}"
+                    except (OSError, OverflowError, ValueError):
+                        continue
+                    if m_id not in day_ids and m_id not in entry_ids:
+                        day_ids.append(m_id)
+            for m_id in day_ids:
+                m_dir = self.tapes_root / m_id
+                if not m_dir.is_dir():
+                    continue
+                m_motion_map = self._motion_scores_for_session(m_id, slug, canon_name, cam)
+                m_tape_dirs = [m_dir / media_slug]
+                if slug != media_slug:
+                    m_tape_dirs.append(m_dir / slug)
+                for tape_cam_dir in m_tape_dirs:
+                    if not tape_cam_dir.exists():
+                        continue
+                    for p in sorted(tape_cam_dir.glob("seg_*.ts")):
+                        if p.name in by_key:
+                            continue
+                        m = m_motion_map.get(p.name)
+                        s_ms = m[0] if m else (parse_segment_start_ms(p.name) or 0)
+                        e_ms = m[1] if m else (s_ms + 3000)
+                        if e_ms < start_ms - 5000 or s_ms > end_ms + 5000:
+                            continue
+                        eng = m[2] if m else 0.0
+                        by_key[p.name] = SegmentInfo(
+                            path=p,
+                            start_ms=s_ms,
+                            end_ms=e_ms,
+                            energy=eng,
+                            camera=canon_name,
+                            kind="m",
+                            session_id=m_id,
+                        )
+                        if not m:
+                            inferred_names.add(p.name)
+                        added_fallback = True
+
+            if added_fallback:
+                ordered = self._reconcile_inferred_segments(sorted(by_key.values(), key=lambda s: s.start_ms), inferred_names)
+                matched = [s for s in ordered if s.end_ms >= start_ms - 2500 and s.start_ms <= end_ms + 2500]
+
+        return matched
 
     def _find_camera(self, name_or_slug: str | None) -> CameraConfig | None:
         if not name_or_slug:
@@ -17251,9 +17344,13 @@ def create_app(service: ArmoryCamService) -> Flask:
                     and cfg.wake_on_start
                     and bool(service.adb.serial(cfg))
                     and not service.adb.tv_awake_requested
+                    and not service.adb.manual_sleep_active
                 )
             if should_wake:
                 service.trigger_adb_wake_async(force=False)
+        else:
+            with service.adb.lock:
+                service.adb.manual_sleep_active = False
         return jsonify({"ok": True})
 
     @app.post("/api/wallboard/wake")
@@ -17269,8 +17366,17 @@ def create_app(service: ArmoryCamService) -> Flask:
         with service.lock:
             cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
             url = service.effective_wallboard_url()
+        with service.adb.lock:
+            blocked_by_manual_sleep = bool(not force and service.adb.manual_sleep_active)
         if not (cfg.enabled and cfg.wake_on_start) and not force:
             adb_res: dict[str, Any] = {"ok": False, "skipped": True, "message": "Wake on workout start disabled"}
+        elif blocked_by_manual_sleep:
+            adb_res = {
+                "ok": True,
+                "skipped": True,
+                "state": service.adb.adb_state,
+                "message": "Wallboard manually closed — say 'open the gym' or finish workout to re-enable auto-wake",
+            }
         elif sync_flag:
             adb_res = service.adb.wake_and_launch(cfg, url, force=force)
         else:
@@ -17294,6 +17400,9 @@ def create_app(service: ArmoryCamService) -> Flask:
         sync_flag = bool(body.get("sync", False))
         service.wallboard.update_state(state_obj, workout_active=False)
         service.voice.set_wallboard_active(False)
+        if reason in ("workout_finished", "workout_end"):
+            with service.adb.lock:
+                service.adb.manual_sleep_active = False
         with service.lock:
             cfg = WallboardConfig.from_dict(service.wallboard_cfg.to_dict())
         if reason != "manual" and not cfg.sleep_on_stop:
@@ -18383,7 +18492,15 @@ def create_app(service: ArmoryCamService) -> Flask:
             source_filter=src,
         )
         if not clips:
+            service.log.warning(
+                "POST /api/clip 404 (no segments): sid=%s ex=%s cams=%s window=%s..%s src=%s",
+                sid, ex_name, cams_list, start_ms, end_ms, src,
+            )
             return jsonify({"ok": False, "error": "No matching video segments found"}), 404
+        service.log.info(
+            "POST /api/clip saved %d clip(s): sid=%s ex=%s files=%s",
+            len(clips), sid, ex_name, [c.get("fileName") for c in clips],
+        )
         return jsonify({**clips[0], "clips": clips})
 
     @app.post("/api/clip/auto-pr")
