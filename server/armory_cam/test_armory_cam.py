@@ -3354,6 +3354,11 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(sd_dir.match_voice_command("Armory Ryder is here")["showId"], "ryder_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Rider debut")["showId"], "ryder_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Jared and Mark are here")["showId"], "jared_mark_walkin")
+            # Unfinished Josh/Gabe templates are disabled by default so ASR hallucinations never misfire them
+            self.assertIsNone(sd_dir.match_voice_command("Armory Gabe is here"))
+            self.assertIsNone(sd_dir.match_voice_command("Armory Josh is here"))
+            sd_dir.update_show("gabe_walkin", {"enabled": True}, rebuild=False)
+            sd_dir.update_show("josh_walkin", {"enabled": True}, rebuild=False)
             self.assertEqual(sd_dir.match_voice_command("Armory Gabe is here")["showId"], "gabe_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Josh is here")["showId"], "josh_walkin")
             self.assertEqual(sd_dir.match_voice_command("Hey Armory, we have guests")["showId"], "welcome_armory")
@@ -5183,6 +5188,8 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(director.match_voice_command("Armory, Avenleigh is here")["showId"], "avenleigh_walkin")
             self.assertEqual(director.match_voice_command("Armory, Avenly walk in")["showId"], "avenleigh_walkin")
             self.assertEqual(director.match_voice_command("Armory, Avenlee is here")["showId"], "avenleigh_walkin")
+            self.assertEqual(director.match_voice_command("Hey Armory, Tavenly is here", wake_word="hey armory")["showId"], "avenleigh_walkin")
+            self.assertEqual(director.match_voice_command("Hey Armory, Avonie is here", wake_word="hey armory")["showId"], "avenleigh_walkin")
             self.assertEqual(director.match_voice_command("Armory, Jared and Mark are here")["showId"], "jared_mark_walkin")
             self.assertEqual(director.match_voice_command("Armory, Jared and Mark VIP")["showId"], "jared_mark_vip")
 
@@ -6511,6 +6518,21 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertTrue(stp["emitted"])
             self.assertTrue(stp.get("localHandled"))
             self.assertEqual(stopped_show, [True])
+
+            # Stale SSE transcript (>12s old) must NEVER replay when a phone reconnects after screen lock
+            v_sse = rv.RoomVoiceService(config=rv.RoomVoiceConfig(wake_word="hey armory"), allow_hardware_audio=False)
+            now_ms = int(time.time() * 1000)
+            v_sse.event_seq = 102
+            v_sse._events.append({"type": "transcript", "id": 101, "tsMs": now_ms - 90_000, "transcript": "Hey Armory, record this"})
+            v_sse._events.append({"type": "transcript", "id": 102, "tsMs": now_ms - 1_500, "transcript": "Hey Armory, check"})
+            gen = v_sse.subscribe_sse(after_id=100, max_replay_age_ms=12_000)
+            f0 = json.loads(next(gen).decode("utf-8").split("data: ", 1)[1])
+            f1 = json.loads(next(gen).decode("utf-8").split("data: ", 1)[1])
+            gen.close()
+            self.assertEqual(f0["type"], "status")
+            self.assertEqual(f1["type"], "transcript")
+            self.assertEqual(f1["id"], 102)
+            self.assertIn("check", f1["transcript"])
 
             # 1. .local mDNS resolver caches IPv4 and preserves Host header
             fake_info = [(2, 1, 6, "", ("192.168.1.21", 80))]

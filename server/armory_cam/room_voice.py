@@ -474,8 +474,8 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "welcome to the Armory",
         "Matt just got here",
         "Ryder is here",
-        "Gabe is here",
-        "Josh is here",
+        "Jenna is here",
+        "Avenleigh is here",
         "Jared and Mark",
         "stop show",
         "rack lights",
@@ -2977,18 +2977,43 @@ class RoomVoiceService:
             self._release_wake_duck_sync()
         return {"ok": True, "spoke": spoke, "chime": bool(chime_played)}
 
-    def subscribe_sse(self, after_id: int | None = None):
-        """Generator yielding SSE `data:` frames (`status` + `transcript`) and keepalive pings."""
+    def subscribe_sse(self, after_id: int | None = None, max_replay_age_ms: int = 12_000):
+        """Generator yielding SSE `data:` frames (`status` + `transcript`) and keepalive pings.
+
+        Never replays buffered transcripts older than `max_replay_age_ms` (default 12s) on reconnect
+        so unlocking a sleeping phone minutes later never fires a stale 'record this' or set log.
+        """
         with self.lock:
             self.sse_clients += 1
             self.last_client_seen_mono = time.monotonic()
             last_seq = self.seq
             req_after = int(after_id or 0)
-            last_ev_id = self.event_seq if req_after > self.event_seq else req_after
+            if req_after <= 0 or req_after > self.event_seq:
+                last_ev_id = self.event_seq
+            else:
+                cutoff_ms = int(time.time() * 1000) - max(0, int(max_replay_age_ms))
+                last_ev_id = req_after
+                for ev in self._events:
+                    ev_id = int(ev.get("id") or 0)
+                    ev_ts = int(ev.get("tsMs") or 0)
+                    if ev_id > last_ev_id and ev_ts > 0 and ev_ts < cutoff_ms:
+                        last_ev_id = ev_id
             self._bump_status_locked()
         try:
             init_payload = json.dumps({"type": "status", **self.status_dict()}, separators=(",", ":"))
             yield f"data: {init_payload}\n\n".encode("utf-8")
+            # Immediately flush any genuinely fresh (<12s) missed events from a brief Wi-Fi blip
+            fresh_replay: list[str] = []
+            with self.lock:
+                cutoff_ms = int(time.time() * 1000) - max(0, int(max_replay_age_ms))
+                for ev in list(self._events):
+                    ev_id = int(ev.get("id") or 0)
+                    ev_ts = int(ev.get("tsMs") or 0)
+                    if ev_id > last_ev_id and (ev_ts == 0 or ev_ts >= cutoff_ms):
+                        last_ev_id = ev_id
+                        fresh_replay.append(json.dumps(ev, separators=(",", ":")))
+            for frame in fresh_replay:
+                yield f"data: {frame}\n\n".encode("utf-8")
             prev_listening = self.listening
             prev_ready = self.is_ready()
             prev_commit_mode = self.cfg.set_commit_mode
