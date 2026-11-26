@@ -3356,6 +3356,8 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(sd_dir.match_voice_command("Armory Jared and Mark are here")["showId"], "jared_mark_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Gabe is here")["showId"], "gabe_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Josh is here")["showId"], "josh_walkin")
+            self.assertEqual(sd_dir.match_voice_command("Hey Armory, we have guests")["showId"], "welcome_armory")
+            self.assertEqual(sd_dir.match_voice_command("Armory welcome to the armory")["showId"], "welcome_armory")
             self.assertEqual(sd_dir.match_voice_command("Armory stop show")["action"], "stop")
             self.assertIsNone(sd_dir.match_voice_command("Armory, incline press 185 for 6"))
             self.assertIsNone(sd_dir.match_voice_command("Armory 225 for 8"))
@@ -3654,6 +3656,7 @@ class ShowDirectorTests(unittest.TestCase):
                     "avenleigh_walkin",
                     "jared_mark_walkin",
                     "jared_mark_vip",
+                    "welcome_armory",
                     "gabe_walkin",
                     "josh_walkin",
                 },
@@ -6430,6 +6433,55 @@ class ShowDirectorTests(unittest.TestCase):
             )
 
             svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_welcome_armory_spec_mdns_ipv4_cache_and_storm_duck(self) -> None:
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_welcome_test_"))
+        try:
+            d = sd.ShowDirector(root_dir=tmp, allow_network=False)
+            spec = d.get_show("welcome_armory")
+            self.assertIsNotNone(spec)
+            assert spec is not None
+            self.assertEqual(spec.denon_vol, 70)
+            self.assertEqual(spec.announcer_voice, "elevenlabs:pNInz6obpgDQGcFmaJgB")
+            self.assertTrue(spec.lights_out)
+            self.assertTrue(spec.trigger_fog)
+            self.assertTrue(spec.add_thunder)
+            self.assertEqual(spec.theater_scene, "thunder")
+            self.assertAlmostEqual(spec.dj_drop_sec, 8.0)
+            self.assertTrue(spec.three_screen_video)
+
+            # 1. .local mDNS resolver caches IPv4 and preserves Host header
+            fake_info = [(2, 1, 6, "", ("192.168.1.21", 80))]
+            with mock.patch("socket.getaddrinfo", return_value=fake_info) as m_ga:
+                u1, h1 = d._resolve_local_url_ipv4("http://smart-fogger.local/api/scene?mode=thunder&ms=25000&fog_ms=5500")
+                u2, h2 = d._resolve_local_url_ipv4("http://smart-fogger.local/api/stop")
+                self.assertEqual(m_ga.call_count, 1)
+                self.assertTrue(u1.startswith("http://192.168.1.21/api/scene?mode=thunder"))
+                self.assertEqual(h1.get("Host"), "smart-fogger.local")
+                self.assertEqual(h1.get("Connection"), "close")
+                self.assertEqual(u2, "http://192.168.1.21/api/stop")
+                self.assertEqual(h2.get("Host"), "smart-fogger.local")
+
+            # 2. Storm DJ seamless mix keeps thunder loud before voice, ducks -14 dB under voice, full at drop
+            sr = sd.STAGE_VIDEO_SR
+            ent_pcm = np.full((int(12.0 * sr), 2), 0.5, dtype=np.float32)
+            fake_voice_44k = np.full((int(2.0 * sd.SHOW_SR), 2), 0.05, dtype=np.float32)
+            with mock.patch.object(d, "_get_announcer_stem", return_value=fake_voice_44k):
+                mixed, drop_s = d._mix_dj_seamless_audio(spec, ent_pcm, sr=sr)
+            self.assertAlmostEqual(drop_s, 8.0, places=2)
+            # t=1.0..2.0s (lightning storm, before voice): full storm loudness (~0.5, un-ducked)
+            storm_rms = float(np.sqrt(np.mean(mixed[int(1.0 * sr):int(2.0 * sr)] ** 2)))
+            # t=6.2..7.2s (during voice, ducked -14 dB to 0.20 * 0.5 = 0.10 + 0.05 voice)
+            voice_rms = float(np.sqrt(np.mean(mixed[int(6.2 * sr):int(7.2 * sr)] ** 2)))
+            # t=9.0..10.0s (post-drop Simply the Best): full loudness
+            drop_rms = float(np.sqrt(np.mean(mixed[int(9.0 * sr):int(10.0 * sr)] ** 2)))
+            self.assertGreater(storm_rms, 0.42)
+            self.assertLess(voice_rms, 0.25)
+            self.assertGreater(drop_rms, 0.42)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

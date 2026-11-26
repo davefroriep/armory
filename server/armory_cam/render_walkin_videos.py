@@ -154,6 +154,29 @@ THEMES: list[ThemeSpec] = [
         drop_sec=8.00,
         drum_teaser_sec=6.74,
     ),
+    ThemeSpec(
+        id="welcome_armory",
+        out_filename="welcome_armory_video.mp4",
+        raw_audio_name="pr_simply_the_best.wav",
+        youtube_url="",
+        start_sec=0.0,
+        end_sec=None,
+        fade_out_sec=2.4,
+        eyebrow="W E L C O M E   T O",
+        headline="THE ARMORY",
+        footer="S I M P L Y   T H E   B E S T",
+        bg_deep_bgr=(14, 14, 22),
+        bg_mid_bgr=(24, 52, 92),
+        primary_bgr=(45, 195, 255),
+        secondary_bgr=(35, 115, 255),
+        accent_bgr=(230, 248, 255),
+        headline_rgb=(255, 248, 228),
+        glow_rgb=(255, 190, 55),
+        style="armory_storm",
+        bpm=104.0,
+        use_serif=False,
+        drop_sec=8.00,
+    ),
 ]
 
 
@@ -197,29 +220,159 @@ def _xfade_stereo(a: np.ndarray, b: np.ndarray, xf_sec: float) -> np.ndarray:
     return np.vstack([a[:-n], mid, b[n:]]).astype(np.float32)
 
 
-def prepare_trimmed_wav(theme: ThemeSpec) -> tuple[Path, np.ndarray, float]:
-    raw_wav = ensure_raw_audio(theme)
-    trimmed_wav = AUDIO_CACHE_DIR / f"{theme.id}_trimmed.wav"
-
-    with wave.open(str(raw_wav), "rb") as wf:
+def _load_wav_stereo_48k(path: Path) -> np.ndarray:
+    with wave.open(str(path), "rb") as wf:
         in_sr = wf.getframerate()
         ch = wf.getnchannels()
         sw = wf.getsampwidth()
         raw_bytes = wf.readframes(wf.getnframes())
-
     if sw != 2:
-        raise RuntimeError(f"Expected 16-bit PCM in {raw_wav}, got sample width {sw}")
+        raise RuntimeError(f"Expected 16-bit PCM in {path}, got sample width {sw}")
     pcm = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
     if ch == 1:
         pcm = np.stack([pcm, pcm], axis=1)
     else:
         pcm = pcm.reshape(-1, ch)[:, :2]
-
     if in_sr != SR:
         from scipy.signal import resample_poly
 
         g = math.gcd(in_sr, SR)
         pcm = resample_poly(pcm, SR // g, in_sr // g, axis=0).astype(np.float32)
+    return pcm.astype(np.float32)
+
+
+def _mix_clip(dst: np.ndarray, src: np.ndarray, start_idx: int, gain: float = 1.0) -> None:
+    if src.shape[0] <= 0 or start_idx >= dst.shape[0]:
+        return
+    n = min(src.shape[0], dst.shape[0] - start_idx)
+    if n > 0:
+        dst[start_idx : start_idx + n] += src[:n] * float(gain)
+
+
+def _draw_lightning_bolt(
+    layer: np.ndarray,
+    x0: float,
+    y0: float,
+    x1: float,
+    y1: float,
+    rng: np.random.Generator,
+    intensity: float,
+    thickness: int = 5,
+    depth: int = 0,
+) -> None:
+    """Render jagged branching lightning bolt with electric blue halo and white-hot core."""
+    pts = [(x0, y0), (x1, y1)]
+    disp = 130.0 if depth == 0 else 58.0
+    for _ in range(5 if depth == 0 else 4):
+        nxt = [pts[0]]
+        for i in range(len(pts) - 1):
+            ax, ay = pts[i]
+            bx, by = pts[i + 1]
+            mx = 0.5 * (ax + bx) + float(rng.uniform(-disp, disp))
+            my = 0.5 * (ay + by) + float(rng.uniform(-disp * 0.28, disp * 0.28))
+            nxt.append((mx, my))
+            nxt.append((bx, by))
+        pts = nxt
+        disp *= 0.52
+
+    poly = np.array([[int(px), int(py)] for px, py in pts], dtype=np.int32)
+    k = max(0.0, min(1.0, float(intensity)))
+    outer_col = (int(255 * k), int(185 * k), int(85 * k))
+    mid_col = (int(255 * k), int(235 * k), int(195 * k))
+    core_col = (int(255 * k), int(255 * k), int(255 * k))
+    cv2.polylines(layer, [poly], False, outer_col, max(2, thickness * 3), cv2.LINE_AA)
+    cv2.polylines(layer, [poly], False, mid_col, max(2, thickness * 2 - 1), cv2.LINE_AA)
+    cv2.polylines(layer, [poly], False, core_col, max(1, thickness), cv2.LINE_AA)
+
+    if depth == 0 and len(pts) > 8:
+        for b_idx in (len(pts) // 4, len(pts) // 2, (3 * len(pts)) // 4):
+            bx, by = pts[b_idx]
+            side = -1.0 if (b_idx % 2 == 0) else 1.0
+            ex = bx + side * float(rng.uniform(160.0, 360.0))
+            ey = min(float(HEIGHT - 40), by + float(rng.uniform(180.0, 340.0)))
+            _draw_lightning_bolt(layer, bx, by, ex, ey, rng, intensity * 0.72, max(2, thickness - 2), depth=1)
+
+
+def prepare_trimmed_wav(theme: ThemeSpec) -> tuple[Path, np.ndarray, float]:
+    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    trimmed_wav = AUDIO_CACHE_DIR / f"{theme.id}_trimmed.wav"
+
+    if theme.id == "welcome_armory":
+        fx_dir = SOURCES_DIR.parent / "fx"
+        song_path = SOURCES_DIR / "pr_simply_the_best.wav"
+        if not song_path.is_file():
+            raise RuntimeError(f"Missing song stem: {song_path}")
+        def _soft_limit(buf: np.ndarray, knee: float = 0.72, ceiling: float = 0.88) -> np.ndarray:
+            head = max(0.02, ceiling - knee)
+            mag = np.abs(buf)
+            over = np.maximum(0.0, mag - knee)
+            return np.where(mag > knee, np.sign(buf) * (knee + head * np.tanh(over / head)), buf).astype(np.float32)
+
+        song_pcm = _load_wav_stereo_48k(song_path)
+        song_rms = float(np.sqrt(np.mean(song_pcm ** 2))) if song_pcm.size else 0.0
+        if song_rms > 1e-4:
+            song_pcm = _soft_limit(song_pcm * min(0.21 / song_rms, 2.2), knee=0.72, ceiling=0.88)
+
+        intro_n = int(round(theme.drop_sec * SR))
+        intro_pcm = np.zeros((intro_n, 2), dtype=np.float32)
+
+        rumble_p = fx_dir / "thunder_rumble.wav"
+        if rumble_p.is_file():
+            rmb = _load_wav_stereo_48k(rumble_p)[:intro_n].copy()
+            r_rms = float(np.sqrt(np.mean(rmb ** 2))) if rmb.size else 0.0
+            if r_rms > 1e-4:
+                rmb = rmb * min(0.22 / r_rms, 3.5)
+            fi = min(rmb.shape[0] // 4, int(round(0.30 * SR)))
+            if fi > 4:
+                rmb[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)[:, None]
+            fo = min(rmb.shape[0] // 3, int(round(0.60 * SR)))
+            if fo > 4:
+                rmb[-fo:] *= np.linspace(1.0, 0.25, fo, dtype=np.float32)[:, None]
+            _mix_clip(intro_pcm, rmb, 0, gain=0.85)
+
+        crack_p = fx_dir / "thunder_crack.wav"
+        if crack_p.is_file():
+            crk_full = _load_wav_stereo_48k(crack_p)
+            c_rms = float(np.sqrt(np.mean(crk_full ** 2))) if crk_full.size else 0.0
+            if c_rms > 1e-4:
+                crk_full = crk_full * min(0.26 / c_rms, 4.0)
+            # Place sharp studio thunder cracks on the 3 main lightning bolts (0.75s, 1.45s, 3.60s)
+            for at_s, src_off_s, dur_s, g in (
+                (0.75, 0.0, 2.4, 1.00),
+                (1.45, 2.8, 2.6, 1.05),
+                (3.60, 0.2, 2.5, 0.92),
+            ):
+                s0 = int(round(src_off_s * SR))
+                sn = int(round(dur_s * SR))
+                seg = crk_full[s0 : s0 + sn].copy()
+                if seg.shape[0] > 32:
+                    fi_c = min(seg.shape[0] // 6, int(round(0.02 * SR)))
+                    fo_c = min(seg.shape[0] // 2, int(round(0.55 * SR)))
+                    seg[:fi_c] *= np.linspace(0.0, 1.0, fi_c, dtype=np.float32)[:, None]
+                    seg[-fo_c:] *= np.linspace(1.0, 0.0, fo_c, dtype=np.float32)[:, None]
+                    _mix_clip(intro_pcm, seg, int(round(at_s * SR)), gain=g)
+
+        intro_pcm = _soft_limit(intro_pcm, knee=0.72, ceiling=0.88)
+
+        clip = _xfade_stereo(intro_pcm, song_pcm, 0.045)
+        dur_sec = float(clip.shape[0]) / float(SR)
+        clip = _soft_limit(clip, knee=0.76, ceiling=0.88)
+
+        fo_n = min(clip.shape[0] // 2, int(round(theme.fade_out_sec * SR)))
+        if fo_n > 8:
+            t_fo = np.linspace(0.0, math.pi * 0.5, fo_n, dtype=np.float32)[:, None]
+            clip[-fo_n:] *= np.cos(t_fo) ** 2
+
+        int16_pcm = np.clip(np.round(clip * 32767.0), -32767, 32767).astype("<i2")
+        with wave.open(str(trimmed_wav), "wb") as wf_out:
+            wf_out.setnchannels(2)
+            wf_out.setsampwidth(2)
+            wf_out.setframerate(SR)
+            wf_out.writeframes(int16_pcm.tobytes())
+        return trimmed_wav, clip, dur_sec
+
+    raw_wav = ensure_raw_audio(theme)
+    pcm = _load_wav_stereo_48k(raw_wav)
 
     fi_8ms = min(pcm.shape[0] // 8, max(2, int(round(0.008 * SR))))
     if theme.id == "jenna":
@@ -552,7 +705,7 @@ class ParticleField:
                 c = tuple(int(v * tw * 0.72) for v in col)
                 cv2.circle(layer, (ix, iy), max(4, int(self.size[i] * 1.6)), c, -1, cv2.LINE_AA)
 
-        else:  # velvet_gold
+        else:  # velvet_gold / armory_storm
             for i in range(self.n):
                 ix, iy = int(self.x[i]), int(self.y[i])
                 tw = 0.55 + 0.45 * math.sin(t * 3.8 + float(self.phase[i]))
@@ -568,6 +721,39 @@ class ParticleField:
                     gc = (210, 242, 255)
                     cv2.line(layer, (gx - arm, gy), (gx + arm, gy), gc, 2, cv2.LINE_AA)
                     cv2.line(layer, (gx, gy - arm), (gx, gy + arm), gc, 2, cv2.LINE_AA)
+            # Championship gold firework blooms during Simply the Best chorus peaks
+            if st == "armory_storm":
+                if (chorus > 0.45 or kick > 0.72) and (f - self.last_fw_frame >= 18) and len(self.fw_shells) < 4:
+                    self.last_fw_frame = f
+                    fx = float(self.rng.uniform(240, WIDTH - 240))
+                    fy = float(self.rng.uniform(130, 410))
+                    ang = np.linspace(0, 2.0 * math.pi, 24, endpoint=False) + self.rng.uniform(0, 0.3)
+                    spd = self.rng.uniform(4.5, 9.2, 24)
+                    pal = [(70, 205, 255), (185, 238, 255), (50, 145, 255)]
+                    self.fw_shells.append({
+                        "x": fx, "y": fy, "ang": ang, "spd": spd,
+                        "age": 0, "max_age": 26, "col": pal[int(self.rng.integers(0, len(pal)))],
+                    })
+                alive_g: list[dict] = []
+                for sh in self.fw_shells:
+                    age = sh["age"]
+                    if age < sh["max_age"]:
+                        prog = float(age) / float(sh["max_age"])
+                        alpha = max(0.0, 1.0 - prog ** 1.3)
+                        dist = (1.0 - (1.0 - prog) ** 2.2) * 190.0
+                        c_sp = tuple(int(v * alpha) for v in sh["col"])
+                        for k_i in range(len(sh["ang"])):
+                            a = float(sh["ang"][k_i])
+                            r_d = dist * (float(sh["spd"][k_i]) / 7.5)
+                            px = int(sh["x"] + math.cos(a) * r_d)
+                            py = int(sh["y"] + math.sin(a) * r_d + prog * prog * 45.0)
+                            px0 = int(sh["x"] + math.cos(a) * max(0.0, r_d - 22.0))
+                            py0 = int(sh["y"] + math.sin(a) * max(0.0, r_d - 22.0) + max(0.0, prog - 0.1) ** 2 * 45.0)
+                            cv2.line(layer, (px0, py0), (px, py), c_sp, 2, cv2.LINE_AA)
+                            cv2.circle(layer, (px, py), 3, c_sp, -1, cv2.LINE_AA)
+                        sh["age"] += 1
+                        alive_g.append(sh)
+                self.fw_shells = alive_g
 
 
 def render_theme_video(theme: ThemeSpec) -> Path:
@@ -722,7 +908,61 @@ def render_theme_video(theme: ThemeSpec) -> Path:
             chorus = float(chorus_arr[f])
             bands = bands_arr[f]
 
-            # 1. Half-res volumetric stage backdrop + sweeping beam lobes
+            # 1. Half-res volumetric stage backdrop + sweeping beam lobes (or storm clouds + lightning for armory_storm intro)
+            if theme.style == "armory_storm" and not is_dropped:
+                # Dark turbulent storm clouds drifting across all 3 screens
+                c1 = np.sin(nx * 2.4 + t * 0.42) * np.cos(ny * 2.1 - t * 0.28)
+                c2 = np.sin(nx * 5.2 - t * 0.65 + ny * 3.1) * 0.5
+                cloud = np.clip(0.5 + 0.35 * c1 + 0.22 * c2, 0.0, 1.0)
+                storm_base = np.zeros((HALF_H, HALF_W, 3), dtype=np.float32)
+                storm_base[:, :, 0] = 10.0 + 34.0 * cloud  # deep storm blue
+                storm_base[:, :, 1] = 6.0 + 18.0 * cloud
+                storm_base[:, :, 2] = 5.0 + 12.0 * cloud
+
+                # Sheet lightning sky glow synced to thunder cracks (0.75s, 1.45s, 3.60s) & pre-drop flashes
+                sky_flash = 0.0
+                active_bolts: list[tuple[float, float, float, float, float, int]] = []
+                for b_idx, (bt, bdur, bx0, bx1, seed_b) in enumerate((
+                    (0.75, 0.28, 620.0, 520.0, 101),
+                    (1.45, 0.34, 1260.0, 1140.0, 202),
+                    (3.60, 0.28, 960.0, 820.0, 303),
+                )):
+                    if bt <= t < (bt + bdur):
+                        prog_b = (t - bt) / bdur
+                        flick = 1.0 if (int(prog_b * 6) % 2 == 0) else 0.55
+                        inten = ((1.0 - prog_b) ** 0.75) * flick
+                        sky_flash = max(sky_flash, inten)
+                        active_bolts.append((bx0, 0.0, bx1, float(HEIGHT * 0.88), inten, seed_b + int(prog_b * 3)))
+                for ft, fdur in ((6.85, 0.20), (7.20, 0.18), (7.55, 0.20)):
+                    if ft <= t < (ft + fdur):
+                        sky_flash = max(sky_flash, 0.55 * (1.0 - (t - ft) / fdur))
+
+                if sky_flash > 0.01:
+                    glow_mask = np.clip(cloud * 0.65 + rad_glow_mask * 0.55, 0.0, 1.0)
+                    storm_base[:, :, 0] += 215.0 * sky_flash * glow_mask
+                    storm_base[:, :, 1] += 205.0 * sky_flash * glow_mask
+                    storm_base[:, :, 2] += 185.0 * sky_flash * glow_mask
+
+                frame = cv2.resize(np.clip(storm_base, 0, 255).astype(np.uint8), (WIDTH, HEIGHT), interpolation=cv2.INTER_LINEAR)
+                if active_bolts:
+                    bolt_layer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+                    for bx0, by0, bx1, by1, inten, s_b in active_bolts:
+                        _draw_lightning_bolt(bolt_layer, bx0, by0, bx1, by1, np.random.default_rng(s_b), inten, thickness=5)
+                    bolt_glow = cv2.GaussianBlur(bolt_layer, (0, 0), sigmaX=11.0, sigmaY=11.0)
+                    frame = cv2.add(frame, cv2.addWeighted(bolt_layer, 0.95, bolt_glow, 0.75, 0))
+                    # Briefly silhouette THE ARMORY emblem in the lightning flash
+                    bg_u16 = frame.astype(np.uint16)
+                    sil_k = min(0.75, sky_flash * 0.85)
+                    sil_fg = (fg_prem.astype(np.float32) * sil_k).astype(np.uint16)
+                    sil_inv = (255.0 - (255.0 - inv_alpha.astype(np.float32)) * sil_k).astype(np.uint16)
+                    frame = np.clip((bg_u16 * sil_inv) // 255 + sil_fg, 0, 255).astype(np.uint8)
+                if t < 0.25:
+                    frame = (frame.astype(np.float32) * (t / 0.25)).astype(np.uint8)
+                proc.stdin.write(frame.tobytes())
+                if (f + 1) % 300 == 0 or (f + 1) == n_frames:
+                    print(f"  {theme.id}: {f + 1}/{n_frames}", flush=True)
+                continue
+
             bg_half = base_bg.copy()
             if is_dropped:
                 pulse_boost = 0.20 + 0.55 * kick + 0.25 * chorus
@@ -889,7 +1129,17 @@ def render_theme_video(theme: ThemeSpec) -> Path:
 
 
 def main() -> None:
+    import sys
+
+    only = ""
+    args = sys.argv[1:]
+    if "--only" in args:
+        idx = args.index("--only")
+        if idx + 1 < len(args):
+            only = args[idx + 1].strip().lower()
     for theme in THEMES:
+        if only and theme.id.lower() != only:
+            continue
         render_theme_video(theme)
 
 

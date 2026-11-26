@@ -470,6 +470,8 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "hit a PR",
         "new PR",
         "I PR'd",
+        "we have guests",
+        "welcome to the Armory",
         "Matt just got here",
         "Ryder is here",
         "Gabe is here",

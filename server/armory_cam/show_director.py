@@ -22,6 +22,7 @@ from pathlib import Path
 import queue
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1238,6 +1239,62 @@ def default_shows() -> list[ShowSpec]:
             theater_scene="vip_gold",
             dj_seamless_intro=True,
             dj_drop_sec=6.80,
+        ),
+        ShowSpec(
+            id="welcome_armory",
+            name="Welcome to the Armory (Storm Intro + Simply the Best)",
+            kind="debut_video",
+            enabled=True,
+            triggers=[
+                "we have guests",
+                "we got guests",
+                "guests are here",
+                "welcome to the armory",
+                "welcome our guests",
+                "show them the armory",
+            ],
+            denon_vol=70,
+            cube_mode="takeover",
+            overlay_gain=1.0,
+            announcer_text="[dramatic] Welcome... to The Armory!!",
+            announcer_voice="elevenlabs:pNInz6obpgDQGcFmaJgB",
+            announcer_rate="-4%",
+            announcer_pitch="",
+            demo_style="anthem",
+            song_start_sec=0.0,
+            song_duration_sec=0.0,
+            fade_out_sec=2.4,
+            trim_leading_silence=True,
+            add_cheer=True,
+            cheer_delay_sec=0.0,
+            add_thunder=True,
+            lights_out=True,
+            lights_flash_count=0,
+            trigger_fog=True,
+            fog_burst_sec=5.5,
+            lightning_flash_sec=0.0,
+            intro_start_sec=0.15,
+            video_source_file="welcome_armory_video.mp4",
+            three_screen_video=True,
+            video_hold_sec=25.22,
+            voice_reverb_wet=0.08,
+            voice_boost_db=0.0,
+            voice_style=(
+                "Deep, commanding, cinematic Atlas-style baritone welcoming VIP guests "
+                "into a storm-lit private strength arena. Confident, booming, resonant authority."
+            ),
+            theater_scene="thunder",
+            dj_seamless_intro=True,
+            dj_drop_sec=8.00,
+            fx_cues=[
+                {"id": "wa_bolt1", "target": "intro", "atSec": 0.75, "type": "flash", "count": 1, "durationSec": 0.22, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True, "zone": "all"},
+                {"id": "wa_bolt2", "target": "intro", "atSec": 1.45, "type": "flash", "count": 1, "durationSec": 0.26, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True, "zone": "all"},
+                {"id": "wa_bolt3", "target": "intro", "atSec": 3.60, "type": "flash", "count": 1, "durationSec": 0.22, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True, "zone": "all"},
+                {"id": "wa_pre1", "target": "intro", "atSec": 6.85, "type": "flash", "count": 1, "durationSec": 0.20, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_pre2_tv", "target": "intro", "atSec": 7.20, "type": "flash", "count": 1, "durationSec": 0.18, "offSec": 0.25, "endOn": False, "lightFlash": False, "screenFlash": True, "zone": "all"},
+                {"id": "wa_pre3", "target": "intro", "atSec": 7.55, "type": "flash", "count": 1, "durationSec": 0.18, "offSec": 0.22, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_drop_on", "target": "video", "atSec": 0.00, "type": "flash", "count": 1, "durationSec": 0.24, "offSec": 0.22, "endOn": True, "lightFlash": False, "screenFlash": True, "zone": "all"},
+            ],
         ),
         ShowSpec(
             id="gabe_walkin",
@@ -3016,6 +3073,7 @@ class ShowDirector:
         self._run_lock = threading.Lock()
         self.log = logging.getLogger("armory-shows")
         self._http_fail_until: dict[str, float] = {}
+        self._mdns_ipv4_cache: dict[str, tuple[str, float]] = {}
         self._active_run_id: int = 0
         self._active_cancel: threading.Event | None = None
         self._active_thread: threading.Thread | None = None
@@ -3719,17 +3777,31 @@ class ShowDirector:
             target_end = max(int(round(0.25 * sr)), drop_n - int(round(0.06 * sr)))
             ann_off = max(int(round(0.08 * sr)), target_end - ann_pcm.shape[0])
 
-        # DJ fader curve: steady 0.28 (-11 dB) during buildup -> crisp 140ms S-curve slam to 1.00 right at drop_n
+        # DJ fader curve: for storm/thunder intros keep full storm loudness until Atlas speaks,
+        # ducking -14 dB (0.20) only beneath speech; for music buildups hold steady 0.28 -> crisp S-curve slam at drop_n
         fader = np.ones(total_n, dtype=np.float32)
         slam_n = min(drop_n // 2, max(16, int(round(0.14 * sr))))
         hold_end = max(0, drop_n - slam_n)
-        fader[:hold_end] = 0.28
-        click_n = min(hold_end, int(round(0.020 * sr)))
-        if click_n > 2:
-            fader[:click_n] = np.linspace(0.0, 0.28, click_n, dtype=np.float32)
-        if drop_n > hold_end:
-            u = np.linspace(0.0, 1.0, drop_n - hold_end, dtype=np.float32)
-            fader[hold_end:drop_n] = 0.28 + 0.72 * 0.5 * (1.0 - np.cos(math.pi * u))
+        if spec.add_thunder and ann_pcm.shape[0] > 0:
+            duck_gain = 0.20
+            ramp_n = min(int(round(0.22 * sr)), max(16, ann_off))
+            duck_start = max(0, ann_off - ramp_n)
+            if ann_off > duck_start:
+                u_dn = np.linspace(0.0, 1.0, ann_off - duck_start, dtype=np.float32)
+                fader[duck_start:ann_off] = 1.0 - (1.0 - duck_gain) * 0.5 * (1.0 - np.cos(math.pi * u_dn))
+            if hold_end > ann_off:
+                fader[ann_off:hold_end] = duck_gain
+            if drop_n > hold_end:
+                u = np.linspace(0.0, 1.0, drop_n - hold_end, dtype=np.float32)
+                fader[hold_end:drop_n] = duck_gain + (1.0 - duck_gain) * 0.5 * (1.0 - np.cos(math.pi * u))
+        else:
+            fader[:hold_end] = 0.28
+            click_n = min(hold_end, int(round(0.020 * sr)))
+            if click_n > 2:
+                fader[:click_n] = np.linspace(0.0, 0.28, click_n, dtype=np.float32)
+            if drop_n > hold_end:
+                u = np.linspace(0.0, 1.0, drop_n - hold_end, dtype=np.float32)
+                fader[hold_end:drop_n] = 0.28 + 0.72 * 0.5 * (1.0 - np.cos(math.pi * u))
         mixed = (ent_pcm * fader[:, None]).astype(np.float32)
 
         # Steady stadium bed under speech (zero choppy word-pumping) -> celebratory roar on drop -> silky fade
@@ -3752,24 +3824,43 @@ class ShowDirector:
                 fi_n = min(c_n, int(round(0.18 * sr)))
                 sw_s = max(fi_n, min(c_n, drop_n - int(round(0.16 * sr))))
                 sw_e = max(sw_s + 1, min(c_n, drop_n + int(round(0.12 * sr))))
-                if fi_n > 1:
-                    c_env[:fi_n] = np.linspace(0.0, 0.15, fi_n, dtype=np.float32)
-                if sw_s > fi_n:
-                    c_env[fi_n:sw_s] = 0.15
-                if sw_e > sw_s:
-                    u_sw = np.linspace(0.0, 1.0, sw_e - sw_s, dtype=np.float32)
-                    c_env[sw_s:sw_e] = 0.15 + 0.27 * 0.5 * (1.0 - np.cos(math.pi * u_sw))
+                if spec.add_thunder:
+                    # Keep stadium silent during dark storm/voice; swell cleanly right into the beat drop
+                    if sw_e > sw_s:
+                        u_sw = np.linspace(0.0, 1.0, sw_e - sw_s, dtype=np.float32)
+                        c_env[sw_s:sw_e] = 0.42 * 0.5 * (1.0 - np.cos(math.pi * u_sw))
+                else:
+                    if fi_n > 1:
+                        c_env[:fi_n] = np.linspace(0.0, 0.15, fi_n, dtype=np.float32)
+                    if sw_s > fi_n:
+                        c_env[fi_n:sw_s] = 0.15
+                    if sw_e > sw_s:
+                        u_sw = np.linspace(0.0, 1.0, sw_e - sw_s, dtype=np.float32)
+                        c_env[sw_s:sw_e] = 0.15 + 0.27 * 0.5 * (1.0 - np.cos(math.pi * u_sw))
                 if c_n > sw_e:
                     u_dc = np.linspace(0.0, 1.0, c_n - sw_e, dtype=np.float32)
                     c_env[sw_e:] = 0.42 * (np.cos(0.5 * math.pi * u_dc) ** 2)
                 mix_into(mixed, cheer[:c_n] * c_env[:, None], 0, gain=1.0)
 
         if ann_pcm.shape[0] > 0:
-            mix_into(mixed, ann_pcm, ann_off, gain=1.0)
+            ann_gain = 1.0
+            song_tail = ent_pcm[drop_n:]
+            if song_tail.shape[0] > sr // 2:
+                song_rms = float(np.sqrt(np.mean(song_tail ** 2)))
+                ann_rms = float(np.sqrt(np.mean(ann_pcm ** 2)))
+                if song_rms > 0.01 and ann_rms > song_rms * 1.15:
+                    ann_gain = max(0.55, min(1.0, (song_rms * 1.15) / ann_rms))
+            mix_into(mixed, ann_pcm, ann_off, gain=ann_gain)
 
+        # Transparent true-peak soft-knee limiter (<= -1.1 dBFS ceiling so AAC never clips or pulls down song loudness)
         pk = float(np.max(np.abs(mixed))) if mixed.size else 0.0
-        if pk > 0.94:
-            mixed = (mixed * (0.92 / pk)).astype(np.float32)
+        if pk > 0.78:
+            knee = 0.76
+            ceil = 0.88
+            head = ceil - knee
+            mag = np.abs(mixed)
+            over = np.maximum(0.0, mag - knee)
+            mixed = np.where(mag > knee, np.sign(mixed) * (knee + head * np.tanh(over / head)), mixed).astype(np.float32)
         return mixed, round(drop_s, 3)
 
     def _build_norm_source_mezzanine(self, src_vid: Path, stamp: str) -> tuple[Path, bool]:
@@ -4790,6 +4881,34 @@ class ShowDirector:
 
     # ---------- HTTP & Smart FX Helpers ----------
 
+    def _resolve_local_url_ipv4(self, url: str) -> tuple[str, dict[str, str]]:
+        """Pre-resolve `*.local` mDNS hostnames to IPv4 with cache so Windows IPv6 mDNS never stalls."""
+        headers = {"Connection": "close"}
+        try:
+            parts = urllib.parse.urlsplit(url)
+            host = (parts.hostname or "").strip().lower()
+            if host.endswith(".local"):
+                orig_netloc = parts.netloc
+                cached = self._mdns_ipv4_cache.get(host)
+                now_m = time.monotonic()
+                ip_addr = cached[0] if (cached and (now_m - cached[1]) < 300.0) else ""
+                if not ip_addr:
+                    try:
+                        infos = socket.getaddrinfo(host, parts.port or 80, socket.AF_INET, socket.SOCK_STREAM)
+                        if infos:
+                            ip_addr = str(infos[0][4][0])
+                            self._mdns_ipv4_cache[host] = (ip_addr, now_m)
+                    except Exception:
+                        ip_addr = cached[0] if cached else ""
+                if ip_addr:
+                    new_netloc = f"{ip_addr}:{parts.port}" if parts.port else ip_addr
+                    resolved = urllib.parse.urlunsplit((parts.scheme, new_netloc, parts.path, parts.query, parts.fragment))
+                    headers["Host"] = orig_netloc
+                    return resolved, headers
+        except Exception:
+            pass
+        return url, headers
+
     def _fire_http_hook(self, url: str) -> dict[str, Any]:
         clean = str(url or "").strip()
         if not clean:
@@ -4806,11 +4925,24 @@ class ShowDirector:
                 return {"ok": code < 400, "url": clean, "status": code}
             if not self.allow_network:
                 return {"ok": False, "skipped": True, "error": "Network disabled"}
-            req = urllib.request.Request(clean, method="GET")
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
-                if host_key:
-                    self._http_fail_until.pop(host_key, None)
-                return {"ok": int(resp.status) < 400, "url": clean, "status": int(resp.status)}
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    target_url, hdrs = self._resolve_local_url_ipv4(clean)
+                    req = urllib.request.Request(target_url, method="GET", headers=hdrs)
+                    with urllib.request.urlopen(req, timeout=2.5) as resp:
+                        try:
+                            resp.read()
+                        except Exception:
+                            pass
+                        if host_key:
+                            self._http_fail_until.pop(host_key, None)
+                        return {"ok": int(resp.status) < 400, "url": clean, "status": int(resp.status)}
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < 2:
+                        time.sleep(0.15 * (attempt + 1))
+            raise last_exc if last_exc is not None else RuntimeError("HTTP hook failed")
         except Exception as exc:
             if host_key and self._http_get is None:
                 self._http_fail_until[host_key] = time.monotonic() + 10.0
