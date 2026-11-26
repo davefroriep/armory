@@ -188,13 +188,16 @@ class VoiceController {
     if (this.inited) return;
     this.inited = true;
     onNativeVoiceResult((ev) => this.handleEvent(ev));
-    lifts.changed.on(() => this.syncCursorToSession());
+    lifts.changed.on(() => {
+      this.syncCursorToSession();
+      this.syncSessionFromSettings();
+    });
     settingsChanged.on(() => {
       this.syncSessionFromSettings();
     });
     if (typeof document !== 'undefined') {
       document.addEventListener('visibilitychange', () => {
-        if (!document.hidden && (this.liftScreenMounted || this.shootoutActive)) this.ensureRoomConnected();
+        if (!document.hidden && (this.liftScreenMounted || !!lifts.active || this.shootoutActive)) this.ensureRoomConnected();
       });
     }
     this.syncSessionFromSettings();
@@ -397,7 +400,7 @@ class VoiceController {
 
   ensureRoomConnected(): void {
     const s = getSettings();
-    const want = (this.shootoutActive || ((s.voiceRoomEnabled || s.voiceAbCompare) && this.liftScreenMounted))
+    const want = (this.shootoutActive || ((s.voiceRoomEnabled || s.voiceAbCompare) && (this.liftScreenMounted || !!lifts.active)))
       && s.gymCamEnabled
       && typeof EventSource !== 'undefined';
     if (!want) return;
@@ -562,7 +565,7 @@ class VoiceController {
 
   private syncRoomStream(): void {
     const s = getSettings();
-    const want = (this.shootoutActive || ((s.voiceRoomEnabled || s.voiceAbCompare) && this.liftScreenMounted))
+    const want = (this.shootoutActive || ((s.voiceRoomEnabled || s.voiceAbCompare) && (this.liftScreenMounted || !!lifts.active)))
       && s.gymCamEnabled
       && typeof EventSource !== 'undefined';
     const cfgSig = `${this.roomBaseUrl()}|${s.voiceWakeWord}|${s.voiceReadback}`;
@@ -655,7 +658,7 @@ class VoiceController {
         this.roomOnline = false;
         this.roomListening = false;
         this.changed.emit();
-        if (this.liftScreenMounted && getSettings().voiceRoomEnabled && getSettings().gymCamEnabled) {
+        if ((this.liftScreenMounted || !!lifts.active) && getSettings().voiceRoomEnabled && getSettings().gymCamEnabled) {
           if (this.roomRetryTimer) clearTimeout(this.roomRetryTimer);
           const delay = this.roomRetryMs;
           this.roomRetryMs = Math.min(15_000, Math.round(this.roomRetryMs * 1.8));
@@ -1018,8 +1021,14 @@ class VoiceController {
     if (!intent) {
       if (hasCommandTailAfterWake(pool[0], wakeWord, armed)) {
         this.armedUntilMs = 0;
-        const n = this.notice(`Didn’t catch “${pool[0]}”`, 'warn', true, "Didn't catch that");
-        this.speakWithSource("Didn't catch that", ev.source, n);
+        const tailWords = pool[0]
+          .replace(new RegExp(`^.*?\\b${wakeWord.trim().replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\b[,.:;\\s-]*`, 'i'), '')
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        const chatterRoom = ev.source === 'room' && tailWords.length > 6;
+        const n = this.notice(`Didn’t catch “${pool[0]}”`, 'warn', true, chatterRoom ? null : "Didn't catch that");
+        this.speakWithSource(chatterRoom ? null : "Didn't catch that", ev.source, n);
       } else {
         this.changed.emit();
       }
@@ -1153,8 +1162,9 @@ class VoiceController {
         if (msg) this.notice(msg, 'info');
       });
       buzz(25);
+      const camShort = intent.camera ? ` ${intent.camera.replace(/ cam$/i, '')}` : '';
       return this.notice(
-        mode === 'arm' ? 'Camera toggled…' : mode === 'guest' ? 'Guest camera toggled…' : 'Clipping last set…',
+        mode === 'arm' ? `Recording${camShort}…` : mode === 'guest' ? `Guest recording${camShort}…` : 'Clipping last set…',
         'info',
         false,
         fallbackSpeech,
@@ -1461,7 +1471,7 @@ class VoiceController {
     if (!canLog(set, ex)) {
       return this.notice(`Need weight & reps for ${cur.label} ${ex.name} (e.g. "Armory 135 for 10")`, 'warn', true, 'Need weight and reps');
     }
-    const wasArmed = gymCam.isArmed(set.id);
+    const wasArmed = gymCam.isArmed(set.id) || !!gymCam.adoptServerArmedForSet?.(s, se, set);
     const logged = toggleDone(se, cur.setIdx, ex);
     if (!logged) {
       return this.notice(`Could not log ${ex.name}`, 'warn', true, 'Could not log set');

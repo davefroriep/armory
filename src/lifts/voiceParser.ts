@@ -723,11 +723,11 @@ export function defaultReadbackForIntent(intent: VoiceIntent, confirmTag = 'got 
     case 'delete_empty_sets':
       return 'Deleted empty sets';
     case 'cam_arm':
-      return intent.camera ? `Recording ${intent.camera.replace(/ cam$/i, '')}` : 'Camera toggled';
+      return intent.camera ? `Recording ${intent.camera.replace(/ cam$/i, '')}` : 'Recording';
     case 'cam_clip_last':
       return 'Clipping last set';
     case 'cam_guest':
-      return intent.camera ? `Guest camera ${intent.camera.replace(/ cam$/i, '')}` : 'Guest camera toggled';
+      return intent.camera ? `Guest camera ${intent.camera.replace(/ cam$/i, '')}` : 'Guest recording';
     case 'buddy_mode':
       return intent.on === true ? 'Buddy mode on' : intent.on === false ? 'Buddy mode off' : 'Buddy mode toggled';
     case 'wb_replay':

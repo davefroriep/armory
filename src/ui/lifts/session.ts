@@ -1575,16 +1575,30 @@ function build(root: HTMLElement, id?: string): () => void {
         if (!ptr) return 'No open set to record';
         const se = s.exs[ptr.exIdx];
         const set = se.sets[ptr.setIdx];
+        const wantsStop = /\b(?:stop|end|finish)\b/i.test(voice.lastHeard);
         if (gymCam.isArmed(set.id)) {
-          const clips = await gymCam.stopAndSaveArmed(s, se, set);
-          if (!dead) { save(); syncVisibleCards(); }
-          return clips.length > 1
-            ? `${clips.length} clips saved · ${exOf(se.exId).name}`
-            : clips.length === 1
-              ? `Clip saved · ${exOf(se.exId).name}`
-              : 'Could not save clip from Gym Cam';
+          if (wantsStop) {
+            const clips = await gymCam.stopAndSaveArmed(s, se, set);
+            if (!dead) { save(); syncVisibleCards(); }
+            return clips.length > 1
+              ? `${clips.length} clips saved · ${exOf(se.exId).name}`
+              : clips.length === 1
+                ? `Clip saved · ${exOf(se.exId).name}`
+                : 'Could not save clip from Gym Cam';
+          }
+          if (camera) {
+            se.cams = [camera];
+            delete se.camPref;
+            save();
+          }
+          const effCams = camera ? [camera] : camsForEx(se);
+          gymCam.armSet(s, se, set, effCams, gymCam.armed?.startEpochMs);
+          if (!dead) syncVisibleCards();
+          const camLbl = effCams.map(shortCamLabel).join(' + ');
+          return `Recording ${camLbl} · ${exOf(se.exId).name} Set ${ptr.setNumber}`;
         }
-        if (!gymCam.online) return 'Gym Cam offline — connect to Armory Wi-Fi';
+        if (wantsStop) return 'Not recording a set right now';
+        if (!gymCam.online && !voice.roomOnline) return 'Gym Cam offline — connect to Armory Wi-Fi';
         active.ensureStarted(s, true);
         if (camera) {
           se.cams = [camera];

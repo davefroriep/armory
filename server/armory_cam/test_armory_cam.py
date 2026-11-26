@@ -6734,6 +6734,87 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_wake_038_single_follow_up_and_optiplex_hosted_camera_voice(self) -> None:
+        from unittest import mock
+
+        # 1. RoomVoiceConfig default wake_threshold restored to 0.38
+        self.assertAlmostEqual(rv.RoomVoiceConfig().wake_threshold, 0.38, places=2)
+        self.assertAlmostEqual(rv.RoomVoiceConfig.from_dict({}).wake_threshold, 0.38, places=2)
+        self.assertIn("Recording", rv.PREWARM_TTS_PHRASES)
+
+        # 2. Armed follow-up window closes on the first completed utterance so room chatter doesn't fire 3-4 commands
+        class _FakeWakeOnce:
+            ready = True
+            threshold = 0.38
+            latest_score = 0.0
+
+            def reset(self) -> None:
+                pass
+
+            def push_samples(self, _pcm: np.ndarray, now_mono: float | None = None) -> tuple[bool, float]:
+                self.latest_score = 0.50
+                return True, 0.50
+
+        v_once = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(wake_word="hey armory", wake_engine="openwakeword", wake_threshold=0.38),
+            allow_hardware_audio=False,
+            wake_spotter=_FakeWakeOnce(),
+        )
+        v_once._ingest_pcm16_frame(np.zeros(512, dtype=np.float32), now_ms=100_000, now_mono=100.0)
+        self.assertGreater(v_once.armed_until_ms, 100_000)
+        # First follow-up utterance completes -> enqueues once and immediately clears armed_until_ms
+        with mock.patch.object(
+            v_once._detector,
+            "push_samples",
+            side_effect=[[np.ones(512, dtype=np.float32)], [np.ones(512, dtype=np.float32) * 2]],
+        ):
+            v_once._ingest_pcm16_frame(np.zeros(512, dtype=np.float32), now_ms=100_500, now_mono=100.5)
+        self.assertEqual(v_once.armed_until_ms, 0)
+        self.assertEqual(v_once._utt_queue.qsize(), 1)
+
+        # 3. OptiPlex-hosted camera voice parsing + fallback arm/stop/clip when phone workout isn't connected
+        self.assertEqual(ac.parse_camera_voice_command("Hey Armory, record this", "hey armory"), {"action": "arm", "guest": False, "camera": None})
+        self.assertEqual(ac.parse_camera_voice_command("Hey Armory, stop recording", "hey armory"), {"action": "stop", "camera": None})
+        self.assertEqual(ac.parse_camera_voice_command("Hey Armory, record smith", "hey armory"), {"action": "arm", "guest": False, "camera": "Smith Cam"})
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_optiplex_cam_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            # Phone workout offline -> OptiPlex arms idempotently and speaks "Recording"
+            r1 = svc._handle_local_voice_command("Hey Armory, record this")
+            self.assertIsNotNone(r1)
+            assert r1 is not None
+            self.assertEqual(r1["speech"], "Recording")
+            self.assertIsNotNone(svc.active_server_armed_clip())
+            t0 = svc.active_server_armed_clip()["armedAtMs"]
+            # Repeating "record this" keeps the original start timestamp (idempotent)
+            r2 = svc._handle_local_voice_command("Hey Armory, record this")
+            self.assertIsNotNone(r2)
+            self.assertEqual(svc.active_server_armed_clip()["armedAtMs"], t0)
+            # Saying "done" while OptiPlex-armed cuts locally and speaks "Clip saved"
+            with mock.patch.object(
+                svc,
+                "cut_clips_multi",
+                return_value=[{"ok": True, "fileName": "Gym_Clip_1.mp4", "lanUrl": "/clips/2026-11-26/Gym_Clip_1.mp4"}],
+            ) as m_cut:
+                r3 = svc._handle_local_voice_command("Hey Armory, done")
+            self.assertIsNotNone(r3)
+            assert r3 is not None
+            self.assertTrue(r3["ok"])
+            self.assertEqual(r3["speech"], "Clip saved")
+            self.assertEqual(m_cut.call_count, 1)
+            self.assertIsNone(svc.active_server_armed_clip())
+
+            # When an active phone workout session is live on SSE, OptiPlex still latches server_armed_clip
+            # and lets the event forward to the phone app without stealing it
+            svc.voice.sse_clients = 1
+            svc.voice.context_active = True
+            r_live = svc._handle_local_voice_command("Hey Armory, record this")
+            self.assertIsNone(r_live)
+            self.assertIsNotNone(svc.active_server_armed_clip())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

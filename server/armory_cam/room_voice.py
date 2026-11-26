@@ -234,8 +234,11 @@ PREWARM_TTS_PHRASES: tuple[str, ...] = (
     "Set added",
     "Next exercise",
     "Previous exercise",
+    "Recording",
     "Recording Rack",
     "Recording Smith",
+    "Guest recording",
+    "Clip saved",
     "Clipping last set",
     "No other views",
     "No video playing",
@@ -513,7 +516,7 @@ class RoomVoiceConfig:
     beam_size: int = 1
     wake_word: str = "armory"
     wake_engine: str = "whisper"  # "whisper" | "openwakeword"
-    wake_threshold: float = 0.45
+    wake_threshold: float = 0.38
     rescue_threshold: float = 0.10  # Two-Tier Silent Rescue Gate: 0.10..wake_threshold checks Whisper w/o ducking (0=off)
     speaker_readback: bool = True
     room_command_readback: bool = True
@@ -580,7 +583,7 @@ class RoomVoiceConfig:
             beam_size=beam_size,
             wake_word=wake,
             wake_engine=wake_engine,
-            wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.45) if raw.get("wakeThreshold") is not None else 0.45), 0.15, 0.90),
+            wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.38) if raw.get("wakeThreshold") is not None else 0.38), 0.15, 0.90),
             rescue_threshold=_clamp(float(raw.get("rescueThreshold", 0.10) if raw.get("rescueThreshold") is not None else 0.10), 0.0, 0.40),
             speaker_readback=bool(raw.get("speakerReadback", True)),
             room_command_readback=bool(raw.get("roomCommandReadback", True)),
@@ -3380,8 +3383,12 @@ class RoomVoiceService:
             if muted:
                 return
             utterances = self._detector.push_samples(pcm16, muted=False)
-            for utt in utterances:
-                self._enqueue_utterance((utt, True))
+            if utterances:
+                self._enqueue_utterance((utterances[0], True))
+                # Consume armed window on first follow-up utterance so background group chatter
+                # over the remaining seconds never fires as 3-4 fake wake commands.
+                self.armed_until_ms = 0
+                self._oww_awaiting_cmd = False
             return
 
         # Idle in openWakeWord mode: NEVER mute openWakeWord during confirmation/error replies so

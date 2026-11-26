@@ -1,6 +1,6 @@
 import { Emitter } from '../emitter';
 import { getSettings, updateSettings } from '../store/settings';
-import { DEFAULT_FALLBACK_CAM, normalizeCamList } from './logic';
+import { DEFAULT_FALLBACK_CAM, camsForExercise, normalizeCamList } from './logic';
 import { lifts } from './store';
 import { uid, type LiftSession, type LiftSet, type SessionEx, type VideoMeta } from './types';
 
@@ -150,6 +150,7 @@ class GymCamController {
   cameras: string[] = [];
   clockOffsetMs = 0;
   armed: { sessionId: string; exUid: string; setId: string; startEpochMs: number; camera: string; cameras: string[] } | null = null;
+  serverArmedClip: { armedAtMs?: number; camera?: string | null; guest?: boolean; sessionId?: string } | null = null;
   savingSetId: string | null = null;
   guestArmed: { sessionId: string; startEpochMs: number; camera?: string } | null = null;
   savingGuest = false;
@@ -208,6 +209,7 @@ class GymCamController {
       this.recording = false;
       this.paused = false;
       this.cameras = [];
+      this.serverArmedClip = null;
       if (was) this.changed.emit();
       return {
         online: false,
@@ -237,6 +239,7 @@ class GymCamController {
         cameras?: string[];
         previewDriveUrl?: string;
         previewUpdatedMs?: number | null;
+        armedClip?: { armedAtMs?: number; camera?: string | null; guest?: boolean; sessionId?: string } | null;
       };
       if (data?.service !== 'armory-cam') throw new Error('Not armory-cam');
       this.probeMisses = 0;
@@ -244,6 +247,7 @@ class GymCamController {
       this.online = true;
       this.recording = !!data.recording;
       this.paused = !!data.paused;
+      this.serverArmedClip = data.armedClip?.armedAtMs ? data.armedClip : null;
       if (typeof data.retentionDays === 'number' && Number.isFinite(data.retentionDays) && data.retentionDays >= 1) {
         this.retentionDays = Math.round(data.retentionDays);
       }
@@ -290,6 +294,7 @@ class GymCamController {
         this.recording = false;
         this.paused = false;
         this.cameras = [];
+        this.serverArmedClip = null;
         if (was) this.changed.emit();
       }
       return {
@@ -373,11 +378,25 @@ class GymCamController {
     this.changed.emit();
   }
 
-  armSet(s: LiftSession, se: SessionEx, set: LiftSet, cameras?: string | string[]): boolean {
-    if (!this.online) return false;
+  armSet(s: LiftSession, se: SessionEx, set: LiftSet, cameras?: string | string[], startEpochMs?: number): boolean {
     const raw = normalizeCamList(cameras);
     const list = raw.length ? raw : [DEFAULT_FALLBACK_CAM];
-    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: this.serverNowMs(), camera: list[0], cameras: list };
+    const startMs = startEpochMs ?? (this.online ? this.serverNowMs() : Date.now());
+    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: startMs, camera: list[0], cameras: list };
+    this.changed.emit();
+    return true;
+  }
+
+  /** Adopts an active OptiPlex `serverArmedClip` latch onto `set` if the phone missed the voice arm event. */
+  adoptServerArmedForSet(s: LiftSession, se: SessionEx, set: LiftSet, cameras?: string | string[]): boolean {
+    const srv = this.serverArmedClip;
+    if (!srv?.armedAtMs || srv.guest || this.isArmed(set.id)) return false;
+    const raw = normalizeCamList(
+      cameras ?? (srv.camera ? [srv.camera] : camsForExercise(lifts.exOrStub(se.exId), lifts.row(se.exId), se, this.cameras)),
+    );
+    const list = raw.length ? raw : [DEFAULT_FALLBACK_CAM];
+    this.armed = { sessionId: s.id, exUid: se.uid, setId: set.id, startEpochMs: srv.armedAtMs, camera: list[0], cameras: list };
+    this.serverArmedClip = null;
     this.changed.emit();
     return true;
   }

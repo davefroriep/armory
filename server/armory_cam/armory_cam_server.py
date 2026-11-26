@@ -48,9 +48,9 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
 try:
-    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService
+    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word
 except ImportError:
-    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService
+    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word
 
 try:
     from .room_audio import RoomAudioRecorder
@@ -3189,6 +3189,7 @@ class ArmoryCamService:
         self.active_session_name: str = ""
         self.recording: bool = False
         self.paused: bool = False
+        self.server_armed_clip: dict[str, Any] | None = None
 
         self.ring_segments: dict[str, list[SegmentInfo]] = {}
         self.seen_files: set[str] = set()
@@ -6475,7 +6476,7 @@ class ArmoryCamService:
                 str(tmp_vid),
             ]
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=enc_timeout)
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=enc_timeout)
             except subprocess.TimeoutExpired:
                 self.log.warning("FFmpeg clip encode timed out after %ss", enc_timeout)
                 tmp_vid.unlink(missing_ok=True)
@@ -6525,7 +6526,7 @@ class ArmoryCamService:
                     str(tmp_mux),
                 ]
                 try:
-                    mres = subprocess.run(mux_cmd, capture_output=True, text=True, timeout=mux_timeout)
+                    mres = subprocess.run(mux_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=mux_timeout)
                 except subprocess.TimeoutExpired:
                     self.log.warning("FFmpeg audio mux timed out after %ss", mux_timeout)
                     tmp_mux.unlink(missing_ok=True)
@@ -7232,6 +7233,8 @@ class ArmoryCamService:
                 ],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=8,
             )
             if res.returncode == 0 and res.stdout.strip():
@@ -7428,7 +7431,7 @@ class ArmoryCamService:
                     "+faststart",
                     str(tmp_out),
                 ]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45)
                 if res.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
                     return {"ok": False, "error": res.stderr.strip() or "Failed to strip audio"}, 500
                 tmp_out.replace(target)
@@ -7462,7 +7465,7 @@ class ArmoryCamService:
                     "+faststart",
                     str(tmp_out),
                 ]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45)
                 if res.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
                     return {"ok": False, "error": res.stderr.strip() or "Failed to mux room audio"}, 500
                 tmp_out.replace(target)
@@ -8223,6 +8226,7 @@ class ArmoryCamService:
             "disk": self.disk_stats(),
             "calibration": self.calibration_status(),
             "preview": self.preview_drive_info(),
+            "armedClip": self.active_server_armed_clip(),
             "cameras": cams,
             "wallboard": wb_status,
             "voice": self.voice.status_dict(),
@@ -8243,6 +8247,93 @@ class ArmoryCamService:
         with self.lock:
             cfg = WallboardConfig.from_dict(self.wallboard_cfg.to_dict())
         return self.adb.schedule_sleep(cfg, delay_sec=0.0, reason="display_off")
+
+    def arm_server_clip(self, camera: str | None = None, guest: bool = False) -> dict[str, Any]:
+        """Idempotently arm OptiPlex server-hosted clip recording, preserving the original start timestamp."""
+        now_ms = int(time.time() * 1000)
+        with self.lock:
+            cur = self.server_armed_clip
+            if (
+                isinstance(cur, dict)
+                and (now_ms - int(cur.get("armedAtMs") or 0)) < 300_000
+                and bool(cur.get("guest")) == bool(guest)
+            ):
+                if camera:
+                    cur["camera"] = camera
+                return dict(cur)
+            entry = {
+                "armedAtMs": now_ms,
+                "camera": camera,
+                "guest": bool(guest),
+                "sessionId": self.active_session_id or "",
+            }
+            self.server_armed_clip = entry
+            return dict(entry)
+
+    def clear_server_armed_clip(self) -> dict[str, Any] | None:
+        with self.lock:
+            cur = self.server_armed_clip
+            self.server_armed_clip = None
+            return dict(cur) if isinstance(cur, dict) else None
+
+    def active_server_armed_clip(self, max_age_ms: int = 300_000) -> dict[str, Any] | None:
+        now_ms = int(time.time() * 1000)
+        with self.lock:
+            cur = self.server_armed_clip
+            if not isinstance(cur, dict):
+                return None
+            if (now_ms - int(cur.get("armedAtMs") or 0)) >= max_age_ms:
+                self.server_armed_clip = None
+                return None
+            return dict(cur)
+
+    def cut_server_armed_or_recent_clip(self, *, mode: str = "armed", camera: str | None = None) -> list[dict[str, Any]]:
+        """Cut a clip directly on OptiPlex when saving an armed clip or 'clip that' without the phone app."""
+        now_ms = int(time.time() * 1000)
+        armed = self.clear_server_armed_clip()
+        with self.lock:
+            enabled_cams = [c.name for c in self.cameras if c.enabled]
+            active_sid = self.active_session_id or ""
+            active_name = self.active_session_name or ""
+
+        if mode == "armed":
+            if not armed:
+                return []
+            start_ms = int(armed["armedAtMs"])
+            end_ms = max(start_ms + 3000, now_ms + 1500)
+            cam = camera or armed.get("camera")
+            cams = [cam] if cam else (enabled_cams[:2] if enabled_cams else ["Rack Cam"])
+            ex_name = "Guest Clip" if armed.get("guest") else (active_name or "Gym Clip")
+            sid = str(armed.get("sessionId") or active_sid or f"motion_{datetime.now().strftime('%Y-%m-%d')}")
+            return self.cut_clips_multi(
+                session_id=sid,
+                ex_name=ex_name,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                cameras=cams,
+            )
+
+        # mode == "clip_last"
+        if armed and (now_ms - int(armed.get("armedAtMs") or 0)) >= 2000:
+            start_ms = int(armed["armedAtMs"])
+            end_ms = max(start_ms + 3000, now_ms + 1500)
+            cam = camera or armed.get("camera")
+            ex_name = "Guest Clip" if armed.get("guest") else (active_name or "Gym Clip")
+            sid = str(armed.get("sessionId") or active_sid or f"motion_{datetime.now().strftime('%Y-%m-%d')}")
+        else:
+            start_ms = now_ms - 25_000
+            end_ms = now_ms
+            cam = camera
+            ex_name = active_name or "Gym Clip"
+            sid = active_sid or f"motion_{datetime.now().strftime('%Y-%m-%d')}"
+        cams = [cam] if cam else ["Rack Cam"]
+        return self.cut_clips_multi(
+            session_id=sid,
+            ex_name=ex_name,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            cameras=cams,
+        )
 
     def _handle_local_voice_command(self, transcript: str) -> dict[str, Any] | None:
         show_match = self.shows.match_voice_command(
@@ -8304,29 +8395,78 @@ class ArmoryCamService:
             }
 
         parsed = parse_display_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
-        if not parsed:
-            return None
-        targets = parsed.get("targets") or [parsed["target"]]
-        if parsed["target"] == "multi" and isinstance(targets, list) and len(targets) > 1:
-            res = self.displays.execute_many(targets, parsed["action"])
-        else:
-            res = self.displays.execute(parsed["target"], parsed["action"])
-        silent = bool(parsed.get("silent"))
-        ok = bool(res.get("ok"))
-        raw_speech = str(parsed.get("speech") or "").strip()
-        err_msg = str(res.get("error") or "Display command failed").strip()
-        speech = "" if silent else (raw_speech if ok else err_msg)
-        ack_label = raw_speech or str(res.get("message") or "Done").strip()
-        return {
-            "handled": True,
-            "ok": ok,
-            "target": parsed["target"],
-            "targets": targets,
-            "action": parsed["action"],
-            "speech": speech,
-            "ackText": f"✓ {ack_label}" if ok else f"✗ {err_msg}",
-            "result": res,
-        }
+        if parsed:
+            targets = parsed.get("targets") or [parsed["target"]]
+            if parsed["target"] == "multi" and isinstance(targets, list) and len(targets) > 1:
+                res = self.displays.execute_many(targets, parsed["action"])
+            else:
+                res = self.displays.execute(parsed["target"], parsed["action"])
+            silent = bool(parsed.get("silent"))
+            ok = bool(res.get("ok"))
+            raw_speech = str(parsed.get("speech") or "").strip()
+            err_msg = str(res.get("error") or "Display command failed").strip()
+            speech = "" if silent else (raw_speech if ok else err_msg)
+            ack_label = raw_speech or str(res.get("message") or "Done").strip()
+            return {
+                "handled": True,
+                "ok": ok,
+                "target": parsed["target"],
+                "targets": targets,
+                "action": parsed["action"],
+                "speech": speech,
+                "ackText": f"✓ {ack_label}" if ok else f"✗ {err_msg}",
+                "result": res,
+            }
+
+        cam_cmd = parse_camera_voice_command(transcript, wake_word=self.voice.cfg.wake_word)
+        if cam_cmd:
+            with self.voice.lock:
+                phone_session_live = bool(
+                    self.voice.sse_clients > 0 and (self.voice.context_active or self.voice.wallboard_active)
+                )
+            act = cam_cmd.get("action")
+            cam = cam_cmd.get("camera")
+            short_cam = re.sub(r"\s+cam$", "", cam, flags=re.IGNORECASE) if cam else ""
+            if act == "arm":
+                is_guest = bool(cam_cmd.get("guest"))
+                armed_info = self.arm_server_clip(camera=cam, guest=is_guest)
+                if not phone_session_live:
+                    speech = (
+                        f"Guest recording {short_cam}".strip()
+                        if is_guest
+                        else (f"Recording {short_cam}" if short_cam else "Recording")
+                    )
+                    return {
+                        "handled": True,
+                        "ok": True,
+                        "target": "camera",
+                        "action": "arm",
+                        "speech": speech,
+                        "ackText": f"🎥 {speech}…",
+                        "armedClip": armed_info,
+                    }
+                # Active phone workout session connected: let SSE deliver to session.ts while keeping server_armed_clip latched
+                return None
+            if act in ("stop", "clip_last") or (
+                act == "commit_done" and self.active_server_armed_clip() is not None
+            ):
+                if not phone_session_live:
+                    clips = self.cut_server_armed_or_recent_clip(
+                        mode="clip_last" if act == "clip_last" else "armed",
+                        camera=cam,
+                    )
+                    ok = bool(clips)
+                    speech = "Clip saved" if ok else "Could not save clip"
+                    return {
+                        "handled": True,
+                        "ok": ok,
+                        "target": "camera",
+                        "action": act,
+                        "speech": speech,
+                        "ackText": "✓ Clip saved on OptiPlex" if ok else "✗ No matching video segments",
+                        "clips": clips,
+                    }
+        return None
 
     def play_house_audio_test(self, params: dict[str, Any]) -> dict[str, Any]:
         """Execute an explicit House Audio / Mode Test Bench cue with direct S330 fallback support."""
@@ -17126,6 +17266,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             "paused": paused,
             "retentionDays": ret_days,
             "cameras": cams,
+            "armedClip": service.active_server_armed_clip(),
             "voice": {
                 "enabled": vx["enabled"],
                 "ready": vx["ready"],
@@ -17351,7 +17492,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         else:
             with service.adb.lock:
                 service.adb.manual_sleep_active = False
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "armedClip": service.active_server_armed_clip()})
 
     @app.post("/api/wallboard/wake")
     def api_wallboard_wake() -> Response:
@@ -18501,6 +18642,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             "POST /api/clip saved %d clip(s): sid=%s ex=%s files=%s",
             len(clips), sid, ex_name, [c.get("fileName") for c in clips],
         )
+        service.clear_server_armed_clip()
         return jsonify({**clips[0], "clips": clips})
 
     @app.post("/api/clip/auto-pr")
@@ -18621,6 +18763,89 @@ def create_app(service: ArmoryCamService) -> Flask:
         return _serve_mp4_from_root(service.previews_root, relpath)
 
     return app
+
+
+_CAM_VOICE_TOK_RE = r"smith\s+wide|fly\s+machine|chest\s+fly|pec\s+deck|leg\s+machine|rack|smith|fly|leg"
+_CAM_VOICE_MAP = {
+    "rack": "Rack Cam",
+    "smith": "Smith Cam",
+    "smith wide": "Smith Wide",
+    "fly": "Fly Machine Cam",
+    "fly machine": "Fly Machine Cam",
+    "chest fly": "Fly Machine Cam",
+    "pec deck": "Fly Machine Cam",
+    "leg": "Leg Machine Cam",
+    "leg machine": "Leg Machine Cam",
+}
+
+
+def _map_camera_voice_tok(tok: str | None) -> str | None:
+    clean = re.sub(r"\s+", " ", str(tok or "").strip().lower())
+    return _CAM_VOICE_MAP.get(clean)
+
+
+def parse_camera_voice_command(transcript: str, wake_word: str = "hey armory") -> dict[str, Any] | None:
+    """Parse camera arm/stop/clip/done voice triggers for OptiPlex-hosted fallback and server timestamp latching."""
+    tail = strip_wake_word(transcript, wake_word).strip().lower()
+    tail = re.sub(r"[—–\-/,]+", " ", tail)
+    tail = re.sub(r"['’]", "", tail)
+    tail = re.sub(r"^[.,!?:;\s]+|[.,!?:;\s]+$", "", tail)
+    tail = re.sub(r"\s+", " ", tail).strip()
+    if not tail:
+        return None
+    tail = re.sub(r"^(?:please|uh|um|hey|ok|okay|alright|go\s+ahead(?:\s+and)?)\s+", "", tail)
+    tail = re.sub(r"\s+(?:please|thanks|thank\s+you|now|alright|okay|ok|yeah|yep|lets\s+go)$", "", tail).strip()
+    if not tail:
+        return None
+
+    m_stop = re.match(
+        rf"^(?:stop|end|finish)\s+(?:recording|camera|cam|guest(?:\s+clip|\s+recording)?)(?:\s+(?:on\s+)?(?:the\s+)?({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?)?$",
+        tail,
+    )
+    if m_stop:
+        return {"action": "stop", "camera": _map_camera_voice_tok(m_stop.group(1))}
+
+    m_guest_a = re.match(
+        rf"^(?:guest\s+(?:record|camera|cam|clip)|(?:record|start|arm)\s+guest(?:\s+clip|\s+set|\s+cam(?:era)?)?)(?:\s+(?:on\s+)?(?:the\s+)?({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?)?$",
+        tail,
+    )
+    if m_guest_a:
+        return {"action": "arm", "guest": True, "camera": _map_camera_voice_tok(m_guest_a.group(1))}
+
+    m_guest_b = re.match(rf"^guest\s+({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?$", tail)
+    if m_guest_b:
+        return {"action": "arm", "guest": True, "camera": _map_camera_voice_tok(m_guest_b.group(1))}
+
+    m_arm_a = re.match(
+        rf"^(?:({_CAM_VOICE_TOK_RE})\s+)?(?:camera|cam|(?:record|film)(?:\s+(?:me|this(?:\s+set)?|my\s+set|that|set))?|(?:start|arm)\s+(?:camera|recording))(?:\s+(?:on\s+)?(?:the\s+)?({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?)?$",
+        tail,
+    )
+    if m_arm_a:
+        cam = _map_camera_voice_tok(m_arm_a.group(1) or m_arm_a.group(2))
+        return {"action": "arm", "guest": False, "camera": cam}
+
+    m_arm_b = re.match(
+        rf"^(?:start|arm|record|film|camera)\s+(?:on\s+)?(?:the\s+)?({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?$",
+        tail,
+    )
+    if m_arm_b:
+        return {"action": "arm", "guest": False, "camera": _map_camera_voice_tok(m_arm_b.group(1))}
+
+    m_clip_a = re.match(
+        rf"^(?:clip\s+that|save\s+clip|clip\s+last(?:\s+set)?|clip\s+set)(?:\s+(?:on\s+|from\s+)?(?:the\s+)?({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?)?$",
+        tail,
+    )
+    if m_clip_a:
+        return {"action": "clip_last", "camera": _map_camera_voice_tok(m_clip_a.group(1))}
+
+    m_clip_b = re.match(rf"^clip\s+(?:on\s+|from\s+)?(?:the\s+)?({_CAM_VOICE_TOK_RE})(?:\s+cam(?:era)?)?$", tail)
+    if m_clip_b:
+        return {"action": "clip_last", "camera": _map_camera_voice_tok(m_clip_b.group(1))}
+
+    if re.match(r"^(?:check|check\s+it|check\s+set|log|log\s+it|log\s+set|done|got\s+it|crushed\s+it|nailed\s+it)$", tail):
+        return {"action": "commit_done", "camera": None}
+
+    return None
 
 
 def run_server(root_dir: Path | None = None, port_override: int | None = None) -> None:

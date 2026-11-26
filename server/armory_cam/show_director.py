@@ -2824,6 +2824,8 @@ def _probe_media_duration_sec(media_path: Path, ffmpeg_bin: str) -> float:
             ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             **_no_window_kwargs(),
         )
@@ -2839,6 +2841,8 @@ def _probe_media_duration_sec(media_path: Path, ffmpeg_bin: str) -> float:
                 [ffmpeg_bin, "-i", str(media_path)],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
                 **_no_window_kwargs(),
             )

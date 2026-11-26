@@ -907,6 +907,9 @@ describe('wallboard snapshot & routing', () => {
     expect(defaultReadbackForIntent({ kind: 'wb_switch_view' })).toBe('Switching views');
     expect(voiceIntentKey({ kind: 'wb_switch_view' })).toBe('wb_switch_view');
     expect(defaultReadbackForIntent({ kind: 'wb_close_replay' })).toBe('Closing video');
+    expect(defaultReadbackForIntent({ kind: 'cam_arm' })).toBe('Recording');
+    expect(defaultReadbackForIntent({ kind: 'cam_arm', camera: 'Rack Cam' })).toBe('Recording Rack');
+    expect(defaultReadbackForIntent({ kind: 'cam_guest' })).toBe('Guest recording');
     expect(defaultReadbackForIntent({ kind: 'cam_guest', camera: 'Smith Cam' })).toBe('Guest camera Smith');
 
     expect(DEFAULTS.gymCamBuddyMode).toBe(false);

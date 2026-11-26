@@ -346,7 +346,7 @@ class RoomAudioRecorder:
                     "+faststart",
                     str(tmp_out),
                 ]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45)
                 if res.returncode != 0 or not tmp_out.is_file() or tmp_out.stat().st_size == 0:
                     self.log.warning("RoomAudio extract failed: %s", res.stderr.strip())
                     tmp_out.unlink(missing_ok=True)
