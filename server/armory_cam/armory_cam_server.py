@@ -17961,6 +17961,7 @@ def create_app(service: ArmoryCamService) -> Flask:
             payload = {
                 "port": service.port,
                 "retentionDays": service.retention_days,
+                "audioSyncOffsetMs": service.audio_sync_offset_ms,
                 "preRollSec": service.pre_roll_sec,
                 "driveBackupDir": service.drive_backup_dir,
                 "bumpAlertNtfy": service.bump_alert_ntfy,
