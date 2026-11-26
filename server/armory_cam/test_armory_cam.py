@@ -5760,6 +5760,15 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertIn("end", duck_events)
         self.assertFalse(svc._wake_duck_held)
 
+        # Stale afterId higher than post-restart event_seq must NEVER drop new SSE events!
+        svc._stop_event.clear()
+        stream = svc.subscribe_sse(after_id=svc.event_seq + 999999)
+        _ = next(stream)
+        svc._emit_transcript("record this", latency_ms=150, from_oww=True)
+        frame = next(stream).decode("utf-8")
+        stream.close()
+        self.assertIn("Armory, record this", frame)
+
     def test_dual_stage_listening_vs_speaking_ducking_and_dashboard_api(self) -> None:
         state = {"vol": -10.0, "cmds": []}
 

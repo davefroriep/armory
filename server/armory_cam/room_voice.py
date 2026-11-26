@@ -2225,7 +2225,7 @@ class RoomVoiceService:
         self._last_spoken_mono: float = 0.0
 
         self.seq = 0
-        self.event_seq = 0
+        self.event_seq = int(time.time() * 1000)
         self._events: deque[dict[str, Any]] = deque(maxlen=40)
         self.recent_transcripts: deque[dict[str, Any]] = deque(maxlen=MAX_RECENT_TRANSCRIPTS)
 
@@ -2870,7 +2870,8 @@ class RoomVoiceService:
             self.sse_clients += 1
             self.last_client_seen_mono = time.monotonic()
             last_seq = self.seq
-            last_ev_id = int(after_id or 0)
+            req_after = int(after_id or 0)
+            last_ev_id = self.event_seq if req_after > self.event_seq else req_after
             self._bump_status_locked()
         try:
             init_payload = json.dumps({"type": "status", **self.status_dict()}, separators=(",", ":"))
