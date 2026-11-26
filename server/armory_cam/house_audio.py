@@ -717,7 +717,31 @@ class DenonAvrClient:
                     )
                     desired_db = out_tgt if want_out else saved
                     if abs(desired_db - cur_ducked) >= 0.9:
-                        if self._ramp_volume(cur_ducked, desired_db, max(1, min(2, cfg.denon_ramp_steps)), min(50, cfg.denon_ramp_step_ms)):
+                        steps_n = max(1, min(2, cfg.denon_ramp_steps))
+                        step_d = min(50, cfg.denon_ramp_step_ms)
+                        is_restore_up = (not want_out) and (desired_db > cur_ducked)
+                        if is_restore_up and self._allow_network and self._http_get is None:
+                            # Output duck is Off (e.g. Cube MAY_DUCK owns voice): ramp Denon back up
+                            # asynchronously so voice playback starts ~200-250ms faster!
+                            start_from = float(cur_ducked)
+                            target_to = float(desired_db)
+                            self._ducked_db = target_to
+                            cur_ducked = target_to
+                            self.last_duck_info = {
+                                "ducked": True,
+                                "stage": "output",
+                                "mode": out_mode,
+                                "fromDb": saved,
+                                "toDb": target_to,
+                                "dropDb": round(saved - target_to, 1),
+                                "asyncRestore": True,
+                                "at": _utc_iso_now(),
+                            }
+                            def _bg_restore() -> None:
+                                with self._lock:
+                                    self._ramp_volume(start_from, target_to, steps_n, step_d)
+                            threading.Thread(target=_bg_restore, name="denon-output-restore", daemon=True).start()
+                        elif self._ramp_volume(cur_ducked, desired_db, steps_n, step_d):
                             actual = self._last_ramp_db if self._last_ramp_db is not None else desired_db
                             self._ducked_db = actual
                             cur_ducked = actual
@@ -953,6 +977,8 @@ class FireTvCubeAudioClient:
         self._sleep = sleep_fn or time.sleep
         self._allow_network = bool(allow_network)
         self.last_health: dict[str, Any] = {"ok": False, "error": "Not polled yet"}
+        self._last_health_mono: float = 0.0
+        self._last_health_key: str = ""
         self.last_adb_probe: dict[str, Any] = {}
 
     def _do_get(self, url: str, timeout: float = 0.9) -> tuple[int, bytes]:
@@ -1012,7 +1038,27 @@ class FireTvCubeAudioClient:
         except Exception as exc:
             res = {"ok": False, "error": str(exc)}
         self.last_health = res
+        if res.get("ok"):
+            self._last_health_mono = time.monotonic()
+            self._last_health_key = f"{host}:{int(port)}"
+        else:
+            self._last_health_mono = 0.0
         return res
+
+    def cached_health(self, host: str, port: int = 8767, max_age_sec: float = 15.0) -> dict[str, Any]:
+        """Return recent OK Cube health without blocking on HTTP when fresh within `max_age_sec`."""
+        key = f"{host}:{int(port)}"
+        if (
+            self.last_health.get("ok")
+            and self._last_health_key == key
+            and self._last_health_mono > 0.0
+            and (time.monotonic() - self._last_health_mono) <= float(max_age_sec)
+        ):
+            return dict(self.last_health)
+        return self.health(host, port)
+
+    def invalidate_health_cache(self) -> None:
+        self._last_health_mono = 0.0
 
     def play_audio_bytes(
         self,
@@ -1441,14 +1487,24 @@ class HouseAudioManager:
         if cfg.output_route == "cube":
             return "cube"
         # "auto": play on Cube only when Denon is ON on Media Player AND Cube :8767/health is alive
+        use_cache = bool(self.allow_network and self.denon._http_get is None)
         if cfg.denon_enabled and cfg.denon_host:
-            den_st = denon_status if denon_status is not None else self.denon.get_status()
+            den_st = (
+                denon_status
+                if denon_status is not None
+                else (self.denon.get_cached_status(max_age_sec=8.0) if use_cache else self.denon.get_status())
+            )
             if not den_st.get("ok") or den_st.get("power") != "ON":
                 return "s330"
             inp = str(den_st.get("input") or "").upper()
             if inp not in ("MPLAY", "MEDIA PLAYER"):
                 return "s330"
-        health = cube_health if cube_health is not None else self.cube.health(cfg.cube_host, cfg.cube_port)
+        use_cube_cache = bool(self.allow_network and self.cube._http_get is None)
+        health = (
+            cube_health
+            if cube_health is not None
+            else (self.cube.cached_health(cfg.cube_host, cfg.cube_port, max_age_sec=15.0) if use_cube_cache else self.cube.health(cfg.cube_host, cfg.cube_port))
+        )
         res_target = "cube" if health.get("ok") else "s330"
         if not health.get("ok"):
             self._maybe_auto_revive_cube(cfg)
@@ -1486,6 +1542,7 @@ class HouseAudioManager:
             )
         if res.get("ok"):
             return {"handled": True, "route": "cube", "mode": mode, "durationSec": dur_sec}
+        self.cube.invalidate_health_cache()
         self._maybe_auto_revive_cube(cfg)
         return {
             "handled": False,

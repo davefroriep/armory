@@ -18,6 +18,7 @@ import ctypes
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 import glob
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -2350,6 +2351,7 @@ class WallboardRelay:
                 "todayItems": list(obj["todayItems"]),
                 "completedItems": list(obj.get("completedItems") or []) if isinstance(obj.get("completedItems"), list) else [],
                 "nextUp": dict(obj["nextUp"]) if isinstance(obj.get("nextUp"), dict) else None,
+                "upcomingDays": dict(obj["upcomingDays"]) if isinstance(obj.get("upcomingDays"), dict) else {},
             }
             if isinstance(obj.get("isRestDay"), bool):
                 rec["isRestDay"] = obj["isRestDay"]
@@ -2364,13 +2366,25 @@ class WallboardRelay:
         completed_items: list[Any] | None = None,
         next_up: dict[str, Any] | None = None,
         is_rest_day: bool | None = None,
+        upcoming_days: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        clean_upcoming: dict[str, Any] = {}
+        if isinstance(upcoming_days, dict):
+            for k, v in upcoming_days.items():
+                if isinstance(k, str) and len(k) == 10 and isinstance(v, dict):
+                    clean_upcoming[k] = {
+                        "weekLabel": str(v.get("weekLabel") or ""),
+                        "todayItems": list(v.get("todayItems") or []) if isinstance(v.get("todayItems"), list) else [],
+                        "isRestDay": bool(v.get("isRestDay", False)),
+                        "nextUp": dict(v["nextUp"]) if isinstance(v.get("nextUp"), dict) else None,
+                    }
         rec: dict[str, Any] = {
             "ymd": ymd,
             "weekLabel": week_label,
             "todayItems": list(today_items),
             "completedItems": list(completed_items or []),
             "nextUp": dict(next_up) if isinstance(next_up, dict) else None,
+            "upcomingDays": clean_upcoming,
         }
         if isinstance(is_rest_day, bool):
             rec["isRestDay"] = is_rest_day
@@ -2379,30 +2393,37 @@ class WallboardRelay:
         tmp.replace(self.standby_cache_path)
         return rec
 
-    def get_html(self) -> str:
+    def _raw_html_source(self) -> str:
         repo_html: str | None = None
-        repo_mtime = 0.0
         if self.repo_page_ts_path.is_file():
             repo_html = extract_wallboard_html_from_ts(self.repo_page_ts_path)
-            if repo_html:
-                repo_mtime = self.repo_page_ts_path.stat().st_mtime
-
         cache_html: str | None = None
-        cache_mtime = 0.0
         if self.cache_html_path.is_file():
             try:
                 txt = self.cache_html_path.read_text(encoding="utf-8")
                 if "<!doctype html" in txt[:200].lower():
                     cache_html = txt
-                    cache_mtime = self.cache_html_path.stat().st_mtime
             except Exception:
                 pass
-
         if repo_html:
-            return inject_wallboard_stage_overlay(repo_html)
+            return repo_html
         if cache_html:
-            return inject_wallboard_stage_overlay(cache_html)
-        return inject_wallboard_stage_overlay(FALLBACK_WALLBOARD_HTML)
+            return cache_html
+        return FALLBACK_WALLBOARD_HTML
+
+    def get_html_version(self) -> str:
+        raw = self._raw_html_source()
+        return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+    def get_html(self) -> str:
+        raw = self._raw_html_source()
+        ver = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        out = inject_wallboard_stage_overlay(raw)
+        ver_tag = f'<script>window.__WB_HTML_VER={json.dumps(ver)};</script>'
+        idx = out.lower().rfind("</body>")
+        if idx >= 0:
+            return out[:idx] + ver_tag + out[idx:]
+        return out + ver_tag
 
     def save_uploaded_html(self, html: str) -> bool:
         if not isinstance(html, str) or "<!doctype html" not in html[:200].lower():
@@ -2419,9 +2440,34 @@ class WallboardRelay:
         ymd = dt.strftime("%Y-%m-%d")
         with self.cond:
             saved = dict(self.saved_standby) if self.saved_standby else None
-        synced = bool(saved and saved.get("ymd") == ymd)
+        exact_sync = bool(saved and saved.get("ymd") == ymd)
+        upcoming_day: dict[str, Any] | None = None
+        if not exact_sync and saved and isinstance(saved.get("upcomingDays"), dict):
+            cand = saved["upcomingDays"].get(ymd)
+            if isinstance(cand, dict):
+                upcoming_day = cand
+        synced = bool(exact_sync or upcoming_day is not None)
+        if exact_sync and saved:
+            wk_lbl = str(saved.get("weekLabel") or "")
+            t_items = list(saved.get("todayItems") or [])
+            c_items = list(saved.get("completedItems") or [])
+            nxt_up = dict(saved["nextUp"]) if isinstance(saved.get("nextUp"), dict) else None
+            rest_flag = saved.get("isRestDay") if isinstance(saved.get("isRestDay"), bool) else None
+        elif upcoming_day is not None:
+            wk_lbl = str(upcoming_day.get("weekLabel") or "")
+            t_items = list(upcoming_day.get("todayItems") or [])
+            c_items = []
+            nxt_up = dict(upcoming_day["nextUp"]) if isinstance(upcoming_day.get("nextUp"), dict) else None
+            rest_flag = upcoming_day.get("isRestDay") if isinstance(upcoming_day.get("isRestDay"), bool) else None
+        else:
+            wk_lbl = ""
+            t_items = []
+            c_items = []
+            nxt_up = None
+            rest_flag = None
         return {
             "ts": ts,
+            "htmlVersion": self.get_html_version(),
             "mode": "standby",
             "hr": {
                 "bpm": 0,
@@ -2440,13 +2486,14 @@ class WallboardRelay:
                 "banner": None,
             },
             "standby": {
+                "ymd": ymd,
                 "dateLabel": dt.strftime("%a, %b ") + str(dt.day),
                 "timeLabel": f"{hour12}:{dt.strftime('%M %p')}",
-                "weekLabel": str(saved.get("weekLabel") or "") if synced and saved else "",
-                "todayItems": list(saved.get("todayItems") or []) if synced and saved else [],
-                "completedItems": list(saved.get("completedItems") or []) if synced and saved else [],
-                "nextUp": dict(saved["nextUp"]) if synced and saved and isinstance(saved.get("nextUp"), dict) else None,
-                **({"isRestDay": bool(saved["isRestDay"])} if synced and saved and isinstance(saved.get("isRestDay"), bool) else {}),
+                "weekLabel": wk_lbl,
+                "todayItems": t_items,
+                "completedItems": c_items,
+                "nextUp": nxt_up,
+                **({"isRestDay": bool(rest_flag)} if isinstance(rest_flag, bool) else {}),
                 "scheduleSynced": synced,
             },
         }
@@ -2471,11 +2518,14 @@ class WallboardRelay:
     ) -> None:
         now_ms = int(time.time() * 1000)
         payload = dict(state_obj) if isinstance(state_obj, dict) else self.standby_state_dict(now_ms)
+        payload["htmlVersion"] = self.get_html_version()
         saved_rec: dict[str, Any] | None = None
         if payload.get("mode") == "standby" and isinstance(payload.get("standby"), dict):
             sb = dict(payload["standby"])
             if sb.get("scheduleSynced") is not False:
                 ymd = datetime.fromtimestamp(now_ms / 1000.0).strftime("%Y-%m-%d")
+                existing_up = (self.saved_standby or {}).get("upcomingDays") if isinstance(self.saved_standby, dict) else {}
+                up_in = sb.get("upcomingDays") if isinstance(sb.get("upcomingDays"), dict) else existing_up
                 saved_rec = self._save_standby_schedule(
                     ymd,
                     str(sb.get("weekLabel") or ""),
@@ -2483,8 +2533,11 @@ class WallboardRelay:
                     list(sb.get("completedItems") or []) if isinstance(sb.get("completedItems"), list) else [],
                     dict(sb["nextUp"]) if isinstance(sb.get("nextUp"), dict) else None,
                     sb.get("isRestDay") if isinstance(sb.get("isRestDay"), bool) else None,
+                    up_in if isinstance(up_in, dict) else None,
                 )
+                sb["ymd"] = ymd
                 sb["scheduleSynced"] = True
+                sb.pop("upcomingDays", None)
                 payload["standby"] = sb
         compact = json.dumps(payload, separators=(",", ":")).replace("\r", " ").replace("\n", " ")
         with self.cond:
@@ -15628,6 +15681,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 service.wallboard.sse_clients += 1
                 last_seq = service.wallboard.seq
             try:
+                last_ymd = datetime.now().strftime("%Y-%m-%d")
                 initial = service.wallboard.current_state_json()
                 yield f"data: {initial}\n\n".encode("utf-8")
                 while not service._stop_event.is_set():
@@ -15638,6 +15692,13 @@ def create_app(service: ArmoryCamService) -> Flask:
                         if service.wallboard.seq != last_seq:
                             last_seq = service.wallboard.seq
                             payload = service.wallboard.latest_json or service.wallboard.current_state_json()
+                    cur_ymd = datetime.now().strftime("%Y-%m-%d")
+                    if payload is None and cur_ymd != last_ymd:
+                        last_ymd = cur_ymd
+                        if service.wallboard.mode == "standby":
+                            payload = service.wallboard.current_state_json()
+                    elif payload is not None:
+                        last_ymd = cur_ymd
                     if payload:
                         yield f"data: {payload}\n\n".encode("utf-8")
                     else:

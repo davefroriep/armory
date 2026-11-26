@@ -6034,6 +6034,138 @@ class ShowDirectorTests(unittest.TestCase):
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_two_tier_silent_rescue_gate_cube_cache_and_7day_wallboard_rollover(self) -> None:
+        """Verify Two-Tier Silent Rescue Gate, cached Cube health probes, and 7-day Wallboard midnight rollover."""
+        import room_voice as rv
+        import house_audio as ha
+
+        # 1. Two-Tier Silent Rescue Gate: grey-zone score (0.29 < 0.45) rescues valid command w/o ducking,
+        #    and silently drops music lyrics (0.31) w/o ducking or SSE emit!
+        class _SeqSpotter:
+            ready = True
+            threshold = 0.45
+            latest_score = 0.0
+
+            def __init__(self, scores: list[float]) -> None:
+                self._scores = list(scores)
+                self._i = 0
+
+            def reset(self) -> None:
+                pass
+
+            def push_samples(self, _pcm: np.ndarray, now_mono: float | None = None) -> tuple[bool, float]:
+                sc = self._scores[self._i] if self._i < len(self._scores) else 0.0
+                self._i += 1
+                self.latest_score = sc
+                return (sc >= self.threshold), sc
+
+        ducks: list[str] = []
+        transcripts = iter(["Hey Jarvis, done.", "the waves turn the minutes to hours"])
+        svc = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(
+                wake_word="hey jarvis",
+                wake_engine="openwakeword",
+                wake_threshold=0.45,
+                rescue_threshold=0.10,
+                end_silence_ms=390,
+            ),
+            asr_transcribe_fn=lambda _a, _p, _h: next(transcripts),
+            allow_hardware_audio=False,
+            wake_duck_callbacks={"begin": lambda: (ducks.append("duck"), {"ducked": True})[1]},
+            wake_spotter=_SeqSpotter([0.29] + [0.02] * 80 + [0.31] + [0.02] * 80),
+        )
+        svc.sse_clients = 1
+        svc.context_active = True
+
+        frame = np.zeros(512, dtype=np.float32)
+        t_mono = 100.0
+        for _ in range(162):
+            svc._ingest_pcm16_frame(frame, now_ms=int(t_mono * 1000), now_mono=t_mono)
+            t_mono += 0.032
+
+        self.assertEqual(ducks, [])  # ZERO Denon ducks in grey zone!
+        self.assertEqual(svc._utt_queue.qsize(), 2)
+        item1 = svc._utt_queue.get_nowait()
+        self.assertEqual(len(item1), 4)
+        self.assertTrue(item1[2])  # from_rescue=True
+        e1 = svc._emit_transcript("Hey Jarvis, done.", 220, from_rescue=True, rescue_score=item1[3])
+        self.assertTrue(e1["emitted"])
+        self.assertEqual(len(svc._events), 1)
+        self.assertIn("done", svc._events[-1]["transcript"].lower())
+
+        item2 = svc._utt_queue.get_nowait()
+        e2 = svc._emit_transcript("the waves turn the minutes to hours", 210, from_rescue=True, rescue_score=item2[3])
+        self.assertFalse(e2["emitted"])
+        self.assertTrue(e2.get("rescueDropped"))
+        self.assertEqual(len(svc._events), 1)  # Still only 1 emitted event!
+        self.assertEqual(len(svc.recent_transcripts), 1)  # Music lyric not logged!
+
+        # 2. Cached Cube health avoids redundant HTTP probes within 15s and invalidates cleanly
+        calls: list[str] = []
+        cube = ha.FireTvCubeAudioClient(
+            http_get=lambda u, _t: (calls.append(u), (200, b'{"ok":true,"v":1}'))[1],
+            allow_network=False,
+        )
+        h1 = cube.cached_health("192.168.1.151", 8767, max_age_sec=15.0)
+        h2 = cube.cached_health("192.168.1.151", 8767, max_age_sec=15.0)
+        self.assertTrue(h1["ok"] and h2["ok"])
+        self.assertEqual(len(calls), 1)
+        cube.invalidate_health_cache()
+        cube.cached_health("192.168.1.151", 8767, max_age_sec=15.0)
+        self.assertEqual(len(calls), 2)
+
+        # 3. WallboardRelay 7-day upcomingDays automatic midnight rollover + htmlVersion injection
+        tmp = Path(tempfile.mkdtemp(prefix="armory_wb_7day_"))
+        try:
+            relay = ac.WallboardRelay(tmp)
+            html_out = relay.get_html()
+            ver = relay.get_html_version()
+            self.assertIn(f'window.__WB_HTML_VER="{ver}"', html_out)
+
+            # Save Wed Nov 25 completed state + Thu Nov 26 upcoming projection
+            wed_ms = int(datetime(2026, 11, 25, 19, 45, 0).timestamp() * 1000)
+            thu_ms = int(datetime(2026, 11, 26, 8, 10, 0).timestamp() * 1000)
+            sun_ms = int(datetime(2026, 11, 29, 9, 0, 0).timestamp() * 1000)
+            relay.saved_standby = relay._save_standby_schedule(
+                "2026-11-25",
+                "Wk 2 · Step 8/24",
+                [],
+                completed_items=[{"title": "Lower 1", "equipmentLabel": "Strength", "summary": "52m · 12 sets"}],
+                next_up={"title": "Upper 1", "dateLabel": "Tomorrow"},
+                is_rest_day=False,
+                upcoming_days={
+                    "2026-11-26": {
+                        "weekLabel": "Wk 2 · Step 8/24",
+                        "todayItems": [{"title": "Upper 1", "equipmentLabel": "Strength", "carried": False, "preview": "Bench (3)"}],
+                        "isRestDay": False,
+                        "nextUp": {"title": "Spin Z2", "dateLabel": "Tomorrow"},
+                    },
+                    "2026-11-29": {
+                        "weekLabel": "Wk 2 · Step 10/24",
+                        "todayItems": [],
+                        "isRestDay": True,
+                        "nextUp": {"title": "Lower 2", "dateLabel": "Tomorrow"},
+                    },
+                },
+            )
+            st_wed = relay.standby_state_dict(wed_ms)
+            self.assertEqual(st_wed["htmlVersion"], ver)
+            self.assertTrue(st_wed["standby"]["scheduleSynced"])
+            self.assertEqual(len(st_wed["standby"]["completedItems"]), 1)
+
+            st_thu = relay.standby_state_dict(thu_ms)
+            self.assertTrue(st_thu["standby"]["scheduleSynced"])
+            self.assertEqual(st_thu["standby"]["ymd"], "2026-11-26")
+            self.assertEqual(st_thu["standby"]["todayItems"][0]["title"], "Upper 1")
+            self.assertFalse(st_thu["standby"]["isRestDay"])
+
+            st_sun = relay.standby_state_dict(sun_ms)
+            self.assertTrue(st_sun["standby"]["scheduleSynced"])
+            self.assertTrue(st_sun["standby"]["isRestDay"])
+            self.assertEqual(st_sun["standby"]["todayItems"], [])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

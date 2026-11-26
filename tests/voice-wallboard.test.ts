@@ -1063,6 +1063,13 @@ describe('Wave 2 Wallboard & Voice bounds hardening', () => {
     expect(sbDone.standby!.completedItems![0].equipmentLabel).toBe('Strength');
     expect(sbDone.standby!.completedItems![0].summary).toContain('2 sets');
     expect(sbDone.standby!.nextUp).toEqual({ title: 'Day 2 — Upper 1 + Z5 #1', dateLabel: 'Tomorrow' });
+    // 7-day upcomingDays standby projection lets OptiPlex auto-roll over at midnight without Pixel open
+    expect(Object.keys(sbDone.standby!.upcomingDays ?? {})).toHaveLength(7);
+    expect(sbDone.standby!.upcomingDays!['2026-11-26'].isRestDay).toBe(false);
+    expect(sbDone.standby!.upcomingDays!['2026-11-26'].todayItems.length).toBeGreaterThan(0);
+    expect(sbDone.standby!.upcomingDays!['2026-11-29'].isRestDay).toBe(true);
+    expect(sbDone.standby!.upcomingDays!['2026-11-29'].todayItems).toHaveLength(0);
+    expect(WALLBOARD_HTML).toContain('__WB_HTML_VER');
 
     // True Sunday rest day sets isRestDay: true and empty completedItems
     const sunNow = new Date(2026, 10, 29, 10, 0, 0).getTime(); // Sun Nov 29, 2026

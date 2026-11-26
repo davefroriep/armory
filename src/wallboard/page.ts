@@ -404,6 +404,10 @@ function markFresh() {
 
 function render(st) {
   if (!st) return;
+  if (st.htmlVersion && window.__WB_HTML_VER && st.htmlVersion !== window.__WB_HTML_VER) {
+    try { location.reload(); } catch {}
+    return;
+  }
   lastState = st;
   markFresh();
   const app = document.getElementById('app');
@@ -654,7 +658,8 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) keep
 document.addEventListener('click', keepAwake);
 
 setInterval(() => {
-  const t = new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+  const nowD = new Date();
+  const t = nowD.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
   document.querySelectorAll('.clk, .standby-big').forEach((el) => { el.textContent = t; });
   const stale = !!(lastState && lastState.mode !== 'standby' && Date.now() - lastRxMs > 12000);
   document.body.classList.toggle('stale', stale);
@@ -662,6 +667,10 @@ setInterval(() => {
     const sbEl = document.getElementById('staleBanner');
     const agoT = new Date(lastRxMs).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
     if (sbEl) sbEl.textContent = 'PHONE PAUSED · last update ' + agoT;
+  }
+  if (lastState && lastState.mode === 'standby' && lastState.standby && lastState.standby.ymd) {
+    const localToday = nowD.getFullYear() + '-' + String(nowD.getMonth() + 1).padStart(2, '0') + '-' + String(nowD.getDate()).padStart(2, '0');
+    if (localToday !== lastState.standby.ymd) pollOnce();
   }
 }, 5000);
 

@@ -510,7 +510,8 @@ class RoomVoiceConfig:
     beam_size: int = 1
     wake_word: str = "armory"
     wake_engine: str = "whisper"  # "whisper" | "openwakeword"
-    wake_threshold: float = 0.38
+    wake_threshold: float = 0.45
+    rescue_threshold: float = 0.10  # Two-Tier Silent Rescue Gate: 0.10..wake_threshold checks Whisper w/o ducking (0=off)
     speaker_readback: bool = True
     room_command_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
@@ -532,6 +533,7 @@ class RoomVoiceConfig:
             "wakeWord": self.wake_word,
             "wakeEngine": self.wake_engine,
             "wakeThreshold": round(float(self.wake_threshold), 2),
+            "rescueThreshold": round(float(self.rescue_threshold), 2),
             "speakerReadback": bool(self.speaker_readback),
             "roomCommandReadback": bool(self.room_command_readback),
             "ttsVoice": self.tts_voice,
@@ -575,7 +577,8 @@ class RoomVoiceConfig:
             beam_size=beam_size,
             wake_word=wake,
             wake_engine=wake_engine,
-            wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.38) or 0.38), 0.15, 0.90),
+            wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.45) if raw.get("wakeThreshold") is not None else 0.45), 0.15, 0.90),
+            rescue_threshold=_clamp(float(raw.get("rescueThreshold", 0.10) if raw.get("rescueThreshold") is not None else 0.10), 0.0, 0.40),
             speaker_readback=bool(raw.get("speakerReadback", True)),
             room_command_readback=bool(raw.get("roomCommandReadback", True)),
             tts_voice=tts_voice,
@@ -1189,6 +1192,7 @@ class UtteranceDetector:
         self._speech_frames = 0
         self._idle_frames = 0
         self._active_max_frames = 0
+        self._active_end_silence_frames = 0
         self._collected: list[np.ndarray] = []
         self.latest_rms = 0.0
         self.latest_vad = 0.0
@@ -1213,6 +1217,7 @@ class UtteranceDetector:
         self._speech_frames = 0
         self._idle_frames = 0
         self._active_max_frames = 0
+        self._active_end_silence_frames = 0
         self._collected.clear()
         self.vad.reset()
 
@@ -1222,6 +1227,7 @@ class UtteranceDetector:
         *,
         preroll_sec: float = 1.2,
         max_post_sec: float = 2.6,
+        end_silence_ms: int = 390,
     ) -> None:
         """Start an active utterance seeded with unbroken pre-wake audio so short 1-word commands never clip."""
         self.reset()
@@ -1240,6 +1246,7 @@ class UtteranceDetector:
         self._idle_frames = 0
         post_frames = max(25, int(round((float(max_post_sec) * 1000.0) / 32.0)))
         self._active_max_frames = len(self._collected) + post_frames
+        self._active_end_silence_frames = min(self.end_silence_frames, max(4, int(round(float(end_silence_ms) / 32.0))))
 
     def push_samples(self, samples_16k: np.ndarray, muted: bool = False) -> list[np.ndarray]:
         """Ingest 16 kHz mono float32 samples; returns zero or more completed utterance arrays."""
@@ -1298,8 +1305,9 @@ class UtteranceDetector:
                     self._silence_streak += 1
 
                 eff_max_frames = self._active_max_frames if self._active_max_frames > 0 else self.max_frames
-                if self._silence_streak >= self.end_silence_frames or len(self._collected) >= eff_max_frames:
-                    clean_silence_end = self._silence_streak >= self.end_silence_frames
+                eff_end_sil = self._active_end_silence_frames if self._active_end_silence_frames > 0 else self.end_silence_frames
+                if self._silence_streak >= eff_end_sil or len(self._collected) >= eff_max_frames:
+                    clean_silence_end = self._silence_streak >= eff_end_sil
                     if self._speech_frames >= self.min_speech_frames:
                         completed.append(np.concatenate(self._collected).astype(np.float32))
                     if clean_silence_end:
@@ -1318,6 +1326,7 @@ class UtteranceDetector:
                     self._speech_frames = 0
                     self._idle_frames = 0
                     self._active_max_frames = 0
+                    self._active_end_silence_frames = 0
 
         return completed
 
@@ -2186,6 +2195,11 @@ class RoomVoiceService:
         self._oww_loading = False
         self._oww_preroll: deque[np.ndarray] = deque(maxlen=48)
         self._oww_awaiting_cmd = False
+        self._rescue_active = False
+        self._rescue_chunks: list[np.ndarray] = []
+        self._rescue_post_samples = 0
+        self._rescue_peak_score = 0.0
+        self._rescue_last_mono = 0.0
         self._wake_duck_held = False
         self._release_wake_duck_on_play_done = False
         self._wake_duck_release_timer: threading.Timer | None = None
@@ -2647,6 +2661,8 @@ class RoomVoiceService:
         force_emit: bool = False,
         *,
         from_oww: bool = False,
+        from_rescue: bool = False,
+        rescue_score: float = 0.0,
     ) -> dict[str, Any]:
         clean = re.sub(r"\s+", " ", transcript or "").strip()
         now_ms = int(time.time() * 1000)
@@ -2655,7 +2671,40 @@ class RoomVoiceService:
             client_wake = (self._client_wake_word or wake).strip().lower() or wake
             was_armed = now_ms < self.armed_until_ms
             has_wake = matches_wake_word(clean, wake)
-            if from_oww:
+            if from_rescue:
+                # Two-Tier Silent Rescue Gate: STRICT confirmation required — must match wake word
+                # AND contain a concise, non-hallucinated gym command tail. Otherwise drop 100% silently!
+                cmd_tail = strip_wake_word(clean, wake) if has_wake else ""
+                tail_words = re.findall(r"[a-z0-9]+", cmd_tail.lower())
+                if not has_wake or not cmd_tail or not tail_words or len(tail_words) > 9 or is_hallucination(cmd_tail):
+                    return {
+                        "id": 0,
+                        "tsMs": now_ms,
+                        "transcript": clean,
+                        "wakeMatched": False,
+                        "emitted": False,
+                        "rescueDropped": True,
+                        "latencyMs": int(latency_ms),
+                        "ackText": "",
+                    }
+                self.armed_until_ms = 0
+                self._oww_awaiting_cmd = False
+                display_clean = f"{format_wake_display(wake)}, {cmd_tail}"
+                if client_wake != wake and not matches_wake_word(display_clean, client_wake):
+                    sse_clean = f"{format_wake_display(client_wake)}, {cmd_tail}"
+                    sse_wake = client_wake
+                else:
+                    sse_clean = display_clean
+                    sse_wake = wake
+                has_wake = True
+                emitted = True
+                self.log.info(
+                    "Two-Tier Silent Rescue caught (score=%.3f, %dms): %s",
+                    float(rescue_score),
+                    int(latency_ms),
+                    display_clean,
+                )
+            elif from_oww:
                 cmd_tail = strip_wake_word(clean, wake)
                 if not cmd_tail:
                     # User said lone "Hey Jarvis" and paused; keep armed + Denon ducked waiting for the command!
@@ -3254,6 +3303,9 @@ class RoomVoiceService:
         self._oww_preroll.append(pcm16.copy())
         triggered, score = self._oww_spotter.push_samples(pcm16, now_mono=cur_mono)
         if triggered:
+            self._rescue_active = False
+            self._rescue_chunks.clear()
+            self._rescue_post_samples = 0
             self._mute_until_mono = 0.0
             self.armed_until_ms = cur_ms + ARM_WINDOW_MS
             self._oww_awaiting_cmd = True
@@ -3271,6 +3323,35 @@ class RoomVoiceService:
                 except Exception:
                     pass
             threading.Thread(target=self._on_oww_wake_detected, args=(score,), name="armory-oww-wake", daemon=True).start()
+            return
+
+        # Two-Tier Silent Rescue Gate: grey-zone hits (rescueThreshold <= score < wakeThreshold) capture
+        # quietly in the background without ducking Denon or flashing UI, and verify via GPU Whisper.
+        rescue_thr = float(getattr(self.cfg, "rescue_threshold", 0.0) or 0.0)
+        if self._rescue_active:
+            self._rescue_chunks.append(pcm16.copy())
+            self._rescue_post_samples += int(pcm16.size)
+            if score > self._rescue_peak_score:
+                self._rescue_peak_score = score
+            if self._rescue_post_samples >= int(1.9 * SAMPLE_RATE_16K):
+                cat = np.concatenate(self._rescue_chunks).astype(np.float32, copy=False)
+                pk_sc = self._rescue_peak_score
+                self._rescue_active = False
+                self._rescue_chunks.clear()
+                self._rescue_post_samples = 0
+                self._rescue_peak_score = 0.0
+                self._enqueue_utterance((cat, False, True, pk_sc))
+        elif (
+            rescue_thr > 0.0
+            and rescue_thr <= score < float(self.cfg.wake_threshold)
+            and not muted
+            and (cur_mono - self._rescue_last_mono) >= 2.4
+        ):
+            self._rescue_active = True
+            self._rescue_chunks = list(self._oww_preroll)[-32:]  # ~1.0s unbroken pre-roll
+            self._rescue_post_samples = 0
+            self._rescue_peak_score = score
+            self._rescue_last_mono = cur_mono
 
     def _open_stream(self, *, force_reinit: bool = False) -> bool:
         with self._audio_lock:
@@ -3518,7 +3599,11 @@ class RoomVoiceService:
                 continue
             if self._stop_event.is_set():
                 break
-            if isinstance(raw_item, tuple) and len(raw_item) == 2:
+            from_rescue = False
+            rescue_score = 0.0
+            if isinstance(raw_item, tuple) and len(raw_item) == 4:
+                audio16, from_oww, from_rescue, rescue_score = raw_item
+            elif isinstance(raw_item, tuple) and len(raw_item) == 2:
                 audio16, from_oww = raw_item
             else:
                 audio16, from_oww = raw_item, False
@@ -3534,8 +3619,23 @@ class RoomVoiceService:
             pool = self._local_cmd_pool
             if pool is not None:
                 try:
-                    pool.submit(self._emit_transcript, text, dt_ms, False, from_oww=from_oww)
+                    pool.submit(
+                        self._emit_transcript,
+                        text,
+                        dt_ms,
+                        False,
+                        from_oww=from_oww,
+                        from_rescue=from_rescue,
+                        rescue_score=rescue_score,
+                    )
                     continue
                 except Exception:
                     pass
-            self._emit_transcript(text, latency_ms=dt_ms, force_emit=False, from_oww=from_oww)
+            self._emit_transcript(
+                text,
+                latency_ms=dt_ms,
+                force_emit=False,
+                from_oww=from_oww,
+                from_rescue=from_rescue,
+                rescue_score=rescue_score,
+            )

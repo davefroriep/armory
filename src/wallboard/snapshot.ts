@@ -150,6 +150,20 @@ export interface WallboardStandbyCompletedItem {
   summary: string;
 }
 
+export interface WallboardStandbyItem {
+  title: string;
+  equipmentLabel: string;
+  carried: boolean;
+  preview: string;
+}
+
+export interface WallboardStandbyDay {
+  weekLabel: string;
+  todayItems: WallboardStandbyItem[];
+  isRestDay: boolean;
+  nextUp: { title: string; dateLabel: string } | null;
+}
+
 export interface WallboardState {
   ts: number;
   mode: 'lift' | 'cardio' | 'standby';
@@ -202,14 +216,16 @@ export interface WallboardState {
   };
   cardio?: WallboardCardioSnapshot;
   standby?: {
+    ymd?: string;
     dateLabel: string;
     timeLabel: string;
     weekLabel: string;
-    todayItems: { title: string; equipmentLabel: string; carried: boolean; preview: string }[];
+    todayItems: WallboardStandbyItem[];
     completedItems?: WallboardStandbyCompletedItem[];
     nextUp?: { title: string; dateLabel: string } | null;
     isRestDay?: boolean;
     scheduleSynced?: boolean;
+    upcomingDays?: Record<string, WallboardStandbyDay>;
   };
 }
 
@@ -719,21 +735,28 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
   const step = plan.steps[st.queue.stepIndex];
   const weekLabel = step ? `Wk ${step.week} · Step ${step.index + 1}/${plan.steps.length}` : 'Phase 1 Complete';
   const proj = projectPlan(plan, st.queue, todayYmd, restDay);
-  const todayItems = inp.todayItems.map((it) => {
-    let preview = it.slot.description || '';
-    if (it.equipment === 'strength') {
-      const itemNames = it.items?.length
-        ? it.items.map((x) => `${inp.exOf(x.exId).name} (${x.sets})`)
-        : (matchRoutineByTitle(it.slot.name, inp.routines)?.items ?? []).map((x) => `${inp.exOf(x.exId).name} (${x.sets})`);
+  const buildPreview = (
+    name: string,
+    equipment: Equipment,
+    desc: string,
+    items?: { exId: string; sets: number }[],
+  ): string => {
+    let preview = desc || '';
+    if (equipment === 'strength') {
+      const itemNames = items?.length
+        ? items.map((x) => `${inp.exOf(x.exId).name} (${x.sets})`)
+        : (matchRoutineByTitle(name, inp.routines)?.items ?? []).map((x) => `${inp.exOf(x.exId).name} (${x.sets})`);
       if (itemNames.length) preview = itemNames.slice(0, 4).join(' · ');
     }
-    return {
-      title: it.slot.name,
-      equipmentLabel: EQUIPMENT_LABEL[it.equipment] ?? it.equipment,
-      carried: !!it.carried,
-      preview,
-    };
-  });
+    return preview;
+  };
+
+  const todayItems: WallboardStandbyItem[] = inp.todayItems.map((it) => ({
+    title: it.slot.name,
+    equipmentLabel: EQUIPMENT_LABEL[it.equipment] ?? it.equipment,
+    carried: !!it.carried,
+    preview: buildPreview(it.slot.name, it.equipment, it.slot.description || '', it.items),
+  }));
 
   const liftsDoneToday = (inp.finishedTodayLifts ?? [])
     .filter((x) => x.status === 'done' && localYmd(x.startMs) === todayYmd)
@@ -811,6 +834,47 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     }
   }
 
+  const upcomingDays: Record<string, WallboardStandbyDay> = {};
+  for (let off = 1; off <= 7; off++) {
+    const dYmd = shiftYmd(todayYmd, off);
+    const dItems: WallboardStandbyItem[] = [];
+    let dStep = step;
+    for (const p of proj) {
+      p.step.slots.forEach((slot, si) => {
+        if (p.slotStates[si] === 'pending' && p.slotDates[si] === dYmd) {
+          if (!dItems.length) dStep = p.step;
+          dItems.push({
+            title: slot.name,
+            equipmentLabel: EQUIPMENT_LABEL[slot.equipment] ?? slot.equipment,
+            carried: false,
+            preview: buildPreview(slot.name, slot.equipment, slot.description || ''),
+          });
+        }
+      });
+    }
+    for (const x of st.queue.extras ?? []) {
+      if (!x.doneDate && !x.skippedDate && x.date === dYmd) {
+        dItems.push({
+          title: x.name,
+          equipmentLabel: EQUIPMENT_LABEL[x.equipment] ?? x.equipment,
+          carried: false,
+          preview: buildPreview(x.name, x.equipment, x.description || '', x.items),
+        });
+      }
+    }
+    const dNextProj = proj.find((p) => p.date != null && p.date > dYmd && p.slotStates.some((ss) => ss === 'pending'));
+    const dNextUp = dNextProj?.date
+      ? { title: dNextProj.step.title.replace(/^Wk \d+ · /, ''), dateLabel: fmtStandbyUpcomingDate(dNextProj.date, dYmd) }
+      : null;
+    const dWeekStep = dItems.length ? dStep : (dNextProj?.step ?? step);
+    upcomingDays[dYmd] = {
+      weekLabel: dWeekStep ? `Wk ${dWeekStep.week} · Step ${dWeekStep.index + 1}/${plan.steps.length}` : 'Phase 1 Complete',
+      todayItems: dItems,
+      isRestDay: restDay != null && dayOfWeek(dYmd) === restDay,
+      nextUp: dNextUp,
+    };
+  }
+
   return {
     ts: now,
     mode: 'standby',
@@ -819,6 +883,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     ...(activeCamera ? { camera: activeCamera } : {}),
     ...(activeReplay ? { replay: activeReplay } : {}),
     standby: {
+      ymd: todayYmd,
       dateLabel: d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }),
       timeLabel: d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
       weekLabel,
@@ -826,6 +891,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
       completedItems,
       nextUp,
       isRestDay,
+      upcomingDays,
     },
   };
 }

@@ -352,6 +352,7 @@ class WallboardController {
           c: next.standby.completedItems ?? [],
           n: next.standby.nextUp ?? null,
           r: !!next.standby.isRestDay,
+          u: next.standby.upcomingDays ?? {},
         });
         if (!this.relayBusy && now >= this.relayBackoffUntil
           && (sig !== this.lastStandbySig || (forceRelay && now - this.lastStandbyPushMs >= 5000))) {
