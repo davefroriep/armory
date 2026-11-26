@@ -1476,6 +1476,22 @@ class ArmoryCamTests(unittest.TestCase):
                 svc.check_camera_bump_background(1070.0)
                 time.sleep(0.1)
                 self.assertEqual(m_ntfy.call_count, 1)
+                self.assertTrue((svc.bump_refs_root / "bump_state.json").is_file())
+
+                # Simulated server restart ~1h later still honors persisted 6h cooldown (no duplicate push)
+                svc2 = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestBumpTopic")
+                svc2.cam_connected["rack_cam"] = True
+                svc2.latest_energy = {"rack_cam": 0.1, "fly_machine_cam": 0.1}
+                self.assertEqual(svc2.check_camera_bump_background(4600.0), [])
+                ev_restart = svc2.check_camera_bump_background(4635.0)
+                self.assertEqual(len(ev_restart), 1)
+                self.assertFalse(ev_restart[0]["notified"])
+                time.sleep(0.1)
+                self.assertEqual(m_ntfy.call_count, 1)
+
+                # Refreshing baseline clears persisted cooldown so future bumps alert immediately
+                svc2.capture_bump_baseline("rack_cam")
+                self.assertNotIn("rack_cam", svc2._bump_last_ntfy)
 
                 # When bumpAlertNtfy is disabled -> zero bump image processing occurs
                 svc.bump_alert_ntfy = False

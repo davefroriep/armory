@@ -2612,6 +2612,7 @@ class ArmoryCamService:
         self.previews_root = self.root / "previews"
         self.thumbs_root = self.root / "thumbs"
         self.bump_refs_root = self.root / "bump_refs"
+        self.bump_state_path = self.bump_refs_root / "bump_state.json"
         self.logs_root = self.root / "logs"
         self.config_path = self.root / "config.json"
         self.clips_index_path = self.clips_root / "index.jsonl"
@@ -2702,6 +2703,7 @@ class ArmoryCamService:
         self.motion_record_247: bool = True
         self._bump_strikes: dict[str, int] = {}
         self._bump_last_ntfy: dict[str, float] = {}
+        self._bump_last_shift: dict[str, float] = {}
         self._bump_last_check: dict[str, float] = {}
         self._seg_dims_cache: dict[str, tuple[int, int]] = {}
 
@@ -2757,6 +2759,7 @@ class ArmoryCamService:
         self._started = False
 
         self.load_or_init_config()
+        self._load_bump_state()
         self._rehydrate_ring_index()
 
     @staticmethod
@@ -7036,6 +7039,40 @@ class ArmoryCamService:
                 return img
         return None
 
+    def _load_bump_state(self) -> None:
+        """Restore persisted bump-alert cooldowns so restarts never re-spam recent bump alerts."""
+        try:
+            if not self.bump_state_path.is_file():
+                return
+            raw = json.loads(self.bump_state_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return
+            last_ntfy = raw.get("lastNtfy")
+            if isinstance(last_ntfy, dict):
+                self._bump_last_ntfy = {
+                    str(k): float(v) for k, v in last_ntfy.items() if isinstance(v, (int, float))
+                }
+            last_shift = raw.get("lastShiftPx")
+            if isinstance(last_shift, dict):
+                self._bump_last_shift = {
+                    str(k): float(v) for k, v in last_shift.items() if isinstance(v, (int, float))
+                }
+        except Exception as exc:
+            self.log.debug("Failed loading bump state: %s", exc)
+
+    def _save_bump_state_locked(self) -> None:
+        """Persist bump-alert cooldown timestamps & last alerted shift atomically."""
+        try:
+            payload = {
+                "lastNtfy": {k: round(float(v), 3) for k, v in self._bump_last_ntfy.items()},
+                "lastShiftPx": {k: round(float(v), 1) for k, v in self._bump_last_shift.items()},
+            }
+            tmp_p = self.bump_state_path.with_suffix(".tmp")
+            tmp_p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp_p, self.bump_state_path)
+        except Exception as exc:
+            self.log.debug("Failed saving bump state: %s", exc)
+
     def capture_bump_baseline(self, camera_name: str | None = None) -> dict[str, Any]:
         """Save lightweight 320x180 grayscale baseline PNGs into `bump_refs/<slug>.png` for bump alerts."""
         with self.lock:
@@ -7058,6 +7095,9 @@ class ArmoryCamService:
             if cv2.imwrite(str(out_p), small):
                 with self.lock:
                     self._bump_strikes[phys.slug] = 0
+                    self._bump_last_ntfy.pop(phys.slug, None)
+                    self._bump_last_shift.pop(phys.slug, None)
+                    self._save_bump_state_locked()
                 saved.append(phys.slug)
         return {"ok": bool(saved), "saved": saved}
 
@@ -7113,10 +7153,26 @@ class ArmoryCamService:
                 continue
 
             self._bump_strikes[phys.slug] = 0
-            last_n = self._bump_last_ntfy.get(phys.slug)
-            can_ntfy = bool(topic and (last_n is None or (now_s - last_n) >= BUMP_NTFY_COOLDOWN_SEC))
+            shift_px = float(res["shiftPx"])
+            with self.lock:
+                last_n = self._bump_last_ntfy.get(phys.slug)
+                last_sh = self._bump_last_shift.get(phys.slug)
+                in_cooldown = last_n is not None and 0.0 <= (now_s - last_n) < BUMP_NTFY_COOLDOWN_SEC
+                escalated = bool(in_cooldown and last_sh is not None and shift_px >= (last_sh + BUMP_PX_THRESHOLD))
+                can_ntfy = bool(topic and ((not in_cooldown) or escalated))
+                if can_ntfy:
+                    self._bump_last_ntfy[phys.slug] = now_s
+                    self._bump_last_shift[phys.slug] = shift_px
+                    self._save_bump_state_locked()
+            self.log.info(
+                "Camera bump detected on %s (%.1fpx, %+.1fdeg); notified=%s%s",
+                phys.name,
+                shift_px,
+                float(res["dAngle"]),
+                can_ntfy,
+                " (escalated)" if escalated else ("" if can_ntfy else " (cooldown)"),
+            )
             if can_ntfy:
-                self._bump_last_ntfy[phys.slug] = now_s
                 title = f"Armory Cam Bumped: {phys.name}"
                 msg = (
                     f"{phys.name} appears bumped ({res['shiftPx']:.0f}px, {res['dAngle']:+.1f}°). "
