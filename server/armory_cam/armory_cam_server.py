@@ -97,6 +97,12 @@ BUMP_PX_THRESHOLD = 20.0
 BUMP_DEG_THRESHOLD = 1.8
 BUMP_NTFY_COOLDOWN_SEC = 6 * 3600.0
 BUMP_REF_SIZE = (320, 180)
+BUMP_LIVE_SIZE = (640, 360)
+BUMP_OVERLAY_SIZE = (960, 540)
+BUMP_ALIGNED_PX = 5.0
+BUMP_ALIGNED_DEG = 0.4
+BUMP_CLOSE_PX = 12.0
+BUMP_CLOSE_DEG = 0.9
 WYZE_V3_REF_W = 1920
 WYZE_V3_REF_H = 1080
 WYZE_V3_F_EQ = 965.0
@@ -1255,6 +1261,14 @@ def view_transform_matrix(
 
 _HANN_FULL = cv2.createHanningWindow(BUMP_REF_SIZE, cv2.CV_32F)
 _HANN_HALF = cv2.createHanningWindow((BUMP_REF_SIZE[0] // 2, BUMP_REF_SIZE[1]), cv2.CV_32F)
+_HANN_LIVE_FULL = cv2.createHanningWindow(BUMP_LIVE_SIZE, cv2.CV_32F)
+_HANN_LIVE_HALF = cv2.createHanningWindow((BUMP_LIVE_SIZE[0] // 2, BUMP_LIVE_SIZE[1]), cv2.CV_32F)
+_OVERLAY_COLORS_BGR: dict[str, tuple[int, int, int]] = {
+    "cyan": (255, 238, 56),
+    "lime": (105, 255, 92),
+    "magenta": (245, 90, 255),
+    "amber": (45, 200, 255),
+}
 
 
 def _bump_edge_map(gray_small: np.ndarray) -> np.ndarray:
@@ -1264,42 +1278,127 @@ def _bump_edge_map(gray_small: np.ndarray) -> np.ndarray:
     return mag - float(np.mean(mag))
 
 
-def detect_camera_bump(ref_gray_small: np.ndarray, cur_bgr: np.ndarray) -> dict[str, Any]:
-    """Lightweight phase-correlation camera bump check (~1.2 ms, lighting/brightness invariant)."""
+def detect_camera_bump(
+    ref_gray_small: np.ndarray,
+    cur_bgr: np.ndarray,
+    *,
+    high_res: bool = False,
+    ref_width: float | None = None,
+) -> dict[str, Any]:
+    """Lightweight phase-correlation camera bump check (~1.2 ms bg, ~3 ms live high-res, lighting invariant)."""
     if ref_gray_small is None or ref_gray_small.size == 0 or cur_bgr is None or cur_bgr.size == 0:
-        return {"ok": False, "bumped": False, "shiftPx": 0.0, "dAngle": 0.0, "response": 0.0}
-    if ref_gray_small.shape != (BUMP_REF_SIZE[1], BUMP_REF_SIZE[0]):
-        ref_small = cv2.resize(ref_gray_small, BUMP_REF_SIZE, interpolation=cv2.INTER_AREA)
+        return {
+            "ok": False,
+            "bumped": False,
+            "dxPx": 0.0,
+            "dyPx": 0.0,
+            "shiftPx": 0.0,
+            "dAngle": 0.0,
+            "response": 0.0,
+            "confident": False,
+            "aligned": False,
+            "close": False,
+        }
+    use_hi = bool(high_res and ref_gray_small.shape[1] >= BUMP_LIVE_SIZE[0] and cur_bgr.shape[1] >= BUMP_LIVE_SIZE[0])
+    work_size = BUMP_LIVE_SIZE if use_hi else BUMP_REF_SIZE
+    hann_full = _HANN_LIVE_FULL if use_hi else _HANN_FULL
+    hann_half = _HANN_LIVE_HALF if use_hi else _HANN_HALF
+
+    if ref_gray_small.shape != (work_size[1], work_size[0]):
+        ref_small = cv2.resize(ref_gray_small, work_size, interpolation=cv2.INTER_AREA)
     else:
         ref_small = ref_gray_small
     cur_gray = cv2.cvtColor(cur_bgr, cv2.COLOR_BGR2GRAY) if cur_bgr.ndim == 3 else cur_bgr
-    cur_small = cv2.resize(cur_gray, BUMP_REF_SIZE, interpolation=cv2.INTER_AREA)
+    cur_small = cv2.resize(cur_gray, work_size, interpolation=cv2.INTER_AREA)
 
     if float(np.std(cur_small)) < 6.0 or float(np.std(ref_small)) < 6.0:
-        return {"ok": False, "bumped": False, "shiftPx": 0.0, "dAngle": 0.0, "response": 0.0, "reason": "low_contrast"}
+        return {
+            "ok": False,
+            "bumped": False,
+            "dxPx": 0.0,
+            "dyPx": 0.0,
+            "shiftPx": 0.0,
+            "dAngle": 0.0,
+            "response": 0.0,
+            "confident": False,
+            "aligned": False,
+            "close": False,
+            "reason": "low_contrast",
+        }
 
     e_ref = _bump_edge_map(ref_small)
     e_cur = _bump_edge_map(cur_small)
-    (dx_s, dy_s), resp = cv2.phaseCorrelate(e_ref, e_cur, _HANN_FULL)
-    scale = max(cur_bgr.shape[1] / float(BUMP_REF_SIZE[0]), 1.0)
-    shift_px = math.hypot(float(dx_s), float(dy_s)) * scale
+    (dx_s, dy_s), resp = cv2.phaseCorrelate(e_ref, e_cur, hann_full)
+    target_w = float(ref_width) if (ref_width is not None and ref_width > 0) else float(cur_bgr.shape[1])
+    scale = max(target_w / float(work_size[0]), 1.0)
+    dx_px = float(dx_s) * scale
+    dy_px = float(dy_s) * scale
+    shift_px = math.hypot(dx_px, dy_px)
 
-    half_w = BUMP_REF_SIZE[0] // 2
-    (_, dy_l), resp_l = cv2.phaseCorrelate(e_ref[:, :half_w], e_cur[:, :half_w], _HANN_HALF)
-    (_, dy_r), resp_r = cv2.phaseCorrelate(e_ref[:, half_w:], e_cur[:, half_w:], _HANN_HALF)
+    half_w = work_size[0] // 2
+    (_, dy_l), resp_l = cv2.phaseCorrelate(e_ref[:, :half_w], e_cur[:, :half_w], hann_half)
+    (_, dy_r), resp_r = cv2.phaseCorrelate(e_ref[:, half_w:], e_cur[:, half_w:], hann_half)
     d_angle = (
         math.degrees(math.atan2(float(dy_r - dy_l), float(half_w)))
         if (resp_l >= 0.12 and resp_r >= 0.12)
         else 0.0
     )
+    confident = bool(resp >= 0.12)
     bumped = bool(resp >= 0.10 and (shift_px >= BUMP_PX_THRESHOLD or abs(d_angle) >= BUMP_DEG_THRESHOLD))
+    aligned = bool(confident and shift_px <= BUMP_ALIGNED_PX and abs(d_angle) <= BUMP_ALIGNED_DEG)
+    close = bool(confident and not aligned and shift_px <= BUMP_CLOSE_PX and abs(d_angle) <= BUMP_CLOSE_DEG)
     return {
         "ok": True,
         "bumped": bumped,
+        "dxPx": round(dx_px, 1),
+        "dyPx": round(dy_px, 1),
         "shiftPx": round(shift_px, 1),
         "dAngle": round(d_angle, 2),
         "response": round(float(resp), 3),
+        "confident": confident,
+        "aligned": aligned,
+        "close": close,
     }
+
+
+def render_bump_overlay_png(ref_gray: np.ndarray, mode: str = "edges", color: str = "cyan") -> bytes:
+    """Render a 960x540 transparent landmark wireframe or grayscale ghost PNG from a saved bump baseline."""
+    if ref_gray.ndim == 3:
+        gray = cv2.cvtColor(ref_gray, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = ref_gray
+    if gray.shape != (BUMP_OVERLAY_SIZE[1], BUMP_OVERLAY_SIZE[0]):
+        interp = cv2.INTER_CUBIC if gray.shape[1] < BUMP_OVERLAY_SIZE[0] else cv2.INTER_AREA
+        gray = cv2.resize(gray, BUMP_OVERLAY_SIZE, interpolation=interp)
+
+    if mode == "ghost":
+        ok, buf = cv2.imencode(".png", gray)
+        return buf.tobytes() if ok else b""
+
+    # Edge-preserving smooth kills wall texture/grain while keeping bold structural landmarks
+    smooth = cv2.bilateralFilter(gray, d=7, sigmaColor=42, sigmaSpace=42)
+    edges = cv2.Canny(smooth, 75, 175)
+    # Mask top-left timestamp OSD box so changing clock digits don't clutter landmarks
+    edges[:38, :255] = 0
+    # Drop tiny speckle fragments (< 28 px) so only clean architectural/equipment outlines remain
+    n_lbl, labels, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+    clean = np.zeros_like(edges)
+    for lbl in range(1, n_lbl):
+        if stats[lbl, cv2.CC_STAT_AREA] >= 28:
+            clean[labels == lbl] = 255
+    if int(clean.any()) == 0:
+        clean = edges
+
+    k_halo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    halo = cv2.dilate(clean, k_halo, iterations=1)
+    rgba = np.zeros((BUMP_OVERLAY_SIZE[1], BUMP_OVERLAY_SIZE[0], 4), dtype=np.uint8)
+    halo_m = halo > 0
+    rgba[halo_m] = (0, 0, 0, 185)
+    bgr = _OVERLAY_COLORS_BGR.get(color, _OVERLAY_COLORS_BGR["cyan"])
+    edge_m = clean > 0
+    rgba[edge_m] = (bgr[0], bgr[1], bgr[2], 255)
+    ok, buf = cv2.imencode(".png", rgba)
+    return buf.tobytes() if ok else b""
 
 
 def compute_motion_energy_from_frames(
@@ -2705,6 +2804,7 @@ class ArmoryCamService:
         self._bump_last_ntfy: dict[str, float] = {}
         self._bump_last_shift: dict[str, float] = {}
         self._bump_last_check: dict[str, float] = {}
+        self._bump_overlay_cache: dict[tuple[str, int, str, str], bytes] = {}
         self._seg_dims_cache: dict[str, tuple[int, int]] = {}
 
         self.active_session_id: str | None = None
@@ -3157,13 +3257,24 @@ class ArmoryCamService:
                 self._restart_capture_workers()
                 if drive_changed:
                     threading.Thread(target=self.backfill_drive_clips, name="drive-clip-backfill", daemon=True).start()
-            refresh_bump = bool(self.bump_alert_ntfy and ("cameras" in raw or "bumpAlertNtfy" in raw))
-            if refresh_bump:
-                self._bump_strikes.clear()
+            bump_refresh_slugs: list[str] = []
+            if self.bump_alert_ntfy and ("cameras" in raw or "bumpAlertNtfy" in raw):
+                for phys in self._physical_cameras():
+                    if not phys.enabled:
+                        continue
+                    old_p = prev_by_slug.get(phys.slug)
+                    ref_missing = not (self.bump_refs_root / f"{phys.slug}.png").is_file()
+                    rtsp_changed = bool(old_p is None or old_p.rtsp_url != phys.rtsp_url)
+                    if ref_missing or rtsp_changed:
+                        bump_refresh_slugs.append(phys.slug)
+                        self._bump_strikes.pop(phys.slug, None)
         if self._started and "cameras" in raw:
             threading.Thread(target=self._purge_orphaned_thumb_dirs, name="thumb-orphan-purge", daemon=True).start()
-        if refresh_bump and self._started:
-            threading.Thread(target=self.capture_bump_baseline, name="bump-baseline-refresh", daemon=True).start()
+        if bump_refresh_slugs and self._started:
+            def _refresh_missing_baselines(slugs: list[str] = bump_refresh_slugs) -> None:
+                for sl in slugs:
+                    self.capture_bump_baseline(sl)
+            threading.Thread(target=_refresh_missing_baselines, name="bump-baseline-refresh", daemon=True).start()
         if self._started and ("cameras" in raw or "driveBackupDir" in raw):
             self._trigger_preview_refresh_async()
 
@@ -7013,8 +7124,14 @@ class ArmoryCamService:
             "driveDeleted": drive_deleted,
         }
 
-    def _get_raw_frame_bgr(self, source_slug: str) -> np.ndarray | None:
-        """Fetch latest uncropped/unrotated BGR frame for `source_slug` from ring TS or live MJPEG hub."""
+    def _get_raw_frame_bgr(self, source_slug: str, *, prefer_live: bool = False) -> np.ndarray | None:
+        """Fetch latest uncropped/unrotated BGR frame for `source_slug` from live MJPEG hub or ring TS."""
+        if prefer_live:
+            live_jpg = self.live_hub.recent_frame(source_slug, max_age_sec=3.0)
+            if live_jpg:
+                img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    return img
         with self.lock:
             segs = list(self.ring_segments.get(source_slug, []))
         for seg in reversed(segs[-4:]):
@@ -7032,11 +7149,12 @@ class ArmoryCamService:
                     cap.release()
                     if ok and frm is not None:
                         return frm
-        live_jpg = self.live_hub.recent_frame(source_slug, max_age_sec=3.0)
-        if live_jpg:
-            img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
-            if img is not None:
-                return img
+        if not prefer_live:
+            live_jpg = self.live_hub.recent_frame(source_slug, max_age_sec=3.0)
+            if live_jpg:
+                img = cv2.imdecode(np.frombuffer(live_jpg, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None:
+                    return img
         return None
 
     def _load_bump_state(self) -> None:
@@ -7074,7 +7192,7 @@ class ArmoryCamService:
             self.log.debug("Failed saving bump state: %s", exc)
 
     def capture_bump_baseline(self, camera_name: str | None = None) -> dict[str, Any]:
-        """Save lightweight 320x180 grayscale baseline PNGs into `bump_refs/<slug>.png` for bump alerts."""
+        """Save crisp 960x540 grayscale baseline PNGs into `bump_refs/<slug>.png` for bump alerts & realign HUD."""
         with self.lock:
             if camera_name:
                 target = self._find_camera(camera_name)
@@ -7086,20 +7204,130 @@ class ArmoryCamService:
 
         saved: list[str] = []
         for phys in phys_list:
-            raw_bgr = self._get_raw_frame_bgr(phys.slug)
+            raw_bgr = self._get_raw_frame_bgr(phys.slug, prefer_live=True)
             if raw_bgr is None:
                 continue
             gray = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2GRAY) if raw_bgr.ndim == 3 else raw_bgr
-            small = cv2.resize(gray, BUMP_REF_SIZE, interpolation=cv2.INTER_AREA)
+            small = cv2.resize(gray, BUMP_OVERLAY_SIZE, interpolation=cv2.INTER_AREA)
             out_p = self.bump_refs_root / f"{phys.slug}.png"
             if cv2.imwrite(str(out_p), small):
                 with self.lock:
                     self._bump_strikes[phys.slug] = 0
                     self._bump_last_ntfy.pop(phys.slug, None)
                     self._bump_last_shift.pop(phys.slug, None)
+                    self._bump_overlay_cache = {
+                        k: v for k, v in self._bump_overlay_cache.items() if k[0] != phys.slug
+                    }
                     self._save_bump_state_locked()
                 saved.append(phys.slug)
-        return {"ok": bool(saved), "saved": saved}
+        return {"ok": bool(saved), "saved": saved, "refDims": list(BUMP_OVERLAY_SIZE)}
+
+    def live_bump_alignment(self, camera_name: str) -> dict[str, Any]:
+        """Real-time alignment telemetry for the Realign Cam HUD (~3 ms phase correlation vs saved baseline)."""
+        with self.lock:
+            target = self._find_camera(camera_name)
+            if not target:
+                return {"ok": False, "error": f"Unknown camera: {camera_name}"}
+            phys = self._source_camera(target)
+            segs = list(self.ring_segments.get(phys.slug, []))
+
+        ref_path = self.bump_refs_root / f"{phys.slug}.png"
+        if not ref_path.is_file():
+            return {
+                "ok": True,
+                "slug": phys.slug,
+                "name": phys.name,
+                "hasRef": False,
+                "confident": False,
+                "aligned": False,
+                "close": False,
+                "bumped": False,
+                "dxPx": 0.0,
+                "dyPx": 0.0,
+                "shiftPx": 0.0,
+                "dAngle": 0.0,
+                "response": 0.0,
+                "guide": {"pitch": "ok", "yaw": "ok", "roll": "ok", "pitchPx": 0.0, "yawPx": 0.0, "rollDeg": 0.0},
+            }
+
+        ref_gray = cv2.imread(str(ref_path), cv2.IMREAD_GRAYSCALE)
+        if ref_gray is None:
+            return {"ok": False, "error": "Baseline image unreadable"}
+        ref_mtime_ms = int(ref_path.stat().st_mtime * 1000)
+        cur_bgr = self._get_raw_frame_bgr(phys.slug, prefer_live=True)
+        if cur_bgr is None:
+            return {
+                "ok": False,
+                "slug": phys.slug,
+                "name": phys.name,
+                "hasRef": True,
+                "refDims": [int(ref_gray.shape[1]), int(ref_gray.shape[0])],
+                "refUpdatedMs": ref_mtime_ms,
+                "error": "No live frame available",
+            }
+
+        native_w = float(self._probe_segment_dims(segs[-1].path)[0]) if (segs and segs[-1].path.exists()) else float(cur_bgr.shape[1])
+        res = detect_camera_bump(ref_gray, cur_bgr, high_res=True, ref_width=native_w)
+        dx_px = float(res.get("dxPx", 0.0))
+        dy_px = float(res.get("dyPx", 0.0))
+        d_ang = float(res.get("dAngle", 0.0))
+        confident = bool(res.get("confident", False))
+        # Physical camera correction directions (verified by synthetic warp & live landmarks):
+        # dy < 0 -> scene moved UP -> camera tilted DOWN -> fix: tilt UP
+        # dx < 0 -> scene moved LEFT -> camera panned RIGHT -> fix: pan LEFT
+        # dAngle < 0 -> scene rotated CCW -> camera rolled CW -> fix: roll CCW
+        pitch = "ok" if (not confident or abs(dy_px) < 4.0) else ("up" if dy_px < 0.0 else "down")
+        yaw = "ok" if (not confident or abs(dx_px) < 4.0) else ("left" if dx_px < 0.0 else "right")
+        roll = "ok" if (not confident or abs(d_ang) < 0.35) else ("ccw" if d_ang < 0.0 else "cw")
+        return {
+            **res,
+            "slug": phys.slug,
+            "name": phys.name,
+            "hasRef": True,
+            "refDims": [int(ref_gray.shape[1]), int(ref_gray.shape[0])],
+            "refUpdatedMs": ref_mtime_ms,
+            "guide": {
+                "pitch": pitch,
+                "yaw": yaw,
+                "roll": roll,
+                "pitchPx": round(abs(dy_px), 1),
+                "yawPx": round(abs(dx_px), 1),
+                "rollDeg": round(abs(d_ang), 2),
+            },
+        }
+
+    def get_bump_overlay_png(self, camera_name: str, mode: str = "edges", color: str = "cyan") -> tuple[bytes | None, str]:
+        """Return cached 960x540 transparent wireframe or grayscale ghost PNG for a physical camera baseline."""
+        with self.lock:
+            target = self._find_camera(camera_name)
+            if not target:
+                return None, f"Unknown camera: {camera_name}"
+            phys = self._source_camera(target)
+
+        ref_path = self.bump_refs_root / f"{phys.slug}.png"
+        if not ref_path.is_file():
+            return None, "No saved baseline reference"
+        mtime_ns = int(ref_path.stat().st_mtime_ns)
+        clean_mode = "ghost" if mode == "ghost" else "edges"
+        clean_color = color if color in _OVERLAY_COLORS_BGR else "cyan"
+        cache_key = (phys.slug, mtime_ns, clean_mode, clean_color)
+        with self.lock:
+            cached = self._bump_overlay_cache.get(cache_key)
+        if cached is not None:
+            return cached, ""
+
+        ref_gray = cv2.imread(str(ref_path), cv2.IMREAD_GRAYSCALE)
+        if ref_gray is None:
+            return None, "Baseline unreadable"
+        png_bytes = render_bump_overlay_png(ref_gray, mode=clean_mode, color=clean_color)
+        if not png_bytes:
+            return None, "Failed rendering overlay"
+        with self.lock:
+            self._bump_overlay_cache = {
+                k: v for k, v in self._bump_overlay_cache.items() if k[0] != phys.slug or k[1] == mtime_ns
+            }
+            self._bump_overlay_cache[cache_key] = png_bytes
+        return png_bytes, ""
 
     def check_camera_bump_background(self, now_s: float) -> list[dict[str, Any]]:
         """Quiet-gym bump guard: 0ms when off; lazily saves baseline, confirms 2x, fires ntfy alert only."""
@@ -7176,7 +7404,7 @@ class ArmoryCamService:
                 title = f"Armory Cam Bumped: {phys.name}"
                 msg = (
                     f"{phys.name} appears bumped ({res['shiftPx']:.0f}px, {res['dAngle']:+.1f}°). "
-                    f"Open http://{detect_lan_ip()}:{self.port}/ to inspect and re-frame."
+                    f"Open http://{detect_lan_ip()}:{self.port}/#realign={phys.slug} to realign."
                 )
                 threading.Thread(
                     target=send_ntfy_alert,
@@ -7721,6 +7949,63 @@ DASHBOARD_HTML = """<!doctype html>
   .mm-mbar-track{position:relative;width:72px;height:8px;border-radius:999px;background:#0b1017;border:1px solid var(--line);overflow:hidden}
   .mm-mbar-fill{position:absolute;left:0;top:0;bottom:0;width:0%;background:var(--blue);transition:width .2s}
   .mm-mbar-fill.hot{background:var(--green)}
+  .realign-modal{position:fixed;inset:0;z-index:10000;background:#05080d;display:flex;flex-direction:column;padding:10px 12px;gap:8px;user-select:none;overflow-y:auto}
+  .realign-modal[hidden]{display:none!important}
+  .ra-top{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px}
+  .ra-top-l,.ra-top-r{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+  .ra-pill{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:999px;font-size:12px;font-weight:900;letter-spacing:.03em;border:1px solid var(--line);background:#16202c;color:#cbd5e1;font-variant-numeric:tabular-nums}
+  .ra-pill.locked{background:rgba(34,197,94,.2);border-color:#22c55e;color:#86efac}
+  .ra-pill.close{background:rgba(245,158,11,.2);border-color:#f59e0b;color:#fde68a}
+  .ra-pill.shifted{background:rgba(239,68,68,.22);border-color:#ef4444;color:#fecaca}
+  .ra-pill.hold{background:rgba(100,116,139,.22);border-color:#64748b;color:#e2e8f0}
+  .ra-stage-wrap{flex:1 1 auto;min-height:200px;display:flex;align-items:center;justify-content:center;min-width:0}
+  .ra-stage{position:relative;aspect-ratio:16/9;width:100%;max-width:min(100%,calc((100dvh - 240px) * 16 / 9));background:#000;border-radius:12px;overflow:hidden;border:2px solid var(--line);box-shadow:0 8px 32px rgba(0,0,0,.6);transition:border-color .18s,box-shadow .18s}
+  .ra-stage.locked{border-color:#22c55e;box-shadow:0 0 0 2px rgba(34,197,94,.45),0 0 28px rgba(34,197,94,.32)}
+  .ra-stage.close{border-color:#f59e0b;box-shadow:0 0 0 2px rgba(245,158,11,.35)}
+  .ra-stage.shifted{border-color:#ef4444;box-shadow:0 0 0 2px rgba(239,68,68,.35)}
+  .ra-media{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+  .ra-overlay{transition:opacity .12s ease}
+  .ra-overlay.blink-off{opacity:0!important}
+  .ra-crops{z-index:3}
+  .ra-edge{position:absolute;z-index:5;pointer-events:none;padding:5px 11px;border-radius:999px;font-weight:900;font-size:13px;letter-spacing:.03em;background:rgba(12,18,28,.86);border:1.5px solid #f59e0b;color:#fef3c7;box-shadow:0 4px 16px rgba(0,0,0,.55);opacity:0;transform:scale(.94);transition:opacity .16s ease,transform .16s ease;white-space:nowrap}
+  .ra-edge.on{opacity:1;transform:scale(1)}
+  .ra-edge.hot{border-color:#ef4444;background:rgba(127,29,29,.88);color:#fee2e2}
+  .ra-edge.up{top:10px;left:50%;transform:translateX(-50%) scale(.94)}
+  .ra-edge.up.on{transform:translateX(-50%) scale(1)}
+  .ra-edge.down{bottom:10px;left:50%;transform:translateX(-50%) scale(.94)}
+  .ra-edge.down.on{transform:translateX(-50%) scale(1)}
+  .ra-edge.left{left:10px;top:50%;transform:translateY(-50%) scale(.94)}
+  .ra-edge.left.on{transform:translateY(-50%) scale(1)}
+  .ra-edge.right{right:10px;top:50%;transform:translateY(-50%) scale(.94)}
+  .ra-edge.right.on{transform:translateY(-50%) scale(1)}
+  .ra-edge.roll{top:10px;right:10px}
+  .ra-banner-badge{position:absolute;z-index:6;left:50%;top:12px;transform:translateX(-50%);pointer-events:none;padding:6px 16px;border-radius:999px;font-weight:900;font-size:14px;letter-spacing:.04em;box-shadow:0 6px 20px rgba(0,0,0,.6);white-space:nowrap}
+  .ra-banner-badge.lock{background:rgba(21,128,61,.94);border:1.5px solid #4ade80;color:#f0fdf4}
+  .ra-banner-badge.hold{top:50%;transform:translate(-50%,-50%);background:rgba(15,23,42,.92);border:1.5px solid #64748b;color:#f1f5f9;font-size:15px}
+  .ra-guide-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:9px 12px;display:flex;flex-direction:column;gap:5px}
+  .ra-guide-chips{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px;min-height:32px}
+  .ra-chip{display:inline-flex;align-items:center;gap:6px;padding:5px 13px;border-radius:10px;font-weight:900;font-size:16px;letter-spacing:.02em;font-variant-numeric:tabular-nums}
+  .ra-chip.move{background:rgba(239,68,68,.2);border:1.5px solid rgba(239,68,68,.75);color:#fecaca}
+  .ra-chip.nudge{background:rgba(245,158,11,.2);border:1.5px solid rgba(245,158,11,.75);color:#fde68a}
+  .ra-chip.ok{background:rgba(34,197,94,.22);border:1.5px solid #22c55e;color:#bbf7d0}
+  .ra-chip.hold{background:rgba(100,116,139,.2);border:1.5px solid #64748b;color:#e2e8f0}
+  .ra-metrics{text-align:center;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+  .ra-ctrls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:7px 10px}
+  .ra-ctrl-grp{display:inline-flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .ra-ctrls input[type=range]{width:92px;accent-color:var(--blue)}
+  .ra-swatch{width:22px;height:22px;border-radius:999px;border:2px solid transparent;cursor:pointer;padding:0}
+  .ra-swatch.on{border-color:#fff;box-shadow:0 0 0 2px rgba(255,255,255,.35)}
+  @media (max-width:640px){
+    .realign-modal{padding:8px;gap:8px;justify-content:flex-start}
+    .ra-top{gap:6px}
+    .ra-top .mm-view-sel{min-width:118px;max-width:155px;font-size:12.5px!important}
+    .ra-stage-wrap{flex:0 0 auto;min-height:0}
+    .ra-stage{max-width:100%}
+    .ra-chip{font-size:15px;padding:5px 11px}
+    .ra-edge{font-size:11.5px;padding:4px 8px}
+    .ra-ctrls{gap:6px;padding:7px 8px}
+    .ra-ctrls input[type=range]{width:76px}
+  }
   #toast{position:fixed;left:50%;bottom:20px;transform:translate(-50%,16px);opacity:0;pointer-events:none;z-index:10050;padding:10px 18px;border-radius:10px;font-weight:800;font-size:13px;background:#1d2836;color:var(--fg);border:1px solid var(--line);box-shadow:0 8px 24px rgba(0,0,0,.55);transition:opacity .18s ease,transform .18s ease}
   #toast.show{opacity:1;transform:translate(-50%,0)}
   #toast.ok{background:#15803d;border-color:#4ade80;color:#f0fdf4}
@@ -8957,6 +9242,62 @@ DASHBOARD_HTML = """<!doctype html>
   </div>
 </div>
 
+<div id="realignModal" class="realign-modal" hidden>
+  <div class="ra-top">
+    <div class="ra-top-l">
+      <select id="raCamSel" class="mm-view-sel" aria-label="Select physical camera to realign"></select>
+      <span id="raStatusPill" class="ra-pill">CONNECTING</span>
+    </div>
+    <div class="ra-top-r">
+      <button class="btn sec sm on" id="raChimeBtn" type="button" title="Play a pleasant chime when camera locks into green">🔊 Chime</button>
+      <button class="btn sec sm" id="raCloseBtn" type="button">Done</button>
+    </div>
+  </div>
+  <div class="ra-stage-wrap">
+    <div id="raStage" class="ra-stage">
+      <canvas id="raLiveCanvas" class="ra-media"></canvas>
+      <img id="raOverlayImg" class="ra-media ra-overlay" alt="Saved landmark overlay">
+      <svg id="raCropsSvg" class="ra-media ra-crops" viewBox="0 0 1600 900" preserveAspectRatio="none"></svg>
+      <div id="raArrUp" class="ra-edge up">▲ TILT UP</div>
+      <div id="raArrDown" class="ra-edge down">▼ TILT DOWN</div>
+      <div id="raArrLeft" class="ra-edge left">◀ PAN LEFT</div>
+      <div id="raArrRight" class="ra-edge right">▶ PAN RIGHT</div>
+      <div id="raArrRoll" class="ra-edge roll">↺ ROLL CCW</div>
+      <div id="raLockBadge" class="ra-banner-badge lock" hidden>✓ LOCKED</div>
+      <div id="raHoldBadge" class="ra-banner-badge hold" hidden>✋ Step back / hold steady…</div>
+    </div>
+  </div>
+  <div class="ra-guide-card">
+    <div id="raGuideChips" class="ra-guide-chips">
+      <span class="ra-chip hold">Measuring alignment…</span>
+    </div>
+    <div id="raMetrics" class="ra-metrics">Waiting for live frame…</div>
+  </div>
+  <div class="ra-ctrls">
+    <div class="ra-ctrl-grp">
+      <button class="btn sec sm on" id="raModeEdges" type="button" data-ramode="edges">Wireframe</button>
+      <button class="btn sec sm" id="raModeGhost" type="button" data-ramode="ghost">Ghost</button>
+      <button class="btn sec sm" id="raModeOff" type="button" data-ramode="off">Off</button>
+    </div>
+    <div class="ra-ctrl-grp" id="raColorGrp">
+      <button class="ra-swatch on" type="button" data-racolor="cyan" style="background:#38eef8" title="Cyan wireframe" aria-label="Cyan"></button>
+      <button class="ra-swatch" type="button" data-racolor="lime" style="background:#5cff69" title="Lime wireframe" aria-label="Lime"></button>
+      <button class="ra-swatch" type="button" data-racolor="magenta" style="background:#ff5af5" title="Magenta wireframe" aria-label="Magenta"></button>
+    </div>
+    <div class="ra-ctrl-grp">
+      <span style="font-size:12px;color:var(--mut)">Opacity</span>
+      <input type="range" id="raOpacity" min="15" max="100" step="5" value="85" aria-label="Overlay opacity">
+    </div>
+    <div class="ra-ctrl-grp">
+      <button class="btn sec sm" id="raBlinkBtn" type="button" title="Flash overlay at 1 Hz to compare">Blink</button>
+      <button class="btn sec sm on" id="raCropsBtn" type="button" title="Show virtual view crops and mirror exclusion masks">Crops &amp; Masks</button>
+    </div>
+    <div class="ra-ctrl-grp" style="margin-left:auto">
+      <button class="btn sec sm" id="raAcceptBtn" type="button" title="Save current camera position as the new alignment baseline">Accept New Framing</button>
+    </div>
+  </div>
+</div>
+
 <div id="rawFeeds" hidden></div>
 <div id="toast" role="status" aria-live="polite"></div>
 
@@ -9052,6 +9393,24 @@ const mmState = {
 let mmHiresTimer = null;
 let mmLevelTimer = null;
 
+const raState = {
+  open: false,
+  slug: '',
+  mode: 'edges',
+  color: 'cyan',
+  opacity: 0.85,
+  blink: false,
+  showCrops: true,
+  chimeOn: true,
+  wasLocked: false,
+  lastChimeAt: 0,
+  pollTimer: null,
+  blinkTimer: null,
+  pollAbort: null,
+  pollBusy: false,
+  audioCtx: null,
+};
+
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const MIN_SPAN = 0.15;
@@ -9077,7 +9436,7 @@ function sourceSlugOf(cam) {
 function syncRawFeeds() {
   const box = $('rawFeeds');
   if (!box || !cfg) return;
-  const wantFeeds = !document.hidden && (activePage === 'cameras' || (mmState && mmState.open));
+  const wantFeeds = !document.hidden && (activePage === 'cameras' || (mmState && mmState.open) || (raState && raState.open));
   const activePhys = new Map();
   if (wantFeeds) {
     for (const c of cfg.cameras) {
@@ -9196,7 +9555,7 @@ function drawFeedToCanvas(canvas, rawImg, rot, tilt, crop, applyCrop) {
 
 function drawAllCanvases() {
   if (document.hidden) return;
-  if (typeof activePage !== 'undefined' && activePage !== 'cameras' && !mmState.open) return;
+  if (typeof activePage !== 'undefined' && activePage !== 'cameras' && !mmState.open && !raState.open) return;
   if (!cfg || !cfg.cameras) return;
   cfg.cameras.forEach((c, idx) => {
     const rawImg = $(`rawFeed-${sourceSlugOf(c)}`);
@@ -9209,6 +9568,13 @@ function drawAllCanvases() {
       drawFeedToCanvas(canvas, rawImg, c.rotate || 0, c.tilt || 0, c.crop, !!previewCropped[idx]);
     }
   });
+  if (raState.open && raState.slug) {
+    const rawImg = $(`rawFeed-${raState.slug}`);
+    const raCanvas = $('raLiveCanvas');
+    if (rawImg && raCanvas) {
+      drawFeedToCanvas(raCanvas, rawImg, 0, 0, [0, 0, 1, 1], false);
+    }
+  }
   if (mmState.open && !mmState.hires) {
     const cam = cfg.cameras[mmState.camIdx];
     const rawImg = cam ? $(`rawFeed-${sourceSlugOf(cam)}`) : null;
@@ -10339,10 +10705,13 @@ function renderCameras() {
         `<span class="pill">via ${esc(parent ? parent.name : c.sourceSlug)}</span>`
       : `<span>${esc(c.name)}</span>`;
     const fsBtn = `<button class="btn sec sm" type="button" data-fullscreen="${idx}" title="Open full-screen calibration editor for this view">⤢ Full Screen</button>`;
+    const realignBtn = !isVirt
+      ? `<button class="btn sec sm" type="button" data-realign="${esc(c.slug)}" title="Realign physical camera back onto saved landmarks">◎ Realign</button>`
+      : '';
     const headRight = isVirt
       ? `${fsBtn}<span class="pill live" id="camState-${idx}">CONNECTING</span>` +
         `<button class="btn red sm" type="button" data-delview="${idx}" title="Remove view">Remove</button>`
-      : `${fsBtn}<button class="btn sec sm" type="button" data-addview="${idx}" title="Add another crop/mask view from this camera">+ Add View</button>` +
+      : `${realignBtn}${fsBtn}<button class="btn sec sm" type="button" data-addview="${idx}" title="Add another crop/mask view from this camera">+ Add View</button>` +
         `<span class="pill live" id="camState-${idx}">CONNECTING</span>`;
     const srcSelect = isVirt ? `
       <label>Source Camera</label>
@@ -10555,6 +10924,10 @@ function setCropAspectRatio(idx, lock) {
 $('camGrid').addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
+  if (b.dataset.realign !== undefined) {
+    openRealignModal(b.dataset.realign);
+    return;
+  }
   if (b.dataset.fullscreen !== undefined) {
     openMaskModal(Number(b.dataset.fullscreen), { mode: 'crop' });
     return;
@@ -11464,6 +11837,374 @@ function pollLoop(fn, ms, pageFilter) {
   }, ms);
 }
 
+function realignSlugFromHash() {
+  const raw = String(window.location.hash || '').replace(/^#[/]?/, '');
+  const m = /^realign=(.+)$/i.exec(raw);
+  if (!m) return '';
+  try { return decodeURIComponent(m[1]).trim(); } catch { return m[1].trim(); }
+}
+
+function unlockRealignAudio() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!raState.audioCtx) raState.audioCtx = new Ctx();
+    if (raState.audioCtx.state === 'suspended') raState.audioCtx.resume().catch(() => {});
+  } catch {}
+}
+
+function playRealignLockChime() {
+  if (!raState.chimeOn) return;
+  const nowMs = Date.now();
+  if (nowMs - raState.lastChimeAt < 2500) return;
+  raState.lastChimeAt = nowMs;
+  try {
+    unlockRealignAudio();
+    const ctx = raState.audioCtx;
+    if (!ctx) return;
+    const t0 = ctx.currentTime + 0.01;
+    [880, 1318.5].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, t0 + i * 0.11);
+      gain.gain.setValueAtTime(0.0001, t0 + i * 0.11);
+      gain.gain.linearRampToValueAtTime(0.11, t0 + i * 0.11 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.11 + 0.24);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t0 + i * 0.11);
+      osc.stop(t0 + i * 0.11 + 0.26);
+    });
+  } catch {}
+}
+
+function renderRealignCrops() {
+  const svg = $('raCropsSvg');
+  if (!svg) return;
+  if (!raState.showCrops || !cfg || !cfg.cameras || !raState.slug) {
+    svg.innerHTML = '';
+    svg.hidden = true;
+    return;
+  }
+  svg.hidden = false;
+  const views = cfg.cameras.filter(c => c.enabled && sourceSlugOf(c) === raState.slug);
+  const palette = ['#38bdf8', '#fbbf24', '#c084fc', '#4ade80'];
+  const parts = [];
+  views.forEach((v, vi) => {
+    const col = palette[vi % palette.length];
+    const cr = Array.isArray(v.crop) && v.crop.length === 4 ? v.crop : [0, 0, 1, 1];
+    const x = +(cr[0] * 1600).toFixed(1);
+    const y = +(cr[1] * 900).toFixed(1);
+    const w = +((cr[2] - cr[0]) * 1600).toFixed(1);
+    const h = +((cr[3] - cr[1]) * 900).toFixed(1);
+    parts.push(`<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="none" stroke="${col}" stroke-width="2.6" stroke-dasharray="10 6" vector-effect="non-scaling-stroke"/>`);
+    const tagW = Math.min(300, Math.max(108, v.name.length * 12.5 + 22));
+    const tagH = 30;
+    const tagX = clamp(x + 8, 8, 1592 - tagW);
+    const hitsTopCenter = (y < 64) && (tagX + tagW > 600 && tagX < 1000);
+    const tagY = hitsTopCenter ? clamp(y + h - tagH - 10, 8, 892 - tagH) : clamp(y + 8, 8, 892 - tagH);
+    parts.push(`<rect x="${tagX}" y="${tagY}" width="${tagW}" height="${tagH}" rx="6" fill="rgba(5,8,13,0.86)" stroke="${col}" stroke-width="1.5"/>`);
+    parts.push(`<text x="${tagX + 10}" y="${tagY + 20}" fill="${col}" font-size="18" font-weight="800" font-family="system-ui,sans-serif">${esc(v.name)}</text>`);
+    (v.exclusions || []).forEach(q => {
+      const nq = normQuad(q);
+      if (!nq) return;
+      const pts = nq.map(p => `${(p[0] * 1600).toFixed(1)},${(p[1] * 900).toFixed(1)}`).join(' ');
+      parts.push(`<polygon points="${pts}" fill="rgba(239,68,68,0.16)" stroke="rgba(248,113,113,0.85)" stroke-width="2" stroke-dasharray="6 4" vector-effect="non-scaling-stroke"/>`);
+    });
+  });
+  svg.innerHTML = parts.join('');
+}
+
+function refreshRealignOverlay(bust = true) {
+  const img = $('raOverlayImg');
+  if (!img) return;
+  const colorGrp = $('raColorGrp');
+  if (colorGrp) colorGrp.hidden = raState.mode !== 'edges';
+  document.querySelectorAll('[data-ramode]').forEach(b => b.classList.toggle('on', b.dataset.ramode === raState.mode));
+  document.querySelectorAll('[data-racolor]').forEach(b => b.classList.toggle('on', b.dataset.racolor === raState.color));
+  if (raState.mode === 'off' || !raState.slug) {
+    img.hidden = true;
+    img.removeAttribute('src');
+    return;
+  }
+  img.hidden = false;
+  img.style.opacity = String(raState.opacity);
+  const ts = bust ? `&t=${Date.now()}` : '';
+  img.src = `/api/bump/overlay.png?camera=${encodeURIComponent(raState.slug)}&mode=${encodeURIComponent(raState.mode)}&color=${encodeURIComponent(raState.color)}${ts}`;
+}
+
+function syncRealignBlink() {
+  if (raState.blinkTimer) { clearInterval(raState.blinkTimer); raState.blinkTimer = null; }
+  const img = $('raOverlayImg');
+  if (img) img.classList.remove('blink-off');
+  if ($('raBlinkBtn')) $('raBlinkBtn').classList.toggle('on', raState.blink);
+  if (raState.open && raState.blink && raState.mode !== 'off') {
+    let off = false;
+    raState.blinkTimer = setInterval(() => {
+      off = !off;
+      if ($('raOverlayImg')) $('raOverlayImg').classList.toggle('blink-off', off);
+    }, 650);
+  }
+}
+
+function updateRealignHud(d) {
+  const stage = $('raStage');
+  const pill = $('raStatusPill');
+  const chips = $('raGuideChips');
+  const metrics = $('raMetrics');
+  const lockBadge = $('raLockBadge');
+  const holdBadge = $('raHoldBadge');
+  const setEdge = (id, on, hot, txt) => {
+    const el = $(id);
+    if (!el) return;
+    el.classList.toggle('on', !!on);
+    el.classList.toggle('hot', !!hot);
+    if (txt) el.textContent = txt;
+  };
+  if (!d || !d.ok) {
+    if (stage) stage.className = 'ra-stage';
+    if (pill) { pill.className = 'ra-pill hold'; pill.textContent = 'CONNECTING'; }
+    if (lockBadge) lockBadge.hidden = true;
+    if (holdBadge) holdBadge.hidden = true;
+    ['raArrUp', 'raArrDown', 'raArrLeft', 'raArrRight', 'raArrRoll'].forEach(id => setEdge(id, false, false));
+    if (chips) chips.innerHTML = `<span class="ra-chip hold">${esc((d && d.error) || 'Waiting for live camera frame…')}</span>`;
+    if (metrics) metrics.textContent = 'Waiting for live stream…';
+    return;
+  }
+  if (!d.hasRef) {
+    if (stage) stage.className = 'ra-stage';
+    if (pill) { pill.className = 'ra-pill hold'; pill.textContent = 'NO BASELINE'; }
+    if (lockBadge) lockBadge.hidden = true;
+    if (holdBadge) holdBadge.hidden = true;
+    ['raArrUp', 'raArrDown', 'raArrLeft', 'raArrRight', 'raArrRoll'].forEach(id => setEdge(id, false, false));
+    if (chips) chips.innerHTML = '<span class="ra-chip nudge">No saved baseline yet — click "Accept New Framing" to save landmarks</span>';
+    if (metrics) metrics.textContent = 'Baseline will be saved at 960×540.';
+    return;
+  }
+  const respPct = Math.round((Number(d.response) || 0) * 100);
+  const refDimTxt = Array.isArray(d.refDims) ? `${d.refDims[0]}×${d.refDims[1]}` : '320×180';
+  const refDateTxt = d.refUpdatedMs ? new Date(d.refUpdatedMs).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
+  const dx = Number(d.dxPx || 0);
+  const dy = Number(d.dyPx || 0);
+  const sh = Number(d.shiftPx || 0);
+  const ang = Number(d.dAngle || 0);
+  if (metrics) {
+    metrics.textContent = `Shift ${sh.toFixed(1)} px (dx ${dx >= 0 ? '+' : ''}${dx.toFixed(1)}, dy ${dy >= 0 ? '+' : ''}${dy.toFixed(1)}) · Roll ${ang >= 0 ? '+' : ''}${ang.toFixed(2)}° · Match ${respPct}% · Ref ${refDimTxt}${refDateTxt ? ' (' + refDateTxt + ')' : ''}`;
+  }
+  if (!d.confident) {
+    if (stage) stage.className = 'ra-stage';
+    if (pill) { pill.className = 'ra-pill hold'; pill.textContent = 'HOLD STEADY'; }
+    if (lockBadge) lockBadge.hidden = true;
+    if (holdBadge) holdBadge.hidden = false;
+    ['raArrUp', 'raArrDown', 'raArrLeft', 'raArrRight', 'raArrRoll'].forEach(id => setEdge(id, false, false));
+    if (chips) chips.innerHTML = '<span class="ra-chip hold">✋ Step back / hold steady — view obstructed or moving</span>';
+    raState.wasLocked = false;
+    return;
+  }
+  if (holdBadge) holdBadge.hidden = true;
+  if (d.aligned) {
+    if (stage) stage.className = 'ra-stage locked';
+    if (pill) { pill.className = 'ra-pill locked'; pill.textContent = `✓ LOCKED · ${sh.toFixed(1)}px`; }
+    if (lockBadge) { lockBadge.hidden = false; lockBadge.textContent = `✓ LOCKED (${sh.toFixed(1)} px · ${Math.abs(ang).toFixed(1)}°)`; }
+    ['raArrUp', 'raArrDown', 'raArrLeft', 'raArrRight', 'raArrRoll'].forEach(id => setEdge(id, false, false));
+    if (chips) chips.innerHTML = `<span class="ra-chip ok">✓ ALIGNED — ${sh.toFixed(1)} px · ${Math.abs(ang).toFixed(1)}° · All crops &amp; masks locked</span>`;
+    if (!raState.wasLocked) playRealignLockChime();
+    raState.wasLocked = true;
+    return;
+  }
+  raState.wasLocked = false;
+  if (lockBadge) lockBadge.hidden = true;
+  const isClose = !!d.close;
+  if (stage) stage.className = isClose ? 'ra-stage close' : 'ra-stage shifted';
+  if (pill) {
+    pill.className = isClose ? 'ra-pill close' : 'ra-pill shifted';
+    pill.textContent = `${isClose ? 'CLOSE' : 'SHIFTED'} · ${sh.toFixed(0)}px`;
+  }
+  const g = d.guide || {};
+  const pPx = Number(g.pitchPx || 0);
+  const yPx = Number(g.yawPx || 0);
+  const rDeg = Number(g.rollDeg || 0);
+  setEdge('raArrUp', g.pitch === 'up', pPx >= 15, `▲ TILT UP ${Math.round(pPx)}px`);
+  setEdge('raArrDown', g.pitch === 'down', pPx >= 15, `▼ TILT DOWN ${Math.round(pPx)}px`);
+  setEdge('raArrLeft', g.yaw === 'left', yPx >= 15, `◀ PAN LEFT ${Math.round(yPx)}px`);
+  setEdge('raArrRight', g.yaw === 'right', yPx >= 15, `▶ PAN RIGHT ${Math.round(yPx)}px`);
+  setEdge(
+    'raArrRoll',
+    g.roll === 'ccw' || g.roll === 'cw',
+    rDeg >= 1.0,
+    g.roll === 'ccw' ? `↺ ROLL CCW ${rDeg.toFixed(1)}°` : `↻ ROLL CW ${rDeg.toFixed(1)}°`
+  );
+  const chipHtml = [];
+  const clsFor = (hot) => (hot ? 'ra-chip move' : 'ra-chip nudge');
+  if (g.pitch === 'up') chipHtml.push(`<span class="${clsFor(pPx >= 15)}">↑ TILT UP ${Math.round(pPx)} px</span>`);
+  else if (g.pitch === 'down') chipHtml.push(`<span class="${clsFor(pPx >= 15)}">↓ TILT DOWN ${Math.round(pPx)} px</span>`);
+  if (g.yaw === 'left') chipHtml.push(`<span class="${clsFor(yPx >= 15)}">← PAN LEFT ${Math.round(yPx)} px</span>`);
+  else if (g.yaw === 'right') chipHtml.push(`<span class="${clsFor(yPx >= 15)}">→ PAN RIGHT ${Math.round(yPx)} px</span>`);
+  if (g.roll === 'ccw') chipHtml.push(`<span class="${clsFor(rDeg >= 1.0)}">↺ ROLL CCW ${rDeg.toFixed(1)}°</span>`);
+  else if (g.roll === 'cw') chipHtml.push(`<span class="${clsFor(rDeg >= 1.0)}">↻ ROLL CW ${rDeg.toFixed(1)}°</span>`);
+  if (!chipHtml.length) chipHtml.push(`<span class="ra-chip nudge">Tiny tweak needed (${sh.toFixed(1)} px)</span>`);
+  if (chips) chips.innerHTML = chipHtml.join('');
+}
+
+async function pollRealignLive() {
+  if (!raState.open || !raState.slug || document.hidden || raState.pollBusy) return;
+  raState.pollBusy = true;
+  if (raState.pollAbort) { try { raState.pollAbort.abort(); } catch {} }
+  const ac = new AbortController();
+  raState.pollAbort = ac;
+  const slug = raState.slug;
+  try {
+    const r = await fetch(`/api/bump/live?camera=${encodeURIComponent(slug)}`, { cache: 'no-store', signal: ac.signal });
+    const d = await r.json();
+    if (raState.open && raState.slug === slug) updateRealignHud(d);
+  } catch (err) {
+    if (err && err.name === 'AbortError') return;
+  } finally {
+    raState.pollBusy = false;
+    if (raState.open && raState.slug === slug) {
+      raState.pollTimer = setTimeout(pollRealignLive, 380);
+    }
+  }
+}
+
+function openRealignModal(camSlugOrName) {
+  if (!cfg || !cfg.cameras) return;
+  const physList = cfg.cameras.filter(c => !c.sourceSlug && c.enabled);
+  if (!physList.length) { showToast('No enabled physical cameras', 'err'); return; }
+  const needle = String(camSlugOrName || '').trim().toLowerCase();
+  const matched = physList.find(c => c.slug.toLowerCase() === needle || c.name.toLowerCase() === needle) || physList[0];
+  if (mmState.open) closeMaskModal();
+  unlockRealignAudio();
+  raState.open = true;
+  raState.slug = matched.slug;
+  raState.wasLocked = false;
+  if (raState.pollTimer) { clearTimeout(raState.pollTimer); raState.pollTimer = null; }
+  if (raState.pollAbort) { try { raState.pollAbort.abort(); } catch {} raState.pollAbort = null; }
+  const sel = $('raCamSel');
+  if (sel) {
+    sel.innerHTML = physList.map(p => `<option value="${esc(p.slug)}"${p.slug === matched.slug ? ' selected' : ''}>${esc(p.name)}</option>`).join('');
+  }
+  const modal = $('realignModal');
+  if (modal) modal.hidden = false;
+  document.body.style.overflow = 'hidden';
+  if ($('raOpacity')) $('raOpacity').value = String(Math.round(raState.opacity * 100));
+  if ($('raCropsBtn')) $('raCropsBtn').classList.toggle('on', raState.showCrops);
+  if ($('raChimeBtn')) $('raChimeBtn').classList.toggle('on', raState.chimeOn);
+  syncRawFeeds();
+  renderRealignCrops();
+  refreshRealignOverlay(true);
+  syncRealignBlink();
+  updateRealignHud(null);
+  drawAllCanvases();
+  pollRealignLive();
+}
+
+function closeRealignModal() {
+  if (!raState.open) return;
+  raState.open = false;
+  if (raState.pollTimer) { clearTimeout(raState.pollTimer); raState.pollTimer = null; }
+  if (raState.pollAbort) { try { raState.pollAbort.abort(); } catch {} raState.pollAbort = null; }
+  if (raState.blinkTimer) { clearInterval(raState.blinkTimer); raState.blinkTimer = null; }
+  const modal = $('realignModal');
+  if (modal) modal.hidden = true;
+  document.body.style.overflow = '';
+  if (realignSlugFromHash()) {
+    try { window.history.replaceState(null, '', '#cameras'); } catch {}
+  }
+  syncRawFeeds();
+}
+
+function wireRealignModal() {
+  if ($('raCloseBtn')) $('raCloseBtn').onclick = () => closeRealignModal();
+  if ($('raCamSel')) {
+    $('raCamSel').onchange = (e) => {
+      if (!raState.open) return;
+      openRealignModal(e.target.value);
+    };
+  }
+  document.querySelectorAll('[data-ramode]').forEach(btn => {
+    btn.onclick = () => {
+      raState.mode = btn.dataset.ramode || 'edges';
+      if (raState.mode === 'ghost' && raState.opacity > 0.7) {
+        raState.opacity = 0.45;
+        if ($('raOpacity')) $('raOpacity').value = '45';
+      } else if (raState.mode === 'edges' && raState.opacity < 0.55) {
+        raState.opacity = 0.85;
+        if ($('raOpacity')) $('raOpacity').value = '85';
+      }
+      refreshRealignOverlay(true);
+      syncRealignBlink();
+    };
+  });
+  document.querySelectorAll('[data-racolor]').forEach(btn => {
+    btn.onclick = () => {
+      raState.color = btn.dataset.racolor || 'cyan';
+      refreshRealignOverlay(true);
+    };
+  });
+  if ($('raOpacity')) {
+    $('raOpacity').oninput = (e) => {
+      raState.opacity = clamp(Number(e.target.value) / 100, 0.15, 1);
+      if ($('raOverlayImg')) $('raOverlayImg').style.opacity = String(raState.opacity);
+    };
+  }
+  if ($('raBlinkBtn')) {
+    $('raBlinkBtn').onclick = () => {
+      raState.blink = !raState.blink;
+      syncRealignBlink();
+    };
+  }
+  if ($('raCropsBtn')) {
+    $('raCropsBtn').onclick = () => {
+      raState.showCrops = !raState.showCrops;
+      $('raCropsBtn').classList.toggle('on', raState.showCrops);
+      renderRealignCrops();
+    };
+  }
+  if ($('raChimeBtn')) {
+    $('raChimeBtn').onclick = () => {
+      raState.chimeOn = !raState.chimeOn;
+      $('raChimeBtn').classList.toggle('on', raState.chimeOn);
+      $('raChimeBtn').textContent = raState.chimeOn ? '🔊 Chime' : '🔇 Muted';
+      if (raState.chimeOn) { raState.lastChimeAt = 0; playRealignLockChime(); }
+    };
+  }
+  if ($('raAcceptBtn')) {
+    $('raAcceptBtn').onclick = async () => {
+      if (!raState.slug) return;
+      const cam = (cfg?.cameras || []).find(c => c.slug === raState.slug);
+      const cname = cam ? cam.name : raState.slug;
+      if (!window.confirm(`Replace the saved alignment baseline for ${cname} with the CURRENT camera position?\n\nOnly do this if you intentionally moved the mount (remember to verify your crops & mirror masks afterward).`)) return;
+      const btn = $('raAcceptBtn');
+      setBtnFeedback(btn, 'saving', 'Saving…');
+      try {
+        const r = await fetch('/api/bump/baseline', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ camera: raState.slug }),
+        }).then(x => x.json());
+        if (!r || !r.ok) throw new Error((r && r.error) || 'Failed');
+        setBtnFeedback(btn, 'saved', '✓ Baseline Saved', 2200);
+        showToast(`✓ Saved new 960×540 baseline for ${cname}`, 'ok');
+        raState.wasLocked = false;
+        refreshRealignOverlay(true);
+        if (raState.pollTimer) { clearTimeout(raState.pollTimer); raState.pollTimer = null; }
+        pollRealignLive();
+      } catch (err) {
+        setBtnFeedback(btn, 'save-err', '✗ Failed', 2500);
+        showToast(`✗ Failed saving baseline: ${err.message || err}`, 'err');
+      }
+    };
+  }
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && raState.open) {
+      ev.preventDefault();
+      closeRealignModal();
+    }
+  });
+}
+
 async function init() {
   cfg = await fetch('/api/config').then(r => r.json());
   (cfg.cameras || []).forEach(c => {
@@ -11507,9 +12248,12 @@ async function init() {
   populateDisplaysInputs(cfg.displays || {});
   renderCameras();
   wireMaskModal();
+  wireRealignModal();
   wireNavigation();
   wireTapeScrubber();
   navigatePage(pageFromHash(), false);
+  const initRealign = realignSlugFromHash();
+  if (initRealign) openRealignModal(initRealign);
   setInterval(drawAllCanvases, 100);
   await Promise.all([pollStatus(), pollVoiceStatus(), pollAudioStatus(), pollVoiceAb(), pollClips(), loadShows(), loadTapes()]);
   if (activePage === 'footage') ensureScrubberTimeline();
@@ -11522,6 +12266,7 @@ async function init() {
     syncRawFeeds();
     if (!document.hidden) {
       pollStatus();
+      if (raState.open) pollRealignLive();
       if (activePage === 'audio' || activePage === 'overview') pollVoiceStatus();
       if (activePage === 'audio' || activePage === 'gym' || activePage === 'overview') pollAudioStatus();
       if (activePage === 'footage' || activePage === 'overview') pollClips();
@@ -13261,6 +14006,7 @@ const PAGE_TITLES = {
 };
 
 function pageFromHash() {
+  if (realignSlugFromHash()) return 'cameras';
   const h = String(window.location.hash || '').replace(/^#[/]?/, '').toLowerCase();
   return Object.prototype.hasOwnProperty.call(PAGE_TITLES, h) ? h : 'overview';
 }
@@ -13310,7 +14056,11 @@ function wireNavigation() {
   document.querySelectorAll('.nav-btn[data-nav]').forEach(btn => {
     btn.addEventListener('click', () => navigatePage(btn.dataset.nav));
   });
-  window.addEventListener('hashchange', () => navigatePage(pageFromHash(), false));
+  window.addEventListener('hashchange', () => {
+    const rs = realignSlugFromHash();
+    navigatePage(pageFromHash(), false);
+    if (rs) openRealignModal(rs);
+  });
   window.addEventListener('resize', () => {
     if (activePage === 'footage') drawTapeTimeline();
   });
@@ -13322,7 +14072,7 @@ function wireNavigation() {
     }
   });
   document.addEventListener('keydown', (ev) => {
-    if (mmState.open) return;
+    if (mmState.open || raState.open) return;
     const tag = (ev.target && ev.target.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || ev.ctrlKey || ev.metaKey || ev.altKey) return;
     const pageKeys = ['overview', 'cameras', 'footage', 'shows', 'gym', 'audio'];
@@ -15667,6 +16417,37 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_preview_refresh() -> Response:
         res = service.refresh_drive_preview()
         return jsonify(res), (200 if res.get("ok") else 503)
+
+    @app.get("/api/bump/live")
+    def api_bump_live() -> Response:
+        cam_name = request.args.get("camera") or ""
+        if not cam_name:
+            return jsonify({"ok": False, "error": "Missing camera parameter"}), 400
+        res = service.live_bump_alignment(cam_name)
+        resp = jsonify(res)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, (200 if res.get("ok") else 404)
+
+    @app.get("/api/bump/overlay.png")
+    def api_bump_overlay_png() -> Response:
+        cam_name = request.args.get("camera") or ""
+        mode = request.args.get("mode") or "edges"
+        color = request.args.get("color") or "cyan"
+        if not cam_name:
+            return jsonify({"ok": False, "error": "Missing camera parameter"}), 400
+        png_bytes, err = service.get_bump_overlay_png(cam_name, mode=mode, color=color)
+        if not png_bytes:
+            return jsonify({"ok": False, "error": err or "Overlay unavailable"}), 404
+        resp = Response(png_bytes, mimetype="image/png")
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/bump/baseline")
+    def api_bump_baseline() -> Response:
+        body = request.get_json(silent=True) or {}
+        cam_name = str(body.get("camera") or "").strip() or None
+        res = service.capture_bump_baseline(cam_name)
+        return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.get("/api/status")
     def api_status() -> Response:

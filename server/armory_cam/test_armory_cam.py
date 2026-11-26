@@ -1501,6 +1501,118 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_realign_live_overlay_and_baseline_api(self) -> None:
+        w, h = 1280, 720
+        base = np.full((h, w, 3), 26, dtype=np.uint8)
+        for x in range(80, w - 40, 140):
+            cv2.line(base, (x, 30), (x, h - 30), (225, 225, 225), 5)
+        for y in range(70, h - 40, 120):
+            cv2.line(base, (40, y), (w - 40, y), (165, 210, 240), 4)
+        cv2.rectangle(base, (220, 180), (480, 360), (240, 240, 240), 5)
+        cv2.circle(base, (820, 420), 95, (120, 235, 160), 5)
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_realign_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestRealign")
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            dash = client.get("/").get_data(as_text=True)
+            self.assertIn('id="realignModal"', dash)
+            self.assertIn("data-realign=", dash)
+            self.assertIn("/api/bump/live", dash)
+            self.assertIn("/api/bump/overlay.png", dash)
+
+            # Seed live_hub with 960x540 frame + ring segment (1280x720) to verify native pixel scaling
+            ring_rack = svc.ring_root / "rack_cam"
+            ring_rack.mkdir(parents=True, exist_ok=True)
+            t0_ms = int(datetime(2026, 11, 26, 8, 0, 0).timestamp() * 1000)
+            seg_p = ring_rack / "seg_20261126_080000.ts"
+            png_p = tmp / "base.png"
+            cv2.imwrite(str(png_p), base)
+            subprocess.run(
+                [
+                    svc.ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                    "-loop", "1", "-t", "1.0", "-i", str(png_p),
+                    "-r", "15", "-c:v", "libx264", "-g", "10", "-bf", "0", "-pix_fmt", "yuv420p",
+                    "-f", "mpegts", str(seg_p),
+                ],
+                check=True,
+            )
+            svc.ring_segments["rack_cam"] = [
+                ac.SegmentInfo(path=seg_p, start_ms=t0_ms, end_ms=t0_ms + 1000, energy=0.0, camera="Rack Cam")
+            ]
+
+            def _push_live(img_bgr: np.ndarray) -> None:
+                live_960 = cv2.resize(img_bgr, (960, 540), interpolation=cv2.INTER_AREA)
+                ok, buf = cv2.imencode(".jpg", live_960, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                self.assertTrue(ok)
+                svc.live_hub.publish_frame("rack_cam", buf.tobytes())
+
+            _push_live(base)
+
+            # Explicit POST /api/bump/baseline saves 960x540 PNG
+            r_base = client.post("/api/bump/baseline", json={"camera": "rack_cam"})
+            self.assertEqual(r_base.status_code, 200)
+            self.assertEqual(r_base.get_json()["refDims"], [960, 540])
+            ref_path = svc.bump_refs_root / "rack_cam.png"
+            ref_img = cv2.imread(str(ref_path), cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(ref_img)
+            self.assertEqual((ref_img.shape[1], ref_img.shape[0]), (960, 540))
+
+            # Overlay endpoints return valid 960x540 PNGs (RGBA wireframe & grayscale ghost)
+            r_edges = client.get("/api/bump/overlay.png?camera=rack_cam&mode=edges&color=cyan")
+            self.assertEqual(r_edges.status_code, 200)
+            self.assertEqual(r_edges.mimetype, "image/png")
+            rgba = cv2.imdecode(np.frombuffer(r_edges.data, np.uint8), cv2.IMREAD_UNCHANGED)
+            self.assertEqual(rgba.shape, (540, 960, 4))
+            self.assertGreater(int((rgba[:, :, 3] == 255).sum()), 500)
+            self.assertGreater(int((rgba[:, :, 3] == 0).sum()), 100000)
+
+            r_ghost = client.get("/api/bump/overlay.png?camera=rack_cam&mode=ghost")
+            self.assertEqual(r_ghost.status_code, 200)
+            ghost = cv2.imdecode(np.frombuffer(r_ghost.data, np.uint8), cv2.IMREAD_GRAYSCALE)
+            self.assertEqual(ghost.shape, (540, 960))
+
+            # Aligned live frame -> aligned=True, all guides "ok"
+            r_ok = client.get("/api/bump/live?camera=rack_cam").get_json()
+            self.assertTrue(r_ok["ok"])
+            self.assertTrue(r_ok["aligned"], r_ok)
+            self.assertEqual(r_ok["guide"]["pitch"], "ok")
+            self.assertEqual(r_ok["guide"]["yaw"], "ok")
+            self.assertEqual(r_ok["guide"]["roll"], "ok")
+
+            # Simulate camera tilted DOWN -> scene moves UP (-24 px) -> guide says tilt UP!
+            shifted_up = np.roll(base, -24, axis=0)
+            _push_live(shifted_up)
+            r_up = client.get("/api/bump/live?camera=rack_cam").get_json()
+            self.assertTrue(r_up["ok"])
+            self.assertFalse(r_up["aligned"])
+            self.assertTrue(r_up["bumped"], r_up)
+            self.assertLess(r_up["dyPx"], -18.0)
+            self.assertEqual(r_up["guide"]["pitch"], "up", r_up)
+
+            # Simulate camera rolled CW -> scene rotates CCW (+2.5 deg in cv2) -> guide says roll CCW!
+            M_ccw = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), +2.5, 1.0)
+            rot_ccw = cv2.warpAffine(base, M_ccw, (w, h), borderMode=cv2.BORDER_REPLICATE)
+            _push_live(rot_ccw)
+            r_roll = client.get("/api/bump/live?camera=rack_cam").get_json()
+            self.assertTrue(r_roll["ok"])
+            self.assertLess(r_roll["dAngle"], -1.0, r_roll)
+            self.assertEqual(r_roll["guide"]["roll"], "ccw", r_roll)
+
+            # Editing a crop via POST /api/config must NOT silently overwrite existing bump baseline
+            orig_bytes = ref_path.read_bytes()
+            svc._started = True
+            cfg_now = client.get("/api/config").get_json()
+            cfg_now["cameras"][0]["crop"] = [0.0, 0.1, 0.9, 0.95]
+            self.assertEqual(client.post("/api/config", json={"cameras": cfg_now["cameras"]}).status_code, 200)
+            time.sleep(0.15)
+            self.assertEqual(ref_path.read_bytes(), orig_bytes)
+            svc._started = False
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_v360_defish_parity_cache_and_clip_encode(self) -> None:
         w, h = 640, 360
         src = np.full((h, w, 3), 24, dtype=np.uint8)
