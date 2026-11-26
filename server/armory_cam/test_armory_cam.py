@@ -6107,11 +6107,33 @@ class ShowDirectorTests(unittest.TestCase):
             allow_hardware_audio=False,
         )
 
-        # 1. No phone app connected (sse_clients == 0 and fallback False) -> speaks "App not connected"
+        # 1. No phone app connected (sse_clients == 0 and fallback False) -> speaks "App not connected" ONLY on workout commands
         em_no_app = svc_v._emit_transcript("225 for 8", latency_ms=210, from_oww=True)
         self.assertTrue(em_no_app["emitted"])
         self.assertEqual(em_no_app["ackText"], "App not connected")
         self.assertEqual(spoken, ["App not connected"])
+
+        # 1b. Non-workout / room open phrases must NEVER speak "App not connected"
+        spoken.clear()
+        em_open_chatter = svc_v._emit_transcript("open", latency_ms=150, from_oww=True)
+        self.assertTrue(em_open_chatter["emitted"])
+        self.assertEqual(em_open_chatter["ackText"], "")
+        self.assertEqual(spoken, [])
+        self.assertEqual(
+            dc.parse_display_voice_command("Hey Armory, open", wake_word="hey armory")["target"],
+            "open_gym",
+        )
+        self.assertEqual(
+            dc.parse_display_voice_command("Armory, open the gym", wake_word="hey armory")["target"],
+            "open_gym",
+        )
+        self.assertEqual(
+            dc.parse_display_voice_command("Hey Armoury, open up", wake_word="hey armory")["target"],
+            "open_gym",
+        )
+        self.assertTrue(
+            dc.parse_display_voice_command("Hey Armory, open", wake_word="hey armory").get("silent")
+        )
 
         # 2. Phone app connected (sse_clients == 1) but no active workout session -> speaks "Can't find session"
         spoken.clear()

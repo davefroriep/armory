@@ -2134,6 +2134,28 @@ class OpenWakeWordSpotter:
         return triggered, peak
 
 
+def looks_like_workout_app_command(text: str, wake_word: str = "hey armory") -> bool:
+    """Return True only for workout-logging / phone-session commands that actually require the Armory Fit app."""
+    tail = strip_wake_word(text, wake_word).strip().lower()
+    if not tail:
+        return False
+    # Never alert "App not connected" on room/gym open/close/stop/chatter commands
+    if re.search(r"\b(?:open|close|shut\s*down|power\s*(?:on|off|down)|guests?|welcome|lights?)\b", tail):
+        return False
+    # Numbers/weights/reps (e.g. "225 for 8", "for 10", "50s for 12", "rpe 8.5", "+5")
+    if re.search(r"\b\d+(?:\.\d+)?\b", tail):
+        return True
+    # Explicit workout/set/camera session keywords
+    return bool(
+        re.search(
+            r"\b(?:check|done|log|logged|set|reps?|weight|pounds?|lbs?|rpe|skip|rest|next|previous|back|"
+            r"record|recording|clip|replay|slow|workout|exercise|warmup|warm\s*up|working\s*set|drop\s*set|amrap|"
+            r"timer|pause\s+workout|resume\s+workout|finish|undo|delete\s+(?:last|set))\b",
+            tail,
+        )
+    )
+
+
 class RoomVoiceService:
     """Manages PowerConf S330 audio capture, Whisper ASR, SSE broadcast, and speaker feedback."""
 
@@ -2819,8 +2841,9 @@ class RoomVoiceService:
                 do_alert = False
 
         if emitted:
+            is_app_cmd = looks_like_workout_app_command(display_clean, wake)
             if sse_count > 0:
-                if not ctx_active and do_alert:
+                if not ctx_active and do_alert and is_app_cmd:
                     alert_txt = "Can't find session"
                     with self.lock:
                         entry["ackText"] = alert_txt
@@ -2832,7 +2855,7 @@ class RoomVoiceService:
                     elif not self._started:
                         self._release_wake_duck_sync()
                 else:
-                    self._schedule_wake_duck_release(2.2)
+                    self._schedule_wake_duck_release(2.2 if ctx_active else 0.5)
             else:
                 delivered = False
                 if self.on_fallback_transcript is not None:
@@ -2840,7 +2863,7 @@ class RoomVoiceService:
                         delivered = bool(self.on_fallback_transcript(sse_clean))
                     except Exception:
                         delivered = False
-                if not delivered and do_alert:
+                if not delivered and do_alert and is_app_cmd:
                     alert_txt = "App not connected"
                     with self.lock:
                         entry["ackText"] = alert_txt

@@ -2239,16 +2239,18 @@ def send_wol_magic_packet(
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        ports = (port,) if port != 9 else (9, 7)
         for tok in tokens:
             clean = re.sub(r"[:-]", "", tok).lower()
             if len(clean) != 12 or not re.fullmatch(r"[0-9a-f]{12}", clean):
                 continue
             packet = b"\xff" * 6 + bytes.fromhex(clean) * 16
             for bcast in broadcast_ips:
-                try:
-                    sock.sendto(packet, (bcast, port))
-                except OSError:
-                    pass
+                for p_dst in ports:
+                    try:
+                        sock.sendto(packet, (bcast, p_dst))
+                    except OSError:
+                        pass
             sent.append(":".join(clean[i : i + 2] for i in range(0, 12, 2)))
     finally:
         sock.close()

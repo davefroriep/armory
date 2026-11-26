@@ -480,8 +480,26 @@ def _strip_wake_prefix(text: str, wake_word: str = "armory") -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
     s = re.sub(r"\s+", " ", s).strip()
     wake_raw = (wake_word or "armory").strip().lower() or "armory"
-    if wake_raw == "armory":
-        alts = ["armory fit", "armoryfit", "armourys", "armorys", "armoury", "armory", "amory"]
+    if "armory" in wake_raw or "armoury" in wake_raw:
+        alts = [
+            "hey armory fit",
+            "hey armoryfit",
+            "hey armourys",
+            "hey armorys",
+            "hey armoury",
+            "hey armory",
+            "hey amory",
+            "hey army",
+            "ok armory",
+            "okay armory",
+            "armory fit",
+            "armoryfit",
+            "armourys",
+            "armorys",
+            "armoury",
+            "armory",
+            "amory",
+        ]
     elif "jarvis" in wake_raw:
         alts = [
             "hey jarvis",
@@ -496,6 +514,8 @@ def _strip_wake_prefix(text: str, wake_word: str = "armory") -> str:
             "jarves",
             "jarvish",
         ]
+    elif "atlas" in wake_raw:
+        alts = ["hey atlas", "ok atlas", "okay atlas", "atlas"]
     else:
         alts = [wake_raw]
     pat = r"^(?:(?:hey|ok|okay)\s+)?(?:" + "|".join(re.escape(a) for a in alts) + r")(?:\s+|$)"
@@ -530,7 +550,12 @@ def parse_display_voice_command(transcript: str, wake_word: str = "armory") -> d
         return None
 
     # 1. Open / Close Gym macros
-    if re.search(r"\bopen\s+(?:the\s+)?gym\b", cmd):
+    if re.search(
+        r"\b(?:open(?:\s+up)?|start|wake(?:\s+up)?|turn\s+on|power\s+on)\s+(?:(?:the|this)\s+)?(?:gym|armory|armoury)\b"
+        r"|\bgym\s+on$"
+        r"|^(?:please\s+)?open(?:\s+(?:it\s+)?up)?(?:\s+(?:now|please))?$",
+        cmd,
+    ):
         return {
             "target": "open_gym",
             "targets": ["open_gym"],
