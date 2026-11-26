@@ -3102,6 +3102,7 @@ class ShowDirector:
             "startedAt": "",
             "lastError": "",
         }
+        self._last_trigger: dict[str, Any] = {}
         self._last_result: dict[str, Any] = {}
 
         self._load_or_init()
@@ -3588,6 +3589,7 @@ class ShowDirector:
                 "fxHooks": self.fx_hooks.to_dict(),
                 "active": dict(self._active_state),
                 "lastResult": dict(self._last_result),
+                "lastTrigger": dict(self._last_trigger),
                 "kokoroReady": v_info["kokoroReady"],
                 "voices": v_info["voices"],
                 "ttsProviders": v_info["ttsProviders"],
@@ -6520,6 +6522,8 @@ class ShowDirector:
         *,
         async_run: bool = True,
         exclude_main_tv: bool | None = None,
+        source: str = "",
+        caller: str = "",
     ) -> dict[str, Any]:
         spec = self.get_show(show_id)
         if spec is None:
@@ -6527,18 +6531,29 @@ class ShowDirector:
         if not spec.enabled:
             return {"ok": False, "error": f"Show '{spec.name}' is disabled"}
 
+        src_clean = str(source or "direct").strip() or "direct"
+        caller_clean = str(caller or "").strip()[:160]
+        self.log.info("ShowDirector fire_show(%s) source=%s caller=%s", spec.id, src_clean, caller_clean or "-")
         self.stop_active_show(broadcast_stop=False)
+        now_iso = _utc_iso_now()
         with self._lock:
             self._active_run_id += 1
             run_id = self._active_run_id
             cancel_ev = threading.Event()
             self._active_cancel = cancel_ev
+            self._last_trigger = {
+                "showId": spec.id,
+                "showName": spec.name,
+                "source": src_clean,
+                "caller": caller_clean,
+                "at": now_iso,
+            }
             self._active_state = {
                 "active": True,
                 "showId": spec.id,
                 "showName": spec.name,
                 "phase": "starting",
-                "startedAt": _utc_iso_now(),
+                "startedAt": now_iso,
                 "lastError": "",
             }
 

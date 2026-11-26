@@ -37,6 +37,11 @@ import numpy as np
 from scipy.signal import lfilter, resample_poly
 import sounddevice as sd
 
+try:
+    from .aec_linein import LineInAecProcessor
+except ImportError:
+    from aec_linein import LineInAecProcessor  # type: ignore[no-redef]
+
 SAMPLE_RATE_16K = 16_000
 VAD_FRAME_SAMPLES = 512  # 32 ms @ 16 kHz (native Silero VAD window)
 VAD_CONTEXT_SAMPLES = 64
@@ -518,6 +523,8 @@ class RoomVoiceConfig:
     wake_engine: str = "whisper"  # "whisper" | "openwakeword"
     wake_threshold: float = 0.38
     rescue_threshold: float = 0.10  # Two-Tier Silent Rescue Gate: 0.10..wake_threshold checks Whisper w/o ducking (0=off)
+    aec_enabled: bool = True
+    aec_device_match: str = "Line In"
     speaker_readback: bool = True
     room_command_readback: bool = True
     tts_voice: str = DEFAULT_TTS_VOICE
@@ -540,6 +547,8 @@ class RoomVoiceConfig:
             "wakeEngine": self.wake_engine,
             "wakeThreshold": round(float(self.wake_threshold), 2),
             "rescueThreshold": round(float(self.rescue_threshold), 2),
+            "aecEnabled": bool(self.aec_enabled),
+            "aecDeviceMatch": self.aec_device_match,
             "speakerReadback": bool(self.speaker_readback),
             "roomCommandReadback": bool(self.room_command_readback),
             "ttsVoice": self.tts_voice,
@@ -585,6 +594,8 @@ class RoomVoiceConfig:
             wake_engine=wake_engine,
             wake_threshold=_clamp(float(raw.get("wakeThreshold", 0.38) if raw.get("wakeThreshold") is not None else 0.38), 0.15, 0.90),
             rescue_threshold=_clamp(float(raw.get("rescueThreshold", 0.10) if raw.get("rescueThreshold") is not None else 0.10), 0.0, 0.40),
+            aec_enabled=bool(raw.get("aecEnabled", True)),
+            aec_device_match=str(raw.get("aecDeviceMatch", "Line In") or "").strip(),
             speaker_readback=bool(raw.get("speakerReadback", True)),
             room_command_readback=bool(raw.get("roomCommandReadback", True)),
             tts_voice=tts_voice,
@@ -1191,6 +1202,7 @@ class UtteranceDetector:
         self.idle_reset_frames = max(0, int(idle_reset_frames))
 
         self._buf16 = np.zeros(0, dtype=np.float32)
+        self._vad_buf16 = np.zeros(0, dtype=np.float32)
         self._pre_roll: deque[np.ndarray] = deque(maxlen=PRE_ROLL_FRAMES)
         self._in_speech = False
         self._onset_streak = 0
@@ -1216,6 +1228,7 @@ class UtteranceDetector:
 
     def reset(self) -> None:
         self._buf16 = np.zeros(0, dtype=np.float32)
+        self._vad_buf16 = np.zeros(0, dtype=np.float32)
         self._pre_roll.clear()
         self._in_speech = False
         self._onset_streak = 0
@@ -1254,8 +1267,18 @@ class UtteranceDetector:
         self._active_max_frames = len(self._collected) + post_frames
         self._active_end_silence_frames = min(self.end_silence_frames, max(4, int(round(float(end_silence_ms) / 32.0))))
 
-    def push_samples(self, samples_16k: np.ndarray, muted: bool = False) -> list[np.ndarray]:
-        """Ingest 16 kHz mono float32 samples; returns zero or more completed utterance arrays."""
+    def push_samples(
+        self,
+        samples_16k: np.ndarray,
+        muted: bool = False,
+        vad_samples_16k: np.ndarray | None = None,
+    ) -> list[np.ndarray]:
+        """Ingest 16 kHz mono float32 samples; returns zero or more completed utterance arrays.
+
+        When ``vad_samples_16k`` is supplied (e.g. RES-suppressed audio during loud gym music),
+        Silero VAD gates speech onset/offset on ``vad_samples_16k`` while the returned utterance
+        preserves the un-warbled ``samples_16k`` (Stage-1 linear PBFDAF) for Whisper ASR.
+        """
         if muted:
             self.reset()
             self.latest_rms = 0.0
@@ -1264,19 +1287,28 @@ class UtteranceDetector:
 
         if samples_16k.size == 0:
             return []
-        self._buf16 = np.concatenate([self._buf16, samples_16k.astype(np.float32, copy=False)])
+        raw_arr = samples_16k.astype(np.float32, copy=False)
+        self._buf16 = np.concatenate([self._buf16, raw_arr])
+        if vad_samples_16k is not None and vad_samples_16k.size == raw_arr.size:
+            self._vad_buf16 = np.concatenate([self._vad_buf16, vad_samples_16k.astype(np.float32, copy=False)])
+        else:
+            self._vad_buf16 = np.concatenate([self._vad_buf16, raw_arr])
+        if self._vad_buf16.size != self._buf16.size:
+            self._vad_buf16 = self._buf16.copy()
         completed: list[np.ndarray] = []
 
         while self._buf16.size >= VAD_FRAME_SAMPLES:
             frame = self._buf16[:VAD_FRAME_SAMPLES]
             self._buf16 = self._buf16[VAD_FRAME_SAMPLES:]
+            vad_frame = self._vad_buf16[:VAD_FRAME_SAMPLES]
+            self._vad_buf16 = self._vad_buf16[VAD_FRAME_SAMPLES:]
 
-            rms = float(np.sqrt(np.mean(frame * frame)))
-            self.latest_rms = rms
+            rms = float(np.sqrt(np.mean(vad_frame * vad_frame)))
+            self.latest_rms = float(np.sqrt(np.mean(frame * frame)))
             if rms < self.rms_gate * 0.25 and not self._in_speech:
                 prob = 0.0
             else:
-                prob = self.vad.score_frame(frame, rms_gate=self.rms_gate)
+                prob = self.vad.score_frame(vad_frame, rms_gate=self.rms_gate)
             self.latest_vad = prob
 
             is_speech = (prob >= self.vad_threshold) and (rms >= self.rms_gate * 0.5)
@@ -2176,6 +2208,7 @@ class RoomVoiceService:
         wake_duck_callbacks: dict[str, Callable[..., Any]] | None = None,
         wake_spotter: Any | None = None,
         show_active_fn: Callable[[], bool] | None = None,
+        aec_processor: Any | None = None,
     ) -> None:
         self.cfg = config or RoomVoiceConfig()
         self.root_dir = root_dir
@@ -2235,6 +2268,10 @@ class RoomVoiceService:
         self._wake_duck_release_timer: threading.Timer | None = None
 
         self._stream: sd.InputStream | None = None
+        self._aec_stream: sd.InputStream | None = None
+        self._aec: LineInAecProcessor = (
+            aec_processor if aec_processor is not None else LineInAecProcessor(enabled=self.cfg.aec_enabled)
+        )
         self._stream_sr: int = 48_000
         self._stream_dev_name: str = ""
         self._stream_host_api: str = ""
@@ -2248,6 +2285,15 @@ class RoomVoiceService:
             max_utterance_sec=self.cfg.max_utterance_sec,
             rms_gate=self.cfg.rms_gate,
         )
+        self._aec_vad_detector = UtteranceDetector(
+            vad_threshold=0.42,
+            min_speech_ms=160,
+            end_silence_ms=420,
+            max_utterance_sec=4.5,
+            rms_gate=0.0025,
+        )
+        self._last_emitted_norm: str = ""
+        self._last_emitted_mono: float = 0.0
         cache_dir = (root_dir / "tts_cache") if root_dir is not None else None
         secrets_path = (root_dir / "tts_secrets.json") if root_dir is not None else None
         self._tts = _NeuralTtsSynthesizer(cache_dir=cache_dir, models_dir=models_dir, secrets_path=secrets_path)
@@ -2470,6 +2516,10 @@ class RoomVoiceService:
             merged = {**self.cfg.to_dict(), **(raw or {})}
             next_cfg = RoomVoiceConfig.from_dict(merged)
             dev_changed = next_cfg.device_match != self.cfg.device_match
+            aec_changed = (
+                next_cfg.aec_enabled != self.cfg.aec_enabled
+                or next_cfg.aec_device_match != self.cfg.aec_device_match
+            )
             model_changed = next_cfg.model_size != self.cfg.model_size
             tts_changed = next_cfg.tts_voice != self.cfg.tts_voice
             wake_changed = (
@@ -2477,6 +2527,7 @@ class RoomVoiceService:
                 or next_cfg.wake_engine != self.cfg.wake_engine
             )
             self.cfg = next_cfg
+            self._aec.enabled = bool(next_cfg.aec_enabled)
             self.context_wake_word = next_cfg.wake_word
             self._detector.configure(next_cfg)
             if wake_changed and not self._custom_wake_spotter:
@@ -2505,7 +2556,7 @@ class RoomVoiceService:
             ):
                 threading.Thread(target=self._prewarm_tts_worker, name="armory-voice-ttswarm", daemon=True).start()
             self._bump_status_locked()
-        if dev_changed or not next_cfg.enabled:
+        if dev_changed or aec_changed or not next_cfg.enabled:
             self._close_stream()
         return next_cfg
 
@@ -2687,6 +2738,7 @@ class RoomVoiceService:
                 "testRemainingSec": test_rem,
                 "rms": round(float(self._detector.latest_rms), 5),
                 "vad": round(float(self._detector.latest_vad), 3),
+                "aec": self._aec.status_dict(),
                 "error": self._model_error or self.last_error,
                 "config": self.cfg.to_dict(),
                 "recent": list(self.recent_transcripts),
@@ -2778,6 +2830,27 @@ class RoomVoiceService:
                 sse_clean = clean
                 sse_wake = wake
                 emitted = bool(clean) and (force_emit or has_wake or was_armed)
+            if emitted and not force_emit and (from_oww or from_rescue):
+                norm_cmd = re.sub(r"[^a-z0-9]+", " ", strip_wake_word(display_clean, wake).lower()).strip()
+                now_mono_dedup = time.monotonic()
+                if (
+                    norm_cmd
+                    and norm_cmd == self._last_emitted_norm
+                    and (now_mono_dedup - self._last_emitted_mono) < 3.0
+                ):
+                    return {
+                        "id": 0,
+                        "tsMs": now_ms,
+                        "transcript": display_clean,
+                        "wakeMatched": True,
+                        "emitted": False,
+                        "dedupDropped": True,
+                        "latencyMs": int(latency_ms),
+                        "ackText": "",
+                    }
+                if norm_cmd:
+                    self._last_emitted_norm = norm_cmd
+                    self._last_emitted_mono = now_mono_dedup
             local_handler = self._local_command_handler if emitted else None
 
         show_running = self._is_show_active()
@@ -3366,23 +3439,29 @@ class RoomVoiceService:
         now_ms: int | None = None,
         now_mono: float | None = None,
     ) -> None:
-        """Route 16 kHz mono float32 capture frames through openWakeWord (idle) + Silero VAD (armed) or Whisper mode."""
+        """Route 16 kHz mono float32 capture frames through Line-In AEC + openWakeWord (Tier-1) + AEC-VAD (Tier-2)."""
+        if pcm16.size == 0:
+            return
+        if self._aec is not None and self._aec.enabled:
+            lin_16k, vad_clean_16k, aec_active = self._aec.process_mic_frame(pcm16)
+        else:
+            lin_16k, vad_clean_16k, aec_active = pcm16, pcm16, False
+        vad_in = np.clip(vad_clean_16k * 3.0, -0.98, 0.98).astype(np.float32) if aec_active else None
+
         if not self._using_oww_spotter():
-            utterances = self._detector.push_samples(pcm16, muted=muted)
+            utterances = self._detector.push_samples(lin_16k, muted=muted, vad_samples_16k=vad_in)
             for utt in utterances:
                 self._enqueue_utterance((utt, False))
             return
 
-        if pcm16.size == 0:
-            return
-        self._detector.latest_rms = float(np.sqrt(np.mean(pcm16 * pcm16)))
+        self._detector.latest_rms = float(np.sqrt(np.mean(lin_16k * lin_16k)))
         cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         cur_mono = time.monotonic() if now_mono is None else float(now_mono)
 
         if cur_ms < self.armed_until_ms:
             if muted:
                 return
-            utterances = self._detector.push_samples(pcm16, muted=False)
+            utterances = self._detector.push_samples(lin_16k, muted=False, vad_samples_16k=vad_in)
             if utterances:
                 self._enqueue_utterance((utterances[0], True))
                 # Consume armed window on first follow-up utterance so background group chatter
@@ -3394,12 +3473,13 @@ class RoomVoiceService:
         # Idle in openWakeWord mode: NEVER mute openWakeWord during confirmation/error replies so
         # immediate user retries ("Hey Jarvis, done") are never locked out!
         self._detector.latest_vad = 0.0
-        self._oww_preroll.append(pcm16.copy())
-        triggered, score = self._oww_spotter.push_samples(pcm16, now_mono=cur_mono)
+        self._oww_preroll.append(lin_16k.copy())
+        triggered, score = self._oww_spotter.push_samples(lin_16k, now_mono=cur_mono)
         if triggered:
             self._rescue_active = False
             self._rescue_chunks.clear()
             self._rescue_post_samples = 0
+            self._aec_vad_detector.reset()
             self._mute_until_mono = 0.0
             self.armed_until_ms = cur_ms + ARM_WINDOW_MS
             self._oww_awaiting_cmd = True
@@ -3419,12 +3499,28 @@ class RoomVoiceService:
             threading.Thread(target=self._on_oww_wake_detected, args=(score,), name="armory-oww-wake", daemon=True).start()
             return
 
-        # Two-Tier Silent Rescue Gate: grey-zone hits (rescueThreshold <= score < wakeThreshold) capture
-        # quietly in the background without ducking Denon or flashing UI, and verify via GPU Whisper.
+        # Zero-Miss AEC-VAD Safety Net: while Line-In AEC is actively cancelling loud Denon music,
+        # run Silero VAD on the -15 dB RES-suppressed stream and silently verify any speech burst
+        # via GPU Whisper on the pristine linear-PBFDAF audio (zero false ducks, 100% Vol 69 landing).
+        if aec_active:
+            self._rescue_active = False
+            self._rescue_chunks.clear()
+            self._rescue_post_samples = 0
+            if muted:
+                self._aec_vad_detector.push_samples(lin_16k, muted=True)
+            else:
+                for utt in self._aec_vad_detector.push_samples(lin_16k, muted=False, vad_samples_16k=vad_in):
+                    self._enqueue_utterance((utt, False, True, 0.99))
+            return
+        elif self._aec_vad_detector._in_speech or self._aec_vad_detector._collected:
+            self._aec_vad_detector.reset()
+
+        # Two-Tier Silent Rescue Gate (when Line-In AEC is idle/bypassed): grey-zone hits
+        # (rescueThreshold <= score < wakeThreshold) capture quietly and verify via GPU Whisper.
         rescue_thr = float(getattr(self.cfg, "rescue_threshold", 0.0) or 0.0)
         if self._rescue_active:
-            self._rescue_chunks.append(pcm16.copy())
-            self._rescue_post_samples += int(pcm16.size)
+            self._rescue_chunks.append(lin_16k.copy())
+            self._rescue_post_samples += int(lin_16k.size)
             if score > self._rescue_peak_score:
                 self._rescue_peak_score = score
             if self._rescue_post_samples >= int(1.9 * SAMPLE_RATE_16K):
@@ -3526,6 +3622,8 @@ class RoomVoiceService:
                     if dev["hostApi"] == "Windows WASAPI":
                         self._wasapi_probe_misses = 0
                     self._detector.reset()
+                    self._aec_vad_detector.reset()
+                    self._open_aec_stream_locked(snap, main_dev_index=int(dev["index"]))
                     with self.lock:
                         self.listening = True
                         self.last_error = None
@@ -3548,8 +3646,82 @@ class RoomVoiceService:
                 self._bump_status_locked()
             return False
 
+    def _open_aec_stream_locked(self, snap: dict[str, Any], *, main_dev_index: int) -> None:
+        """Open optional Line-In reference stream for real-time Denon PRE OUT echo cancellation (fail-safe)."""
+        self._close_aec_stream_locked()
+        if not (self.cfg.aec_enabled and self._allow_hardware_audio and self.cfg.aec_device_match):
+            return
+        aec_dev = resolve_audio_device("in", self.cfg.aec_device_match, snap)
+        if aec_dev is None or int(aec_dev["index"]) == int(main_dev_index):
+            self._aec.stream_open = False
+            self._aec.device_name = ""
+            self._aec.host_api = ""
+            self._aec.last_error = f"AEC ref '{self.cfg.aec_device_match}' not found"
+            return
+        aec_sr = int(aec_dev["sampleRate"] or 48_000)
+        aec_max_ch = max(1, int(aec_dev["channels"] or 1))
+        aec_ch_order = [min(2, aec_max_ch), 1] if aec_max_ch >= 2 else [1]
+
+        def _aec_cb(indata: np.ndarray, _frames: int, _time_info: Any, _status: Any) -> None:
+            if self._stop_event.is_set():
+                return
+            mono = indata.mean(axis=1) if indata.ndim > 1 and indata.shape[1] > 1 else indata.reshape(-1)
+            ref16 = resample_to_mono_16k(mono, aec_sr)
+            self._aec.push_ref_samples(ref16)
+
+        last_err = ""
+        for ch in aec_ch_order:
+            try:
+                self._aec.reset()
+                with _PORTAUDIO_LOCK:
+                    astream = sd.InputStream(
+                        device=aec_dev["index"],
+                        samplerate=aec_sr,
+                        channels=ch,
+                        dtype="float32",
+                        blocksize=int(round(aec_sr * 0.032)),
+                        callback=_aec_cb,
+                    )
+                    astream.start()
+                self._aec_stream = astream
+                self._aec.stream_open = True
+                self._aec.device_name = str(aec_dev["name"])
+                self._aec.host_api = str(aec_dev["hostApi"])
+                self._aec.last_error = None
+                self.log.info(
+                    "Line-In AEC ref open: %s [%s @ %d Hz, %d ch]",
+                    aec_dev["name"],
+                    aec_dev["hostApi"],
+                    aec_sr,
+                    ch,
+                )
+                return
+            except Exception as exc:
+                last_err = str(exc)
+        self._aec.stream_open = False
+        self._aec.last_error = last_err or f"Could not open AEC ref {aec_dev['name']}"
+        self.log.warning("Line-In AEC ref unavailable (continuing S330-only): %s", self._aec.last_error)
+
+    def _close_aec_stream_locked(self) -> None:
+        astream = self._aec_stream
+        self._aec_stream = None
+        if astream is not None:
+            with _PORTAUDIO_LOCK:
+                try:
+                    astream.stop()
+                except Exception:
+                    pass
+                try:
+                    astream.close()
+                except Exception:
+                    pass
+            self.log.info("Line-In AEC ref closed (%s)", self._aec.device_name or "idle")
+        self._aec.stream_open = False
+        self._aec.reset()
+
     def _close_stream(self) -> None:
         with self._audio_lock:
+            self._close_aec_stream_locked()
             stream = self._stream
             self._stream = None
             if stream is not None:
@@ -3566,6 +3738,7 @@ class RoomVoiceService:
             self._stream_dev_name = ""
             self._stream_host_api = ""
         self._detector.reset()
+        self._aec_vad_detector.reset()
         with self.lock:
             if self.listening:
                 self.listening = False

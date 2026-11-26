@@ -3475,7 +3475,7 @@ class ShowDirectorTests(unittest.TestCase):
                 svc.voice._stop_event.clear()
                 ev = svc.voice.inject_transcript("Armory, I just hit a PR")
                 self.assertTrue(ev["localHandled"])
-                m_fire.assert_called_once_with("pr", async_run=True)
+                m_fire.assert_called_once_with("pr", async_run=True, source="voice", caller="Armory, I just hit a PR")
                 self.assertEqual(tts_spoken, [])
         finally:
             svc.stop_background()
@@ -6812,6 +6812,124 @@ class ShowDirectorTests(unittest.TestCase):
             r_live = svc._handle_local_voice_command("Hey Armory, record this")
             self.assertIsNone(r_live)
             self.assertIsNotNone(svc.active_server_armed_clip())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_line_in_aec_processor_zero_miss_vad_dedup_and_show_audit(self) -> None:
+        from server.armory_cam.aec_linein import LineInAecProcessor
+
+        # 1. Auto-bypass on silent Line In
+        aec = LineInAecProcessor(enabled=True)
+        quiet_ref = np.zeros(512, dtype=np.float32)
+        mic_sig = (0.05 * np.sin(2.0 * np.pi * 440.0 * np.arange(512) / 16000.0)).astype(np.float32)
+        for _ in range(10):
+            aec.push_ref_samples(quiet_ref)
+            lin, cln, act = aec.process_mic_frame(mic_sig)
+        self.assertFalse(act)
+        np.testing.assert_allclose(lin, mic_sig, atol=1e-6)
+        np.testing.assert_allclose(cln, mic_sig, atol=1e-6)
+
+        # 2. Active echo cancellation on synthetic multi-tap room echo (lag = 1840 samp = 115 ms)
+        rng = np.random.default_rng(42)
+        n_total = 16000 * 6
+        ref = rng.standard_normal(n_total).astype(np.float32) * 0.08
+        # Multi-tap room impulse response starting at 1840 samples (115 ms)
+        mic = np.zeros(n_total, dtype=np.float32)
+        for delay, gain in ((1840, 0.55), (1920, -0.28), (2100, 0.16), (2450, 0.09)):
+            mic[delay:] += gain * ref[:-delay]
+        aec2 = LineInAecProcessor(enabled=True)
+        lin_all = np.zeros(n_total, dtype=np.float32)
+        cln_all = np.zeros(n_total, dtype=np.float32)
+        active_cnt = 0
+        for i in range(0, n_total - 512, 512):
+            aec2.push_ref_samples(ref[i : i + 512])
+            lo, co, act = aec2.process_mic_frame(mic[i : i + 512])
+            lin_all[i : i + 512] = lo
+            cln_all[i : i + 512] = co
+            if act:
+                active_cnt += 1
+        self.assertGreater(active_cnt, 100)
+        st = aec2.status_dict()
+        self.assertTrue(st["active"])
+        self.assertTrue(st["locked"])
+        self.assertAlmostEqual(st["lagMs"], 115.0, delta=4.0)
+        # Measure steady ERLE over last 2 seconds
+        sl = slice(16000 * 4, 16000 * 5 + 8000)
+        lin_erle = 10.0 * np.log10((np.mean(mic[sl] ** 2) + 1e-12) / (np.mean(lin_all[sl] ** 2) + 1e-12))
+        cln_erle = 10.0 * np.log10((np.mean(mic[sl] ** 2) + 1e-12) / (np.mean(cln_all[sl] ** 2) + 1e-12))
+        self.assertGreater(lin_erle, 12.0)
+        self.assertGreater(cln_erle, 14.0)
+
+        # 3. RoomVoiceService Zero-Miss AEC-VAD Safety Net + 3.0s Dedup Guard + status_dict()['aec']
+        class _DummySpotter:
+            ready = True
+            threshold = 0.38
+            latest_score = 0.0
+            def push_samples(self, _x, now_mono=0.0):
+                return False, 0.0
+            def reset(self):
+                pass
+
+        class _FakeAec:
+            enabled = True
+            def process_mic_frame(self, pcm16):
+                return pcm16, pcm16, True
+            def status_dict(self):
+                return {"enabled": True, "streamOpen": True, "active": True, "erleDb": 16.5, "lagMs": 118.0}
+            def reset(self):
+                pass
+
+        rv_cfg = rv.RoomVoiceConfig(
+            enabled=True,
+            wake_engine="openwakeword",
+            wake_word="hey armory",
+            wake_threshold=0.38,
+            rescue_threshold=0.10,
+            speaker_readback=False,
+        )
+        v_aec = rv.RoomVoiceService(
+            config=rv_cfg,
+            allow_hardware_audio=False,
+            wake_spotter=_DummySpotter(),
+            aec_processor=_FakeAec(),
+        )
+        self.assertEqual(v_aec.status_dict()["aec"]["erleDb"], 16.5)
+        fake_utt = np.ones(1600, dtype=np.float32) * 0.1
+        with mock.patch.object(v_aec._aec_vad_detector, "push_samples", return_value=[fake_utt]):
+            v_aec._ingest_pcm16_frame(np.zeros(512, dtype=np.float32), now_ms=50_000, now_mono=50.0)
+        self.assertEqual(v_aec._utt_queue.qsize(), 1)
+        q_item = v_aec._utt_queue.get_nowait()
+        self.assertEqual(len(q_item), 4)
+        self.assertFalse(q_item[1])  # from_oww = False
+        self.assertTrue(q_item[2])   # from_rescue = True (zero Denon duck)
+
+        # 3.0s deduplication guard blocks back-to-back duplicate Tier-1/Tier-2 command
+        v_aec.sse_clients = 1
+        v_aec.context_active = True
+        e1 = v_aec._emit_transcript("Hey Armory, done", latency_ms=120, from_oww=True)
+        e2 = v_aec._emit_transcript("Hey Armory, done", latency_ms=140, from_rescue=True, rescue_score=0.99)
+        self.assertTrue(e1["emitted"])
+        self.assertFalse(e2["emitted"])
+        self.assertTrue(e2.get("dedupDropped"))
+
+        # 4. Show-fire HTTP audit logging records source, remoteAddr, and User-Agent
+        tmp = Path(tempfile.mkdtemp(prefix="armory_show_audit_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc)
+            client = app.test_client()
+            with mock.patch.object(svc.shows, "_run_show_sequence", return_value={"ok": True}):
+                resp = client.post(
+                    "/api/shows/pr/fire",
+                    json={},
+                    headers={"User-Agent": "AuditTestUA/1.0"},
+                )
+            self.assertEqual(resp.status_code, 200)
+            st_shows = svc.shows.status_dict()
+            trig = st_shows.get("lastTrigger") or {}
+            self.assertEqual(trig.get("showId"), "pr")
+            self.assertEqual(trig.get("source"), "http")
+            self.assertIn("AuditTestUA/1.0", trig.get("caller", ""))
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

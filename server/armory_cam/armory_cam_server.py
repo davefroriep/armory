@@ -8381,7 +8381,12 @@ class ArmoryCamService:
                     "ackText": ack,
                     "result": res,
                 }
-            res = self.shows.fire_show(str(show_match.get("showId") or ""), async_run=True)
+            res = self.shows.fire_show(
+                str(show_match.get("showId") or ""),
+                async_run=True,
+                source="voice",
+                caller=transcript[:120],
+            )
             ok = bool(res.get("ok"))
             return {
                 "handled": True,
@@ -11988,6 +11993,15 @@ function syncVoiceUI(vx) {
       `Model: <b>${escHtml(vx.modelSize || 'base.en')}</b>${vx.asrDevice ? ` (${escHtml(vx.asrDevice)})` : ''}`,
       `SSE: <b>${Number(vx.sseClients || 0)}</b>`,
     ];
+    if (vx.aec && vx.aec.enabled) {
+      if (vx.aec.active) {
+        parts.push(`Line-In AEC: <b style="color:var(--green)">ACTIVE (-${Number(vx.aec.erleDb || 0).toFixed(1)} dB · ${Number(vx.aec.lagMs || 0).toFixed(0)}ms)</b>`);
+      } else if (vx.aec.streamOpen) {
+        parts.push(`Line-In AEC: <b>STANDBY (${Number(vx.aec.lineInDb || -99).toFixed(0)} dB)</b>`);
+      } else {
+        parts.push(`Line-In AEC: <span style="color:var(--amber)">${escHtml(vx.aec.error || 'Disconnected')}</span>`);
+      }
+    }
     if (vx.error) parts.push(`<span style="color:var(--amber)">${escHtml(vx.error)}</span>`);
     else if (!vx.listening && vx.enabled) parts.push('Shared mic closed until active Lift workout');
     msgEl.innerHTML = parts.join(' · ');
@@ -18215,7 +18229,10 @@ def create_app(service: ArmoryCamService) -> Flask:
     def api_show_fire(show_id: str) -> Response:
         body = request.get_json(silent=True)
         excl = bool(body["excludeMainTv"]) if isinstance(body, dict) and "excludeMainTv" in body else None
-        res = service.shows.fire_show(show_id, async_run=True, exclude_main_tv=excl)
+        ua = str(request.headers.get("User-Agent") or "").strip()[:80]
+        ref = str(request.headers.get("Referer") or "").strip()[:60]
+        caller = f"{request.remote_addr or '?'} | {ua}" + (f" | ref={ref}" if ref else "")
+        res = service.shows.fire_show(show_id, async_run=True, exclude_main_tv=excl, source="http", caller=caller)
         return jsonify(res), (200 if res.get("ok") else 400)
 
     @app.post("/api/shows/stop")
