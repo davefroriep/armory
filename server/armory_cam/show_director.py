@@ -346,6 +346,7 @@ class SmartFxConfig:
     fog_trigger_url: str = ""
     fog_burst_sec: float = 4.0
     theater_host: str = ""
+    lights_lead_sec: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -362,6 +363,7 @@ class SmartFxConfig:
             "fogTriggerUrl": self.fog_trigger_url,
             "fogBurstSec": round(float(self.fog_burst_sec), 1),
             "theaterHost": self.theater_host,
+            "lightsLeadSec": round(float(self.lights_lead_sec), 2),
         }
 
     @classmethod
@@ -372,6 +374,11 @@ class SmartFxConfig:
             burst = _clamp(float(raw.get("fogBurstSec", 4.0) or 4.0), 1.0, 60.0)
         except (TypeError, ValueError):
             burst = 4.0
+        try:
+            lead_raw = raw.get("lightsLeadSec", 0.0)
+            lead_sec = _clamp(float(0.0 if lead_raw is None or lead_raw == "" else lead_raw), 0.0, 5.0)
+        except (TypeError, ValueError):
+            lead_sec = 0.0
         return cls(
             lights_host=str(raw.get("lightsHost", "") or "").strip(),
             lights_off_url=str(raw.get("lightsOffUrl", "") or "").strip(),
@@ -386,6 +393,7 @@ class SmartFxConfig:
             fog_trigger_url=str(raw.get("fogTriggerUrl", "") or "").strip(),
             fog_burst_sec=burst,
             theater_host=str(raw.get("theaterHost", "") or "").strip(),
+            lights_lead_sec=lead_sec,
         )
 
     @staticmethod
@@ -5511,6 +5519,11 @@ class ShowDirector:
                 return self._wait_cancelable(cancel_ev, wait_s)
 
             # 7. Unified monotonic sorted timeline (lights, strobes, timed speech overlays, custom FX cues)
+            lead_l = max(0.0, float(fx.lights_lead_sec or 0.0))
+            has_explicit_lights_on = any(
+                fc.get("type") == "lights_on" and str(fc.get("zone") or "all").lower() == "all"
+                for fc in spec.fx_cues
+            )
             timeline: list[tuple[float, int, str, dict[str, Any]]] = []
             if spec.lightning_flash_sec > 0.0 and spec.lightning_flash_sec < (intro_dur - 0.8):
                 timeline.append((float(spec.lightning_flash_sec), 10, "lightning", {"on_sec": 0.16, "off_sec": 0.05}))
@@ -5529,9 +5542,9 @@ class ShowDirector:
                     t_p = intro_dur + (idx_p - 1) * p_interval
                     timeline.append((t_p, 25, "pulse_on", {"index": idx_p, "total": n_pulses, "on_sec": p_on}))
                     timeline.append((t_p + p_on, 26, "pulse_off", {}))
-                timeline.append((intro_dur + n_pulses * p_interval, 30, "lights_full_on", {}))
-            elif spec.lights_out:
-                timeline.append((intro_dur, 30, "lights_full_on", {}))
+                timeline.append((max(0.0, intro_dur + n_pulses * p_interval - lead_l), 30, "lights_full_on", {}))
+            elif spec.lights_out and not has_explicit_lights_on:
+                timeline.append((max(0.0, intro_dur - lead_l), 30, "lights_full_on", {}))
 
             raw_vid_timings = meta.get("speechCueTimings")
             if isinstance(raw_vid_timings, list) and raw_vid_timings:
@@ -5565,7 +5578,8 @@ class ShowDirector:
                 base_t = float(fc.get("atSec") or 0.0)
                 show_t = base_t if fc.get("target") == "intro" else (intro_dur + base_t)
                 if show_t < total_dur:
-                    timeline.append((show_t, 35, "fx_cue", dict(fc)))
+                    eff_t = max(0.0, show_t - lead_l) if fc.get("type") in ("lights_on", "lights_off") else show_t
+                    timeline.append((eff_t, 35, "fx_cue", dict(fc)))
 
             timeline.sort(key=lambda item: (item[0], item[1]))
 
@@ -5986,7 +6000,72 @@ class ShowDirector:
                         name=f"ArmoryPrFlash-{spec.id}",
                         daemon=True,
                     ).start()
-            if self._wait_cancelable(cancel_ev, rem_intro):
+            audio_fx_cues: list[tuple[float, dict[str, Any]]] = []
+            if spec.fx_cues and not (spec.three_screen_video and spec.youtube_url):
+                lead_l = max(0.0, float(fx.lights_lead_sec or 0.0))
+                for fc in spec.fx_cues:
+                    base_t = float(fc.get("atSec") or 0.0)
+                    if base_t < preview_dur:
+                        eff_t = max(intro_elapsed, base_t - lead_l) if fc.get("type") in ("lights_on", "lights_off") else max(intro_elapsed, base_t)
+                        if eff_t < preview_dur:
+                            audio_fx_cues.append((eff_t, dict(fc)))
+                audio_fx_cues.sort(key=lambda item: item[0])
+
+            if audio_fx_cues:
+                cur_t = intro_elapsed
+                end_t = max(intro_elapsed + 0.15, preview_dur - 0.05)
+                for cue_t, fc in audio_fx_cues:
+                    if cue_t > end_t:
+                        break
+                    wait_d = max(0.0, cue_t - cur_t)
+                    if wait_d > 0.0 and self._wait_cancelable(cancel_ev, wait_d):
+                        return {"ok": False, "canceled": True}
+                    cur_t = max(cur_t, cue_t)
+                    fx_type = str(fc.get("type") or "flash")
+                    dur_fx = float(fc.get("durationSec") or 0.2)
+                    cnt_fx = int(fc.get("count") or 1)
+                    zone_fx = str(fc.get("zone") or "all")
+                    if fx_type == "flash":
+                        self._flash_lights(
+                            cnt_fx,
+                            cancel_ev=cancel_ev,
+                            show_id=spec.id,
+                            end_on=True,
+                            on_sec=max(0.1, min(2.0, dur_fx)),
+                            off_sec=0.14,
+                            tag_prefix="FLASH · CUSTOM",
+                            zone=zone_fx,
+                        )
+                        cur_t += cnt_fx * max(0.1, min(2.0, dur_fx)) + max(0, cnt_fx - 1) * 0.14
+                    elif fx_type == "lights_off":
+                        self._fire_lights_state(
+                            False, zone=zone_fx, tag="lights_off", label="(LIGHTS OFF · FX)", show_id=spec.id, duration_ms=1200
+                        )
+                        if zone_fx == "all":
+                            lights_turned_off = True
+                            lights_restored = False
+                    elif fx_type == "lights_on":
+                        self._fire_lights_state(
+                            True, zone=zone_fx, tag="lights_on", label="(LIGHTS ON · FX)", show_id=spec.id, duration_ms=1200
+                        )
+                        if zone_fx == "all":
+                            lights_restored = True
+                    elif fx_type == "fog":
+                        b_str = f"{dur_fx:.1f}".rstrip("0").rstrip(".")
+                        self._emit_cue(
+                            "fog",
+                            f"(TRIGGER FOG · {b_str}s)",
+                            show_id=spec.id,
+                            duration_ms=int(dur_fx * 1000),
+                            fogSec=dur_fx,
+                        )
+                        fog_u = fx.resolve_fog_url(burst_sec=dur_fx)
+                        if fog_u:
+                            self._fire_http_hook(fog_u)
+                tail_wait = max(0.0, end_t - cur_t)
+                if tail_wait > 0.0 and self._wait_cancelable(cancel_ev, tail_wait):
+                    return {"ok": False, "canceled": True}
+            elif self._wait_cancelable(cancel_ev, rem_intro):
                 return {"ok": False, "canceled": True}
 
             # 7A. Ryder / Debut 3-screen video + light strobe + 1:20 duck/overlay/MV55 choreography

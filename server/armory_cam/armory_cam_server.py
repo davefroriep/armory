@@ -8949,23 +8949,24 @@ DASHBOARD_HTML = """<!doctype html>
           </summary>
           <div class="show-acc-body">
             <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">
-              <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
-              <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-              <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-              <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
-              <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
-              <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-              <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
+              <div><label>Armory Lights ON URL (Matter Bridge / HTTP)</label><input id="fxLightsOnUrl" type="text" placeholder="http://127.0.0.1:8787/api/armory-lights?on=1"></div>
+              <div><label>Armory Lights OFF URL (Matter Bridge / HTTP)</label><input id="fxLightsOffUrl" type="text" placeholder="http://127.0.0.1:8787/api/armory-lights?on=0"></div>
+              <div><label>Lights Lead Time (0–5s, sync offset)</label><input id="fxLightsLeadSec" type="number" min="0" max="5" step="0.1" value="0"></div>
               <div><label>Smart Fogger v3.1 IP / Host</label><input id="fxTheaterHost" type="text" placeholder="smart-fogger.local or 192.168.1.xxx"></div>
+              <div><label>Fog Machine Relay / ESP32 IP</label><input id="fxFogHost" type="text" placeholder="192.168.1.xxx"></div>
               <div><label>Fog Trigger URL ({sec} placeholder)</label><input id="fxFogUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true&amp;toggle_after={sec}"></div>
               <div><label>Default Fog Burst (1–60s)</label><input id="fxFogBurst" type="number" min="1" max="60" step="1" value="30"></div>
             </div>
             <details style="margin-top:0">
-              <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Single-Relay Legacy Fallback (optional)</summary>
+              <summary style="cursor:pointer;font-size:11px;color:var(--mut)">Optional Dual-Zone Shelly Overrides (Rack / Smith / Legacy IP)</summary>
               <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px;margin-top:6px">
+                <div><label>House Lights – Rack IP (Shelly)</label><input id="fxLightsRackHost" type="text" placeholder="192.168.1.xxx"></div>
+                <div><label>Rack ON URL (optional override)</label><input id="fxLightsRackOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+                <div><label>Rack OFF URL (optional override)</label><input id="fxLightsRackOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
+                <div><label>House Lights – Smith IP (Shelly)</label><input id="fxLightsSmithHost" type="text" placeholder="192.168.1.xxx"></div>
+                <div><label>Smith ON URL (optional override)</label><input id="fxLightsSmithOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
+                <div><label>Smith OFF URL (optional override)</label><input id="fxLightsSmithOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
                 <div><label>Legacy House Lights IP</label><input id="fxLightsHost" type="text" placeholder="192.168.1.xxx"></div>
-                <div><label>Legacy Lights OFF URL</label><input id="fxLightsOffUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=false"></div>
-                <div><label>Legacy Lights ON URL</label><input id="fxLightsOnUrl" type="text" placeholder="http://.../rpc/Switch.Set?id=0&amp;on=true"></div>
               </div>
             </details>
             <div class="ctrl-row" style="margin-top:0;flex-wrap:wrap;gap:6px">
@@ -13300,6 +13301,7 @@ function populateFxHookInputs(fx) {
   if ($('fxTheaterHost')) $('fxTheaterHost').value = fx.theaterHost || '';
   if ($('fxFogUrl')) $('fxFogUrl').value = fx.fogTriggerUrl || '';
   if ($('fxFogBurst')) $('fxFogBurst').value = String(fx.fogBurstSec != null ? fx.fogBurstSec : 30);
+  if ($('fxLightsLeadSec')) $('fxLightsLeadSec').value = String(fx.lightsLeadSec != null ? fx.lightsLeadSec : 0);
 }
 
 function populateTtsProviders(p) {
@@ -13984,6 +13986,7 @@ async function saveFxHooks(extraBody) {
     theaterHost: ($('fxTheaterHost') && $('fxTheaterHost').value.trim()) || '',
     fogTriggerUrl: ($('fxFogUrl') && $('fxFogUrl').value.trim()) || '',
     fogBurstSec: Number(($('fxFogBurst') && $('fxFogBurst').value) || 4.0),
+    lightsLeadSec: Number(($('fxLightsLeadSec') && $('fxLightsLeadSec').value) || 0.0),
     ...(extraBody || {}),
   };
   const r = await fetch('/api/shows/fx-hooks', {

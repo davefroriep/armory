@@ -6321,6 +6321,90 @@ class ShowDirectorTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_matter_lights_lead_sec_and_audio_show_fx_cues(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="armory_matter_lights_"))
+        try:
+            hits: list[tuple[float, str]] = []
+            sim_now = [0.0]
+
+            def fake_sleep(sec: float) -> None:
+                sim_now[0] += max(0.0, float(sec))
+
+            def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+                hits.append((round(sim_now[0], 2), url))
+                if "formMainZone_MainZoneXmlStatus.xml" in url:
+                    return 200, b"<item><Power><value>ON</value></Power><MasterVolume><value>-30.0</value></MasterVolume></item>"
+                return 200, b"ok"
+
+            ham = ha.HouseAudioManager(
+                root_dir=tmp,
+                config=ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15", cube_enabled=True, cube_host="192.168.1.151"),
+                allow_network=False,
+                denon_http_get=fake_get,
+                cube_http_post=lambda _u, _b, _h, _t: (200, b"ok"),
+                sleep_fn=fake_sleep,
+            )
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.shows = sd.ShowDirector(
+                root_dir=tmp,
+                house_audio=ham,
+                allow_network=False,
+                http_get=fake_get,
+                sleep_fn=fake_sleep,
+            )
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # 1. Save Matter Bridge lights ON/OFF URLs + lightsLeadSec via API and verify dashboard input
+            r_fx = client.post(
+                "/api/shows/fx-hooks",
+                json={
+                    "lightsOnUrl": "http://127.0.0.1:8787/api/armory-lights?on=1",
+                    "lightsOffUrl": "http://127.0.0.1:8787/api/armory-lights?on=0",
+                    "lightsLeadSec": 1.2,
+                },
+            )
+            self.assertEqual(r_fx.status_code, 200)
+            self.assertAlmostEqual(r_fx.get_json()["fxHooks"]["lightsLeadSec"], 1.2)
+            self.assertIn("fxLightsLeadSec", client.get("/").get_data(as_text=True))
+
+            # 2. PR drop (lightsOut=True, no fxCues) kills lights at start and auto-restores ON at end
+            hits.clear()
+            sim_now[0] = 0.0
+            svc.shows.update_show("matt_pr", {"lightsOut": True, "lightsFlashCount": 0, "songDurationSec": 3.0}, rebuild=True)
+            res_pr = svc.shows.fire_show("matt_pr", async_run=False)
+            self.assertTrue(res_pr["ok"])
+            light_hits = [(t, u) for t, u in hits if "armory-lights" in u]
+            self.assertEqual(len(light_hits), 2)
+            self.assertTrue(light_hits[0][1].endswith("on=0"))
+            self.assertTrue(light_hits[1][1].endswith("on=1"))
+
+            # 3. Audio walk-in with timed lights_on fxCue fires lights_on early by lightsLeadSec (no duplicate end ON)
+            hits.clear()
+            sim_now[0] = 0.0
+            svc.shows.update_show(
+                "matt_walkin",
+                {
+                    "lightsOut": True,
+                    "lightsFlashCount": 0,
+                    "songDurationSec": 3.0,
+                    "fxCues": [{"id": "fx_drop_on", "target": "intro", "atSec": 3.0, "type": "lights_on", "zone": "all"}],
+                },
+                rebuild=True,
+            )
+            res_wk = svc.shows.fire_show("matt_walkin", async_run=False)
+            self.assertTrue(res_wk["ok"])
+            wk_lights = [(t, u) for t, u in hits if "armory-lights" in u]
+            self.assertEqual(len(wk_lights), 2)
+            self.assertTrue(wk_lights[0][1].endswith("on=0"))
+            self.assertTrue(wk_lights[1][1].endswith("on=1"))
+            # With lightsLeadSec=1.2, cue at 3.0s should fire around ~1.8s (well before full preview ends)
+            self.assertLess(wk_lights[1][0], 2.6)
+
+            svc.stop_background()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()
