@@ -1256,9 +1256,9 @@ def default_shows() -> list[ShowSpec]:
             denon_vol=70,
             cube_mode="takeover",
             overlay_gain=1.0,
-            announcer_text="[dramatic] Welcome... to The Armory!!",
-            announcer_voice="elevenlabs:pNInz6obpgDQGcFmaJgB",
-            announcer_rate="-4%",
+            announcer_text="[dramatic] Welcome... to The Armory!",
+            announcer_voice="elevenlabs:nPczCjzI2devNBz1zQrb",
+            announcer_rate="-8%",
             announcer_pitch="",
             demo_style="anthem",
             song_start_sec=0.0,
@@ -1276,8 +1276,8 @@ def default_shows() -> list[ShowSpec]:
             intro_start_sec=0.15,
             video_source_file="welcome_armory_video.mp4",
             three_screen_video=True,
-            video_hold_sec=25.22,
-            voice_reverb_wet=0.08,
+            video_hold_sec=26.5,
+            voice_reverb_wet=0.11,
             voice_boost_db=0.0,
             voice_style=(
                 "Deep, commanding, cinematic Atlas-style baritone welcoming VIP guests "
@@ -1287,12 +1287,11 @@ def default_shows() -> list[ShowSpec]:
             dj_seamless_intro=True,
             dj_drop_sec=8.00,
             fx_cues=[
-                {"id": "wa_bolt1", "target": "intro", "atSec": 0.75, "type": "flash", "count": 1, "durationSec": 0.22, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True, "zone": "all"},
-                {"id": "wa_bolt2", "target": "intro", "atSec": 1.45, "type": "flash", "count": 1, "durationSec": 0.26, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True, "zone": "all"},
-                {"id": "wa_bolt3", "target": "intro", "atSec": 3.60, "type": "flash", "count": 1, "durationSec": 0.22, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": True, "zone": "all"},
-                {"id": "wa_pre1", "target": "intro", "atSec": 6.85, "type": "flash", "count": 1, "durationSec": 0.20, "offSec": 0.25, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
-                {"id": "wa_pre2_tv", "target": "intro", "atSec": 7.20, "type": "flash", "count": 1, "durationSec": 0.18, "offSec": 0.25, "endOn": False, "lightFlash": False, "screenFlash": True, "zone": "all"},
-                {"id": "wa_pre3", "target": "intro", "atSec": 7.55, "type": "flash", "count": 1, "durationSec": 0.18, "offSec": 0.22, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_bolt1", "target": "intro", "atSec": 0.75, "type": "flash", "count": 1, "durationSec": 0.22, "offSec": 0.24, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_bolt2", "target": "intro", "atSec": 2.10, "type": "flash", "count": 1, "durationSec": 0.26, "offSec": 0.24, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_bolt3", "target": "intro", "atSec": 3.80, "type": "flash", "count": 1, "durationSec": 0.22, "offSec": 0.24, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_pre1", "target": "intro", "atSec": 6.70, "type": "flash", "count": 1, "durationSec": 0.20, "offSec": 0.22, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
+                {"id": "wa_pre2", "target": "intro", "atSec": 7.35, "type": "flash", "count": 1, "durationSec": 0.20, "offSec": 0.22, "endOn": False, "lightFlash": True, "screenFlash": False, "zone": "all"},
                 {"id": "wa_drop_on", "target": "video", "atSec": 0.00, "type": "flash", "count": 1, "durationSec": 0.24, "offSec": 0.22, "endOn": True, "lightFlash": False, "screenFlash": True, "zone": "all"},
             ],
         ),
@@ -3774,13 +3773,14 @@ class ShowDirector:
             ann_pcm = trim_edge_silence_stereo(ann_pcm, sr=sr, thresh=0.003, pad_lead_ms=10.0, pad_tail_ms=85.0)
         ann_off = 0
         if ann_pcm.shape[0] > 0:
-            target_end = max(int(round(0.25 * sr)), drop_n - int(round(0.06 * sr)))
+            lead_before_drop = 0.42 if spec.add_thunder else 0.06
+            target_end = max(int(round(0.25 * sr)), drop_n - int(round(lead_before_drop * sr)))
             ann_off = max(int(round(0.08 * sr)), target_end - ann_pcm.shape[0])
 
         # DJ fader curve: for storm/thunder intros keep full storm loudness until Atlas speaks,
-        # ducking -14 dB (0.20) only beneath speech; for music buildups hold steady 0.28 -> crisp S-curve slam at drop_n
+        # ducking -14 dB (0.20) only beneath speech, then opening smoothly into the pre-drop snare pickup
         fader = np.ones(total_n, dtype=np.float32)
-        slam_n = min(drop_n // 2, max(16, int(round(0.14 * sr))))
+        slam_n = min(drop_n // 2, max(16, int(round((0.46 if spec.add_thunder else 0.14) * sr))))
         hold_end = max(0, drop_n - slam_n)
         if spec.add_thunder and ann_pcm.shape[0] > 0:
             duck_gain = 0.20
@@ -5201,6 +5201,23 @@ class ShowDirector:
 
         return {"ok": True, "url": url, "results": results}
 
+    def _tcp_port_open(self, host: str, port: int, timeout: float = 0.65) -> bool:
+        """Fast non-blocking TCP reachability probe so offline TVs fail fast instead of stalling ADB."""
+        if not self.allow_network or not host:
+            return True
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(max(0.2, float(timeout)))
+        try:
+            s.connect((host, int(port)))
+            return True
+        except Exception:
+            return False
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
     def _restore_wallboard_tv(self, *, force_stop_youtube: bool = False) -> dict[str, Any]:
         """Return the dedicated Wallboard Fire TV cleanly back to the Armory Wallboard URL."""
         wb_cfg = self._wallboard_cfg_fn() if self._wallboard_cfg_fn is not None else None
@@ -5208,6 +5225,8 @@ class ShowDirector:
         wb_port = int(getattr(wb_cfg, "adb_port", 5555) or 5555) if wb_cfg else 5555
         if not wb_host or self.adb is None:
             return {"ok": False, "skipped": True}
+        if not self._tcp_port_open(wb_host, wb_port, timeout=0.6):
+            return {"ok": False, "state": "offline", "error": f"{wb_host}:{wb_port} unreachable"}
         wb_ser = f"{wb_host}:{wb_port}" if ":" not in wb_host else wb_host
         wb_url = f"{self._resolve_stage_base_url()}/wallboard"
         st, detail = self.adb._connect_and_status(wb_ser)
@@ -5436,13 +5455,8 @@ class ShowDirector:
                 duration_ms=3000,
             )
 
-            # 2. Fire Lights Out + Theater FX + Fog Machine immediately so fog builds while TVs lock HDMI
-            mm_scene_dur_ms = int(max(15_000, min(300_000, round((total_dur + 2.0) * 1000))))
-            lights_turned_off, theater_started = self._trigger_pre_show_fx(
-                spec, fx, scene_dur_ms=mm_scene_dur_ms, out_res=out_res
-            )
-
-            # 3. Broadcast stage_prepare immediately so already-open Wallboard blanks to #000 & buffers MP4
+            # 2. Broadcast stage_prepare immediately so already-open Wallboard blanks to #000 & buffers MP4
+            mm_scene_dur_ms = int(max(15_000, min(300_000, round((total_dur + 4.0) * 1000))))
             base_url = self._resolve_stage_base_url()
             try:
                 ver_tag = int(mp4_path.stat().st_mtime)
@@ -5558,6 +5572,18 @@ class ShowDirector:
             def _prep_wallboard() -> dict[str, Any]:
                 if not wb_ser or self.adb is None:
                     return {"ok": False, "skipped": True}
+                if not self._tcp_port_open(wb_host, wb_port, timeout=0.65):
+                    wk = self.displays.execute("wallboard", "on") if self.displays is not None else None
+                    woke = False
+                    if self.allow_network:
+                        deadline_wb = time.monotonic() + 2.0
+                        while time.monotonic() < deadline_wb and not cancel_ev.is_set():
+                            if self._tcp_port_open(wb_host, wb_port, timeout=0.45):
+                                woke = True
+                                break
+                            time.sleep(0.25)
+                    if not woke:
+                        return {"ok": False, "state": "offline", "wake": wk, "error": f"{wb_ser} unreachable"}
                 st, detail = self.adb._connect_and_status(wb_ser)
                 if st != "device" and self.displays is not None:
                     wk = self.displays.execute("wallboard", "on")
@@ -5618,6 +5644,11 @@ class ShowDirector:
 
             if cancel_ev.is_set():
                 return {"ok": False, "canceled": True}
+
+            # 4.5 Fire Lights Out + Theater FX + Fog Machine right as TVs finish staging (so fog builds ~2s before play, never 15s early)
+            lights_turned_off, theater_started = self._trigger_pre_show_fx(
+                spec, fx, scene_dur_ms=mm_scene_dur_ms, out_res=out_res
+            )
 
             # 5. Wait for Cube & Wallboard stages to finish buffering + settle HDMI/HDCP switches cleanly
             roles_to_wait: list[str] = []
@@ -5926,85 +5957,88 @@ class ShowDirector:
             out_res = {"ok": False, "showId": spec.id, "error": str(exc)}
             return out_res
         finally:
-            self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
-            self._cleanup_post_show_fx(
-                spec,
-                fx,
-                theater_started=theater_started,
-                lights_turned_off=lights_turned_off,
-                lights_restored=lights_restored,
-            )
-            if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
-                self._restore_denon_down(current_db, prev_db, fast=True)
-            if self.displays is not None:
+            with self._lock:
+                is_current = self._active_run_id == run_id
+            if is_current:
+                self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
+                self._cleanup_post_show_fx(
+                    spec,
+                    fx,
+                    theater_started=theater_started,
+                    lights_turned_off=lights_turned_off,
+                    lights_restored=lights_restored,
+                )
+                if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
+                    self._restore_denon_down(current_db, prev_db, fast=True)
+                if self.displays is not None:
+                    try:
+                        self.displays.sync_denon_monitor_for_spin()
+                    except Exception:
+                        pass
                 try:
-                    self.displays.sync_denon_monitor_for_spin()
+                    self._restore_wallboard_tv(force_stop_youtube=False)
                 except Exception:
                     pass
-            try:
-                self._restore_wallboard_tv(force_stop_youtube=False)
-            except Exception:
-                pass
-            if cube_stage_launched and cube_ser and self.adb is not None:
-                try:
-                    st, _ = self.adb._connect_and_status(cube_ser)
-                    if st == "device":
-                        self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "4"], timeout=4.0)
-                        self.adb._run(["-s", cube_ser, "shell", "am", "force-stop", "com.froriep.armorywallboard"], timeout=4.0)
-                        target_comp = str(prev_media.get("focusedComponent") or "").strip()
-                        target_pkg = str(prev_media.get("focusedPackage") or prev_media.get("mediaPackage") or "").strip()
-                        if target_comp or target_pkg:
-                            _, win_out, _ = self.adb._run(
-                                ["-s", cube_ser, "shell", "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'"],
-                                timeout=4.0,
-                            )
-                            cur_win = parse_cube_media_snapshot("---ARMORY_WIN---\n" + (win_out or ""))
-                            cur_pkg = str(cur_win.get("focusedPackage") or "")
-                            if target_pkg and cur_pkg != target_pkg:
-                                if target_comp:
-                                    self.adb._run(
-                                        ["-s", cube_ser, "shell", f"am start -n {shlex.quote(target_comp)}"],
-                                        timeout=5.0,
-                                    )
-                                elif target_pkg:
-                                    self.adb._run(
-                                        [
-                                            "-s",
-                                            cube_ser,
-                                            "shell",
-                                            f"monkey -p {shlex.quote(target_pkg)} -c android.intent.category.LAUNCHER 1",
-                                        ],
-                                        timeout=5.0,
-                                    )
-                        if prev_media.get("wasPlaying"):
-                            if not self._has_custom_sleep:
-                                self._sleep(0.7)
-                            _, ms_out, _ = self.adb._run(
-                                ["-s", cube_ser, "shell", "dumpsys", "media_session"], timeout=4.5
-                            )
-                            cur_ms = parse_cube_media_snapshot(ms_out or "")
-                            if not cur_ms.get("wasPlaying"):
-                                self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "126"], timeout=4.0)
+                if cube_stage_launched and cube_ser and self.adb is not None:
+                    try:
+                        st, _ = self.adb._connect_and_status(cube_ser)
+                        if st == "device":
+                            self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "4"], timeout=4.0)
+                            self.adb._run(["-s", cube_ser, "shell", "am", "force-stop", "com.froriep.armorywallboard"], timeout=4.0)
+                            target_comp = str(prev_media.get("focusedComponent") or "").strip()
+                            target_pkg = str(prev_media.get("focusedPackage") or prev_media.get("mediaPackage") or "").strip()
+                            if target_comp or target_pkg:
+                                _, win_out, _ = self.adb._run(
+                                    ["-s", cube_ser, "shell", "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'"],
+                                    timeout=4.0,
+                                )
+                                cur_win = parse_cube_media_snapshot("---ARMORY_WIN---\n" + (win_out or ""))
+                                cur_pkg = str(cur_win.get("focusedPackage") or "")
+                                if target_pkg and cur_pkg != target_pkg:
+                                    if target_comp:
+                                        self.adb._run(
+                                            ["-s", cube_ser, "shell", f"am start -n {shlex.quote(target_comp)}"],
+                                            timeout=5.0,
+                                        )
+                                    elif target_pkg:
+                                        self.adb._run(
+                                            [
+                                                "-s",
+                                                cube_ser,
+                                                "shell",
+                                                f"monkey -p {shlex.quote(target_pkg)} -c android.intent.category.LAUNCHER 1",
+                                            ],
+                                            timeout=5.0,
+                                        )
+                            if prev_media.get("wasPlaying"):
                                 if not self._has_custom_sleep:
-                                    self._sleep(0.75)
-                                _, ms_out2, _ = self.adb._run(
+                                    self._sleep(0.7)
+                                _, ms_out, _ = self.adb._run(
                                     ["-s", cube_ser, "shell", "dumpsys", "media_session"], timeout=4.5
                                 )
-                                cur_ms2 = parse_cube_media_snapshot(ms_out2 or "")
-                                if not cur_ms2.get("wasPlaying") and cur_ms2.get("mediaState") == 2:
-                                    rc_disp, _, _ = self.adb._run(
-                                        ["-s", cube_ser, "shell", "cmd media_session dispatch play"], timeout=4.0
+                                cur_ms = parse_cube_media_snapshot(ms_out or "")
+                                if not cur_ms.get("wasPlaying"):
+                                    self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "126"], timeout=4.0)
+                                    if not self._has_custom_sleep:
+                                        self._sleep(0.75)
+                                    _, ms_out2, _ = self.adb._run(
+                                        ["-s", cube_ser, "shell", "dumpsys", "media_session"], timeout=4.5
                                     )
-                                    if rc_disp != 0:
-                                        self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "85"], timeout=4.0)
-                except Exception:
-                    pass
-                finally:
-                    if hasattr(self.adb, "disconnect_serial"):
-                        try:
-                            self.adb.disconnect_serial(cube_ser)
-                        except Exception:
-                            pass
+                                    cur_ms2 = parse_cube_media_snapshot(ms_out2 or "")
+                                    if not cur_ms2.get("wasPlaying") and cur_ms2.get("mediaState") == 2:
+                                        rc_disp, _, _ = self.adb._run(
+                                            ["-s", cube_ser, "shell", "cmd media_session dispatch play"], timeout=4.0
+                                        )
+                                        if rc_disp != 0:
+                                            self.adb._run(["-s", cube_ser, "shell", "input", "keyevent", "85"], timeout=4.0)
+                    except Exception:
+                        pass
+                    finally:
+                        if hasattr(self.adb, "disconnect_serial"):
+                            try:
+                                self.adb.disconnect_serial(cube_ser)
+                            except Exception:
+                                pass
             with self._lock:
                 if self._active_run_id == run_id:
                     self._active_state = {
@@ -6405,29 +6439,32 @@ class ShowDirector:
             out_res = {"ok": False, "showId": spec.id, "error": str(exc)}
             return out_res
         finally:
-            self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
-            self._cleanup_post_show_fx(
-                spec,
-                fx,
-                theater_started=theater_started,
-                lights_turned_off=lights_turned_off,
-                lights_restored=lights_restored,
-            )
-            # Emergency safety guarantee: ALWAYS ramp Denon back down FIRST before stopping Cube!
-            if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
-                self._restore_denon_down(current_db, prev_db, fast=True)
-            if wallboard_youtube_launched:
-                try:
-                    self._restore_wallboard_tv(force_stop_youtube=True)
-                except Exception:
-                    pass
-            if cancel_ev.is_set() and cube_started and self.house_audio is not None:
-                try:
-                    cfg_ha = self.house_audio.get_config()
-                    if cfg_ha.cube_host:
-                        self.house_audio.cube.stop(cfg_ha.cube_host, cfg_ha.cube_port)
-                except Exception:
-                    pass
+            with self._lock:
+                is_current = self._active_run_id == run_id
+            if is_current:
+                self._broadcast_stage_event("stage_stop", runId=run_id, showId=spec.id)
+                self._cleanup_post_show_fx(
+                    spec,
+                    fx,
+                    theater_started=theater_started,
+                    lights_turned_off=lights_turned_off,
+                    lights_restored=lights_restored,
+                )
+                # Emergency safety guarantee: ALWAYS ramp Denon back down FIRST before stopping Cube!
+                if denon_raised and not denon_restored and has_baseline and prev_db is not None and self.house_audio is not None:
+                    self._restore_denon_down(current_db, prev_db, fast=True)
+                if wallboard_youtube_launched:
+                    try:
+                        self._restore_wallboard_tv(force_stop_youtube=True)
+                    except Exception:
+                        pass
+                if cancel_ev.is_set() and cube_started and self.house_audio is not None:
+                    try:
+                        cfg_ha = self.house_audio.get_config()
+                        if cfg_ha.cube_host:
+                            self.house_audio.cube.stop(cfg_ha.cube_host, cfg_ha.cube_port)
+                    except Exception:
+                        pass
             with self._lock:
                 if self._active_run_id == run_id:
                     self._active_state = {

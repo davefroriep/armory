@@ -140,7 +140,7 @@ try { const es = new EventSource('/wallboard/events'); es.onmessage = (e) => { t
 WALLBOARD_STAGE_OVERLAY_SNIPPET = """
 <div id="armoryShowStage" style="display:none;position:fixed;inset:0;z-index:999999;background:#000;overflow:hidden">
   <video id="armoryStageVid" playsinline muted preload="auto" style="width:100%;height:100%;object-fit:contain;background:#000"></video>
-  <div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:#fff;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
+  <div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:radial-gradient(circle,rgba(255,255,255,0.92) 0%,rgba(220,238,255,0.68) 65%,rgba(180,218,255,0.45) 100%);mix-blend-mode:screen;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
 </div>
 <script>
 (function(){
@@ -193,7 +193,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     for (var i = 0; i < flashWindows.length; i++){
       if (t >= flashWindows[i].t0 && t < flashWindows[i].t1){ lit = true; break; }
     }
-    if (flashEl) flashEl.style.opacity = lit ? '0.95' : '0';
+    if (flashEl) flashEl.style.opacity = lit ? '0.58' : '0';
     flashRaf = requestAnimationFrame(tickFlash);
   }
 
@@ -267,7 +267,7 @@ WALLBOARD_STAGE_OVERLAY_SNIPPET = """
     vid.oncanplay = function(){ clearTimeout(fallbackT); sendReady(); };
     vid.onloadeddata = function(){ try { vid.currentTime = 0; } catch(e){} };
     vid.onerror = function(){ stopStage(); };
-    safetyTimer = setTimeout(stopStage, 14000);
+    safetyTimer = setTimeout(stopStage, 30000);
     vid.onended = function(){
       var rid = curRunId;
       stopStage();
@@ -364,7 +364,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
 </style></head>
 <body>
 <video id="stVid" playsinline preload="auto"></video>
-<div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:#fff;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
+<div id="armoryStageFlash" style="pointer-events:none;position:fixed;inset:0;background:radial-gradient(circle,rgba(255,255,255,0.92) 0%,rgba(220,238,255,0.68) 65%,rgba(180,218,255,0.45) 100%);mix-blend-mode:screen;opacity:0;z-index:10;transition:opacity 0.05s linear"></div>
 <script>
 (function(){
   var q = new URLSearchParams(location.search);
@@ -417,7 +417,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hid
     for (var i = 0; i < flashWindows.length; i++){
       if (t >= flashWindows[i].t0 && t < flashWindows[i].t1){ lit = true; break; }
     }
-    if (flashEl) flashEl.style.opacity = lit ? '0.95' : '0';
+    if (flashEl) flashEl.style.opacity = lit ? '0.58' : '0';
     flashRaf = requestAnimationFrame(tickFlash);
   }
 

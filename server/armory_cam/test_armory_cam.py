@@ -6446,13 +6446,17 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertIsNotNone(spec)
             assert spec is not None
             self.assertEqual(spec.denon_vol, 70)
-            self.assertEqual(spec.announcer_voice, "elevenlabs:pNInz6obpgDQGcFmaJgB")
+            self.assertEqual(spec.announcer_voice, "elevenlabs:nPczCjzI2devNBz1zQrb")
             self.assertTrue(spec.lights_out)
             self.assertTrue(spec.trigger_fog)
             self.assertTrue(spec.add_thunder)
             self.assertEqual(spec.theater_scene, "thunder")
             self.assertAlmostEqual(spec.dj_drop_sec, 8.0)
             self.assertTrue(spec.three_screen_video)
+            # Lightning bolts render directly in 1080p video so screenFlash must not cover them with white overlay
+            bolts = [c for c in spec.fx_cues if str(c.get("id", "")).startswith("wa_bolt")]
+            self.assertEqual(len(bolts), 3)
+            self.assertTrue(all(c.get("lightFlash") is True and c.get("screenFlash") is False for c in bolts))
 
             # 1. .local mDNS resolver caches IPv4 and preserves Host header
             fake_info = [(2, 1, 6, "", ("192.168.1.21", 80))]

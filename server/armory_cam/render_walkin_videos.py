@@ -299,64 +299,85 @@ def prepare_trimmed_wav(theme: ThemeSpec) -> tuple[Path, np.ndarray, float]:
 
     if theme.id == "welcome_armory":
         fx_dir = SOURCES_DIR.parent / "fx"
-        song_path = SOURCES_DIR / "pr_simply_the_best.wav"
-        if not song_path.is_file():
-            raise RuntimeError(f"Missing song stem: {song_path}")
-        def _soft_limit(buf: np.ndarray, knee: float = 0.72, ceiling: float = 0.88) -> np.ndarray:
+        raw_tina = AUDIO_CACHE_DIR / "simply_the_best_raw.wav"
+        fallback_song = SOURCES_DIR / "pr_simply_the_best.wav"
+
+        def _soft_limit(buf: np.ndarray, knee: float = 0.78, ceiling: float = 0.88) -> np.ndarray:
             head = max(0.02, ceiling - knee)
             mag = np.abs(buf)
             over = np.maximum(0.0, mag - knee)
             return np.where(mag > knee, np.sign(buf) * (knee + head * np.tanh(over / head)), buf).astype(np.float32)
 
-        song_pcm = _load_wav_stereo_48k(song_path)
-        song_rms = float(np.sqrt(np.mean(song_pcm ** 2))) if song_pcm.size else 0.0
+        # Prefer full Tina Turner "The Best" starting at 61.35s (synth swell -> 61.85s iconic snare fill -> 62.40s chorus drop!)
+        use_full_tina = raw_tina.is_file() and raw_tina.stat().st_size > 1_000_000
+        if use_full_tina:
+            full_pcm = _load_wav_stereo_48k(raw_tina)
+            song_pcm = full_pcm[int(round(61.35 * SR)) : int(round(81.20 * SR))].copy()
+            pickup_sec = 1.05  # 61.35s -> 62.40s ("You're simply the best!" lands exactly at drop_sec=8.00s)
+        elif fallback_song.is_file():
+            song_pcm = _load_wav_stereo_48k(fallback_song)
+            pickup_sec = 0.045
+        else:
+            raise RuntimeError(f"Missing song stem: {raw_tina} and {fallback_song}")
+
+        # Gentle clean RMS leveling (preserve dynamic range, zero brickwall distortion)
+        song_body = song_pcm[int(round(pickup_sec * SR)) :] if song_pcm.shape[0] > int(round(pickup_sec * SR)) + SR else song_pcm
+        song_rms = float(np.sqrt(np.mean(song_body ** 2))) if song_body.size else 0.0
         if song_rms > 1e-4:
-            song_pcm = _soft_limit(song_pcm * min(0.21 / song_rms, 2.2), knee=0.72, ceiling=0.88)
+            song_pcm = _soft_limit(song_pcm * min(0.18 / song_rms, 1.8), knee=0.80, ceiling=0.88)
 
-        intro_n = int(round(theme.drop_sec * SR))
-        intro_pcm = np.zeros((intro_n, 2), dtype=np.float32)
+        song_start_sec = max(0.0, theme.drop_sec - pickup_sec)
+        song_start_n = int(round(song_start_sec * SR))
+        total_n = song_start_n + song_pcm.shape[0]
+        clip = np.zeros((total_n, 2), dtype=np.float32)
 
+        # 1. Clean atmospheric storm rumble bed (-21 dB RMS, zero overboost/clipping)
+        intro_end_n = min(total_n, int(round((theme.drop_sec - 0.10) * SR)))
         rumble_p = fx_dir / "thunder_rumble.wav"
         if rumble_p.is_file():
-            rmb = _load_wav_stereo_48k(rumble_p)[:intro_n].copy()
+            rmb = _load_wav_stereo_48k(rumble_p)[:intro_end_n].copy()
             r_rms = float(np.sqrt(np.mean(rmb ** 2))) if rmb.size else 0.0
             if r_rms > 1e-4:
-                rmb = rmb * min(0.22 / r_rms, 3.5)
-            fi = min(rmb.shape[0] // 4, int(round(0.30 * SR)))
+                rmb = rmb * min(0.085 / r_rms, 1.2)
+            fi = min(rmb.shape[0] // 4, int(round(0.45 * SR)))
             if fi > 4:
                 rmb[:fi] *= np.linspace(0.0, 1.0, fi, dtype=np.float32)[:, None]
-            fo = min(rmb.shape[0] // 3, int(round(0.60 * SR)))
+            fo = min(rmb.shape[0] // 2, int(round(1.30 * SR)))
             if fo > 4:
-                rmb[-fo:] *= np.linspace(1.0, 0.25, fo, dtype=np.float32)[:, None]
-            _mix_clip(intro_pcm, rmb, 0, gain=0.85)
+                rmb[-fo:] *= np.linspace(1.0, 0.0, fo, dtype=np.float32)[:, None]
+            _mix_clip(clip, rmb, 0, gain=1.0)
 
+        # 2. Three clean, crisp, unclipped studio thunderclaps synced 1:1 to lightning bolts (0.75s, 2.10s, 3.80s)
         crack_p = fx_dir / "thunder_crack.wav"
         if crack_p.is_file():
             crk_full = _load_wav_stereo_48k(crack_p)
-            c_rms = float(np.sqrt(np.mean(crk_full ** 2))) if crk_full.size else 0.0
-            if c_rms > 1e-4:
-                crk_full = crk_full * min(0.26 / c_rms, 4.0)
-            # Place sharp studio thunder cracks on the 3 main lightning bolts (0.75s, 1.45s, 3.60s)
-            for at_s, src_off_s, dur_s, g in (
-                (0.75, 0.0, 2.4, 1.00),
-                (1.45, 2.8, 2.6, 1.05),
-                (3.60, 0.2, 2.5, 0.92),
+            for at_s, src_off_s, dur_s, target_pk in (
+                (0.75, 0.98, 1.65, 0.72),
+                (2.10, 2.48, 1.85, 0.78),
+                (3.80, 4.48, 1.75, 0.68),
             ):
                 s0 = int(round(src_off_s * SR))
                 sn = int(round(dur_s * SR))
                 seg = crk_full[s0 : s0 + sn].copy()
-                if seg.shape[0] > 32:
-                    fi_c = min(seg.shape[0] // 6, int(round(0.02 * SR)))
-                    fo_c = min(seg.shape[0] // 2, int(round(0.55 * SR)))
+                if seg.shape[0] > 64:
+                    seg_pk = float(np.max(np.abs(seg)))
+                    if seg_pk > 1e-4:
+                        seg = seg * min(target_pk / seg_pk, 1.5)
+                    fi_c = min(seg.shape[0] // 8, int(round(0.015 * SR)))
+                    fo_c = min(seg.shape[0] // 2, int(round(0.65 * SR)))
                     seg[:fi_c] *= np.linspace(0.0, 1.0, fi_c, dtype=np.float32)[:, None]
                     seg[-fo_c:] *= np.linspace(1.0, 0.0, fo_c, dtype=np.float32)[:, None]
-                    _mix_clip(intro_pcm, seg, int(round(at_s * SR)), gain=g)
+                    _mix_clip(clip, seg, int(round(at_s * SR)), gain=1.0)
 
-        intro_pcm = _soft_limit(intro_pcm, knee=0.72, ceiling=0.88)
+        # 3. Smooth pickup fade-in of Tina Turner synth swell + iconic snare fill -> full chorus drop at 8.00s
+        if song_pcm.shape[0] > 64:
+            fi_s = min(song_pcm.shape[0] // 4, int(round((0.45 if use_full_tina else 0.045) * SR)))
+            if fi_s > 4:
+                song_pcm[:fi_s] *= np.linspace(0.0, 1.0, fi_s, dtype=np.float32)[:, None]
+            _mix_clip(clip, song_pcm, song_start_n, gain=1.0)
 
-        clip = _xfade_stereo(intro_pcm, song_pcm, 0.045)
         dur_sec = float(clip.shape[0]) / float(SR)
-        clip = _soft_limit(clip, knee=0.76, ceiling=0.88)
+        clip = _soft_limit(clip, knee=0.80, ceiling=0.88)
 
         fo_n = min(clip.shape[0] // 2, int(round(theme.fade_out_sec * SR)))
         if fo_n > 8:
@@ -908,34 +929,58 @@ def render_theme_video(theme: ThemeSpec) -> Path:
             chorus = float(chorus_arr[f])
             bands = bands_arr[f]
 
-            # 1. Half-res volumetric stage backdrop + sweeping beam lobes (or storm clouds + lightning for armory_storm intro)
+            # 1. Half-res volumetric stage backdrop + sweeping beam lobes (or storm clouds + fog + lightning for armory_storm intro)
             if theme.style == "armory_storm" and not is_dropped:
-                # Dark turbulent storm clouds drifting across all 3 screens
-                c1 = np.sin(nx * 2.4 + t * 0.42) * np.cos(ny * 2.1 - t * 0.28)
-                c2 = np.sin(nx * 5.2 - t * 0.65 + ny * 3.1) * 0.5
-                cloud = np.clip(0.5 + 0.35 * c1 + 0.22 * c2, 0.0, 1.0)
-                storm_base = np.zeros((HALF_H, HALF_W, 3), dtype=np.float32)
-                storm_base[:, :, 0] = 10.0 + 34.0 * cloud  # deep storm blue
-                storm_base[:, :, 1] = 6.0 + 18.0 * cloud
-                storm_base[:, :, 2] = 5.0 + 12.0 * cloud
+                # Visible moody steel-indigo storm clouds + rolling low-altitude ground mist (never a flat black screen)
+                c1 = np.sin(nx * 2.3 + t * 0.45) * np.cos(ny * 2.0 - t * 0.30)
+                c2 = np.sin(nx * 5.0 - t * 0.72 + ny * 2.9) * 0.50
+                c3 = np.cos(nx * 3.6 + t * 0.35 - ny * 4.2) * 0.30
+                cloud = np.clip(0.50 + 0.32 * c1 + 0.22 * c2 + 0.14 * c3, 0.0, 1.0)
+                # Rolling ground-level mist billowing across the bottom 38% of the screen
+                mist_band = np.clip((ny - 0.18) / 0.82, 0.0, 1.0) ** 1.4
+                mist_wave = np.clip(0.55 + 0.45 * np.sin(nx * 3.1 - t * 0.85 + np.cos(ny * 4.5 + t * 0.4)), 0.0, 1.0)
+                mist = mist_band * mist_wave
 
-                # Sheet lightning sky glow synced to thunder cracks (0.75s, 1.45s, 3.60s) & pre-drop flashes
+                storm_base = np.zeros((HALF_H, HALF_W, 3), dtype=np.float32)
+                storm_base[:, :, 0] = 26.0 + 62.0 * cloud + 44.0 * mist  # steel storm blue
+                storm_base[:, :, 1] = 18.0 + 40.0 * cloud + 36.0 * mist
+                storm_base[:, :, 2] = 14.0 + 28.0 * cloud + 32.0 * mist
+
+                # Subtle distant cloud-to-cloud ambient sheet flicker so the storm feels alive between bolts
+                ambient_sheet = max(0.0, math.sin(t * 7.3) * math.sin(t * 2.9)) ** 6 * 0.26
+                if ambient_sheet > 0.01:
+                    top_mask = np.clip((0.55 - ny) / 1.4, 0.0, 1.0) * cloud
+                    storm_base[:, :, 0] += 130.0 * ambient_sheet * top_mask
+                    storm_base[:, :, 1] += 115.0 * ambient_sheet * top_mask
+                    storm_base[:, :, 2] += 105.0 * ambient_sheet * top_mask
+
+                # 3 dramatic multi-branched lightning strikes synced 1:1 to thunder cracks & overhead lights (0.75s, 2.10s, 3.80s)
                 sky_flash = 0.0
                 active_bolts: list[tuple[float, float, float, float, float, int]] = []
-                for b_idx, (bt, bdur, bx0, bx1, seed_b) in enumerate((
-                    (0.75, 0.28, 620.0, 520.0, 101),
-                    (1.45, 0.34, 1260.0, 1140.0, 202),
-                    (3.60, 0.28, 960.0, 820.0, 303),
-                )):
+                for bt, bdur, bx0, bx1, seed_b in (
+                    (0.75, 0.36, 560.0, 430.0, 101),
+                    (2.10, 0.40, 1340.0, 1210.0, 202),
+                    (3.80, 0.36, 980.0, 860.0, 303),
+                ):
                     if bt <= t < (bt + bdur):
                         prog_b = (t - bt) / bdur
-                        flick = 1.0 if (int(prog_b * 6) % 2 == 0) else 0.55
-                        inten = ((1.0 - prog_b) ** 0.75) * flick
+                        flick = 1.0 if (int(prog_b * 7) % 2 == 0) else 0.58
+                        inten = ((1.0 - prog_b) ** 0.65) * flick
                         sky_flash = max(sky_flash, inten)
-                        active_bolts.append((bx0, 0.0, bx1, float(HEIGHT * 0.88), inten, seed_b + int(prog_b * 3)))
-                for ft, fdur in ((6.85, 0.20), (7.20, 0.18), (7.55, 0.20)):
-                    if ft <= t < (ft + fdur):
-                        sky_flash = max(sky_flash, 0.55 * (1.0 - (t - ft) / fdur))
+                        active_bolts.append((bx0, 0.0, bx1, float(HEIGHT * 0.90), inten, seed_b + int(prog_b * 3)))
+
+                # During Atlas voice (4.6s..8.0s), warm golden arena energy rises out of the mist toward the 8.0s drop!
+                reveal_k = np.clip((t - 4.55) / 3.25, 0.0, 1.0)
+                if reveal_k > 0.0:
+                    snare_hit = 0.0
+                    for ft, fdur in ((6.70, 0.22), (7.35, 0.22), (7.65, 0.30)):
+                        if ft <= t < (ft + fdur):
+                            snare_hit = max(snare_hit, (1.0 - (t - ft) / fdur) * 0.55)
+                    gold_env = (reveal_k ** 1.35) * 0.72 + snare_hit * 0.55
+                    # BGR warm championship gold/amber radiating from center + horizon
+                    storm_base[:, :, 0] += 36.0 * gold_env * rad_glow_mask
+                    storm_base[:, :, 1] += 118.0 * gold_env * (rad_glow_mask * 0.8 + mist * 0.4)
+                    storm_base[:, :, 2] += 185.0 * gold_env * (rad_glow_mask * 0.85 + mist * 0.45)
 
                 if sky_flash > 0.01:
                     glow_mask = np.clip(cloud * 0.65 + rad_glow_mask * 0.55, 0.0, 1.0)
@@ -947,15 +992,17 @@ def render_theme_video(theme: ThemeSpec) -> Path:
                 if active_bolts:
                     bolt_layer = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
                     for bx0, by0, bx1, by1, inten, s_b in active_bolts:
-                        _draw_lightning_bolt(bolt_layer, bx0, by0, bx1, by1, np.random.default_rng(s_b), inten, thickness=5)
-                    bolt_glow = cv2.GaussianBlur(bolt_layer, (0, 0), sigmaX=11.0, sigmaY=11.0)
-                    frame = cv2.add(frame, cv2.addWeighted(bolt_layer, 0.95, bolt_glow, 0.75, 0))
-                    # Briefly silhouette THE ARMORY emblem in the lightning flash
-                    bg_u16 = frame.astype(np.uint16)
-                    sil_k = min(0.75, sky_flash * 0.85)
-                    sil_fg = (fg_prem.astype(np.float32) * sil_k).astype(np.uint16)
-                    sil_inv = (255.0 - (255.0 - inv_alpha.astype(np.float32)) * sil_k).astype(np.uint16)
-                    frame = np.clip((bg_u16 * sil_inv) // 255 + sil_fg, 0, 255).astype(np.uint8)
+                        _draw_lightning_bolt(bolt_layer, bx0, by0, bx1, by1, np.random.default_rng(s_b), inten, thickness=6)
+                    bolt_glow = cv2.GaussianBlur(bolt_layer, (0, 0), sigmaX=12.0, sigmaY=12.0)
+                    frame = cv2.add(frame, cv2.addWeighted(bolt_layer, 0.98, bolt_glow, 0.82, 0))
+
+                # Show THE ARMORY subtly through storm mist (0.20 baseline), flashing bright on lightning & rising to 0.92 under Atlas voice!
+                emblem_k = max(0.22, min(0.95, sky_flash * 0.92), float(reveal_k) * 0.92)
+                bg_u16 = frame.astype(np.uint16)
+                sil_fg = (fg_prem.astype(np.float32) * emblem_k).astype(np.uint16)
+                sil_inv = (255.0 - (255.0 - inv_alpha.astype(np.float32)) * emblem_k).astype(np.uint16)
+                frame = np.clip((bg_u16 * sil_inv) // 255 + sil_fg, 0, 255).astype(np.uint8)
+
                 if t < 0.25:
                     frame = (frame.astype(np.float32) * (t / 0.25)).astype(np.uint8)
                 proc.stdin.write(frame.tobytes())
