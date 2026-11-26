@@ -3155,7 +3155,7 @@ class ArmoryCamTests(unittest.TestCase):
         prompt, _hotwords = rv.build_whisper_prompt("armory", ["Bench Press"])
         long_echo = " ".join(prompt.replace(",", " ").split()[:10])
         self.assertTrue(rv.is_prompt_echo(long_echo, prompt))
-        for real_cmd in ("Armory Matt just hit a PR", "wake", "log 225 for 10", "Armory next exercise"):
+        for real_cmd in ("Armory I just hit a PR", "wake", "log 225 for 10", "Armory next exercise"):
             self.assertFalse(rv.is_prompt_echo(real_cmd, prompt), msg=real_cmd)
 
     def test_optiplex_config_backup_and_restore_roundtrip(self) -> None:
@@ -3164,7 +3164,7 @@ class ArmoryCamTests(unittest.TestCase):
             root = tmp / "camroot"
             drive_dir = tmp / "drive_root" / "Clips"
             svc = ac.ArmoryCamService(root_dir=root, drive_backup_dir=drive_dir)
-            (root / "shows.json").write_text(json.dumps({"shows": [{"id": "matt_pr"}]}), encoding="utf-8")
+            (root / "shows.json").write_text(json.dumps({"shows": [{"id": "pr"}]}), encoding="utf-8")
             (root / "tts_secrets.json").write_text(json.dumps({"openaiApiKey": "sk-test-123"}), encoding="utf-8")
 
             app = ac.create_app(svc)
@@ -3326,18 +3326,19 @@ class ShowDirectorTests(unittest.TestCase):
             svc.voice._speak_fn = lambda txt: (tts_spoken.append(txt), True)[1]
 
             prompt, hotwords = rv.build_whisper_prompt("armory")
-            self.assertIn("Matt just hit a PR", prompt)
+            self.assertIn("I just hit a PR", prompt)
             self.assertIn("I PR'd", prompt)
-            self.assertIn("Matt PR'd", prompt)
+            self.assertIn("new PR", prompt)
             self.assertIn("Matt just got here", prompt)
             self.assertIn("Ryder is here", prompt)
             self.assertIn("Jared and Mark", prompt)
 
             sd_dir = svc.shows
-            self.assertEqual(sd_dir.match_voice_command("Armory, Matt just hit a PR")["showId"], "matt_pr")
-            self.assertEqual(sd_dir.match_voice_command("Hey Armory matt hit a p.r.")["showId"], "matt_pr")
+            self.assertEqual(sd_dir.get_show("pr").name, "PR")
+            self.assertFalse(any("matt" in t.lower() for t in sd_dir.get_show("pr").triggers))
+            self.assertEqual(sd_dir.match_voice_command("Armory, I just hit a PR")["showId"], "pr")
+            self.assertEqual(sd_dir.match_voice_command("Hey Armory hit a p.r.")["showId"], "pr")
             for pr_phrase in (
-                "Armory, Matt PR'd",
                 "Armory, I PR'd",
                 "Armory, I P.R.'d",
                 "Armory, Ryder just PR'd",
@@ -3346,7 +3347,7 @@ class ShowDirectorTests(unittest.TestCase):
                 "Armory, new PR",
                 "Armory, PR",
             ):
-                self.assertEqual(sd_dir.match_voice_command(pr_phrase)["showId"], "matt_pr", msg=pr_phrase)
+                self.assertEqual(sd_dir.match_voice_command(pr_phrase)["showId"], "pr", msg=pr_phrase)
             self.assertEqual(sd_dir.match_voice_command("Armory Matt just got here")["showId"], "matt_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory Matt's in the gym")["showId"], "matt_walkin")
             self.assertEqual(sd_dir.match_voice_command("Armory, Matt is here")["showId"], "matt_walkin")
@@ -3360,17 +3361,17 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertIsNone(sd_dir.match_voice_command("Armory 225 for 8"))
             self.assertIsNone(sd_dir.match_voice_command("Armory open the gym"))
 
-            # Disabling matt_pr cleanly disables both trigger matching and the global PR fallback
-            sd_dir.shows["matt_pr"].enabled = False
+            # Disabling pr cleanly disables both trigger matching and the PR fallback
+            sd_dir.shows["pr"].enabled = False
             self.assertIsNone(sd_dir.match_voice_command("Armory, I PR'd"))
-            sd_dir.shows["matt_pr"].enabled = True
+            sd_dir.shows["pr"].enabled = True
 
-            # Voice injection for matt_pr fires locally, stays off Pixel SSE, and suppresses S330 TTS readback
-            with mock.patch.object(svc.shows, "fire_show", return_value={"ok": True, "showId": "matt_pr", "showName": "Matt PR Drop-In"}) as m_fire:
+            # Voice injection for pr fires locally, stays off Pixel SSE, and suppresses S330 TTS readback
+            with mock.patch.object(svc.shows, "fire_show", return_value={"ok": True, "showId": "pr", "showName": "PR"}) as m_fire:
                 svc.voice._stop_event.clear()
-                ev = svc.voice.inject_transcript("Armory, Matt just hit a PR")
+                ev = svc.voice.inject_transcript("Armory, I just hit a PR")
                 self.assertTrue(ev["localHandled"])
-                m_fire.assert_called_once_with("matt_pr", async_run=True)
+                m_fire.assert_called_once_with("pr", async_run=True)
                 self.assertEqual(tts_spoken, [])
         finally:
             svc.stop_background()
@@ -3421,7 +3422,7 @@ class ShowDirectorTests(unittest.TestCase):
                 allow_network=False,
                 sleep_fn=lambda _s: None,
             )
-            res = director.fire_show("matt_pr", async_run=False)
+            res = director.fire_show("pr", async_run=False)
             self.assertTrue(res["ok"])
 
             # Verify strict ordering: Cube duck play BEFORE first upward Denon MV ramp
@@ -3454,7 +3455,7 @@ class ShowDirectorTests(unittest.TestCase):
                 allow_network=False,
                 sleep_fn=cancel_during_play,
             )
-            spec = director_cancel.get_show("matt_pr")
+            spec = director_cancel.get_show("pr")
             assert spec is not None
             director_cancel._active_run_id = 99
             c_res = director_cancel._run_show_sequence(spec, 99, cancel_ev)
@@ -3646,7 +3647,7 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(
                 ids,
                 {
-                    "matt_pr",
+                    "pr",
                     "matt_walkin",
                     "ryder_walkin",
                     "jenna_walkin",
@@ -3659,10 +3660,10 @@ class ShowDirectorTests(unittest.TestCase):
             )
 
             # Preview WAV builds cleanly, has instant non-silent onset in first 150ms and clean faded tail
-            prev = client.get("/api/shows/matt_pr/preview.wav")
+            prev = client.get("/api/shows/pr/preview.wav")
             self.assertEqual(prev.status_code, 200)
             self.assertEqual(prev.mimetype, "audio/wav")
-            prev_path = tmp / "shows" / "rendered" / "matt_pr_preview.wav"
+            prev_path = tmp / "shows" / "rendered" / "pr_preview.wav"
             arr = sd.read_wav_stereo_float(prev_path)
             self.assertGreater(arr.shape[0], 10 * sd.SHOW_SR)
             first_rms = float(np.sqrt(np.mean(arr[: int(0.15 * sd.SHOW_SR)] ** 2)))
@@ -3672,7 +3673,7 @@ class ShowDirectorTests(unittest.TestCase):
 
             # Path traversal upload MUST be rejected with HTTP 400
             bad_up = client.post(
-                "/api/shows/matt_pr/upload?filename=../evil.wav",
+                "/api/shows/pr/upload?filename=../evil.wav",
                 data=b"RIFF0000WAVE",
                 content_type="application/octet-stream",
             )
@@ -3686,25 +3687,25 @@ class ShowDirectorTests(unittest.TestCase):
             synth_wav = sd.encode_stereo_pcm16_wav(np.concatenate([sil, tone], axis=0), sr=sr)
 
             up = client.post(
-                "/api/shows/matt_pr/upload?filename=custom_best.wav&songStartSec=0&songDurationSec=3&trimLeadingSilence=1",
+                "/api/shows/pr/upload?filename=custom_best.wav&songStartSec=0&songDurationSec=3&trimLeadingSilence=1",
                 data=synth_wav,
                 content_type="audio/wav",
             )
             self.assertEqual(up.status_code, 200)
             j_up = up.get_json()
             self.assertTrue(j_up["ok"])
-            self.assertEqual(j_up["show"]["sourceFile"], "matt_pr_custom_best.wav")
-            self.assertTrue((tmp / "shows" / "sources" / "matt_pr_custom_best.wav").is_file())
+            self.assertEqual(j_up["show"]["sourceFile"], "pr_custom_best.wav")
+            self.assertTrue((tmp / "shows" / "sources" / "pr_custom_best.wav").is_file())
             rebuilt = sd.read_wav_stereo_float(prev_path)
             onset_rms = float(np.sqrt(np.mean(rebuilt[: int(0.10 * sr)] ** 2)))
             self.assertGreater(onset_rms, 0.05)
 
             # Config update persists across reload
-            cfg_res = client.post("/api/shows/matt_pr/config", json={"denonVol": 68, "songStartSec": 1.25})
+            cfg_res = client.post("/api/shows/pr/config", json={"denonVol": 68, "songStartSec": 1.25})
             self.assertEqual(cfg_res.status_code, 200)
             reloaded = sd.ShowDirector(root_dir=tmp, allow_network=False)
-            self.assertEqual(reloaded.get_show("matt_pr").denon_vol, 68)
-            self.assertAlmostEqual(reloaded.get_show("matt_pr").song_start_sec, 1.25)
+            self.assertEqual(reloaded.get_show("pr").denon_vol, 68)
+            self.assertAlmostEqual(reloaded.get_show("pr").song_start_sec, 1.25)
         finally:
             svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
@@ -4778,8 +4779,8 @@ class ShowDirectorTests(unittest.TestCase):
 
             # 4. PR drop-in with lightsFlashCount=2 triggers dual-zone flashes cleanly
             hits.clear()
-            svc.shows.update_show("matt_pr", {"lightsFlashCount": 2, "songDurationSec": 1.0}, rebuild=True)
-            res_pr = svc.shows.fire_show("matt_pr", async_run=False)
+            svc.shows.update_show("pr", {"lightsFlashCount": 2, "songDurationSec": 1.0}, rebuild=True)
+            res_pr = svc.shows.fire_show("pr", async_run=False)
             self.assertTrue(res_pr["ok"])
             self.assertTrue(any("192.168.1.71/rpc/Switch.Set" in u for u in hits))
             self.assertTrue(any("192.168.1.72/rpc/Switch.Set" in u for u in hits))
@@ -6371,8 +6372,8 @@ class ShowDirectorTests(unittest.TestCase):
             # 2. PR drop (lightsOut=True, no fxCues) kills lights at start and auto-restores ON at end
             hits.clear()
             sim_now[0] = 0.0
-            svc.shows.update_show("matt_pr", {"lightsOut": True, "lightsFlashCount": 0, "songDurationSec": 3.0}, rebuild=True)
-            res_pr = svc.shows.fire_show("matt_pr", async_run=False)
+            svc.shows.update_show("pr", {"lightsOut": True, "lightsFlashCount": 0, "songDurationSec": 3.0}, rebuild=True)
+            res_pr = svc.shows.fire_show("pr", async_run=False)
             self.assertTrue(res_pr["ok"])
             light_hits = [(t, u) for t, u in hits if "armory-lights" in u]
             self.assertEqual(len(light_hits), 2)

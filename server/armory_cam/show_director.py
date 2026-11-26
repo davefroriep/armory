@@ -914,21 +914,17 @@ def default_shows() -> list[ShowSpec]:
     """Return built-in shows requested by Dave (PR drops, walk-ins, debut templates)."""
     return [
         ShowSpec(
-            id="matt_pr",
-            name="Global PR Drop-In (Simply the Best)",
+            id="pr",
+            name="PR",
             kind="pr_drop",
             enabled=True,
             triggers=[
                 "i prd",
-                "matt prd",
                 "just prd",
                 "hit a pr",
                 "new pr",
-                "matt just hit a pr",
-                "matt hit a pr",
-                "matt pr",
-                "matthew just hit a pr",
-                "matthew hit a pr",
+                "i just hit a pr",
+                "personal record",
             ],
             denon_vol=70,
             cube_mode="duck",
@@ -3303,6 +3299,39 @@ class ShowDirector:
                             self.fx_hooks = SmartFxConfig.from_dict(raw["fxHooks"])
                         raw_shows = raw.get("shows")
                         if isinstance(raw_shows, dict):
+                            if "matt_pr" in raw_shows and "pr" not in raw_shows and isinstance(raw_shows["matt_pr"], dict):
+                                legacy_pr = dict(raw_shows.pop("matt_pr"))
+                                legacy_pr["id"] = "pr"
+                                legacy_pr["name"] = "PR"
+                                cleaned_trigs = [
+                                    t for t in (legacy_pr.get("triggers") or [])
+                                    if "matt" not in str(t).lower()
+                                ]
+                                for base_t in default_map["pr"].triggers:
+                                    if base_t not in cleaned_trigs:
+                                        cleaned_trigs.append(base_t)
+                                legacy_pr["triggers"] = cleaned_trigs
+                                src_f = str(legacy_pr.get("sourceFile") or "").strip()
+                                if src_f.startswith("matt_pr_"):
+                                    new_src_f = "pr_" + src_f[len("matt_pr_"):]
+                                    old_src_p = self.sources_dir / src_f
+                                    new_src_p = self.sources_dir / new_src_f
+                                    try:
+                                        if old_src_p.is_file() and not new_src_p.exists():
+                                            old_src_p.rename(new_src_p)
+                                    except Exception:
+                                        pass
+                                    if new_src_p.is_file() or not old_src_p.exists():
+                                        legacy_pr["sourceFile"] = new_src_f
+                                old_prev = self.rendered_dir / "matt_pr_preview.wav"
+                                new_prev = self.rendered_dir / "pr_preview.wav"
+                                try:
+                                    if old_prev.is_file() and not new_prev.exists():
+                                        old_prev.rename(new_prev)
+                                except Exception:
+                                    pass
+                                raw_shows = {"pr": legacy_pr, **raw_shows}
+                                dirty = True
                             if any(sid not in raw_shows for sid in default_map):
                                 dirty = True
                             for sid, sraw in raw_shows.items():
@@ -4692,7 +4721,7 @@ class ShowDirector:
         *,
         workout_active: bool = False,
     ) -> dict[str, Any] | None:
-        """Match spoken show triggers (`Matt just hit a PR`, `stop show`, bare `stop`/`enough`/`end`/`cancel`, etc.)."""
+        """Match spoken show triggers (`I just hit a PR`, `stop show`, bare `stop`/`enough`/`end`/`cancel`, etc.)."""
         cmd = _strip_optional_wake(transcript, wake_word=wake_word)
         if not cmd:
             return None

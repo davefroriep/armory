@@ -8492,7 +8492,7 @@ DASHBOARD_HTML = """<!doctype html>
             <div class="deck-group">
               <div class="eyebrow">PR &amp; Show Triggers</div>
               <div class="ctrl-row">
-                <button class="btn ok sm" type="button" onclick="fireShow('matt_pr')">🔥 Global PR Drop</button>
+                <button class="btn ok sm" type="button" onclick="fireShow('pr')">🔥 PR</button>
                 <button class="btn red sm" type="button" onclick="stopShow()">⏹ Stop Show</button>
               </div>
             </div>
@@ -8905,7 +8905,7 @@ DASHBOARD_HTML = """<!doctype html>
         </details>
 
         <div class="card">
-          <h2><span>Global PR Drop-In &amp; Walk-In Shows</span><span id="shCountPill" class="pill">Loading…</span></h2>
+          <h2><span>PR &amp; Walk-In Shows</span><span id="shCountPill" class="pill">Loading…</span></h2>
           <div id="shGrid" class="show-grid">
             <div style="color:var(--mut);font-size:12px">Loading shows…</div>
           </div>
