@@ -459,7 +459,7 @@ function render(st) {
       const valTxt = exType === 'time'
         ? (slot.weightVal && slot.weightVal !== 'HOLD' ? slot.repsVal + ' @ ' + slot.weightVal : slot.repsVal)
         : slot.weightVal + ' × ' + slot.repsVal;
-      return '<div class="s-row done"><span class="s-tag">' + esc(tagTxt) + '</span>'
+      return '<div class="s-row done' + (slot.targeted ? ' active' : '') + '"><span class="s-tag">' + (slot.targeted ? '▶ ' : '') + esc(tagTxt) + '</span>'
         + '<div class="s-slots"><span class="s-logged">' + esc(valTxt) + '</span>'
         + (slot.rpeText ? '<span class="s-rpe">' + esc(slot.rpeText) + '</span>' : '')
         + '</div><span class="wb-chk on">✓</span></div>';

@@ -254,7 +254,7 @@ function build(root: HTMLElement, id?: string): () => void {
   const paintTarget = (): void => {
     const ptr = edit ? null : resolveTargetSet(s.exs, voice.cursor);
     root.querySelectorAll<HTMLElement>('.srow').forEach((row) => {
-      row.classList.toggle('cur-target', !!ptr && row.dataset.sid === ptr.setId && !row.classList.contains('done'));
+      row.classList.toggle('cur-target', !!ptr && row.dataset.sid === ptr.setId);
     });
   };
 

@@ -18,6 +18,7 @@ import json
 import math
 from pathlib import Path
 import re
+import socket
 import threading
 import time
 from typing import Any, Callable, Iterator
@@ -632,6 +633,40 @@ class DenonAvrClient:
                 return {"restored": False, "stillNested": True}
             return self._restore_if_zero_locked()
 
+    @staticmethod
+    def _extract_host(cfg: HouseAudioConfig) -> str:
+        raw_host = str(cfg.denon_host or "").strip()
+        if not raw_host:
+            return ""
+        if raw_host.startswith("["):
+            return raw_host.split("]", 1)[0].lstrip("[")
+        if ":" in raw_host:
+            return raw_host.rpartition(":")[0]
+        return raw_host
+
+    def _send_telnet_command(self, cfg: HouseAudioConfig, cmd: str, timeout: float = 1.5) -> dict[str, Any]:
+        host = self._extract_host(cfg)
+        if not host:
+            return {"ok": False, "command": cmd, "via": "telnet", "error": "Denon host empty"}
+        sock: socket.socket | None = None
+        try:
+            sock = socket.create_connection((host, 23), timeout=timeout)
+            sock.settimeout(0.15)
+            sock.sendall((cmd + "\r").encode("ascii"))
+            try:
+                sock.recv(256)
+            except socket.timeout:
+                pass
+            return {"ok": True, "command": cmd, "via": "telnet"}
+        except Exception as exc:
+            return {"ok": False, "command": cmd, "via": "telnet", "error": str(exc)}
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
     def send_command(self, cmd: str) -> dict[str, Any]:
         cfg = self._get_cfg()
         base = self._base_url(cfg)
@@ -641,11 +676,25 @@ class DenonAvrClient:
         if not clean:
             return {"ok": False, "error": "Empty command"}
         encoded = urllib.parse.quote(clean, safe="")
+        http_err = ""
         try:
             code, _ = self._do_get(f"{base}/goform/formiPhoneAppDirect.xml?{encoded}", 1.2)
-            return {"ok": code < 400, "command": clean, "status": code}
+            if code < 400:
+                return {"ok": True, "command": clean, "status": code}
+            http_err = f"HTTP {code}"
         except Exception as exc:
-            return {"ok": False, "command": clean, "error": str(exc)}
+            http_err = str(exc)
+
+        if self._http_get is None and self._allow_network and clean.upper() in ("PWON", "PWSTANDBY", "ZMON", "ZMOFF"):
+            t_res = self._send_telnet_command(cfg, clean)
+            if t_res.get("ok"):
+                return t_res
+            return {
+                "ok": False,
+                "command": clean,
+                "error": f"{http_err}; telnet: {t_res.get('error', 'failed')}",
+            }
+        return {"ok": False, "command": clean, "error": http_err}
 
     def _ramp_volume(self, start_db: float, end_db: float, steps: int, step_ms: int) -> bool:
         n_steps = max(1, int(steps))
@@ -667,6 +716,10 @@ class DenonAvrClient:
                 sent_cmds.append(cmd)
                 last_cmd = cmd
                 self._last_ramp_db = round(step_db * 2.0) / 2.0
+                if self.last_status.get("ok"):
+                    self.last_status["volumeDb"] = self._last_ramp_db
+                    self.last_status["volumeAbs"] = round(80.0 + self._last_ramp_db, 1)
+                    self._last_status_mono = time.monotonic()
             if i < n_steps and delay_sec > 0.0:
                 self._sleep(delay_sec)
         return bool(sent_cmds)
@@ -1515,11 +1568,13 @@ class HouseAudioManager:
         cfg = self.get_config()
         target = self.resolve_voice_target(kind=kind)
         if target != "cube":
+            if kind == "ready_chime":
+                return {"handled": False, "route": "s330"}
             return {"handled": False, "route": "s330", "duckContext": self.denon.duck_context}
 
         dur_sec = float(np.asarray(mono_pcm).size) / float(max(1, sr))
         wav_bytes = encode_mono_pcm_to_wav(mono_pcm, sr)
-        if kind in ("chime", "rest_done"):
+        if kind in ("chime", "ready_chime", "rest_done"):
             mode = cfg.chime_mode
             gain = cfg.sfx_gain
         elif kind == "hype":
@@ -1529,7 +1584,7 @@ class HouseAudioManager:
             mode = cfg.readback_mode
             gain = cfg.readback_gain
 
-        with self.denon.duck_context():
+        if kind == "ready_chime":
             res = self.cube.play_wav_bytes(
                 cfg.cube_host,
                 cfg.cube_port,
@@ -1540,6 +1595,18 @@ class HouseAudioManager:
                 max_sec=max(5, int(math.ceil(dur_sec + 3.0))),
                 sync=True,
             )
+        else:
+            with self.denon.duck_context():
+                res = self.cube.play_wav_bytes(
+                    cfg.cube_host,
+                    cfg.cube_port,
+                    wav_bytes,
+                    mode=mode,
+                    usage=cfg.cube_usage,
+                    gain=gain,
+                    max_sec=max(5, int(math.ceil(dur_sec + 3.0))),
+                    sync=True,
+                )
         if res.get("ok"):
             return {"handled": True, "route": "cube", "mode": mode, "durationSec": dur_sec}
         self.cube.invalidate_health_cache()

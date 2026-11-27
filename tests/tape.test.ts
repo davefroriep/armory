@@ -583,4 +583,78 @@ describe('tape linking & scrubbing helpers', () => {
       lifts.sessions.clear();
     }
   });
+
+  it('uses strict trigger-to-trigger endMs without +2s padding and sends stable requestId for armed & guest manual recordings', async () => {
+    const origFetch = globalThis.fetch;
+    const origSettings = getSettings();
+    const calls: { url: string; body?: Record<string, unknown> }[] = [];
+    const dateSpy = vi.spyOn(Date, 'now');
+    try {
+      updateSettings({ gymCamEnabled: true, gymCamUrl: 'http://192.168.1.152:8766' });
+      gymCam.online = true;
+      gymCam.clockOffsetMs = 0;
+
+      globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+        calls.push({ url, body });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            lanUrl: '/clips/2026-11-26/bench_manual.mp4',
+            fileName: 'bench_manual.mp4',
+            camera: 'Rack Cam',
+            durationSec: 20,
+            startMs: body?.startMs,
+            endMs: body?.endMs,
+            bytes: 400_000,
+          }),
+          { status: 200 },
+        );
+      }) as unknown as typeof fetch;
+
+      const sess = {
+        id: 's_manual',
+        name: 'Upper 1',
+        routineId: null,
+        eventId: null,
+        startMs: 1_000_000,
+        endMs: null,
+        status: 'active' as const,
+        exs: [],
+        rpe: null,
+        bwKg: null,
+      };
+      const se = { uid: 'se_bp', exId: 'barbell-bench-press', sets: [] };
+      const set = { id: 'st_bp1', w: 100, r: 5, done: false, kind: 'n' as const, vids: [] };
+
+      dateSpy.mockReturnValue(1_020_000);
+      gymCam.armSet(sess, se, set, ['Rack Cam'], 1_000_000);
+      const armedRes = await gymCam.stopAndSaveArmed(sess, se, set);
+      expect(armedRes).toHaveLength(1);
+      const armedBody = calls[0].body!;
+      expect(armedBody.startMs).toBe(1_000_000);
+      expect(armedBody.endMs).toBe(1_020_000);
+      expect(armedBody.requestId).toBe('set_st_bp1_1000000_1020000');
+
+      dateSpy.mockReturnValue(1_050_000);
+      gymCam.armGuest(sess, 'Smith Cam');
+      dateSpy.mockReturnValue(1_068_500);
+      const guestRes = await gymCam.stopAndSaveGuest(sess);
+      expect(guestRes).not.toBeNull();
+      const guestBody = calls[1].body!;
+      expect(guestBody.startMs).toBe(1_050_000);
+      expect(guestBody.endMs).toBe(1_068_500);
+      expect(guestBody.requestId).toBe('guest_1050000_1068500_Smith Cam');
+    } finally {
+      dateSpy.mockRestore();
+      gymCam.cancelArm();
+      gymCam.cancelGuest();
+      gymCam.online = false;
+      globalThis.fetch = origFetch;
+      updateSettings({ gymCamEnabled: origSettings.gymCamEnabled, gymCamUrl: origSettings.gymCamUrl });
+      lifts.videos.clear();
+      lifts.sessions.clear();
+    }
+  });
 });

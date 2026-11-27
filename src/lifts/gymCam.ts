@@ -466,11 +466,12 @@ class GymCamController {
   async stopAndSaveGuest(s: LiftSession): Promise<VideoMeta | null> {
     if (!this.guestArmed || this.savingGuest) return null;
     const { startEpochMs: startMs, camera, sessionId } = this.guestArmed;
-    const endMs = Math.max(startMs + 3000, this.serverNowMs() + 2000);
+    const endMs = Math.max(startMs + 1000, this.serverNowMs());
     this.guestArmed = null;
     this.savingGuest = true;
     this.changed.emit();
     try {
+      const requestId = `guest_${Math.round(startMs)}_${Math.round(endMs)}_${camera || 'auto'}`;
       const body = {
         sessionId: sessionId || (s.camSessionId ?? s.id),
         exId: '_guest',
@@ -478,12 +479,13 @@ class GymCamController {
         setId: `_guest_${uid()}`,
         startMs,
         endMs,
+        requestId,
         ...(camera ? { camera } : {}),
       };
-      let res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+      let res = await this.postJson<ClipApiResponse>('/api/clip', body, 120_000);
       if (!res) {
         await new Promise((r) => setTimeout(r, 1200));
-        res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+        res = await this.postJson<ClipApiResponse>('/api/clip', body, 120_000);
       }
       const lanUrl = this.resolveLanUrl(res?.lanUrl);
       if (!lanUrl || !res) return null;
@@ -554,12 +556,13 @@ class GymCamController {
     const { startEpochMs: startMs, camera, cameras } = this.armed;
     const camList = normalizeCamList(cameras?.length ? cameras : camera);
     const effCams = camList.length ? camList : [DEFAULT_FALLBACK_CAM];
-    const endMs = Math.max(startMs + 3000, this.serverNowMs() + 2000);
+    const endMs = Math.max(startMs + 1000, this.serverNowMs());
     this.armed = null;
     this.savingSetId = set.id;
     this.changed.emit();
     try {
       const exName = lifts.exOrStub(se.exId).name;
+      const requestId = `set_${set.id}_${Math.round(startMs)}_${Math.round(endMs)}`;
       const body = {
         sessionId: s.camSessionId ?? s.id,
         exId: se.exId,
@@ -567,13 +570,14 @@ class GymCamController {
         setId: set.id,
         startMs,
         endMs,
+        requestId,
         camera: effCams[0],
         cameras: effCams,
       };
-      let res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+      let res = await this.postJson<ClipApiResponse>('/api/clip', body, 120_000);
       if (!res) {
         await new Promise((r) => setTimeout(r, 1200));
-        res = await this.postJson<ClipApiResponse>('/api/clip', body, 45_000);
+        res = await this.postJson<ClipApiResponse>('/api/clip', body, 120_000);
       }
       const rawClips = res?.clips?.length ? res.clips : (res?.lanUrl ? [res] : []);
       if (!rawClips.length) return [];

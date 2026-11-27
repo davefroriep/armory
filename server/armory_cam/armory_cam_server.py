@@ -3550,6 +3550,9 @@ class ArmoryCamService:
         self._worker_by_slug: dict[str, threading.Thread] = {}
         self._worker_threads: list[threading.Thread] = []
         self._clips_index_lock = threading.RLock()
+        self._clip_dedup_lock = threading.Lock()
+        self._clip_inflight: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._clip_recent: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._backup_lock = threading.Lock()
         self._last_camera_ui_mono: float = 0.0
         self._last_poll_ok_ms: int = 0
@@ -4070,37 +4073,52 @@ class ArmoryCamService:
             self.log.debug("Startup no-deep-sleep enforcement error: %s", exc)
 
     def _denon_ip_control_watch_loop(self) -> None:
-        """One-shot watcher: when Denon comes online, verify or safely enable IP Control = Always On."""
-        if self.displays.get_denon_ip_control_state().get("state") in ("verified_always_on", "needs_review"):
-            return
+        """Self-healing watcher: verify & enforce Denon IP Control = Always On periodically."""
+        reverify_interval_sec = 6 * 3600.0
         delay_sec = 5.0
         while not self._stop_event.is_set():
             if self._stop_event.wait(delay_sec):
                 return
-            delay_sec = 30.0
-            if self.displays.get_denon_ip_control_state().get("state") in ("verified_always_on", "needs_review"):
+            cur_state = self.displays.get_denon_ip_control_state()
+            state_name = cur_state.get("state")
+            if state_name == "needs_review":
                 return
+            if state_name == "verified_always_on":
+                try:
+                    age_ms = time.time() * 1000.0 - float(cur_state.get("updatedAtMs") or 0.0)
+                    if 0.0 <= age_ms < reverify_interval_sec * 1000.0:
+                        delay_sec = 300.0
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                delay_sec = 60.0
+            else:
+                delay_sec = 30.0
             if not self.displays.is_denon_tcp_reachable(timeout=0.8):
                 continue
             if self._stop_event.wait(2.0):
                 return
             try:
-                res = self.displays.ensure_denon_ip_control_always_on()
+                res = self.displays.ensure_denon_ip_control_always_on(max_age_sec=reverify_interval_sec)
             except Exception as exc:
                 self.log.debug("Denon IP Control watcher error: %s", exc)
                 delay_sec = 60.0
                 continue
             state = res.get("state")
             if state == "verified_always_on":
-                self.log.info("Denon AVR-3313CI IP Control verified Always On: %s", res)
-                if self.ntfy_topic:
-                    send_ntfy_alert(
-                        self.ntfy_topic,
-                        "Denon IP Control Enabled",
-                        "Denon AVR-3313CI IP Control is now verified Always On. Voice 'Open the gym' can wake the Denon!",
-                        tags="white_check_mark,loud_sound",
-                    )
-                return
+                if res.get("changed"):
+                    self.log.info("Denon AVR-3313CI IP Control verified Always On: %s", res)
+                    if self.ntfy_topic:
+                        send_ntfy_alert(
+                            self.ntfy_topic,
+                            "Denon IP Control Enabled",
+                            "Denon AVR-3313CI IP Control is now verified Always On. Voice 'Open the gym' can wake the Denon!",
+                            tags="white_check_mark,loud_sound",
+                        )
+                else:
+                    self.log.debug("Denon AVR-3313CI IP Control re-verified Always On")
+                delay_sec = 300.0
+                continue
             if state == "needs_review":
                 self.log.info("Denon network web pages captured for review: %s", res)
                 if self.ntfy_topic:
@@ -7337,6 +7355,77 @@ class ArmoryCamService:
                     self.log.warning("Multi-cam clip failed: %s", exc)
             return out
 
+    def cut_clips_multi_dedup(
+        self,
+        dedup_key: str,
+        session_id: str,
+        ex_name: str,
+        start_ms: int,
+        end_ms: int,
+        cameras: Sequence[str],
+        *,
+        include_audio: bool = False,
+        source_filter: str = "all",
+    ) -> list[dict[str, Any]]:
+        """Run `cut_clips_multi` idempotently so retries or concurrent duplicates reuse the same clip."""
+        key = dedup_key.strip()
+        if not key:
+            return self.cut_clips_multi(
+                session_id=session_id,
+                ex_name=ex_name,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                cameras=cameras,
+                include_audio=include_audio,
+                source_filter=source_filter,
+            )
+        wait_ev: threading.Event | None = None
+        wait_holder: dict[str, Any] | None = None
+        with self._clip_dedup_lock:
+            now_mono = time.monotonic()
+            expired = [k for k, (ts, _) in self._clip_recent.items() if now_mono - ts > 180.0]
+            for k in expired:
+                self._clip_recent.pop(k, None)
+            recent = self._clip_recent.get(key)
+            if recent is not None:
+                return [dict(c) for c in recent[1]]
+            inflight = self._clip_inflight.get(key)
+            if inflight is not None:
+                wait_ev, wait_holder = inflight
+            else:
+                ev = threading.Event()
+                holder: dict[str, Any] = {"clips": []}
+                self._clip_inflight[key] = (ev, holder)
+                wait_ev = None
+                wait_holder = holder
+
+        if wait_ev is not None:
+            wait_ev.wait(timeout=150.0)
+            return [dict(c) for c in (wait_holder.get("clips") or [])]
+
+        clips: list[dict[str, Any]] = []
+        try:
+            clips = self.cut_clips_multi(
+                session_id=session_id,
+                ex_name=ex_name,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                cameras=cameras,
+                include_audio=include_audio,
+                source_filter=source_filter,
+            )
+            if clips:
+                with self._clip_dedup_lock:
+                    self._clip_recent[key] = (time.monotonic(), [dict(c) for c in clips])
+            if wait_holder is not None:
+                wait_holder["clips"] = clips
+            return clips
+        finally:
+            with self._clip_dedup_lock:
+                pair = self._clip_inflight.pop(key, None)
+            if pair is not None:
+                pair[0].set()
+
     def mirror_clip_to_drive(self, src_path: Path, day_str: str) -> dict[str, str]:
         """Copy an encoded MP4 into Google Drive backup folder and read Drive file ID if synced."""
         with self.lock:
@@ -8452,8 +8541,9 @@ class ArmoryCamService:
         return events
 
     def calibration_status(self) -> dict[str, Any]:
-        """Return unique clean clip count and notified pose-calibration milestones."""
-        names: set[str] = set()
+        """Return unique clean set count (skipping dotfiles & multi-cam duplicates) and milestones."""
+        set_key_re = re.compile(r"^(.+_\d{6})_[0-9a-f]{6}\.mp4$", re.IGNORECASE)
+        names: set[tuple[str, str]] = set()
         if self.clips_root.exists():
             try:
                 with os.scandir(self.clips_root) as it:
@@ -8463,8 +8553,14 @@ class ArmoryCamService:
                         try:
                             with os.scandir(ent.path) as sub_it:
                                 for f_ent in sub_it:
-                                    if f_ent.name.lower().endswith(".mp4") and f_ent.is_file(follow_symlinks=False):
-                                        names.add(f_ent.name)
+                                    nm = f_ent.name
+                                    low = nm.lower()
+                                    if nm.startswith(".") or low.endswith((".tmp", ".vid.mp4")) or not low.endswith(".mp4"):
+                                        continue
+                                    if f_ent.is_file(follow_symlinks=False):
+                                        m = set_key_re.match(nm)
+                                        key = m.group(1).lower() if m else low
+                                        names.add((ent.name, key))
                         except OSError:
                             pass
             except OSError:
@@ -8678,7 +8774,7 @@ class ArmoryCamService:
             if not armed:
                 return []
             start_ms = int(armed["armedAtMs"])
-            end_ms = max(start_ms + 3000, now_ms + 1500)
+            end_ms = max(start_ms + 1000, now_ms)
             cam = camera or armed.get("camera")
             cams = [cam] if cam else (enabled_cams[:2] if enabled_cams else ["Rack Cam"])
             ex_name = "Guest Clip" if armed.get("guest") else (active_name or "Gym Clip")
@@ -8694,7 +8790,7 @@ class ArmoryCamService:
         # mode == "clip_last"
         if armed and (now_ms - int(armed.get("armedAtMs") or 0)) >= 2000:
             start_ms = int(armed["armedAtMs"])
-            end_ms = max(start_ms + 3000, now_ms + 1500)
+            end_ms = max(start_ms + 1000, now_ms)
             cam = camera or armed.get("camera")
             ex_name = "Guest Clip" if armed.get("guest") else (active_name or "Gym Clip")
             sid = str(armed.get("sessionId") or active_sid or f"motion_{datetime.now().strftime('%Y-%m-%d')}")
@@ -8784,6 +8880,20 @@ class ArmoryCamService:
                 res = self.displays.execute_many(targets, parsed["action"])
             else:
                 res = self.displays.execute(parsed["target"], parsed["action"])
+            if parsed["target"] in ("open_gym", "close_gym"):
+                failed = list(res.get("failedTargets") or [])
+                if not failed and isinstance(res.get("results"), dict):
+                    failed = [
+                        k for k, sub in res["results"].items()
+                        if isinstance(sub, dict) and not sub.get("ok") and not sub.get("skipped")
+                    ]
+                if failed:
+                    self.log.warning(
+                        "Display macro %s partial failure (%s): %s",
+                        parsed["target"],
+                        ", ".join(failed),
+                        res.get("results"),
+                    )
             silent = bool(parsed.get("silent"))
             ok = bool(res.get("ok"))
             raw_speech = str(parsed.get("speech") or "").strip()
@@ -19879,8 +19989,14 @@ def create_app(service: ArmoryCamService) -> Flask:
                 cams_list = [s_cam]
         include_audio = bool(body.get("includeAudio", False))
         src = str(body.get("source") or "all")
+        request_id = str(body.get("requestId") or "").strip()
+        dedup_key = request_id or (
+            f"{sid}|{start_ms // 1000}|{end_ms // 1000}|"
+            f"{','.join(sorted(c.lower() for c in cams_list))}|{int(include_audio)}|{src}"
+        )
         service.clear_server_armed_clip()
-        clips = service.cut_clips_multi(
+        clips = service.cut_clips_multi_dedup(
+            dedup_key=dedup_key,
             session_id=sid,
             ex_name=ex_name,
             start_ms=start_ms,

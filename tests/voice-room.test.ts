@@ -507,4 +507,94 @@ describe('VoiceController room source relay', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('handles go to exercise N set N, uncheck (preserving numbers), relog advancing past done sets, clear, and silent cancel/nevermind', async () => {
+    const sess: LiftSession = {
+      id: 'sess_nav_uncheck',
+      name: 'Upper 1',
+      routineId: null,
+      eventId: null,
+      startMs: Date.now() - 60_000,
+      endMs: null,
+      status: 'active',
+      started: true,
+      exs: [
+        {
+          uid: 'u1',
+          exId: 'barbell-bench-press',
+          ss: true,
+          sets: [
+            { id: 's1', w: 135 * KG_PER_LB, r: 10, done: true, at: 1_001_000, kind: 'n' },
+            { id: 's2', w: 185 * KG_PER_LB, r: 8, done: true, at: 1_002_000, kind: 'n' },
+            { id: 's3', w: 185 * KG_PER_LB, r: 8, done: false, kind: 'n' },
+          ],
+        },
+        {
+          uid: 'u2',
+          exId: 'barbell-row',
+          sets: [
+            { id: 'r1', w: 155 * KG_PER_LB, r: 8, done: true, at: 1_003_000, kind: 'n' },
+            { id: 'r2', w: 155 * KG_PER_LB, r: 8, done: false, kind: 'n' },
+          ],
+        },
+      ],
+      rpe: null,
+      bwKg: 88.5,
+    };
+    mockState.activeSess = sess;
+    mockState.speakCalls.length = 0;
+
+    // 1. Go to exercise 1, set 2 (checked) -> cursor lands explicitly on s2
+    const jRes = voice.runTextCommand('go to exercise 1, set 2');
+    expect(jRes?.text).toContain('Set 2');
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's2', explicit: true });
+
+    // 2. Uncheck -> pulls ONLY the checkmark, keeps 185 x 8, keeps cursor on s2
+    voice.runTextCommand('uncheck');
+    expect(sess.exs[0].sets[1].done).toBe(false);
+    expect(Math.round((sess.exs[0].sets[1].w ?? 0) / KG_PER_LB)).toBe(185);
+    expect(sess.exs[0].sets[1].r).toBe(8);
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's2' });
+
+    // 3. Log "50 for 10" -> updates s2 to 50 x 10, marks checked, advances to next undone set (r2 in superset)
+    voice.runTextCommand('50 for 10');
+    expect(sess.exs[0].sets[1].done).toBe(true);
+    expect(Math.round((sess.exs[0].sets[1].w ?? 0) / KG_PER_LB)).toBe(50);
+    expect(sess.exs[0].sets[1].r).toBe(10);
+    expect(voice.cursor).toEqual({ exUid: 'u2', setId: 'r2' });
+
+    // 4. Jump to exercise 1, set 1 and say "clear" -> clears w/r/done and keeps cursor on s1
+    voice.runTextCommand('go to exercise 1, set 1');
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's1', explicit: true });
+    voice.runTextCommand('clear');
+    expect(sess.exs[0].sets[0].done).toBe(false);
+    expect(sess.exs[0].sets[0].w).toBeNull();
+    expect(sess.exs[0].sets[0].r).toBeNull();
+    expect(voice.cursor).toEqual({ exUid: 'u1', setId: 's1' });
+
+    // 5. Silent cancel / nevermind while armed -> disarms with ZERO toast, ZERO TTS, ZERO ackRoom, ZERO undo
+    const fetchMock = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true, spoke: false }) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const toasts: string[] = [];
+    const offToast = voice.toasted.on((t) => toasts.push(t.msg));
+    try {
+      voice.receiveExternalEvent({ transcript: 'Armory', isFinal: true, source: 'room', state: 'room' });
+      expect(voice.isArmed()).toBe(true);
+      const armedNotice = voice.lastAction;
+      const callsBefore = fetchMock.mock.calls.length;
+      mockState.speakCalls.length = 0;
+
+      voice.receiveExternalEvent({ transcript: 'nevermind', isFinal: true, source: 'room', state: 'room' });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(voice.isArmed()).toBe(false);
+      expect(toasts).toEqual([]);
+      expect(mockState.speakCalls).toEqual([]);
+      expect(voice.lastAction).toBe(armedNotice);
+      expect(fetchMock.mock.calls.length).toBe(callsBefore);
+      expect(sess.exs[0].sets[1].done).toBe(true); // Did NOT undo s2!
+    } finally {
+      offToast();
+      vi.unstubAllGlobals();
+    }
+  });
 });

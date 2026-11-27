@@ -4,6 +4,7 @@ import type { Exercise, LiftSet, SessionEx } from './types';
 export interface CursorRef {
   exUid: string;
   setId?: string;
+  explicit?: boolean;
 }
 
 export interface SetPointer {
@@ -95,7 +96,7 @@ export function resolveTargetSet(exs: SessionEx[], cursor?: CursorRef | null): S
       const se = exs[exIdx];
       if (cursor.setId) {
         const si = se.sets.findIndex((s) => s.id === cursor.setId);
-        if (si >= 0 && !se.sets[si].done) return makePointer(exs, labs, exIdx, si);
+        if (si >= 0 && (!se.sets[si].done || cursor.explicit)) return makePointer(exs, labs, exIdx, si);
       }
       const firstOpen = se.sets.findIndex((s) => !s.done);
       if (firstOpen >= 0) return makePointer(exs, labs, exIdx, firstOpen);
@@ -186,9 +187,9 @@ const SPOKEN_SUFFIX: Record<string, string> = {
 function normalizeLabelQuery(raw: string): string {
   const cleaned = raw.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').trim();
   const toks = cleaned.split(/\s+/).filter((t) => t && !['exercise', 'group', 'set', 'the', 'to'].includes(t));
-  if (toks.length === 1 && /^[1-9][a-d]?$/.test(toks[0])) return toks[0];
+  if (toks.length === 1 && /^[1-9]\d*[a-d]?$/.test(toks[0])) return toks[0];
   if (toks.length === 2) {
-    const num = SPOKEN_PREFIX[toks[0]] ?? (/^[1-9]$/.test(toks[0]) ? toks[0] : '');
+    const num = SPOKEN_PREFIX[toks[0]] ?? (/^[1-9]\d*$/.test(toks[0]) ? toks[0] : '');
     const letCh = SPOKEN_SUFFIX[toks[1]] ?? (/^[a-d]$/.test(toks[1]) ? toks[1] : '');
     if (num && letCh) return `${num}${letCh}`;
   }
@@ -196,22 +197,54 @@ function normalizeLabelQuery(raw: string): string {
   return '';
 }
 
-/** Jumps the cursor to a superset/exercise label (`2B`, `"two b"`) or best-matching exercise name (`"pull ups"`). */
-export function jumpToExerciseCursor(exs: SessionEx[], rawTarget: string, exOf: (id: string) => Exercise): CursorRef | null {
+/** Resolves 1-based working set number (falling back to overall index when no working sets match). */
+export function findSetIndexByNumber(se: SessionEx, setNum: number): number {
+  if (!Number.isFinite(setNum) || setNum < 1) return -1;
+  let workingOrd = 0;
+  for (let i = 0; i < se.sets.length; i++) {
+    if (se.sets[i].kind !== 'w') {
+      workingOrd += 1;
+      if (workingOrd === setNum) return i;
+    }
+  }
+  return setNum - 1 < se.sets.length ? setNum - 1 : -1;
+}
+
+/** Jumps the cursor to a superset/exercise label (`2B`, `"two b"`, `"exercise 1"`), exercise name, and optional 1-based set number. */
+export function jumpToExerciseCursor(
+  exs: SessionEx[],
+  rawTarget: string,
+  exOf: (id: string) => Exercise,
+  setNum?: number,
+): CursorRef | null {
   if (!exs.length) return null;
   const labs = labels(exs);
   const labQ = normalizeLabelQuery(rawTarget);
-  if (labQ) {
-    const idx = labs.findIndex((l) => l.toLowerCase() === labQ);
-    if (idx >= 0) {
-      const se = exs[idx];
-      const open = se.sets.find((s) => !s.done) ?? se.sets[se.sets.length - 1];
-      return open ? { exUid: se.uid, setId: open.id } : { exUid: se.uid };
+  const pickSet = (se: SessionEx): CursorRef | null => {
+    if (setNum != null && setNum >= 1) {
+      const si = findSetIndexByNumber(se, setNum);
+      return si >= 0 ? { exUid: se.uid, setId: se.sets[si].id, explicit: true } : null;
     }
+    const open = se.sets.find((s) => !s.done);
+    if (open) return { exUid: se.uid, setId: open.id };
+    const last = se.sets[se.sets.length - 1];
+    return last ? { exUid: se.uid, setId: last.id, explicit: true } : { exUid: se.uid };
+  };
+
+  if (labQ) {
+    let idx = labs.findIndex((l) => l.toLowerCase() === labQ);
+    if (idx < 0 && /^[1-9]\d*$/.test(labQ)) {
+      idx = labs.findIndex((l) => l.toLowerCase() === `${labQ}a`);
+    }
+    if (idx < 0 && /^[1-9]\d*$/.test(labQ)) {
+      const ordIdx = Number(labQ) - 1;
+      if (ordIdx >= 0 && ordIdx < exs.length) idx = ordIdx;
+    }
+    if (idx >= 0) return pickSet(exs[idx]);
   }
 
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  const q = norm(rawTarget);
+  const q = norm(rawTarget).replace(/^exercise\s+/, '').trim();
   if (!q) return null;
   const qTokens = q.split(' ').filter((w) => w.length >= 2);
   let bestIdx = -1;
@@ -237,9 +270,23 @@ export function jumpToExerciseCursor(exs: SessionEx[], rawTarget: string, exOf: 
   });
 
   if (bestIdx < 0) return null;
-  const se = exs[bestIdx];
-  const open = se.sets.find((s) => !s.done) ?? se.sets[se.sets.length - 1];
-  return open ? { exUid: se.uid, setId: open.id } : { exUid: se.uid };
+  return pickSet(exs[bestIdx]);
+}
+
+/** Jumps the cursor to 1-based `setNum` within the currently focused exercise. */
+export function jumpToSetInCurrentExercise(
+  exs: SessionEx[],
+  cursor: CursorRef | null,
+  setNum: number,
+): CursorRef | null {
+  if (!exs.length || !Number.isFinite(setNum) || setNum < 1) return null;
+  const cur = resolveTargetSet(exs, cursor);
+  const se = cur
+    ? exs[cur.exIdx]
+    : (cursor?.exUid ? exs.find((e) => e.uid === cursor.exUid) : undefined) ?? exs[0];
+  const si = findSetIndexByNumber(se, setNum);
+  if (si < 0) return null;
+  return { exUid: se.uid, setId: se.sets[si].id, explicit: true };
 }
 
 export interface SetMutationResult {

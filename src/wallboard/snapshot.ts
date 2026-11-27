@@ -71,6 +71,7 @@ export interface WallboardLiftExerciseSummary {
 export interface WallboardSetSlot {
   label: string;
   state: 'done' | 'active' | 'queued';
+  targeted?: boolean;
   kind: 'n' | 'w' | 'd' | 'f';
   exType: 'weight' | 'bodyweight' | 'time';
   weightVal: string;
@@ -301,6 +302,7 @@ function formatSetSlot(
   rx: CoachPrescription,
   prev: LiftSet | null,
   u: 'lb' | 'kg',
+  targeted = false,
 ): WallboardSetSlot {
   let weightVal = '';
   let weightPlaceholder = `___ ${u}`;
@@ -324,6 +326,7 @@ function formatSetSlot(
   return {
     label,
     state,
+    ...(targeted ? { targeted: true } : {}),
     kind: x.kind,
     exType: ex.type,
     weightVal,
@@ -467,7 +470,7 @@ function buildLiftStage(
           ? 'active'
           : 'queued';
       const prev = prevSetFor(prevSe, se, idx);
-      return formatSetSlot(x, setLab, state, ex, rx, prev, u);
+      return formatSetSlot(x, setLab, state, ex, rx, prev, u, isActive && idx === curPtr.setIdx);
     });
 
     stations.push({

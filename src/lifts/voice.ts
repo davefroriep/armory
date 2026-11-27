@@ -8,10 +8,10 @@ import { getSettings, settingsChanged, updateSettings } from '../store/settings'
 import { active } from './active';
 import {
   advanceCursorAfterLog, applyAddSet, applyAddSetToLastEx, applyDeleteEmptySets,
-  jumpToExerciseCursor, resolveTargetSet, stepExerciseCursor, type CursorRef,
+  jumpToExerciseCursor, jumpToSetInCurrentExercise, resolveTargetSet, stepExerciseCursor, type CursorRef,
 } from './cursor';
 import { gymCam } from './gymCam';
-import { canLog, editReps, editWeight, labels, toggleDone } from './logic';
+import { canLog, editReps, editWeight, forward, labels, toggleDone } from './logic';
 import { fmtKg, fromDisplay, liftSettings } from './settings';
 import { lifts } from './store';
 import {
@@ -112,7 +112,8 @@ interface WebSpeechRec {
 
 const ARM_WINDOW_MS = 6500;
 const BASE_BIAS = [
-  'armory', 'check', 'done', 'log', 'undo', 'back', 'go back', 'next exercise', 'previous exercise',
+  'armory', 'check', 'done', 'log', 'undo', 'uncheck', 'clear', 'cancel', 'nevermind',
+  'back', 'go back', 'next exercise', 'previous exercise', 'go to exercise',
   'add set', 'add set to last exercise', 'delete empty sets',
   'skip rest', 'add 30 seconds', 'start hold', 'bodyweight', 'pause workout', 'resume workout', 'finish workout', 'rpe',
   'camera', 'record set', 'record rack', 'record smith', 'rack camera', 'smith camera', 'clip that', 'save clip', 'clip rack', 'clip smith',
@@ -633,6 +634,15 @@ class VoiceController {
             this.changed.emit();
             return;
           }
+          if (d.type === 'disarm') {
+            this.armedUntilMs = 0;
+            if (this.armTimer) {
+              clearTimeout(this.armTimer);
+              this.armTimer = null;
+            }
+            this.changed.emit();
+            return;
+          }
           if (d.type === 'transcript' && d.transcript) {
             const evId = Number(d.id || 0);
             if (evId > 0) {
@@ -1102,6 +1112,15 @@ class VoiceController {
     speakIt = false,
     source: NativeVoiceEvent['source'] = 'mic',
   ): VoiceActionNotice {
+    if (intent.kind === 'cancel_listen') {
+      this.armedUntilMs = 0;
+      if (this.armTimer) {
+        clearTimeout(this.armTimer);
+        this.armTimer = null;
+      }
+      this.changed.emit();
+      return { text: '', kind: 'info', atMs: Date.now() };
+    }
     const n = this.runIntent(intent);
     if (source === 'room' || (speakIt && n.speech)) {
       this.speakWithSource(speakIt ? (n.speech ?? null) : null, source, n);
@@ -1115,6 +1134,15 @@ class VoiceController {
       this.armNow();
       buzz(20);
       return this.notice('Listening… say weight & reps or "check"', 'info', false, null);
+    }
+    if (intent.kind === 'cancel_listen') {
+      this.armedUntilMs = 0;
+      if (this.armTimer) {
+        clearTimeout(this.armTimer);
+        this.armTimer = null;
+      }
+      this.changed.emit();
+      return { text: '', kind: 'info', atMs: Date.now() };
     }
 
     const fallbackSpeech = defaultReadbackForIntent(intent);
@@ -1306,18 +1334,95 @@ class VoiceController {
     }
 
     if (intent.kind === 'jump_ex') {
-      const jumped = jumpToExerciseCursor(s.exs, intent.target, lifts.exOrStub);
+      const jumped = jumpToExerciseCursor(s.exs, intent.target, lifts.exOrStub, intent.setNum);
       if (!jumped) return this.notice(`Could not find "${intent.target}" in workout`, 'warn', true, "Didn't find that exercise");
       this.cursor = jumped;
       const ptr = resolveTargetSet(s.exs, this.cursor);
       const exTitle = ptr ? lifts.exOrStub(s.exs[ptr.exIdx].exId).name : intent.target;
       buzz(20);
+      const setSuffix = intent.setNum != null && ptr ? ` · Set ${ptr.setNumber}` : '';
+      const spk = intent.setNum != null && ptr ? `${exTitle}, set ${ptr.setNumber}` : `Up now, ${exTitle}`;
       return this.notice(
-        ptr ? `Target → ${ptr.label} ${lifts.exOrStub(s.exs[ptr.exIdx].exId).name}` : 'Jumped exercise',
+        ptr ? `Target → ${ptr.label} ${exTitle}${setSuffix}` : 'Jumped exercise',
         'info',
         true,
-        `Up now, ${exTitle}`,
+        spk,
       );
+    }
+
+    if (intent.kind === 'jump_set') {
+      const jumped = jumpToSetInCurrentExercise(s.exs, this.cursor, intent.setNum);
+      if (!jumped) return this.notice(`Could not find set ${intent.setNum}`, 'warn', true, "Didn't find that set");
+      this.cursor = jumped;
+      const ptr = resolveTargetSet(s.exs, this.cursor);
+      const exTitle = ptr ? lifts.exOrStub(s.exs[ptr.exIdx].exId).name : '';
+      buzz(20);
+      return this.notice(
+        ptr ? `Target → ${ptr.label} ${exTitle} · Set ${ptr.setNumber}` : `Set ${intent.setNum}`,
+        'info',
+        true,
+        `Set ${intent.setNum}`,
+      );
+    }
+
+    if (intent.kind === 'uncheck_set') {
+      let targetSe: typeof s.exs[number] | undefined;
+      let targetSet: typeof s.exs[number]['sets'][number] | undefined;
+      if (cur && s.exs[cur.exIdx]?.sets[cur.setIdx]?.done) {
+        targetSe = s.exs[cur.exIdx];
+        targetSet = targetSe.sets[cur.setIdx];
+      } else {
+        let bestAt = -1;
+        for (const candSe of s.exs) {
+          for (const candSet of candSe.sets) {
+            if (!candSet.done) continue;
+            const at = candSet.at ?? 0;
+            if (at >= bestAt) {
+              bestAt = at;
+              targetSe = candSe;
+              targetSet = candSet;
+            }
+          }
+        }
+      }
+      if (!targetSe || !targetSet) {
+        return this.notice('No checked set to uncheck', 'warn', true, 'Nothing to uncheck');
+      }
+      const exTitle = lifts.exOrStub(targetSe.exId).name;
+      pushExsUndo(exTitle);
+      targetSet.done = false;
+      delete targetSet.at;
+      active.clearRest();
+      void active.resetIfNoneLogged(s);
+      this.cursor = { exUid: targetSe.uid, setId: targetSet.id };
+      lifts.saveSession(s, true);
+      buzz(20);
+      return this.notice(`Unchecked ${exTitle}`, 'info', true, fallbackSpeech);
+    }
+
+    if (intent.kind === 'clear_set') {
+      if (!cur) return this.notice('No target set to clear', 'warn', true, 'Nothing to clear');
+      const targetSe = s.exs[cur.exIdx];
+      const targetSet = targetSe.sets[cur.setIdx];
+      const exTitle = lifts.exOrStub(targetSe.exId).name;
+      pushExsUndo(exTitle);
+      const wasDone = !!targetSet.done;
+      targetSet.done = false;
+      delete targetSet.at;
+      targetSet.w = null;
+      targetSet.r = null;
+      delete targetSet.wAuto;
+      delete targetSet.rAuto;
+      delete targetSet.rpe;
+      delete targetSet.rxLock;
+      if (wasDone) {
+        active.clearRest();
+        void active.resetIfNoneLogged(s);
+      }
+      this.cursor = { exUid: targetSe.uid, setId: targetSet.id };
+      lifts.saveSession(s, true);
+      buzz(20);
+      return this.notice(`Cleared ${cur.label} ${exTitle} · Set ${cur.setNumber}`, 'info', true, fallbackSpeech);
     }
 
     if (intent.kind === 'undo') {
@@ -1472,9 +1577,17 @@ class VoiceController {
       return this.notice(`Need weight & reps for ${cur.label} ${ex.name} (e.g. "Armory 135 for 10")`, 'warn', true, 'Need weight and reps');
     }
     const wasArmed = gymCam.isArmed(set.id) || !!gymCam.adoptServerArmedForSet?.(s, se, set);
-    const logged = toggleDone(se, cur.setIdx, ex);
-    if (!logged) {
-      return this.notice(`Could not log ${ex.name}`, 'warn', true, 'Could not log set');
+    if (set.done) {
+      if (set.w == null) set.w = 0;
+      set.at = Date.now();
+      set.wAuto = false;
+      set.rAuto = false;
+      forward(se, cur.setIdx, { w: true, r: true });
+    } else {
+      const logged = toggleDone(se, cur.setIdx, ex);
+      if (!logged) {
+        return this.notice(`Could not log ${ex.name}`, 'warn', true, 'Could not log set');
+      }
     }
     if (undoSnap) {
       this.undoStack.push(undoSnap);

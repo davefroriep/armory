@@ -200,8 +200,9 @@ body.dock-open .lsession { padding-bottom: max(56dvh, 420px); }
 .shold.on { background: var(--amber); color: #191000; }
 .xth { color: var(--mut); font-size: .6rem; font-weight: 800; letter-spacing: .1em; text-align: center; padding: 2px 0 4px; }
 .srow { padding: 3px 0; border-radius: 12px; transition: background .15s; }
-.srow.cur-target:not(.done) { background: rgba(56, 189, 248, .08); box-shadow: inset 0 0 0 1.5px rgba(56, 189, 248, .55); }
+.srow.cur-target { background: rgba(56, 189, 248, .08); box-shadow: inset 0 0 0 1.5px rgba(56, 189, 248, .55); }
 .srow.done { background: transparent; }
+.srow.done.cur-target { background: rgba(56, 189, 248, .08); box-shadow: inset 0 0 0 1.5px rgba(56, 189, 248, .75); }
 .snum { position: relative; height: 40px; border-radius: 10px; background: var(--card2); font-weight: 800; font-size: .95rem; display: grid; place-items: center; }
 .snum.has-rpe { padding-bottom: 8px; }
 .srow.k-w .snum { color: var(--amber); }

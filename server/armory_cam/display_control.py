@@ -803,12 +803,36 @@ class GymDisplayController:
         except OSError:
             return False
 
-    def ensure_denon_ip_control_always_on(self, *, force: bool = False) -> dict[str, Any]:
+    def _denon_refresh_setup_page(self, page_url: str) -> None:
+        """Fetch sibling `r_*.asp` before `d_*.asp` so Denon BridgeCo refreshes live AVR MCU state."""
+        try:
+            parsed = urllib.parse.urlparse(page_url)
+            parts = parsed.path.rsplit("/", 1)
+            fname = parts[-1]
+            if not fname.lower().startswith("d_"):
+                return
+            r_fname = ("r_" if fname.startswith("d_") else "R_") + fname[2:]
+            r_path = f"{parts[0]}/{r_fname}" if len(parts) == 2 else r_fname
+            r_url = urllib.parse.urlunparse(parsed._replace(path=r_path))
+            code, _ = self._do_get(r_url, 2.5)
+            if code < 400:
+                self._sleep(0.35)
+        except Exception:
+            pass
+
+    def ensure_denon_ip_control_always_on(self, *, force: bool = False, max_age_sec: float | None = None) -> dict[str, Any]:
         """Crawl Denon `/SETUP/NETWORK/`, verify or set IP Control = Always On, else safely dump HTML."""
         if not force:
             cur = self.get_denon_ip_control_state()
             if cur.get("state") == "verified_always_on":
-                return {**cur, "ok": True}
+                if max_age_sec is None:
+                    return {**cur, "ok": True}
+                try:
+                    age_ms = time.time() * 1000.0 - float(cur.get("updatedAtMs") or 0.0)
+                    if 0.0 <= age_ms < float(max_age_sec) * 1000.0:
+                        return {**cur, "ok": True}
+                except (TypeError, ValueError):
+                    pass
 
         if self.denon is None:
             return {"ok": False, "state": "pending", "error": "Denon client unavailable"}
@@ -841,6 +865,7 @@ class GymDisplayController:
                 continue
             seen.add(url)
             try:
+                self._denon_refresh_setup_page(url)
                 code, raw = self._do_get(url, 3.0)
             except Exception:
                 continue
@@ -966,6 +991,7 @@ class GymDisplayController:
 
             self._sleep(1.0)
             try:
+                self._denon_refresh_setup_page(page_url)
                 vcode, vraw = self._do_get(page_url, 3.0)
             except Exception as exc:
                 res = {
@@ -1079,7 +1105,9 @@ class GymDisplayController:
             return {"ok": False, "error": "Denon disabled or unconfigured"}
 
         try:
-            code, raw = self._do_get(f"{base}/SETUP/VIDEO/d_video.asp", 3.5)
+            video_url = f"{base}/SETUP/VIDEO/d_video.asp"
+            self._denon_refresh_setup_page(video_url)
+            code, raw = self._do_get(video_url, 3.5)
             if code < 400:
                 fields = _parse_denon_video_form(raw.decode("utf-8", errors="ignore"))
                 if "radioMonitorOut" in fields:
@@ -1728,13 +1756,28 @@ class GymDisplayController:
             if r1.get("ok"):
                 self._sleep(0.25)
                 self.denon.send_command("SIMPLAY")
-            return {**r1, "target": "avr", "action": "on", "message": "Denon AVR powered on (Media Player)"}
+            msg = (
+                "Denon AVR powered on (Media Player)"
+                if r1.get("ok")
+                else f"Denon AVR on failed: {r1.get('error', 'unreachable')}"
+            )
+            return {**r1, "target": "avr", "action": "on", "message": msg}
         if action == "off":
             r1 = self.denon.send_command("PWSTANDBY")
-            return {**r1, "target": "avr", "action": "off", "message": "Denon AVR standby"}
+            msg = (
+                "Denon AVR standby"
+                if r1.get("ok")
+                else f"Denon AVR off failed: {r1.get('error', 'unreachable')}"
+            )
+            return {**r1, "target": "avr", "action": "off", "message": msg}
         if action == "mch_stereo":
             r1 = self.denon.send_command("MSMCH STEREO")
-            return {**r1, "target": "avr", "action": "mch_stereo", "message": "Denon Multi Ch Stereo"}
+            msg = (
+                "Denon Multi Ch Stereo"
+                if r1.get("ok")
+                else f"Denon AVR mch_stereo failed: {r1.get('error', 'unreachable')}"
+            )
+            return {**r1, "target": "avr", "action": "mch_stereo", "message": msg}
         if action == "monitor1":
             return {**self.set_denon_monitor_out("1"), "target": "avr", "action": "monitor1"}
         if action == "monitor_auto":
@@ -1848,8 +1891,31 @@ class GymDisplayController:
                         results[err_key] = {"ok": False, "target": err_key, "error": str(exc)}
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
+            failed_targets: list[str] = []
+            for k in ("tv", "spin", "wallboard", "avr", "music", "cube"):
+                r = results.get(k)
+                if isinstance(r, dict) and not r.get("ok") and not r.get("skipped"):
+                    failed_targets.append(k)
             ok = any(bool(r.get("ok")) for r in results.values() if isinstance(r, dict))
-            return {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": "Gym opened (All 3 TVs, Denon, YouTube Music)"}
+            if not failed_targets:
+                msg = "Gym opened (All 3 TVs, Denon, YouTube Music)"
+            elif failed_targets == ["avr"]:
+                msg = "Gym opened (Denon unreachable)"
+            else:
+                labels = {
+                    "tv": "Main TV",
+                    "spin": "SmartSpin TV",
+                    "wallboard": "Wallboard",
+                    "avr": "Denon",
+                    "music": "YouTube Music",
+                    "cube": "Fire TV Cube",
+                }
+                names = ", ".join(labels.get(k, k) for k in failed_targets)
+                msg = f"Gym opened (failed: {names})"
+            out_res: dict[str, Any] = {"ok": ok, "target": "open_gym", "action": "run", "results": results, "message": msg}
+            if failed_targets:
+                out_res["failedTargets"] = failed_targets
+            return out_res
         if tgt == "close_gym":
             results = {}
             close_tasks: dict[str, Callable[[], dict[str, Any]]] = {

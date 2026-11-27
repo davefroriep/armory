@@ -3044,6 +3044,177 @@ class ArmoryCamTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp4, ignore_errors=True)
 
+    def test_denon_r_asp_refresh_self_healing_telnet_fallback_and_open_gym_honesty(self) -> None:
+        from unittest import mock
+
+        ha_cfg = ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15")
+        denon_cli = ha.DenonAvrClient(lambda: ha_cfg, http_get=lambda _u, _t: (200, b""), sleep_fn=lambda _s: None)
+
+        # 1. r_network.asp refresh before initial read & post-POST verify detects stale web RAM vs real MCU state
+        tmp1 = Path(tempfile.mkdtemp(prefix="denon_r_refresh_"))
+        try:
+            mcu_state = {"val": "OFF"}
+            ram_cache = {"val": "ON"}  # Stale BridgeCo RAM would lie unless r_network.asp runs
+            persist_to_mcu = {"enabled": False}
+            seq: list[str] = []
+
+            def fake_get_refresh(url: str, _to: float) -> tuple[int, bytes]:
+                seq.append(url.rsplit("/", 1)[-1])
+                if url.endswith("/SETUP/NETWORK/r_network.asp"):
+                    ram_cache["val"] = mcu_state["val"]
+                    return 200, b"<HTML>refresh</HTML>"
+                if url.endswith("/SETUP/NETWORK/d_network.asp"):
+                    chk_on = " checked" if ram_cache["val"] == "ON" else ""
+                    chk_off = " checked" if ram_cache["val"] == "OFF" else ""
+                    html_doc = (
+                        '<FORM name="networksetup" action="s_network.asp">'
+                        f'<INPUT type="radio" name="radioNetworkStandby" value="ON"{chk_on}>Always On'
+                        f'<INPUT type="radio" name="radioNetworkStandby" value="OFF"{chk_off}>Off In Standby'
+                        '</FORM>'
+                    )
+                    return 200, html_doc.encode("ascii")
+                return 404, b""
+
+            def fake_post_refresh(url: str, body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+                seq.append("POST:" + url.rsplit("/", 1)[-1])
+                val = urllib.parse.parse_qs(body.decode("ascii"))["radioNetworkStandby"][0]
+                ram_cache["val"] = val
+                if persist_to_mcu["enabled"]:
+                    mcu_state["val"] = val
+                return 200, b""
+
+            ctrl = dc.GymDisplayController(
+                denon_client=denon_cli,
+                http_get=fake_get_refresh,
+                http_post=fake_post_refresh,
+                sleep_fn=lambda _s: None,
+                allow_network=False,
+                state_dir=tmp1,
+            )
+
+            # First run: MCU drops the POST -> r_network.asp reveals OFF instead of stale RAM ON
+            res_fail = ctrl.ensure_denon_ip_control_always_on()
+            self.assertFalse(res_fail["ok"])
+            self.assertEqual(res_fail["state"], "needs_review")
+            self.assertIn("r_network.asp", seq)
+            post_idx = seq.index("POST:s_network.asp")
+            self.assertGreater(post_idx, seq.index("r_network.asp"))
+            self.assertEqual(seq[post_idx + 1 : post_idx + 3], ["r_network.asp", "d_network.asp"])
+
+            # Second run: MCU persists -> verified_always_on
+            seq.clear()
+            persist_to_mcu["enabled"] = True
+            res_ok = ctrl.ensure_denon_ip_control_always_on(force=True)
+            self.assertTrue(res_ok["ok"])
+            self.assertTrue(res_ok["changed"])
+            self.assertEqual(res_ok["state"], "verified_always_on")
+
+            # max_age_sec fresh -> cached noop (0 HTTP requests)
+            seq.clear()
+            res_fresh = ctrl.ensure_denon_ip_control_always_on(max_age_sec=3600.0)
+            self.assertTrue(res_fresh["ok"])
+            self.assertEqual(seq, [])
+
+            # Stale updatedAtMs + MCU reverted to OFF -> self-heals back to ON
+            state_path = tmp1 / "denon_ip_control_state.json"
+            stale_doc = json.loads(state_path.read_text(encoding="utf-8"))
+            stale_doc["updatedAtMs"] = int((time.time() - 7200.0) * 1000)
+            state_path.write_text(json.dumps(stale_doc), encoding="utf-8")
+            ctrl._denon_ip_ctrl_state = stale_doc
+            mcu_state["val"] = "OFF"
+            res_heal = ctrl.ensure_denon_ip_control_always_on(max_age_sec=3600.0)
+            self.assertTrue(res_heal["ok"])
+            self.assertTrue(res_heal["changed"])
+            self.assertEqual(mcu_state["val"], "ON")
+        finally:
+            shutil.rmtree(tmp1, ignore_errors=True)
+
+        # 2. set_denon_monitor_out requests r_video.asp before d_video.asp
+        video_gets: list[str] = []
+
+        def fake_video_get(url: str, _to: float) -> tuple[int, bytes]:
+            video_gets.append(url.rsplit("/", 1)[-1])
+            if url.endswith("/SETUP/VIDEO/r_video.asp"):
+                return 200, b""
+            if url.endswith("/SETUP/VIDEO/d_video.asp"):
+                return 200, b'<FORM name="video"><INPUT type="radio" name="radioMonitorOut" value="AUTO" checked></FORM>'
+            return 404, b""
+
+        v_ctrl = dc.GymDisplayController(
+            denon_client=denon_cli,
+            http_get=fake_video_get,
+            http_post=lambda _u, _b, _h, _t: (200, b""),
+            sleep_fn=lambda _s: None,
+            allow_network=False,
+        )
+        v_res = v_ctrl.set_denon_monitor_out("1")
+        self.assertTrue(v_res["ok"])
+        self.assertEqual(video_gets[:2], ["r_video.asp", "d_video.asp"])
+
+        # 3. open_gym honesty when Denon AVR fails vs succeeds
+        def fake_adb_runner(_cmd: list[str], _to: float) -> tuple[int, str, str]:
+            return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n192.168.1.151:5555\tdevice\n", ""
+
+        fake_adb = ac.FireTvAdbController(adb_bin="adb", runner=fake_adb_runner, settle_sec=0.0)
+        denon_up = {"ok": False}
+
+        def fake_denon_flaky(url: str, _to: float) -> tuple[int, bytes]:
+            if not denon_up["ok"]:
+                raise TimeoutError("timed out")
+            return 200, b""
+
+        denon_flaky = ha.DenonAvrClient(lambda: ha_cfg, http_get=fake_denon_flaky, sleep_fn=lambda _s: None)
+        og_ctrl = dc.GymDisplayController(
+            config=dc.GymDisplaysConfig(
+                primary=dc.PrimaryDisplayConfig(host="192.168.1.230", mac="bc:09:b9:e7:35:26"),
+                spin=dc.SpinDisplayConfig(enabled=False, host=""),
+                open_gym_play_music=True,
+                open_gym_music_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            ),
+            adb_controller=fake_adb,
+            denon_client=denon_flaky,
+            wake_wallboard_fn=lambda _force=True: {"ok": True},
+            sleep_fn=lambda _s: None,
+            allow_network=False,
+        )
+        og_fail = og_ctrl.execute("open_gym", "run")
+        self.assertTrue(og_fail["ok"])
+        self.assertEqual(og_fail.get("failedTargets"), ["avr"])
+        self.assertEqual(og_fail["message"], "Gym opened (Denon unreachable)")
+        self.assertFalse(og_fail["results"]["avr"]["ok"])
+        self.assertIn("failed", og_fail["results"]["avr"]["message"].lower())
+
+        denon_up["ok"] = True
+        og_ok = og_ctrl.execute("open_gym", "run")
+        self.assertTrue(og_ok["ok"])
+        self.assertNotIn("failedTargets", og_ok)
+        self.assertEqual(og_ok["message"], "Gym opened (All 3 TVs, Denon, YouTube Music)")
+
+        # 4. Telnet (:23) fallback on DenonAvrClient.send_command("PWON") when HTTP fails
+        telnet_cli = ha.DenonAvrClient(lambda: ha_cfg, sleep_fn=lambda _s: None, allow_network=True)
+        sent_telnet: list[bytes] = []
+
+        class FakeSock:
+            def settimeout(self, _t: float) -> None:
+                pass
+
+            def sendall(self, data: bytes) -> None:
+                sent_telnet.append(data)
+
+            def recv(self, _n: int) -> bytes:
+                return b"PWON\r"
+
+            def close(self) -> None:
+                pass
+
+        with mock.patch.object(ha, "_default_http_get", side_effect=TimeoutError("http timeout")), \
+             mock.patch("house_audio.socket.create_connection", return_value=FakeSock()) as mk_conn:
+            t_res = telnet_cli.send_command("PWON")
+            self.assertTrue(t_res["ok"])
+            self.assertEqual(t_res.get("via"), "telnet")
+            mk_conn.assert_called_once_with(("192.168.1.15", 23), timeout=1.5)
+            self.assertEqual(sent_telnet, [b"PWON\r"])
+
     def test_room_audio_recorder_silent_clips_and_mux_endpoints(self) -> None:
         ffmpeg = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
         ffprobe = ac.resolve_tool_bin("ffprobe", "ARMORY_CAM_FFPROBE")
@@ -7712,6 +7883,297 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(svc_reload.bt_button_cfg.single_action, "record")
             self.assertEqual(svc_reload.bt_button_cfg.hold_ms, 500)
         finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_trigger_to_trigger_armed_clip_dedup_and_calibration_set_counting(self) -> None:
+        from unittest import mock
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_cam_dedup_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp, ntfy_topic="TestTopic")
+            app = ac.create_app(svc)
+            client = app.test_client()
+
+            # 1. Strict trigger-to-trigger endMs on server-armed clip (no +1500ms tail)
+            with mock.patch.object(ac.time, "time", return_value=1700000.0):
+                svc.arm_server_clip(camera="Rack Cam")
+            captured: list[tuple[int, int]] = []
+
+            def fake_cut_multi(**kwargs):
+                captured.append((int(kwargs["start_ms"]), int(kwargs["end_ms"])))
+                return [{"ok": True, "fileName": "Clip_1.mp4", "lanUrl": "/clips/2026-11-26/Clip_1.mp4"}]
+
+            with mock.patch.object(ac.time, "time", return_value=1700025.0):
+                with mock.patch.object(svc, "cut_clips_multi", side_effect=fake_cut_multi):
+                    clips = svc.cut_server_armed_or_recent_clip(mode="armed")
+            self.assertEqual(len(clips), 1)
+            self.assertEqual(captured[0], (1700000000, 1700025000))
+
+            # 2. POST /api/clip deduplicates retries / concurrent calls with same requestId
+            call_count = 0
+
+            def slow_cut(**kwargs):
+                nonlocal call_count
+                call_count += 1
+                return [
+                    {
+                        "ok": True,
+                        "fileName": "Dumbbell_Curl_215830_aaaaaa.mp4",
+                        "lanUrl": "/clips/2026-11-23/Dumbbell_Curl_215830_aaaaaa.mp4",
+                        "camera": "Rack Cam",
+                    }
+                ]
+
+            with mock.patch.object(svc, "cut_clips_multi", side_effect=slow_cut):
+                payload = {
+                    "sessionId": "s1",
+                    "exName": "Dumbbell Curl",
+                    "startMs": 1700000000,
+                    "endMs": 1700040000,
+                    "cameras": ["Rack Cam"],
+                    "requestId": "req-dup-123",
+                }
+                r1 = client.post("/api/clip", json=payload)
+                r2 = client.post("/api/clip", json=payload)
+            self.assertEqual(r1.status_code, 200)
+            self.assertEqual(r2.status_code, 200)
+            self.assertEqual(call_count, 1)
+            self.assertEqual(r1.get_json()["fileName"], r2.get_json()["fileName"])
+
+            # 3. calibration_status skips dotfiles & collapses multi-cam sibling files into 1 set
+            day_dir = svc.clips_root / "2026-11-23"
+            day_dir.mkdir(parents=True, exist_ok=True)
+            for fn in (
+                ".Deadlift_143415_c2f76d.86d9ab32.vid.mp4",
+                "Dumbbell_Curl_215830_aaaaaa.mp4",
+                "Dumbbell_Curl_215830_bbbbbb.mp4",
+                "Dumbbell_Curl_215830_cccccc.mp4",
+                "Bench_Press_220100_111111.mp4",
+            ):
+                (day_dir / fn).write_bytes(b"mp4-bytes")
+            cal = svc.calibration_status()
+            self.assertEqual(cal["clipCount"], 2)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_lift_detector_v2_periodic_exit_clamp_fp_rejection_and_eq_symmetry(self) -> None:
+        import math
+        from server.armory_cam import lift_detector as ld
+
+        def _mk_pose(t: float, **kw) -> ld.PoseFrame:
+            defaults = dict(
+                present=True, cx=0.50, cy=0.56, bw=0.25, bh=0.56,
+                torso_ang=6.0, sh_y=0.38, hip_y=0.56, wrist_y=0.50,
+                wrist_to_sh_y=0.60, elbow_ang=150.0, knee_ang=170.0,
+                ankle_x=0.50, ankle_y=0.84, torso_len=0.18, hip_ankle_dy=0.28,
+            )
+            defaults.update(kw)
+            return ld.PoseFrame(t=float(t), **defaults)
+
+        # 1. Periodic seated rep set + post-set stand-up & walk-away must clamp OUT before stand-up
+        frames_seated: list[ld.PoseFrame] = []
+        t = 0.0
+        while t <= 26.0:
+            if 2.0 <= t <= 18.0:
+                phase = math.sin(2.0 * math.pi * (t - 2.0) / 3.2)
+                elb = 105.0 + 55.0 * phase
+                wr = 0.36 + 0.14 * (-phase)
+                frames_seated.append(_mk_pose(
+                    t, cx=0.52, bh=0.52, sh_y=0.46, hip_y=0.66, wrist_y=wr,
+                    wrist_to_sh_y=(wr - 0.46) / 0.20, elbow_ang=elb, knee_ang=88.0, torso_len=0.20,
+                ))
+            elif t < 2.0:
+                frames_seated.append(_mk_pose(
+                    t, cx=0.52, bh=0.56, sh_y=0.45, hip_y=0.66, wrist_y=0.30,
+                    wrist_to_sh_y=-0.75, elbow_ang=160.0, knee_ang=88.0, torso_len=0.21,
+                ))
+            else:
+                # Immediate stand-up & walk away after rack at t > 18.5s
+                dx = min(0.28, (t - 18.5) * 0.10)
+                frames_seated.append(_mk_pose(
+                    t, cx=0.52 + dx, bh=0.72, sh_y=0.33, hip_y=0.53, wrist_y=0.52,
+                    wrist_to_sh_y=0.95, elbow_ang=155.0, knee_ang=170.0, torso_len=0.20,
+                ))
+            t += 0.4
+        blks_seated = ld.detect_lift_blocks_from_pose(frames_seated, clip_dur_sec=26.0, multi_block=False)
+        self.assertEqual(len(blks_seated), 1)
+        self.assertGreaterEqual(blks_seated[0]["repCount"], 4.0)
+        self.assertLessEqual(blks_seated[0]["endSec"], 19.2)
+
+        # 2. Single-bend plate loading walk (translate to rack side -> 1 bend -> walk back) must return []
+        frames_plate: list[ld.PoseFrame] = []
+        t = 0.0
+        while t <= 16.0:
+            if t < 4.0:
+                cx = 0.50 + 0.09 * t
+                tang = 5.0
+            elif t <= 8.0:
+                cx = 0.85
+                tang = 5.0 + 40.0 * math.sin(math.pi * (t - 4.0) / 4.0)
+            else:
+                cx = max(0.45, 0.85 - 0.08 * (t - 8.0))
+                tang = 5.0
+            frames_plate.append(_mk_pose(t, cx=cx, torso_ang=tang, sh_y=0.38 + 0.002 * tang))
+            t += 0.4
+        self.assertEqual(ld.detect_lift_blocks_from_pose(frames_plate, clip_dur_sec=16.0, multi_block=True), [])
+
+        # 3. Foreground camera walk (bh=0.86, moving horizontally) must return []
+        frames_fg = [
+            _mk_pose(k * 0.4, cx=0.20 + 0.04 * k, bh=0.86, bw=0.36, elbow_ang=100.0 + 40.0 * math.sin(k))
+            for k in range(25)
+        ]
+        self.assertEqual(ld.detect_lift_blocks_from_pose(frames_fg, clip_dur_sec=10.0, multi_block=True), [])
+
+        # 4. Pre-unrack <-> rack grayscale bar symmetry snaps IN & OUT cleanly around lifted window
+        # Bar visible at side bands (x=0..45, 115..160) resting at y=60 before t=6s and back at y=60 after t=20s; moved to y=95 during t=6..20s
+        frames_squat: list[ld.PoseFrame] = []
+        grays_squat: list[np.ndarray] = []
+        t = 0.0
+        while t <= 26.0:
+            is_unracked = 6.0 <= t <= 20.0
+            if 8.0 <= t <= 18.0:
+                ph = 0.5 - 0.5 * math.cos(2.0 * math.pi * (t - 8.0) / 3.3)
+                kn = 170.0 - 85.0 * ph
+                sh = 0.36 + 0.14 * ph
+                bh = 0.54 - 0.16 * ph
+                hip = 0.52 + 0.12 * ph
+            else:
+                kn, sh, bh, hip = 170.0, 0.36, 0.54, 0.52
+            if t < 2.0 or t > 22.0:
+                cx, w2s, bh_cur = (0.58 if t > 22.0 else 0.50), (0.80 if t > 22.0 else 0.15), 0.72
+            else:
+                cx, w2s, bh_cur = 0.50, 0.12, bh
+            frames_squat.append(_mk_pose(
+                t, cx=cx, bh=bh_cur, sh_y=sh, hip_y=hip, wrist_y=sh + 0.02,
+                wrist_to_sh_y=w2s, knee_ang=kn, elbow_ang=55.0,
+            ))
+            img = np.full((180, 160), 40, dtype=np.uint8)
+            bar_y = 95 if is_unracked else 52
+            cv2.rectangle(img, (10, bar_y - 14), (42, bar_y + 14), 220, -1)
+            cv2.rectangle(img, (118, bar_y - 14), (150, bar_y + 14), 220, -1)
+            grays_squat.append(cv2.GaussianBlur(img, (5, 5), 0))
+            t += 0.4
+
+        blks_sq = ld.detect_lift_blocks_from_pose(
+            frames_squat, clip_dur_sec=26.0, multi_block=False, frames_gray=grays_squat
+        )
+        self.assertEqual(len(blks_sq), 1)
+        self.assertTrue(blks_sq[0]["eqSignal"])
+        self.assertGreaterEqual(blks_sq[0]["startSec"], 4.0)
+        self.assertLessEqual(blks_sq[0]["startSec"], 7.5)
+        self.assertLessEqual(blks_sq[0]["endSec"], 21.5)
+
+    def test_ble_manual_wake_preserves_denon_duck_and_silent_cancel_disarms(self) -> None:
+        from unittest import mock
+
+        state = {"vol": -10.0, "cmds": [], "cube_plays": 0}
+
+        def fake_denon(url: str, _to: float) -> tuple[int, bytes]:
+            if "formMainZone_MainZoneXmlStatus.xml" in url:
+                xml = (
+                    f"<item><Power><value>ON</value></Power><InputFuncSelect><value>MPLAY</value></InputFuncSelect>"
+                    f"<MasterVolume><value>{state['vol']:.1f}</value></MasterVolume>"
+                    f"<Mute><value>off</value></Mute><SurrMode><value>MULTI CH STEREO</value></SurrMode></item>"
+                )
+                return 200, xml.encode("utf-8")
+            if "formiPhoneAppDirect.xml?" in url:
+                cmd = url.split("?", 1)[1]
+                state["cmds"].append(cmd)
+                if cmd.startswith("MV"):
+                    raw = cmd[2:]
+                    val = float(raw[:2]) + (0.5 if len(raw) == 3 and raw[2] == "5" else 0.0)
+                    state["vol"] = val - 80.0
+                return 200, b""
+            return 404, b""
+
+        def fake_cube_get(url: str, _to: float) -> tuple[int, bytes]:
+            if "/health" in url:
+                return 200, b'{"ok":true}'
+            return 404, b""
+
+        def fake_cube_post(url: str, _body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+            if "/play" in url:
+                state["cube_plays"] += 1
+                return 200, b'{"ok":true}'
+            return 404, b""
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_ble_duck_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.house_audio.update_config({
+                "denonEnabled": True,
+                "denonHost": "192.168.1.15",
+                "denonDuckEnabled": True,
+                "denonDuckMode": "proportional",
+                "denonDuckThresholdDb": -35.0,
+                "denonDuckMaxDropDb": 24.0,
+                "denonDuckSpanDb": 30.0,
+                "denonDuckExponent": 1.55,
+                "denonDuckFloorDb": -35.0,
+                "denonOutputDuckMode": "off",
+                "cubeEnabled": True,
+                "cubeHost": "192.168.1.151",
+                "outputRoute": "auto",
+            })
+            svc.house_audio.denon._http_get = fake_denon
+            svc.house_audio.denon._sleep = lambda _s: None
+            svc.house_audio.cube._http_get = fake_cube_get
+            svc.house_audio.cube._http_post = fake_cube_post
+
+            spoken: list[str] = []
+            svc.voice._speak_fn = lambda txt: (spoken.append(txt), True)[1]
+            svc.voice.sse_clients = 1
+            svc.voice.context_active = True
+            stream = svc.voice.subscribe_sse()
+            _init_frame = next(stream)
+
+            # 1. BLE long-press triggers manual_wake: Denon ducks -18 dB (-10 -> -28 dB), ready_chime plays on Cube,
+            #    and Denon MUST stay ducked at -28.0 dB (even though denonOutputDuckMode == "off")!
+            res_mw = svc.execute_bt_button_action("voice", {"gesture": "hold"})
+            self.assertTrue(res_mw["ok"])
+            self.assertTrue(res_mw["ducked"])
+            self.assertEqual(state["cube_plays"], 1)
+            self.assertAlmostEqual(state["vol"], -28.0)
+            self.assertGreater(svc.voice.armed_until_ms, int(time.time() * 1000) + 3000)
+            _wake_frame = next(stream)
+
+            # 2. Saying "nevermind" (or "Hey Jarvis, cancel") while armed MUST silently disarm,
+            #    immediately restore Denon back to -10.0 dB, emit SSE disarm frame, and NEVER speak/chime!
+            res_cancel = svc.voice._emit_transcript("nevermind", latency_ms=42)
+            self.assertTrue(res_cancel["localHandled"])
+            self.assertTrue(res_cancel["cancelled"])
+            self.assertFalse(res_cancel["emitted"])
+            self.assertEqual(res_cancel["ackText"], "")
+            self.assertEqual(svc.voice.armed_until_ms, 0)
+            self.assertEqual(spoken, [])
+            disarm_frame = next(stream).decode("utf-8")
+            self.assertIn('"type":"disarm"', disarm_frame)
+
+            # Release runs on local_cmd_pool or thread; wait briefly for async restore
+            deadline = time.monotonic() + 2.0
+            while abs(state["vol"] - (-10.0)) > 0.1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertAlmostEqual(state["vol"], -10.0)
+
+            # 3. BLE long-press again -> timeout release restores Denon back to -10.0 dB identically to Hey Jarvis
+            svc.voice.update_config({"wakeWord": "hey jarvis", "wakeEngine": "openwakeword"})
+            res_mw2 = svc.execute_bt_button_action("voice", {"gesture": "hold"})
+            self.assertTrue(res_mw2["ducked"])
+            self.assertAlmostEqual(state["vol"], -28.0)
+            _wake_frame2 = next(stream)
+
+            res_cancel2 = svc.voice._emit_transcript("Hey Jarvis, cancel", latency_ms=35, from_oww=True)
+            self.assertTrue(res_cancel2["cancelled"])
+            self.assertEqual(spoken, [])
+            disarm_frame2 = next(stream).decode("utf-8")
+            self.assertIn('"type":"disarm"', disarm_frame2)
+            deadline = time.monotonic() + 2.0
+            while abs(state["vol"] - (-10.0)) > 0.1 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertAlmostEqual(state["vol"], -10.0)
+            stream.close()
+        finally:
+            svc.stop_background()
             shutil.rmtree(tmp, ignore_errors=True)
 
 

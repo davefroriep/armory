@@ -448,6 +448,21 @@ def has_command_tail(text: str, wake_word: str = "armory") -> bool:
     return bool(norm[last_end:].strip(" .,!?:;"))
 
 
+_CANCEL_CMD_RE = re.compile(
+    r"^(?:cancel(?:\s+(?:that|it|listening))?|never\s*mind(?:\s+(?:that|it))?|nvm|forget\s+it|disregard|abort(?:\s+listening)?)$",
+    re.IGNORECASE,
+)
+
+
+def is_cancel_command(text: str, wake_word: str = "armory") -> bool:
+    """Return True when `text` is an explicit cancel/nevermind command to drop listening silently."""
+    tail = strip_wake_word(text, wake_word)
+    norm = re.sub(r"[^a-z0-9\s]", " ", tail.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    norm = re.sub(r"^(?:please|uh|um|ok|okay|wait|actually)\s+", "", norm).strip()
+    return bool(norm and _CANCEL_CMD_RE.match(norm))
+
+
 def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tuple[str, str]:
     """Build concise Whisper `initial_prompt` + `hotwords` led by wake-word gym commands and current exercises."""
     wake = (wake_word or "armory").strip() or "armory"
@@ -463,6 +478,7 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "start hold",
         "rpe",
         "next exercise",
+        "go to exercise",
         "add set",
         "skip rest",
         "record rack",
@@ -472,6 +488,10 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
         "buddy mode",
         "undo",
         "undo last set",
+        "uncheck",
+        "clear",
+        "cancel",
+        "nevermind",
         "back",
         "go back",
         "open the gym",
@@ -513,7 +533,8 @@ def build_whisper_prompt(wake_word: str, bias_phrases: Sequence[str] = ()) -> tu
     prompt = lead_sentences + ", ".join(all_terms) + "."
     hotwords = ", ".join([
         wake_cap, "record this", "done", "check", "start hold", "skip rest", "next exercise",
-        "add set", "undo", "back", "rack", "smith", "replay", "switch views", "play music",
+        "go to exercise", "add set", "undo", "uncheck", "clear", "cancel", "nevermind",
+        "back", "rack", "smith", "replay", "switch views", "play music",
         "lights", "PR", "open the gym", "close the gym", "shut down",
         *extras[:6],
     ])
@@ -2205,6 +2226,7 @@ def looks_like_workout_app_command(text: str, wake_word: str = "hey armory") -> 
     return bool(
         re.search(
             r"\b(?:check|done|log|logged|set|reps?|weight|pounds?|lbs?|rpe|skip|rest|next|previous|back|"
+            r"clear|uncheck|"
             r"add\s+(?:set|\d+|thirty|30)|delete(?:\s+(?:last|set|empty))?|start\s+hold|hold|bodyweight|"
             r"camera|rack|smith|record|recording|clip|replay|play\s+set|slow|switch\s+(?:views?|cameras?)|"
             r"buddy(?:\s+mode)?|solo(?:\s+mode)?|workout|exercise|warmup|warm\s*up|working\s*set|drop\s*set|"
@@ -2556,6 +2578,7 @@ class RoomVoiceService:
                 self.seq += 1
                 self._cond.notify_all()
 
+        self._cancel_wake_duck_release_timer()
         ducked = False
         duck_info: dict[str, Any] = {}
         begin_fn = self._wake_duck_cbs.get("begin")
@@ -2855,12 +2878,15 @@ class RoomVoiceService:
                 self.seq += 1
                 self._cond.notify_all()
 
+        self._cancel_wake_duck_release_timer()
         ducked = False
+        duck_info: dict[str, Any] = {}
         begin_fn = self._wake_duck_cbs.get("begin")
         if callable(begin_fn):
             try:
                 res = begin_fn()
                 if isinstance(res, dict):
+                    duck_info = res
                     ducked = bool(res.get("ducked"))
             except Exception as exc:
                 self.log.debug("Manual wake duck begin error: %s", exc)
@@ -2869,10 +2895,26 @@ class RoomVoiceService:
                 self._wake_duck_held = True
                 self._release_wake_duck_on_play_done = False
             self._bump_status_locked()
+        if ducked:
+            self.log.info(
+                "Manual wake (%s) -> Denon duck %.1f dB (%.1f -> %.1f dB)",
+                str(source or "bt_button"),
+                float(duck_info.get("dropDb") or 0.0),
+                float(duck_info.get("fromDb") or 0.0),
+                float(duck_info.get("toDb") or 0.0),
+            )
         self.play_ready_chime()
         self._log_voice_event(
             "manual_wake",
-            {"source": str(source or "bt_button"), "armWindowMs": win_ms, "ducked": bool(ducked)},
+            {
+                "source": str(source or "bt_button"),
+                "armWindowMs": win_ms,
+                "ducked": bool(ducked),
+                "dropDb": round(float(duck_info.get("dropDb") or 0.0), 1),
+                "fromDb": duck_info.get("fromDb"),
+                "toDb": duck_info.get("toDb"),
+                "reason": str(duck_info.get("reason") or ""),
+            },
         )
         return {"ok": True, "armedUntilMs": armed_until, "ducked": bool(ducked), "source": source}
 
@@ -3316,6 +3358,55 @@ class RoomVoiceService:
             local_handler = self._local_command_handler if emitted else None
 
         show_running = self._is_show_active()
+        if emitted and not show_running and is_cancel_command(display_clean, wake):
+            with self.lock:
+                self.armed_until_ms = 0
+                self._oww_awaiting_cmd = False
+                self._didnt_catch_streak = 0
+                self._detector.reset()
+                self._aec_vad_detector.reset()
+                if self._oww_spotter is not None:
+                    self._oww_spotter.reset()
+                self.event_seq += 1
+                ev_id = self.event_seq
+                entry = {
+                    "id": ev_id,
+                    "tsMs": now_ms,
+                    "transcript": display_clean,
+                    "wakeMatched": has_wake,
+                    "emitted": False,
+                    "localHandled": True,
+                    "cancelled": True,
+                    "latencyMs": int(latency_ms),
+                    "ackText": "",
+                }
+                self.recent_transcripts.appendleft(entry)
+                if self.sse_clients > 0:
+                    self._events.append({
+                        "type": "disarm",
+                        "id": ev_id,
+                        "tsMs": now_ms,
+                    })
+                    self.seq += 1
+                    self._cond.notify_all()
+                self._bump_status_locked()
+            self._cancel_wake_duck_release_timer()
+            self._release_wake_duck_async()
+            self._log_voice_event(
+                "utterance",
+                {
+                    "tier": ("tier2_rescue" if from_rescue else ("tier1_oww" if from_oww else "whisper")),
+                    "emitted": False,
+                    "localHandled": True,
+                    "cancelled": True,
+                    "transcript": display_clean,
+                    "ackText": "",
+                    "latencyMs": int(latency_ms),
+                    "rescueScore": round(float(rescue_score), 3) if from_rescue else 0.0,
+                },
+            )
+            return entry
+
         local_res: dict[str, Any] | None = None
         if local_handler is not None:
             try:
@@ -3853,7 +3944,7 @@ class RoomVoiceService:
                         lead_ms=lead_ms,
                         tail_ms=tail_ms,
                         target_peak=target_peak,
-                        kind="chime",
+                        kind="ready_chime",
                         mute_mic=False,
                     )
                 elif kind == "tts":
@@ -3944,7 +4035,7 @@ class RoomVoiceService:
             except queue.Full:
                 return False
         return self._play_pcm_blocking(
-            tone, sr, lead_ms=100, tail_ms=60, target_peak=0.28, kind="chime", mute_mic=False
+            tone, sr, lead_ms=100, tail_ms=60, target_peak=0.28, kind="ready_chime", mute_mic=False
         )
 
     def play_commit_chime(self) -> bool:

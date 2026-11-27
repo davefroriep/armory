@@ -1,11 +1,15 @@
 export type VoiceIntent =
   | { kind: 'arm_wake' }
+  | { kind: 'cancel_listen' }
   | { kind: 'log_current'; weight?: number; reps?: number; seconds?: number; bodyweight?: boolean; rpe?: number }
   | { kind: 'set_only'; weight?: number; reps?: number }
   | { kind: 'start_hold'; seconds?: number }
   | { kind: 'next_ex' }
   | { kind: 'prev_ex' }
-  | { kind: 'jump_ex'; target: string }
+  | { kind: 'jump_ex'; target: string; setNum?: number }
+  | { kind: 'jump_set'; setNum: number }
+  | { kind: 'uncheck_set' }
+  | { kind: 'clear_set' }
   | { kind: 'undo' }
   | { kind: 'rest_skip' }
   | { kind: 'rest_add'; deltaSec: number }
@@ -77,7 +81,7 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
   {
     title: 'Switch / Jump Exercise',
     slot: 'next_ex',
-    examples: ['next', 'next exercise', 'previous exercise', 'go to bench', 'jump to pull ups', '2A', '2B'],
+    examples: ['next', 'next exercise', 'previous exercise', 'go to bench', 'go to exercise 1, set 2', 'go to set 2', '2A', '2B'],
   },
   {
     title: 'Add / Remove Sets',
@@ -102,7 +106,7 @@ export const VOICE_COMMAND_GROUPS: readonly { title: string; slot?: VoiceAliasSl
   {
     title: 'Workout & Undo',
     slot: 'undo',
-    examples: ['undo', 'back', 'go back', 'pause workout', 'resume workout', 'finish workout'],
+    examples: ['undo', 'uncheck', 'clear', 'cancel', 'nevermind', 'back', 'go back', 'pause workout', 'resume workout', 'finish workout'],
   },
 ];
 
@@ -362,6 +366,9 @@ function parseLeadingNoisyTail(tail: string, rpe?: number): VoiceIntent | null {
   if (/^(?:delete|remove|drop|clear)\s+(?:all\s+|the\s+)?(?:empty|unlogged|unfinished|remaining)\s+sets?\b/.test(tail)) {
     return { kind: 'delete_empty_sets' };
   }
+  if (/^(?:cancel|never\s*mind|forget\s+it)\b/.test(tail)) return { kind: 'cancel_listen' };
+  if (/^uncheck\b/.test(tail)) return { kind: 'uncheck_set' };
+  if (/^clear(?:\s+(?:this|that|current)?(?:\s+(?:set|data|row|numbers?))?)?\b/.test(tail)) return { kind: 'clear_set' };
   if (/^pause\s+workout\b/.test(tail)) return { kind: 'pause_workout' };
   if (/^resume\s+workout\b/.test(tail)) return { kind: 'resume_workout' };
   if (/^(?:finish|end|complete)\s+workout\b/.test(tail)) return { kind: 'finish_workout' };
@@ -423,7 +430,13 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases, allo
   const customHit = matchCustomVoiceAlias(tailNoRpe, customAliases, rpe);
   if (customHit) return customHit;
 
-  if (/^(?:undo(?:\s+(?:that|last(?:\s+set)?|set))?|uncheck(?:\s+(?:that|last(?:\s+set)?|set))?|cancel(?:\s+last)?|(?:go\s+|step\s+)?back(?:\s+(?:1|one|a\s+set|(?:1|one)\s+set|to\s+last(?:\s+set)?))?)$/.test(tail)) {
+  if (/^(?:cancel(?:\s+(?:that|it|listening))?|never\s*mind(?:\s+(?:that|it))?|nvm|forget\s+it|disregard)$/.test(tail)) {
+    return { kind: 'cancel_listen' };
+  }
+  if (/^(?:uncheck(?:\s+(?:this|that|current|last)?(?:\s+set)?)?|pull(?:\s+the)?\s+check|remove\s+check|mark\s+undone)$/.test(tail)) {
+    return { kind: 'uncheck_set' };
+  }
+  if (/^(?:undo(?:\s+(?:that|last(?:\s+set)?|set))?|(?:go\s+|step\s+)?back(?:\s+(?:1|one|a\s+set|(?:1|one)\s+set|to\s+last(?:\s+set)?))?)$/.test(tail)) {
     return { kind: 'undo' };
   }
   if (/^(?:check|check\s+it|check\s+set|log|log\s+it|log\s+set|done|same|same\s+reps|same\s+weight|repeat|mark\s+done|complete(?:\s+set)?|yep|got\s+it|crushed\s+it|nailed\s+it|good(?:\s+set)?|easy|boom|locked\s+in)$/.test(tailNoRpe)) {
@@ -550,9 +563,23 @@ function parseBodytail(tailRaw: string, customAliases?: CustomVoiceAliases, allo
   if (/^(?:delete|remove|drop|clear)\s+(?:all\s+|the\s+)?(?:empty|unlogged|unfinished|remaining)\s+sets?$/.test(tail)) {
     return { kind: 'delete_empty_sets' };
   }
+  if (/^(?:clear(?:\s+(?:this|that|current)?(?:\s+(?:set|data|row|numbers?))?)?|wipe(?:\s+(?:this|that)?(?:\s+set)?)?)$/.test(tail)) {
+    return { kind: 'clear_set' };
+  }
 
   if (/^(?:next|next\s+exercise|skip\s+exercise)$/.test(tail)) return { kind: 'next_ex' };
   if (/^(?:prev|previous|previous\s+exercise|back\s+exercise)$/.test(tail)) return { kind: 'prev_ex' };
+
+  const jumpExSetM = tail.match(/^(?:go\s+to|jump\s+to|switch\s+to|move\s+to)\s+(?:exercise\s+)?(.+?)\s+set\s+(\d+)$/)
+    ?? tail.match(/^exercise\s+(.+?)\s+set\s+(\d+)$/);
+  if (jumpExSetM && jumpExSetM[1].trim()) {
+    return { kind: 'jump_ex', target: jumpExSetM[1].trim(), setNum: Number(jumpExSetM[2]) };
+  }
+  const jumpSetOnlyM = tail.match(/^(?:go\s+to|jump\s+to|switch\s+to|move\s+to)\s+set\s+(\d+)$/)
+    ?? tail.match(/^set\s+(\d+)$/);
+  if (jumpSetOnlyM) {
+    return { kind: 'jump_set', setNum: Number(jumpSetOnlyM[1]) };
+  }
 
   const jumpM = tail.match(/^(?:go\s+to|jump\s+to|switch\s+to|move\s+to|exercise)\s+(.+)$/);
   if (jumpM && jumpM[1].trim()) return { kind: 'jump_ex', target: jumpM[1].trim() };
@@ -617,6 +644,12 @@ function validateVoiceIntent(intent: VoiceIntent | null): VoiceIntent | null {
       return intent;
     case 'rest_add':
       if (Math.abs(intent.deltaSec) < 1 || Math.abs(intent.deltaSec) > 600) return null;
+      return intent;
+    case 'jump_ex':
+      if (intent.setNum != null && (intent.setNum < 1 || intent.setNum > 50)) return null;
+      return intent;
+    case 'jump_set':
+      if (intent.setNum < 1 || intent.setNum > 50) return null;
       return intent;
     case 'wb_replay':
       if (intent.setNum != null && (intent.setNum < 1 || intent.setNum > 50)) return null;
@@ -685,6 +718,7 @@ export function pickSetConfirmTag(
 export function defaultReadbackForIntent(intent: VoiceIntent, confirmTag = 'got it'): string | null {
   switch (intent.kind) {
     case 'arm_wake':
+    case 'cancel_listen':
       return null;
     case 'log_current':
       if (intent.seconds != null) return `${intent.seconds} seconds, ${confirmTag}`;
@@ -703,7 +737,13 @@ export function defaultReadbackForIntent(intent: VoiceIntent, confirmTag = 'got 
     case 'prev_ex':
       return 'Previous exercise';
     case 'jump_ex':
-      return `Jumping to ${intent.target}`;
+      return intent.setNum != null ? `Jumping to ${intent.target}, set ${intent.setNum}` : `Jumping to ${intent.target}`;
+    case 'jump_set':
+      return `Set ${intent.setNum}`;
+    case 'uncheck_set':
+      return 'Set unchecked';
+    case 'clear_set':
+      return 'Set cleared';
     case 'undo':
       return 'Undid last';
     case 'rest_skip':
@@ -789,7 +829,9 @@ export function voiceIntentKey(intent: VoiceIntent | null): string {
     case 'start_hold':
       return `hold:${intent.seconds ?? '_'}`;
     case 'jump_ex':
-      return `jump:${normalizeVoiceText(intent.target)}`;
+      return `jump:${normalizeVoiceText(intent.target)}${intent.setNum != null ? `:s${intent.setNum}` : ''}`;
+    case 'jump_set':
+      return `jump_set:${intent.setNum}`;
     case 'rest_add':
       return `rest_add:${intent.deltaSec}`;
     case 'cam_arm':

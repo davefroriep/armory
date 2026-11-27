@@ -1129,4 +1129,81 @@ describe('Wave 2 Wallboard & Voice bounds hardening', () => {
     expect(parseVoiceTranscript('armory add 999 seconds')).toBeNull();
     expect(parseVoiceTranscript('check out that song', { armed: true })).toBeNull();
   });
+
+  it('supports go to exercise N set N, uncheck, clear, and completely silent cancel/nevermind', async () => {
+    // 1. Parser coverage for new navigation, uncheck, clear, and cancel commands
+    expect(parseVoiceTranscript('Armory, go to exercise 1, set 2')).toEqual({ kind: 'jump_ex', target: '1', setNum: 2 });
+    expect(parseVoiceTranscript('Armory, go to exercise two b, set three')).toEqual({ kind: 'jump_ex', target: '2 b', setNum: 3 });
+    expect(parseVoiceTranscript('Armory, go to 2B set 3')).toEqual({ kind: 'jump_ex', target: '2b', setNum: 3 });
+    expect(parseVoiceTranscript('Armory, go to bench set 2')).toEqual({ kind: 'jump_ex', target: 'bench', setNum: 2 });
+    expect(parseVoiceTranscript('Armory, go to set 2')).toEqual({ kind: 'jump_set', setNum: 2 });
+    expect(parseVoiceTranscript('Armory, set 2')).toEqual({ kind: 'jump_set', setNum: 2 });
+    expect(parseVoiceTranscript('Armory, uncheck')).toEqual({ kind: 'uncheck_set' });
+    expect(parseVoiceTranscript('Armory, pull the check')).toEqual({ kind: 'uncheck_set' });
+    expect(parseVoiceTranscript('Armory, clear')).toEqual({ kind: 'clear_set' });
+    expect(parseVoiceTranscript('Armory, clear this set')).toEqual({ kind: 'clear_set' });
+    expect(parseVoiceTranscript('Armory, clear empty sets')).toEqual({ kind: 'delete_empty_sets' });
+    expect(parseVoiceTranscript('Armory, clear rest')).toEqual({ kind: 'rest_skip' });
+    expect(parseVoiceTranscript('Armory, cancel')).toEqual({ kind: 'cancel_listen' });
+    expect(parseVoiceTranscript('Armory, nevermind')).toEqual({ kind: 'cancel_listen' });
+    expect(parseVoiceTranscript('Armory, never mind')).toEqual({ kind: 'cancel_listen' });
+    expect(voiceIntentKey({ kind: 'jump_ex', target: '1', setNum: 2 })).toBe('jump:1:s2');
+    expect(voiceIntentKey({ kind: 'jump_set', setNum: 2 })).toBe('jump_set:2');
+    expect(defaultReadbackForIntent({ kind: 'cancel_listen' })).toBeNull();
+
+    // 2. Cursor + Wallboard snapshot targeted state on checked set
+    const { jumpToExerciseCursor, resolveTargetSet } = await import('../src/lifts/cursor');
+    const sess: LiftSession = {
+      id: 's_nav_uncheck',
+      name: 'Upper Test',
+      routineId: null,
+      eventId: null,
+      startMs: 1_000_000,
+      endMs: null,
+      status: 'active',
+      started: true,
+      exs: [
+        {
+          uid: 'ex1',
+          exId: 'barbell-bench-press',
+          ss: true,
+          sets: [
+            mkSet(135, 10, { id: 'e1s1', done: true, at: 1_001_000 }),
+            mkSet(185, 8, { id: 'e1s2', done: true, at: 1_002_000 }),
+            mkSet(185, 8, { id: 'e1s3', done: false }),
+          ],
+        },
+        {
+          uid: 'ex2',
+          exId: 'barbell-row',
+          sets: [
+            mkSet(155, 8, { id: 'e2s1', done: true, at: 1_003_000 }),
+            mkSet(155, 8, { id: 'e2s2', done: false }),
+          ],
+        },
+      ],
+      rpe: null,
+      bwKg: 88.5,
+    };
+    const jumped = jumpToExerciseCursor(sess.exs, '1', exOf, 2);
+    expect(resolveTargetSet(sess.exs, jumped)?.setId).toBe('e1s2');
+
+    const wbJump = buildWallboardSnapshot({
+      now: 1_005_000,
+      settings: { hrMax: 180, recoveryHrPct: 72, voiceEnabled: false, voiceRoomEnabled: true, voiceWakeWord: 'armory', queue: defaultQueueState() },
+      unit: 'lb',
+      hr: { bpm: 110, fresh: true, recentPoints: [] },
+      voice: { listening: true, armed: false, banner: null, cursor: jumped },
+      cardioSnap: null,
+      holdSnap: null,
+      activeSession: sess,
+      elapsedSec: 60,
+      rest: null,
+      todayItems: [],
+      routines: PHASE1_ROUTINES,
+      exOf,
+      prevOf: () => null,
+    });
+    expect(wbJump.lift!.stage!.stations[0].sets[1].targeted).toBe(true);
+  });
 });
