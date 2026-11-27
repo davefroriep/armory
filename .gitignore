@@ -32,3 +32,6 @@ Thumbs.db
 local-secrets/
 __pycache__/
 *.pyc
+# PlatformIO & local hardware secrets
+.pio/
+hardware/armory_strap_button/PlatformIO/include/secrets.h
