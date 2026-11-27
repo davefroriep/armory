@@ -9,7 +9,7 @@
 // Host Identity
 constexpr const char* DEVICE_NAME   = "ArmoryStrapBtn";
 constexpr const char* MDNS_HOSTNAME = "armory-btn";
-constexpr const char* FW_REVISION   = "Rev v1.0";
+constexpr const char* FW_REVISION   = "Rev v2.0";
 
 // OptiPlex Hub Endpoint
 constexpr const char* OPTIPLEX_TRIGGER_URL = "http://192.168.1.152:8766/api/bt-button/trigger";
@@ -19,8 +19,8 @@ constexpr int PIN_RF_SW_PWR = 3;
 constexpr int PIN_RF_SW_CFG = 14;
 
 // Active-LOW Tactile Switches wired to LP-capable GPIOs (0..7 wake ESP32-C6 from deep sleep!)
-constexpr int PIN_BTN1 = 1;    // D1 (GPIO1) -> Top Paddle (SW1: Done / Undo)
-constexpr int PIN_BTN2 = 2;    // D2 (GPIO2) -> Bottom Paddle (SW2: Voice / Record)
+constexpr int PIN_BTN1 = 1;    // D1 (GPIO1) -> SW1 Single Button (Check / Record / Voice)
+constexpr int PIN_BTN2 = 2;    // D2 (GPIO2) -> Optional spare button input
 constexpr int PIN_LED  = 15;   // Built-in yellow user LED (active LOW; strapping pin -> init post-rescue)
 
 // Gesture & Power Management Timings
@@ -36,4 +36,4 @@ enum class ButtonLayoutMode : uint8_t {
   ONE_BUTTON = 1   // SW1 & SW2 identical: single=check, double=record, long=voice
 };
 
-constexpr ButtonLayoutMode DEFAULT_LAYOUT_MODE = ButtonLayoutMode::TWO_BUTTON;
+constexpr ButtonLayoutMode DEFAULT_LAYOUT_MODE = ButtonLayoutMode::ONE_BUTTON;
