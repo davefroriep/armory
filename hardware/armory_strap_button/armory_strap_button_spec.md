@@ -8,7 +8,8 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.2` — Version C Eased-Wing S
 
 ## 1. Mechanical Envelope & Z-Stackup (`Method 2` Solid Floor, `DRC 13 / 34`)
 
-- **Main Pod Body (`v2.1`):** `47.00 mm (L) × 37.60 mm (W) × 10.50 mm (H)` (`12.10 mm` with `1.60 mm` optional anti-mash guard bezel)
+- **Main Pod Body (`v2.2`):** `47.00 mm (L) × 37.60 mm (W) × 10.50 mm (H)` (`12.10 mm` with `1.60 mm` optional anti-mash guard bezel)
+- **Wi-Fi / mDNS Identity:** **`ArmoryClicker`** (`armoryclicker.local`, `15 ms` debounce fast-tap, zero min-hold rejection)
 - **Overall Width w/ Eased 30 mm Strap Wings:** **`62.20 mm (L) × 37.60 mm (W)`** (`0.00 mm` added Z thickness; `2.8 mm` shorter than Polar H10)
 - **Eased-Transition Monolithic Strap Wings (`Z = 0.00..2.60 mm`):**
   - Zero inner stub: **`4.80 mm` wide open slots** (`31.20 mm` tall) start flush against Base walls (`X = 0.00` / `X = 47.00`)
@@ -33,10 +34,10 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.2` — Version C Eased-Wing S
 |---|---|---|---|---|
 | `U1` | **Seeed Studio XIAO ESP32-C6** | 1 | `20.96 × 17.78 × 4.8 mm` (USB-C, built-in 100 mA LiPo charger) | Wi-Fi MCU, USB-C rechargeable, LP-GPIO deep-sleep wake |
 | `BT1` | **3.7 V `502030` LiPo Pouch w/ PCM** | 1 | `250 mAh`, `5.0 × 20.0 × 30.0 mm`, built-in protection circuit | Internal battery (~10–15 hr active workout runtime, months shelf) |
-| `SW1` | **Tactile Push-Button Switch** | 1 | `6.0 × 6.0 × 4.3 mm` 4-pin TH/SMT momentary (`250 gf`+ recommended) | Single wide paddle button (`1× Check`, `2× Record`, `Hold Voice`) |
+| `SW1` | **Tactile Push-Button Switch** | 1 | `6.0 × 6.0 × 4.3 mm` 4-pin TH/SMT momentary (`250 gf`+ recommended) | Single wide paddle button (`1× Check`, `2× Record`, `3× Undo`, `Hold Voice`) |
 | `W1–W4` | **30 AWG Silicone Hookup Wire** | 4 | Ultra-flexible `200 °C` silicone stranded (Red/Black/Blue/Slate) | Direct-soldered flexible point-to-point leads (~155 mm total) |
 | `P1` | `armory_strap_button_base.step` | 1 | `62.2 × 37.6 × 8.8 mm` PETG (~7.5 g) | Monolithic Base + eased `4.8 mm` strap wings + `502030` + XIAO + `SW1` |
-| `P2` | `armory_strap_button_lid.step` | 1 | `47.0 × 37.6 × 4.9 mm` PETG (~4.0 g) | Single-button wide cantilever flex-paddle lid (`ARMORY v2.1`) |
+| `P2` | `armory_strap_button_lid.step` | 1 | `47.0 × 37.6 × 4.9 mm` PETG (~4.0 g) | Single-button wide cantilever flex-paddle lid (`ARMORY v2.2`) |
 | `P3` | `armory_strap_button_bezel.step` | 1 | `24.8 × 14.6 × 1.90 mm` PETG (~1.0 g) | Optional `1.60 mm` raised barbell/chest-pad anti-mash guard |
 
 ---
@@ -56,7 +57,7 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.2` — Version C Eased-Wing S
 
 ## 4. Flash Studio Slicer Profile (`Flashforge Adventurer 5M Pro` — PETG)
 
-- **Filament:** PETG (already in shop) — do NOT enable extra global XY elephant-foot compensation (built-in `0.80 mm × 45°` perimeter chamfers keep `ARMORY v2.1` sharp).
+- **Filament:** PETG (already in shop) — do NOT enable extra global XY elephant-foot compensation (built-in `0.80 mm × 45°` perimeter chamfers keep `ARMORY v2.2` sharp).
 - **Layer Height:** `0.20 mm` (`0.20 mm` initial layer) — **Supports: OFF (all 3 `.step` parts print flat at `Z = 0.00 mm`, `0` overhangs)**.
 - **Line Width / Walls:** `0.40 mm` nozzle, **`3` wall loops**, `25%` Gyroid or Grid infill.
 
@@ -66,6 +67,7 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.2` — Version C Eased-Wing S
 
 All 3 printable `.step` files (`models/`) passed Gate 4 OpenCASCADE kernel verification (`0.000000 mm³` mated interference, `100%` support-free printability at `Z = 0.00 mm`, `DRC 10/13/14/22/24/29/34/37/39`) and Gate 5 visual inspection:
 
+- **Interactive Pan-and-Zoom Inspector (`DRC 43`):** [`armory_strap_button_inspector.html`](file:///C:/Users/davef/.gemini/antigravity/brain/17b9157d-6878-4a18-8c64-aa205aebb08d/armory_strap_button_inspector.html)
 - **3D Component & Build-Plate Sheet:** [`armory_strap_button_verification.png`](file:///C:/Users/davef/.gemini/antigravity/brain/17b9157d-6878-4a18-8c64-aa205aebb08d/armory_strap_button_verification.png)
 - **True BRep Internal Cross-Sections:** [`armory_strap_button_internal_mechanics.png`](file:///C:/Users/davef/.gemini/antigravity/brain/17b9157d-6878-4a18-8c64-aa205aebb08d/armory_strap_button_internal_mechanics.png)
 - **30 mm Polar Strap Eased Flow & Exploded 3D:** [`armory_strap_button_context_exploded_3d.png`](file:///C:/Users/davef/.gemini/antigravity/brain/17b9157d-6878-4a18-8c64-aa205aebb08d/armory_strap_button_context_exploded_3d.png)

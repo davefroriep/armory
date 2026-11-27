@@ -12,6 +12,9 @@ inline bool isDeepSleepWake() {
 inline void initSafeOtaRescue(const char* ssid, const char* password, const char* hostname, uint32_t windowMs = 5000) {
   WiFi.persistent(false);
   WiFi.mode(WIFI_STA);
+  if (hostname && hostname[0] != '\0') {
+    WiFi.setHostname(hostname);
+  }
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);  // Wi-Fi only (no BLE) -> zero wake jitter
   if (ssid && ssid[0] != '\0' && strcmp(ssid, "YOUR_WIFI_SSID") != 0) {

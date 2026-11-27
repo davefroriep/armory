@@ -69,7 +69,7 @@ static void onButtonAction(const char* action, uint8_t btnId, const char* gestur
     http.addHeader("Content-Type", "application/json");
     JsonDocument doc;
     doc["action"] = action;
-    doc["source"] = "xiao_c6_strap";
+    doc["source"] = "armoryclicker";
     doc["button"] = btnId;
     doc["gesture"] = gesture;
     String payload;
@@ -78,14 +78,17 @@ static void onButtonAction(const char* action, uint8_t btnId, const char* gestur
     http.end();
     if (code >= 200 && code < 300) {
       gTriggersSent++;
-      blinkLed(strcmp(action, "record") == 0 ? 2 : 1, 35, 50);
+      int blinks = 1;
+      if (strcmp(action, "undo") == 0) blinks = 3;
+      else if (strcmp(action, "record") == 0) blinks = 2;
+      blinkLed(blinks, 35, 50);
     } else {
       Serial.printf("[HTTP] Trigger POST failed (%d)\n", code);
-      blinkLed(3, 25, 30);
+      blinkLed(4, 25, 30);
     }
   } else {
     Serial.println("[WIFI] Not connected when action fired.");
-    blinkLed(3, 25, 30);
+    blinkLed(4, 25, 30);
   }
 }
 
@@ -208,5 +211,5 @@ void loop() {
   if ((now - gLastActivityMs) >= WORKOUT_AWAKE_MS) {
     enterDeepSleep();
   }
-  delay(5);
+  delay(2);
 }

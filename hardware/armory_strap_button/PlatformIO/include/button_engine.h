@@ -78,13 +78,21 @@ class ButtonEngine {
   void emitTap(uint8_t id, uint8_t count) {
     if (!cb_) return;
     if (mode == ButtonLayoutMode::ONE_BUTTON) {
-      cb_(count >= 2 ? "record" : "check", id, count >= 2 ? "double" : "single");
+      if (count >= 3) {
+        cb_("undo", id, "triple");
+      } else if (count == 2) {
+        cb_("record", id, "double");
+      } else {
+        cb_("check", id, "single");
+      }
       return;
     }
     if (id == 1) {
       cb_("check", 1, "single");
+    } else if (count >= 3) {
+      cb_("undo", 2, "triple");
     } else {
-      cb_(count >= 2 ? "record" : "voice", 2, count >= 2 ? "double" : "single");
+      cb_(count == 2 ? "record" : "voice", 2, count == 2 ? "double" : "single");
     }
   }
 
@@ -116,9 +124,9 @@ class ButtonEngine {
         } else {
           ch.tapCount++;
           ch.lastReleaseMs = now;
-          if (ch.tapCount >= 2) {
+          if (ch.tapCount >= 3) {
             ch.tapCount = 0;
-            emitTap(ch.id, 2);
+            emitTap(ch.id, 3);
           }
         }
       }
@@ -130,9 +138,10 @@ class ButtonEngine {
       emitLong(ch.id);
     }
 
-    if (ch.tapCount == 1 && (now - ch.lastReleaseMs) >= DOUBLE_TAP_MS) {
+    if (!ch.stablePressed && ch.tapCount > 0 && (now - ch.lastReleaseMs) >= MULTI_TAP_WINDOW_MS) {
+      const uint8_t count = ch.tapCount;
       ch.tapCount = 0;
-      emitTap(ch.id, 1);
+      emitTap(ch.id, count);
     }
   }
 };
