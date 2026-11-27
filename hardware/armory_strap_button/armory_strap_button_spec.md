@@ -1,16 +1,16 @@
-# Armory Chest Strap Wi-Fi Button Pod — Master Engineering Spec (`Rev v1.0`)
+# Armory Chest Strap Wi-Fi Button Pod — Master Engineering Spec (`Rev v1.1`)
 
 ## Executive Summary
 
-The **Armory Chest Strap Wi-Fi Button Pod (`Rev v1.0`)** is a slim, low-profile wireless chest-strap remote designed for Armory Fit to trigger set completion (`check`), workout video tagging (`record`), voice ducking (`voice`), and `undo` directly over gym Wi-Fi (`POST http://192.168.1.152:8766/api/bt-button/trigger`) without BLE sleep timeouts or dropped first clicks. Built around a **Seeed Studio XIAO ESP32-C6**, a **`502030` 250 mAh 3.7 V LiPo pouch** (USB-C rechargeable via the XIAO's built-in 100 mA charger), and two **`6×6×4.3 mm` tactile switches** in a side-by-side layout on a **30 mm Polar chest strap**, the enclosure keeps overall thickness to **11.10 mm** (**12.90 mm** with the optional anti-mash barbell guard bezel) while protecting the battery behind an internal PETG armor divider. Both interchangeable **2-button** (raised horizontal bars + recessed thumb dimple) and **1-button** PETG cantilever flex-paddle snap lids click onto the same base shell with slotted positive-click snaps.
+The **Armory Chest Strap Wi-Fi Button Pod (`Rev v1.1`)** is a slim, low-profile wireless chest-strap remote designed for Armory Fit to trigger set completion (`check`), workout video tagging (`record`), voice ducking (`voice`), and `undo` directly over gym Wi-Fi (`POST http://192.168.1.152:8766/api/bt-button/trigger`) without BLE sleep timeouts or dropped first clicks. Built around a **Seeed Studio XIAO ESP32-C6**, a **`502030` 250 mAh 3.7 V LiPo pouch** (USB-C rechargeable via the XIAO's built-in 100 mA charger), and two **`6×6×4.3 mm` tactile switches** in a side-by-side layout on a **30 mm Polar chest strap**, the enclosure keeps overall thickness to **11.10 mm** (**12.90 mm** with the optional anti-mash barbell guard bezel) while protecting the battery behind an internal PETG armor divider. Flush **slotted slip-in C-bar strap wings** (`3.00 × 3.40 mm` bars with centered `2.60 -> 4.20 mm` flared entry slits) let the Polar elastic band weave in sideways cleanly without removing either bulky plastic strap clip. Both interchangeable **2-button** (raised horizontal bars + recessed thumb dimple) and **1-button** PETG cantilever flex-paddle snap lids click onto the same base shell with slotted positive-click snaps.
 
 ---
 
 ## 1. Mechanical Envelope & Z-Stackup (`Method 2` Solid Floor, `DRC 13 / 34`)
 
 - **Main Pod Body:** `56.40 mm (L) × 37.60 mm (W) × 11.10 mm (H)` (`12.90 mm` with `1.80 mm` optional anti-mash bezel)
-- **Overall Width w/ Flush 30 mm Polar Strap Wings:** `70.00 mm (L) × 37.60 mm (W)` (`0.00 mm` added Z thickness)
-- **Polar Strap Slots:** `31.20 mm × 2.80 mm` through-slots (`Z = 0.00..3.20 mm`, `2.20 mm` solid outer bar)
+- **Overall Width w/ Flush 30 mm Polar Strap Wings:** `71.60 mm (L) × 37.60 mm (W)` (`0.00 mm` added Z thickness)
+- **Polar Slotted C-Bar Wings:** `31.20 mm × 2.80 mm` strap slots (`Z = 0.00..3.40 mm`), framed by `3.00 × 3.40 mm` PETG outer bars with centered `2.60 mm` throat / `4.20 mm` 45°-flared sideways slip-in slits (clears Polar plastic end clips without unbuckling)
 - **Bottom-Up Z-Stackup (mated coordinates):**
   - `Z = 0.00..1.20 mm` (`1.20 mm`): 100% solid continuous PETG bottom floor (`Method 2`), `0.80 mm × 45°` anti-elephant-foot outer chamfer (`DRC 29`)
   - `Z = 1.20..4.50 mm` (`3.30 mm`): Floated XIAO ESP32-C6 corner support piers (`component_lib` bare-PCB zones only; `100%` open airgap beneath `ANT1` ceramic chip & all header pins per `DRC 24/37`)
@@ -18,7 +18,7 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v1.0`)** is a slim, low-profile 
   - `Z = 1.20..5.50 mm`: `6×6×4.3 mm` tactile switches seated in snug `6.70 × 6.70 mm` PETG retention cradles on solid floor
   - `Z = 5.80 mm`: Base/Lid parting plane (`1.00 mm` solid PETG bridge above USB-C stadium -> clean un-notched Lid skirt)
   - `Z = 5.80..9.30 mm` (`3.50 mm`): Stepped `1.45 mm` shoulder tongue on `-X/+X/+Y` with **2× `10 mm` slotted cantilever snap tabs** (`0.60 mm` barb, `0.10 mm` radial slip gap = **`0.50 mm` net interference**, `1.21 mm` solid Lid retaining lip per `DRC 10/30`)
-  - `Z = 9.50..11.10 mm` (`1.60 mm`): Solid Lid roof (`ARMORY v1.0` `0.40 mm` deboss leaves `1.20 mm` solid backing per `DRC 8`)
+  - `Z = 9.50..11.10 mm` (`1.60 mm`): Solid Lid roof (`ARMORY v1.1` `0.40 mm` deboss leaves `1.20 mm` solid backing per `DRC 8`)
   - `Z = 11.10..12.90 mm` (`1.80 mm`): Optional removable/CA-bond Anti-Mash Barbell Guard Bezel (`4× Ø1.44 mm` alignment pins mate into `0.40 mm` blind Lid dimples)
 
 ---
@@ -32,7 +32,7 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v1.0`)** is a slim, low-profile 
 | `SW1` | **Tactile Push-Button Switch (Top)** | 1 | `6.0 × 6.0 × 4.3 mm` 4-pin TH/SMT momentary (recommend `250 gf`+) | Primary button (`Done / Check` single press; `Undo` long press) |
 | `SW2` | **Tactile Push-Button Switch (Bot)** | 1 | `6.0 × 6.0 × 4.3 mm` 4-pin TH/SMT momentary (recommend `250 gf`+) | Secondary button (`Voice` single press; `Record` long/double press) |
 | `W1–W5` | **30 AWG Silicone Hookup Wire** | 5 | Ultra-flexible `200 °C` silicone stranded (Red/Black/Blue/Green/Slate) | Direct-soldered flexible point-to-point harnesses (~265 mm total) |
-| `P1` | `armory_strap_button_base.step` | 1 | `70.0 × 37.6 × 9.3 mm` PETG (~8 g) | Main strap base + armored LiPo bay + XIAO piers + switch cradles |
+| `P1` | `armory_strap_button_base.step` | 1 | `71.6 × 37.6 × 9.3 mm` PETG (~8.5 g) | Main strap base + slotted clip-clearing wings + LiPo bay + XIAO piers |
 | `P2A` | `armory_strap_button_lid_2btn.step` | 1 | `56.4 × 37.6 × 5.3 mm` PETG (~5 g) | Primary 2-button tactile-coded flex-paddle lid (Bars + Dimple) |
 | `P2B` | `armory_strap_button_lid_1btn.step` | 1 | `56.4 × 37.6 × 5.3 mm` PETG (~5 g) | Interchangeable 1-button wide flex-paddle lid |
 | `P3` | `armory_strap_button_bezel.step` | 1 | `21.0 × 31.2 × 2.15 mm` PETG (~1.5 g) | Optional `1.80 mm` raised barbell/chest-pad anti-mash guard |
@@ -57,7 +57,7 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v1.0`)** is a slim, low-profile 
 
 ## 4. Flash Studio Slicer Profile (`Flashforge Adventurer 5M Pro` — PETG)
 
-- **Filament:** PETG (already in shop) — do NOT enable extra global XY elephant-foot compensation (built-in `0.80 mm × 45°` perimeter chamfers handle first-layer squish while keeping `ARMORY v1.0` lettering crisp).
+- **Filament:** PETG (already in shop) — do NOT enable extra global XY elephant-foot compensation (built-in `0.80 mm × 45°` perimeter chamfers handle first-layer squish while keeping `ARMORY v1.1` lettering crisp).
 - **Layer Height:** `0.20 mm` (`0.20 mm` initial layer) — guarantees exact `3` full layers (`0.60 mm`) on the cantilever snap barb crests and crisp `0.40 mm` tactile grooves.
 - **Line Width / Walls:** `0.40 mm` nozzle, **`3` wall loops**, `25%` Gyroid or Grid infill, **Supports: OFF (100% support-free at `Z=0`)**.
 - **Orientation:** Import all 4 `.step` files directly onto the build plate as exported (`Z = 0.00 mm` flat — Base floor down, Lids roof down with `ARMORY v1.0` facing the bed, Bezel flat top down with tiny `0.35 mm` locating pins pointing `+Z`).

@@ -1,12 +1,12 @@
 """
 build_armory_strap_button_cad.py
-Master Parametric CAD Generator for Armory Chest Strap Wi-Fi Button Pod (Rev v1.0).
+Master Parametric CAD Generator for Armory Chest Strap Wi-Fi Button Pod (Rev v1.1).
 
 Architecture (Method 2 Solid Bottom Floor + Unified Mated Space per DRC 34):
   - Compact side-by-side low-profile pod resting on 30 mm Polar chest strap wings
-    (0.00 mm added Z height from strap tunnel):
+    (0.00 mm added Z height from strap tunnel; slotted slip-in C-bars clear plastic end clips):
       * Main body: 56.40 mm (L) x 37.60 mm (W) x 11.10 mm (H) [with 1.80 mm optional bezel = 12.90 mm]
-      * Overall with flush 30 mm strap wings: 70.00 mm (L) x 37.60 mm (W)
+      * Overall with flush 30 mm strap wings: 71.60 mm (L) x 37.60 mm (W)
   - 3 Armored Internal Bays over 1.20 mm solid continuous bottom floor (Z=0..1.20):
       1. Bay 1 (-X): 502030 (250 mAh) LiPo pouch + PCM cavity (20.80 x 32.60 mm)
       2. Bay 2 (Center): Floated Seeed XIAO ESP32-C6 (belly-down, 3.30 mm piers, rotation=-90 deg -> USB-C exits -Y flush)
@@ -39,6 +39,7 @@ from build123d import (
     FontStyle,
     GeomType,
     Plane,
+    Polygon,
     Rectangle,
     SlotOverall,
     Text,
@@ -86,13 +87,16 @@ LID_CEIL_Z = H_BASE + TONGUE_H + 0.20   # 9.50 mm interior Lid ceiling
 ROOF_T = 1.60                 # Leaves 1.20 mm solid backing behind 0.40 mm deboss/grooves (DRC 8)
 H_TOTAL = LID_CEIL_Z + ROOF_T # 11.10 mm total pod thickness
 
-# Side-Wing Flush Polar 30 mm Chest-Strap Mounts (0.00 mm Z penalty)
-WING_EXT = 6.80               # Wing overhang past enclosure ends
-WING_H = 3.20                 # Z = 0.00..3.20 (< H_BASE=5.80)
+# Side-Wing Flush Polar 30 mm Chest-Strap Mounts (0.00 mm Z penalty, slotted C-bars clear end clips)
+WING_EXT = 7.60               # Wing overhang past enclosure ends (71.60 mm wing-to-wing)
+WING_H = 3.40                 # Z = 0.00..3.40 (< H_BASE=5.80)
 WING_R = 2.40
 SLOT_LEN_Y = 31.20            # Fits 30 mm Polar strap cleanly
 SLOT_W_X = 2.80               # Strap slot width
-WING_OUTER_BAR = 2.20         # Outer solid PETG loop bar
+WING_OUTER_BAR = 3.00         # Beefed-up 3.00 x 3.40 mm slotted C-bar cross-section
+SLIT_THROAT_HALF_Y = 1.30     # 2.60 mm throat width (retains strap flat, passes ~1.9mm elastic edgewise)
+SLIT_OUTER_HALF_Y = 2.10      # 4.20 mm flared entry mouth (45-deg funnel)
+SLIT_INNER_HALF_Y = 1.70      # 3.40 mm soft inner flare into strap slot
 
 # Bay 1 (-X): 502030 (250 mAh) LiPo Pouch
 LIPO_BAY_X0 = CAV_X0          # 3.40 mm
@@ -223,9 +227,9 @@ def _build_base_and_common_lid():
     # 2. Hollow main interior cavity above 1.20 mm solid continuous floor (Z = FLOOR_T..LID_CEIL_Z)
     hull = hull - PosBox(CAV_X0, CAV_X1, CAV_Y0, CAV_Y1, FLOOR_T, LID_CEIL_Z)
 
-    # 3. Deboss ARMORY / v1.0 on left flat Lid roof (X in [4.5, 31.0]) per DRC 8 (>= 1.20 mm solid backing left)
+    # 3. Deboss ARMORY / v1.1 on left flat Lid roof (X in [4.5, 31.0]) per DRC 8 (>= 1.20 mm solid backing left)
     t_brand = Text("ARMORY", font_size=5.6, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
-    t_rev = Text("v1.0", font_size=5.0, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
+    t_rev = Text("v1.1", font_size=5.0, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
     deb1 = extrude(Plane.XY.offset(H_TOTAL - 0.40) * t_brand, amount=0.60).translate((18.5, +4.2, 0.0))
     deb2 = extrude(Plane.XY.offset(H_TOTAL - 0.40) * t_rev, amount=0.60).translate((18.5, -4.8, 0.0))
 
@@ -267,18 +271,49 @@ def _build_base_and_common_lid():
     base = base_raw + tongue
     lid_common_mated = lid_raw - clr_outer
 
-    # 6. Add Flush Side-Wing 30 mm Polar Chest-Strap Mounts at Z = 0..3.20 mm (+0.00 mm Z build-up)
+    # 6. Add Flush Side-Wing 30 mm Polar Chest-Strap Mounts at Z = 0..3.40 mm (slotted C-bars clear plastic clips!)
     left_wing = _rounded_rect_prism(-WING_EXT, 1.80, Y_MIN, Y_MAX, 0.0, WING_H, WING_R)
     right_wing = _rounded_rect_prism(ENC_L - 1.80, ENC_L + WING_EXT, Y_MIN, Y_MAX, 0.0, WING_H, WING_R)
     for wg in (left_wing, right_wing):
         wg_bot = [e for e in wg.edges() if abs(e.bounding_box().min.Z) < 0.05 and abs(e.bounding_box().max.Z) < 0.05]
         base = base + chamfer(wg_bot, length=0.60)
-    # Subtract rounded 31.20 x 2.80 mm strap slots cleanly through wings
-    left_slot_x0 = -WING_EXT + WING_OUTER_BAR
-    right_slot_x1 = ENC_L + WING_EXT - WING_OUTER_BAR
+    # Subtract rounded 31.20 x 2.80 mm strap slots + centered hourglass slip-in slits through outer bars
+    left_slot_x0 = -WING_EXT + WING_OUTER_BAR      # -4.60 mm
+    right_slot_x1 = ENC_L + WING_EXT - WING_OUTER_BAR  # +61.00 mm
     for sx0, sx1 in ((left_slot_x0, left_slot_x0 + SLOT_W_X), (right_slot_x1 - SLOT_W_X, right_slot_x1)):
         slot_cut = _rounded_rect_prism(sx0, sx1, -0.5 * SLOT_LEN_Y, 0.5 * SLOT_LEN_Y, -0.50, WING_H + 0.50, 0.80)
         base = base - slot_cut
+
+    # Left (-X) outer bar slip-in slit (outer X=-7.60 -> neck X=-5.90 -> slot X=-4.60)
+    l_pts = [
+        (-WING_EXT - 0.40, -SLIT_OUTER_HALF_Y),
+        (-WING_EXT + 0.80, -SLIT_OUTER_HALF_Y),
+        (-WING_EXT + 1.60, -SLIT_THROAT_HALF_Y),
+        (left_slot_x0 - 0.40, -SLIT_THROAT_HALF_Y),
+        (left_slot_x0 + 0.30, -SLIT_INNER_HALF_Y),
+        (left_slot_x0 + 0.30, +SLIT_INNER_HALF_Y),
+        (left_slot_x0 - 0.40, +SLIT_THROAT_HALF_Y),
+        (-WING_EXT + 1.60, +SLIT_THROAT_HALF_Y),
+        (-WING_EXT + 0.80, +SLIT_OUTER_HALF_Y),
+        (-WING_EXT - 0.40, +SLIT_OUTER_HALF_Y),
+    ]
+    # Right (+X) outer bar slip-in slit (mirrored around pod)
+    x_out_r = ENC_L + WING_EXT
+    r_pts = [
+        (x_out_r + 0.40, -SLIT_OUTER_HALF_Y),
+        (x_out_r - 0.80, -SLIT_OUTER_HALF_Y),
+        (x_out_r - 1.60, -SLIT_THROAT_HALF_Y),
+        (right_slot_x1 + 0.40, -SLIT_THROAT_HALF_Y),
+        (right_slot_x1 - 0.30, -SLIT_INNER_HALF_Y),
+        (right_slot_x1 - 0.30, +SLIT_INNER_HALF_Y),
+        (right_slot_x1 + 0.40, +SLIT_THROAT_HALF_Y),
+        (x_out_r - 1.60, +SLIT_THROAT_HALF_Y),
+        (x_out_r - 0.80, +SLIT_OUTER_HALF_Y),
+        (x_out_r + 0.40, +SLIT_OUTER_HALF_Y),
+    ]
+    for s_pts in (l_pts, r_pts):
+        slit_cut = extrude(Plane.XY.offset(-0.50) * Polygon(*s_pts, align=None), amount=WING_H + 1.00)
+        base = base - slit_cut
 
     # 7. Bay 1 & Bay 2 Armored PETG Partition Walls (Z=5.40 stays clear of 5.80 split parity probe while protecting 5.0mm LiPo)
     div_top_z = 5.40
@@ -510,8 +545,8 @@ def _write_spec_json(path, snaps_spec, xiao_spec, variant_label):
     ]
 
     spec = {
-        "project": f"Armory Chest Strap Wi-Fi Button Pod v1.0 ({variant_label})",
-        "title": f"Armory Strap Button v1.0 ({variant_label}) — BRep Internals",
+        "project": f"Armory Chest Strap Wi-Fi Button Pod v1.1 ({variant_label})",
+        "title": f"Armory Strap Button v1.1 ({variant_label}) — BRep Internals",
         "architecture": "method2",
         "uses_wire_combs": False,
         "has_usb_port": True,
