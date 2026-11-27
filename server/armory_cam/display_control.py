@@ -1197,6 +1197,55 @@ class GymDisplayController:
         self.last_cube_probe = res
         return res
 
+    def _ensure_no_deep_sleep(self, ser: str) -> None:
+        if self.adb is not None and hasattr(self.adb, "apply_no_deep_sleep"):
+            try:
+                self.adb.apply_no_deep_sleep(ser)
+            except Exception:
+                pass
+
+    def enforce_no_deep_sleep_all(self, wallboard_cfg: Any | None = None) -> dict[str, Any]:
+        """Connect briefly to Wallboard, Main TV, and Fire TV Cube to lock out deep sleep & Doze."""
+        if self.adb is None:
+            return {"ok": False, "error": "ADB controller unavailable"}
+        cfg = self.get_config()
+        targets: list[tuple[str, str, bool]] = []
+        if wallboard_cfg is not None and getattr(wallboard_cfg, "enabled", True):
+            wb_ser = self._adb_serial(getattr(wallboard_cfg, "fire_tv_host", ""), int(getattr(wallboard_cfg, "adb_port", 5555) or 5555))
+            if wb_ser:
+                targets.append(("wallboard", wb_ser, True))
+        if cfg.primary.enabled and cfg.primary.host:
+            p_ser = self._adb_serial(cfg.primary.host, cfg.primary.adb_port)
+            if p_ser:
+                targets.append(("primary", p_ser, True))
+        if cfg.cube_host:
+            c_ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+            if c_ser:
+                targets.append(("cube", c_ser, False))
+
+        results: dict[str, Any] = {}
+        for key, ser, should_disconnect in targets:
+            try:
+                st, detail = self.adb._connect_and_status(ser)
+                if st != "device":
+                    results[key] = {"ok": False, "serial": ser, "state": st, "detail": detail}
+                    continue
+                ok, msg = (
+                    self.adb.apply_no_deep_sleep(ser)
+                    if hasattr(self.adb, "apply_no_deep_sleep")
+                    else (True, "")
+                )
+                results[key] = {"ok": bool(ok), "serial": ser, "message": msg}
+            except Exception as exc:
+                results[key] = {"ok": False, "serial": ser, "error": str(exc)}
+            finally:
+                if should_disconnect and hasattr(self.adb, "disconnect_serial"):
+                    try:
+                        self.adb.disconnect_serial(ser)
+                    except Exception:
+                        pass
+        return {"ok": any(bool(v.get("ok")) for v in results.values()), "results": results}
+
     def _control_primary(self, action: str) -> dict[str, Any]:
         cfg = self.get_config().primary
         if not cfg.enabled:
@@ -1213,6 +1262,7 @@ class GymDisplayController:
                 st, detail = self.adb._connect_and_status(ser)
             if st != "device":
                 return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+            self._ensure_no_deep_sleep(ser)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
             return {
                 "ok": rc == 0,
@@ -1226,6 +1276,7 @@ class GymDisplayController:
             st, detail = self.adb._connect_and_status(ser)
             if st != "device":
                 return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+            self._ensure_no_deep_sleep(ser)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "223"], timeout=4.0)
             if rc == 0:
                 self._sleep(0.25)
@@ -1252,6 +1303,7 @@ class GymDisplayController:
                 st, detail = self.adb._connect_and_status(ser)
             if st != "device":
                 return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
+            self._ensure_no_deep_sleep(ser)
             self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
             self._sleep(0.25)
             rc, out, err = self.adb._run(
@@ -1372,6 +1424,7 @@ class GymDisplayController:
         st, detail = self.adb._connect_and_status(ser)
         if st != "device":
             return {"ok": False, "state": st, "error": f"Cube ADB {st}: {detail}"}
+        self._ensure_no_deep_sleep(ser)
         self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
         q_over = str(query_override or "").strip()
         if not q_over and cfg.open_gym_music_url:
@@ -1440,6 +1493,7 @@ class GymDisplayController:
             return {"ok": False, "target": "cube", "action": action, "state": st, "error": f"Cube ADB {st}: {detail}"}
 
         if action == "on":
+            self._ensure_no_deep_sleep(ser)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
             return {
                 "ok": rc == 0,
@@ -1450,6 +1504,7 @@ class GymDisplayController:
             }
 
         if action == "off":
+            self._ensure_no_deep_sleep(ser)
             self.adb._run(["-s", ser, "shell", "input", "keyevent", "127"], timeout=4.0)
             self._sleep(0.15)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "223"], timeout=4.0)
@@ -1462,6 +1517,7 @@ class GymDisplayController:
             }
 
         if action == "home":
+            self._ensure_no_deep_sleep(ser)
             self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
             self._sleep(0.2)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "3"], timeout=4.0)

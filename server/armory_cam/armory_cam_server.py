@@ -2280,6 +2280,15 @@ def send_wol_magic_packet(
     return sent
 
 
+NO_DEEP_SLEEP_SHELL = (
+    "settings put secure sleep_timeout 0; "
+    "settings put system screen_off_timeout 2147460000; "
+    "settings put global wifi_sleep_policy 2; "
+    "settings put global wifi_wakeup_enabled 1; "
+    "dumpsys deviceidle disable"
+)
+
+
 class FireTvAdbController:
     """Manages ADB-over-Wi-Fi wake, Silk/kiosk launch, screensaver suppression, and auto-sleep."""
 
@@ -2380,18 +2389,23 @@ class FireTvAdbController:
             except Exception:
                 pass
 
+    def apply_no_deep_sleep(self, ser: str, *, disable_screensaver: bool = False) -> tuple[bool, str]:
+        """Keep Fire TV display/Wi-Fi out of deep sleep and Android Doze (never resets sleep_timeout)."""
+        cmd = NO_DEEP_SLEEP_SHELL
+        if disable_screensaver:
+            cmd = f"settings put secure screensaver_enabled 0; {cmd}"
+        rc, out, err = self._run(["-s", ser, "shell", cmd], timeout=6.0)
+        return rc == 0, (err or out or "").strip()
+
     def _apply_wallboard_tv_settings(self, ser: str, *, suppress_screensaver: bool) -> None:
-        """Disable Fire OS home-screen featured video/audio autoplay (and screensaver during wake)."""
+        """Disable Fire OS home-screen featured video/audio autoplay and lock out deep sleep."""
         cmds = [
             "settings put global com.amazon.tv.settings.featured_item_video_enabled 0",
             "settings put global com.amazon.tv.settings.featured_item_video_volume 0.0",
+            NO_DEEP_SLEEP_SHELL,
         ]
         if suppress_screensaver:
-            cmds.extend([
-                "settings put secure screensaver_enabled 0",
-                "settings put secure sleep_timeout 0",
-                "settings put global wifi_sleep_policy 2",
-            ])
+            cmds.insert(2, "settings put secure screensaver_enabled 0")
         self._run(["-s", ser, "shell", "; ".join(cmds)], timeout=6.0)
 
     def _offline_diagnostic_message(self, ser: str, detail: str) -> str:
@@ -2712,14 +2726,7 @@ class FireTvAdbController:
                         self._sleep_retry_count = 0
                 return {"ok": False, "configured": True, "state": st, "serial": ser, "message": msg}
             try:
-                if cfg.suppress_screensaver:
-                    self._run(
-                        [
-                            "-s", ser, "shell",
-                            "settings put secure screensaver_enabled 1; settings put secure sleep_timeout 1200000",
-                        ],
-                        timeout=5.0,
-                    )
+                self.apply_no_deep_sleep(ser, disable_screensaver=False)
                 self._run(["-s", ser, "shell", "input", "keyevent", "KEYCODE_SLEEP"], timeout=5.0)
                 if self.settle_sec > 0:
                     time.sleep(min(0.25, self.settle_sec))
@@ -4047,7 +4054,22 @@ class ArmoryCamService:
                 )
                 guard_t.start()
                 self._worker_threads.append(guard_t)
+                no_sleep_t = threading.Thread(
+                    target=self._startup_enforce_no_deep_sleep,
+                    name="firetv-no-deep-sleep",
+                    daemon=True,
+                )
+                no_sleep_t.start()
+                self._worker_threads.append(no_sleep_t)
         self.trigger_optiplex_config_backup_async()
+
+    def _startup_enforce_no_deep_sleep(self) -> None:
+        if self._stop_event.wait(3.0):
+            return
+        try:
+            self.displays.enforce_no_deep_sleep_all(self.wallboard_cfg)
+        except Exception as exc:
+            self.log.debug("Startup no-deep-sleep enforcement error: %s", exc)
 
     def _denon_ip_control_watch_loop(self) -> None:
         """One-shot watcher: when Denon comes online, verify or safely enable IP Control = Always On."""

@@ -382,7 +382,9 @@ class ArmoryCamTests(unittest.TestCase):
             ).get_json()
             self.assertTrue(slp_now["adb"]["ok"])
             flat2 = [" ".join(c) for c in cmds]
-            self.assertTrue(any("screensaver_enabled 1" in x for x in flat2))
+            self.assertFalse(any("sleep_timeout 1200000" in x for x in flat2))
+            self.assertTrue(any("sleep_timeout 0" in x for x in flat2))
+            self.assertTrue(any("dumpsys deviceidle disable" in x for x in flat2))
             self.assertTrue(any("KEYCODE_SLEEP" in x for x in flat2))
             self.assertFalse(adb.tv_awake_requested)
 
@@ -3859,7 +3861,7 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertTrue(any("featured_item_video_volume 0.0" in s for s in flat))
         self.assertEqual(cmds[-1], ["disconnect", "192.168.1.204:5555"])
 
-        # 2. Wake also applies autoplay-off + screensaver suppression and disconnects cleanly
+        # 2. Wake also applies autoplay-off + no-deep-sleep + screensaver suppression and disconnects cleanly
         evicted["done"] = False
         cmds.clear()
         wk = adb.wake_and_launch(cfg, "http://192.168.1.152:8766/wallboard", force=True)
@@ -3867,13 +3869,21 @@ class ShowDirectorTests(unittest.TestCase):
         flat_w = [" ".join(c) for c in cmds]
         self.assertTrue(any("featured_item_video_enabled 0" in s for s in flat_w))
         self.assertTrue(any("screensaver_enabled 0" in s for s in flat_w))
+        self.assertTrue(any("sleep_timeout 0" in s for s in flat_w))
+        self.assertTrue(any("screen_off_timeout 2147460000" in s for s in flat_w))
+        self.assertTrue(any("wifi_sleep_policy 2" in s for s in flat_w))
+        self.assertTrue(any("dumpsys deviceidle disable" in s for s in flat_w))
         self.assertEqual(cmds[-1], ["disconnect", "192.168.1.204:5555"])
 
-        # 3. Sleep disconnects cleanly after KEYCODE_SLEEP
+        # 3. Sleep disconnects cleanly after KEYCODE_SLEEP and NEVER restores sleep_timeout 1200000
         cmds.clear()
         sl = adb.sleep_now(cfg, reason="manual")
         self.assertTrue(sl["ok"])
-        self.assertTrue(any("KEYCODE_SLEEP" in " ".join(c) for c in cmds))
+        flat_s = [" ".join(c) for c in cmds]
+        self.assertTrue(any("KEYCODE_SLEEP" in s for s in flat_s))
+        self.assertFalse(any("sleep_timeout 1200000" in s for s in flat_s))
+        self.assertTrue(any("sleep_timeout 0" in s for s in flat_s))
+        self.assertTrue(any("dumpsys deviceidle disable" in s for s in flat_s))
         self.assertEqual(cmds[-1], ["disconnect", "192.168.1.204:5555"])
 
     def test_house_audio_cube_wav_normalization_dedup_poll_and_timing(self) -> None:
