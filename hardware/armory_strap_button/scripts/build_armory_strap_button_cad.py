@@ -311,9 +311,11 @@ def _build_base_and_common_lid():
         (x_out_r - 0.80, +SLIT_OUTER_HALF_Y),
         (x_out_r + 0.40, +SLIT_OUTER_HALF_Y),
     ]
-    for s_pts in (l_pts, r_pts):
-        slit_cut = extrude(Plane.XY.offset(-0.50) * Polygon(*s_pts, align=None), amount=WING_H + 1.00)
+    for s_pts in (l_pts, list(reversed(r_pts))):
+        slit_cut = extrude(Plane.XY.offset(-0.50) * Polygon(*s_pts, align=None), amount=WING_H + 1.00, dir=(0, 0, 1))
         base = base - slit_cut
+    assert not base.is_inside((-WING_EXT + 1.50, 0.0, 1.50)), "Left (-X) wing slip-in slit must be open air!"
+    assert not base.is_inside((ENC_L + WING_EXT - 1.50, 0.0, 1.50)), "Right (+X) wing slip-in slit must be open air!"
 
     # 7. Bay 1 & Bay 2 Armored PETG Partition Walls (Z=5.40 stays clear of 5.80 split parity probe while protecting 5.0mm LiPo)
     div_top_z = 5.40
