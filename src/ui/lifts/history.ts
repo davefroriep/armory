@@ -3,12 +3,13 @@ import { liftSettings, fmtKg } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { condenseSets, fmtDuration, fmtVolume, sessionPRs } from '../../lifts/summary';
 import { startWorkout } from './train';
-import { getMeta, getSamples } from '../../store/db';
+import { allMeta, getMeta, getSamples } from '../../store/db';
+import type { WorkoutMeta } from '../../types';
 import { hrSummary } from '../../lifts/intervals';
 import { updateFinishedDuration } from '../../lifts/intervals';
 import type { LiftSession } from '../../lifts/types';
 import { esc } from '../dom';
-import { openShareCard, sessionRow, stat } from './cards';
+import { openShareCard, ruckRow, sessionRow, stat } from './cards';
 import { LI, actionSheet, confirmSheet, mount, resumeBar, tabBar, toast, wireClock } from './kit';
 import { openEditTimeSheet } from './timeSheet';
 import { playVideo } from './video';
@@ -20,13 +21,19 @@ export function historyScreen(root: HTMLElement): () => void {
     let y = now.getFullYear();
     let m = now.getMonth();
     let sel: string | null = null;
+    let rucks: WorkoutMeta[] = [];
 
     const paint = (): void => {
-      const all = lifts.finished().reverse();
-      const byDay = new Map<string, typeof all>();
-      for (const s of all) {
-        const k = dayKey(s.startMs);
-        byDay.set(k, [...(byDay.get(k) ?? []), s]);
+      const allLifts = lifts.finished().reverse();
+      type HistEntry = { startMs: number; kind: 'lift'; s: LiftSession } | { startMs: number; kind: 'ruck'; m: WorkoutMeta };
+      const all: HistEntry[] = [
+        ...allLifts.map((s) => ({ startMs: s.startMs, kind: 'lift' as const, s })),
+        ...rucks.map((rm) => ({ startMs: rm.startEpochMs, kind: 'ruck' as const, m: rm })),
+      ].sort((a, b) => b.startMs - a.startMs);
+      const byDay = new Map<string, HistEntry[]>();
+      for (const entry of all) {
+        const k = dayKey(entry.startMs);
+        byDay.set(k, [...(byDay.get(k) ?? []), entry]);
       }
       const first = new Date(y, m, 1);
       const lead = (first.getDay() + 6) % 7;
@@ -39,14 +46,14 @@ export function historyScreen(root: HTMLElement): () => void {
         const n = byDay.get(k)?.length ?? 0;
         cells += `<button class="cal-d${n ? ' has' : ''}${k === today ? ' today' : ''}${k === sel ? ' sel' : ''}" data-day="${k}" ${n ? '' : 'disabled'}>${d}${n ? '<u></u>' : ''}</button>`;
       }
-      const inMonth = all.filter((s) => { const d = new Date(s.startMs); return d.getFullYear() === y && d.getMonth() === m; });
+      const inMonth = all.filter((entry) => { const d = new Date(entry.startMs); return d.getFullYear() === y && d.getMonth() === m; });
       const list = sel ? byDay.get(sel) ?? [] : all;
       let html = '';
       let lastMonth = '';
-      for (const s of list) {
-        const mk = new Date(s.startMs).toLocaleDateString([], { month: 'long', year: 'numeric' });
+      for (const entry of list) {
+        const mk = new Date(entry.startMs).toLocaleDateString([], { month: 'long', year: 'numeric' });
         if (!sel && mk !== lastMonth) { html += `<h2 class="sec">${mk.toUpperCase()}</h2>`; lastMonth = mk; }
-        html += sessionRow(s);
+        html += entry.kind === 'lift' ? sessionRow(entry.s) : ruckRow(entry.m);
       }
       root.innerHTML = `<header class="bar"><a class="icon-btn" href="#/strength" aria-label="Back"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></a><h1>History</h1></header>
         <main class="page has-tabs">
@@ -60,6 +67,10 @@ export function historyScreen(root: HTMLElement): () => void {
         </main>${resumeBar()}${tabBar('history')}`;
     };
     paint();
+    void allMeta().then((metas) => {
+      const nextRucks = metas.filter((rm) => rm.status === 'saved' && rm.programId === 'ruck');
+      if (nextRucks.length) { rucks = nextRucks; paint(); }
+    });
     const offClock = wireClock(root);
     const offStore = lifts.changed.on(paint);
     root.addEventListener('click', (e) => {

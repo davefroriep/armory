@@ -232,6 +232,27 @@ def adversarial_phrases_for(phrase: str) -> list[str]:
             "hey armory",
             "atlas",
         ])
+    elif "jarvis" in clean:
+        base.extend([
+            "hey harvest",
+            "harvest",
+            "hey service",
+            "service",
+            "hey nervous",
+            "nervous",
+            "hey travis",
+            "travis",
+            "hey davis",
+            "davis",
+            "hey marcus",
+            "hey javier",
+            "hey garbage",
+            "hey office",
+            "hey target",
+            "hey armory",
+            "hey atlas",
+            "jarvis",
+        ])
     # Deduplicate while preserving order
     seen: set[str] = set()
     out: list[str] = []
@@ -355,6 +376,7 @@ def augment_clip(
     reverb_prob: float = 0.75,
     eq_prob: float = 0.65,
     trailing_tail_prob: float = 0.38,
+    music_snr_range: tuple[float, float] = (-1.0, 22.0),
 ) -> np.ndarray:
     """Build a 2.0s (32,000-sample) int16 clip with wake aligned cleanly near the right edge."""
     v = voice_pcm.astype(np.float32, copy=True)
@@ -420,7 +442,8 @@ def augment_clip(
         else:
             bg = np.resize(bg_src, CLIP_SAMPLES).copy()
         bg_rms = float(np.sqrt(np.mean(bg * bg))) or 1e-5
-        snr_db = rng.uniform(-1.0, 22.0)
+        snr_lo, snr_hi = float(music_snr_range[0]), float(music_snr_range[1])
+        snr_db = rng.uniform(min(snr_lo, snr_hi), max(snr_lo, snr_hi))
         desired_bg_rms = target_v_rms / (10.0 ** (snr_db / 20.0))
         out = out + bg * (desired_bg_rms / bg_rms)
     else:
@@ -728,7 +751,60 @@ def generate_datasets(phrase: str, work_dir: Path) -> None:
     print(f"      Saved gym_neg_features.npy: {gym_neg_emb.shape}")
 
 
-def load_user_positives(work_dir: Path, fe: Any) -> np.ndarray:
+def _load_or_build_cmd_tails() -> list[np.ndarray]:
+    """Load cached 16 kHz gym command tails (or synthesize once via Kokoro) for user-positive mixing."""
+    cache_p = NEG_DIR / "cmd_tails_16k.npz"
+    if cache_p.is_file():
+        try:
+            with np.load(cache_p) as z:
+                clips = [np.asarray(z[k], dtype=np.float32) for k in z.files if z[k].size >= 800]
+            if clips:
+                return clips
+        except Exception:
+            pass
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from room_voice import get_shared_kokoro
+
+        kokoro, _ = get_shared_kokoro(ROOT_DIR / "models")
+        voices = ("am_michael", "am_onyx", "am_fenrir", "am_adam")
+        clips: list[np.ndarray] = []
+        for idx, tail_txt in enumerate(GYM_COMMAND_TAILS):
+            pcm, sr = kokoro.create(tail_txt, voice=voices[idx % len(voices)], speed=1.02, lang="en-us")
+            arr = trim_silence(resample_16k(pcm, sr))
+            if arr.size >= 800:
+                clips.append(arr)
+        if clips:
+            cache_p.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_p, **{f"c{i}": c for i, c in enumerate(clips)})
+        return clips
+    except Exception:
+        return []
+
+
+def _load_or_cache_user_beds() -> list[np.ndarray]:
+    """Load cached 16 kHz gym audio beds (or mine once) so user-clip retraining skips 24 FFmpeg spawns."""
+    cache_p = NEG_DIR / "user_bg_beds_16k.npz"
+    if cache_p.is_file():
+        try:
+            with np.load(cache_p) as z:
+                beds = [np.asarray(z[k], dtype=np.float32) for k in z.files if z[k].size >= SR * 4]
+            if beds:
+                return beds
+        except Exception:
+            pass
+    loud_beds, ambient_beds = mine_gym_backgrounds(max_segments=24)
+    beds = loud_beds + ambient_beds
+    if beds:
+        try:
+            cache_p.parent.mkdir(parents=True, exist_ok=True)
+            np.savez(cache_p, **{f"b{i}": b[: SR * 12] for i, b in enumerate(beds)})
+        except Exception:
+            pass
+    return beds
+
+
+def load_user_positives(work_dir: Path, fe: Any) -> tuple[np.ndarray, int]:
     """Encode any personal voice recordings placed in `<work_dir>/user_positives/` with heavy augmentation."""
     user_dir = work_dir / "user_positives"
     user_dir.mkdir(parents=True, exist_ok=True)
@@ -737,15 +813,15 @@ def load_user_positives(work_dir: Path, fe: Any) -> np.ndarray:
         if p.is_file() and p.suffix.lower() in (".wav", ".m4a", ".mp3", ".ogg", ".flac")
     ]
     if not audio_files:
-        return np.zeros((0, 16, 96), dtype=np.float32)
+        return np.zeros((0, 16, 96), dtype=np.float32), 0
 
     rng = random.Random(777)
-    loud_beds, ambient_beds = mine_gym_backgrounds(max_segments=24)
-    all_beds = loud_beds + ambient_beds
+    all_beds = _load_or_cache_user_beds()
+    cmd_tails_pcm = _load_or_build_cmd_tails()
     raw_clips = [trim_silence(load_audio_16k(p)) for p in audio_files]
     raw_clips = [c for c in raw_clips if c.size >= 3200]
     if not raw_clips:
-        return np.zeros((0, 16, 96), dtype=np.float32)
+        return np.zeros((0, 16, 96), dtype=np.float32), 0
 
     aug_clips: list[np.ndarray] = []
     reps = max(25, min(80, 1200 // len(raw_clips)))
@@ -756,30 +832,48 @@ def load_user_positives(work_dir: Path, fe: Any) -> np.ndarray:
                     src,
                     rng,
                     all_beds,
-                    add_music_prob=0.70,
+                    cmd_tail_pool=cmd_tails_pcm or None,
+                    add_music_prob=0.55,
                     reverb_prob=0.45,  # Real gym clips already have natural room acoustics!
                     eq_prob=0.40,
-                    trailing_tail_prob=0.0,
+                    trailing_tail_prob=0.30 if cmd_tails_pcm else 0.0,
+                    music_snr_range=(6.0, 22.0),  # Keep speech clearly dominant over music so MLP never learns "rock = wake"
                 )
             )
     emb = extract_last16_embeddings(fe, aug_clips)
     print(f"Encoded {len(raw_clips)} user voice clips -> {emb.shape[0]} personalized training samples")
-    return emb
+    return emb, len(raw_clips)
 
 
-def eval_validation_fph(model: WakeWordMlp, val_neg_2d: np.ndarray, threshold: float = 0.50) -> tuple[int, float, float]:
-    """Run model over 10.7h continuous validation_set_features.npy (481,345 frames -> 30,084 16-frame blocks)."""
-    model.eval()
+def build_val_blocks(val_neg_2d: np.ndarray) -> tuple[np.ndarray, float]:
+    """Pre-build contiguous stride-4 `(N, 16, 96)` float32 blocks once for fast validation."""
     n_frames = val_neg_2d.shape[0]
-    # Stride 4 frames (320ms) for fast exact sliding evaluation across all 10.7 hours!
-    starts = np.arange(0, n_frames - 16 + 1, 4)
+    hours = (n_frames * 0.080) / 3600.0
+    view = np.lib.stride_tricks.sliding_window_view(val_neg_2d, 16, axis=0)[::4]  # (N, 96, 16)
+    blocks = np.ascontiguousarray(np.swapaxes(view, 1, 2), dtype=np.float32)
+    return blocks, hours
+
+
+def eval_validation_fph(
+    model: WakeWordMlp,
+    val_neg: np.ndarray,
+    threshold: float = 0.50,
+    hours_override: float | None = None,
+) -> tuple[int, float, float]:
+    """Run model over 10.7h continuous validation_set_features.npy (or pre-built 3D stride-4 blocks)."""
+    model.eval()
+    if val_neg.ndim == 2:
+        blocks, hours = build_val_blocks(val_neg)
+    else:
+        blocks = val_neg
+        hours = float(hours_override or ((len(blocks) * 4 * 0.080) / 3600.0))
+
     fp_events = 0
     cooldown = 0
     max_score = 0.0
     with torch.no_grad():
-        for i in range(0, len(starts), 2048):
-            idx = starts[i : i + 2048]
-            batch = np.stack([val_neg_2d[s : s + 16] for s in idx], axis=0).astype(np.float32)
+        for i in range(0, len(blocks), 4096):
+            batch = np.asarray(blocks[i : i + 4096], dtype=np.float32)
             probs = model(torch.from_numpy(batch)).squeeze(-1).numpy()
             bmax = float(probs.max())
             if bmax > max_score:
@@ -791,7 +885,6 @@ def eval_validation_fph(model: WakeWordMlp, val_neg_2d: np.ndarray, threshold: f
                 if p >= threshold:
                     fp_events += 1
                     cooldown = 5  # ~1.6s debounce matching live openWakeWord cooldown
-    hours = (n_frames * 0.080) / 3600.0
     return fp_events, fp_events / max(0.1, hours), max_score
 
 
@@ -832,21 +925,47 @@ def mine_hard_negatives(
     return cat
 
 
+def _configure_low_impact_cpu() -> None:
+    """Prevent wake-word training from starving live RTSP capture, FFmpeg clips, and Whisper ASR."""
+    import os
+    threads = max(1, min(3, (os.cpu_count() or 4) // 2))
+    try:
+        torch.set_num_threads(threads)
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+            handle = ctypes.windll.kernel32.GetCurrentProcess()
+            ctypes.windll.kernel32.SetPriorityClass(handle, BELOW_NORMAL_PRIORITY_CLASS)
+        except Exception:
+            pass
+
+
 def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int = 9000) -> dict[str, Any]:
     torch.manual_seed(42)
     np.random.seed(42)
-    torch.set_num_threads(6)
+    _configure_low_impact_cpu()
 
     fe = build_oww_feature_extractor()
     synth_pos = np.load(work_dir / "synth_pos_features.npy").astype(np.float32)
     val_pos = np.load(work_dir / "val_pos_features.npy").astype(np.float32)
     adv_neg = np.load(work_dir / "adv_neg_features.npy").astype(np.float32)
     gym_neg = np.load(work_dir / "gym_neg_features.npy").astype(np.float32)
-    user_pos = load_user_positives(work_dir, fe)
+    user_pos, user_files_count = load_user_positives(work_dir, fe)
 
-    acav_neg = np.load(NEG_DIR / "acav100m_subset.npy", mmap_mode="r")
-    val_neg_2d = np.load(NEG_DIR / "validation_set_features.npy", mmap_mode="r")
+    # Load 1.29 GB float16 ACAV bank directly into RAM to eliminate 9M+ random mmap seeks
+    acav_neg = np.load(NEG_DIR / "acav100m_subset.npy")
+    val_neg_2d = np.load(NEG_DIR / "validation_set_features.npy")
+    val_blocks, val_hours = build_val_blocks(val_neg_2d)
+    del val_neg_2d
 
+    has_user = len(user_pos) > 0
     print(
         f"Training '{phrase}' MLP (2-stage hard-negative mining) | synth_pos={len(synth_pos)} user_pos={len(user_pos)} "
         f"adv_neg={len(adv_neg)} gym_neg={len(gym_neg)} acav_neg={len(acav_neg):,} val_pos={len(val_pos)}"
@@ -858,7 +977,7 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
     rng = np.random.default_rng(42)
 
     hard_bank = np.zeros((0, 16, 96), dtype=np.float32)
-    mine_steps = {int(steps * 0.50)}
+    mine_steps = {int(steps * 0.45), int(steps * 0.72)}
     best_snapshots: list[tuple[float, dict[str, torch.Tensor]]] = []
     t0 = time.perf_counter()
 
@@ -871,10 +990,10 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
         progress = min(1.0, step / float(steps * 0.85))
         neg_weight = 8.0 + 160.0 * (progress ** 1.3)
 
-        if len(user_pos) > 0:
+        if has_user:
             bx_pos = np.concatenate([
-                user_pos[rng.integers(0, len(user_pos), size=48)],
-                synth_pos[rng.integers(0, len(synth_pos), size=80)],
+                user_pos[rng.integers(0, len(user_pos), size=6)],
+                synth_pos[rng.integers(0, len(synth_pos), size=122)],
             ], axis=0)
         else:
             bx_pos = synth_pos[rng.integers(0, len(synth_pos), size=128)]
@@ -882,7 +1001,7 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
         acav_idx = rng.integers(0, len(acav_neg), size=1024)
         bx_acav = np.asarray(acav_neg[acav_idx], dtype=np.float32)
         bx_adv = adv_neg[rng.integers(0, len(adv_neg), size=256)]
-        bx_gym = gym_neg[rng.integers(0, len(gym_neg), size=192)]
+        bx_gym = gym_neg[rng.integers(0, len(gym_neg), size=(256 if has_user else 192))]
 
         # Regularization: mild feature jitter on positives + negatives prevents overfitting to training slices
         bx_pos = bx_pos + rng.normal(0.0, 0.04, size=bx_pos.shape).astype(np.float32)
@@ -891,7 +1010,7 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
         neg_w_blocks = [
             np.ones(len(bx_acav), dtype=np.float32) * (neg_weight * 0.9),
             np.ones(len(bx_adv), dtype=np.float32) * (neg_weight * 1.8),
-            np.ones(len(bx_gym), dtype=np.float32) * (neg_weight * 1.8),
+            np.ones(len(bx_gym), dtype=np.float32) * (neg_weight * (3.0 if has_user else 1.8)),
         ]
         if len(hard_bank) >= 32:
             bx_hard = hard_bank[rng.integers(0, len(hard_bank), size=192)]
@@ -931,8 +1050,8 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
                 rec_38 = float(np.mean(vp >= 0.38))
                 ap = model(torch.from_numpy(adv_neg[:1200])).squeeze(-1).numpy()
                 adv_fp = float(np.mean(ap >= 0.50))
-            fp_cnt, fph, v_max = eval_validation_fph(model, val_neg_2d, threshold=0.50)
-            score = rec_50 - 1.1 * fph - 4.0 * adv_fp
+            fp_cnt, fph, v_max = eval_validation_fph(model, val_blocks, threshold=0.50, hours_override=val_hours)
+            score = rec_50 - 3.5 * fph - 5.0 * adv_fp
             print(
                 f"  step {step:4d}/{steps} ({time.perf_counter()-t0:4.1f}s) | loss={loss.item():.4f} "
                 f"| unseen_recall@0.50={rec_50*100:.1f}% (@0.38={rec_38*100:.1f}%) "
@@ -956,8 +1075,8 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
         vp = model(torch.from_numpy(val_pos)).squeeze(-1).numpy()
         rec_50 = float(np.mean(vp >= 0.50))
         rec_38 = float(np.mean(vp >= 0.38))
-    fp_cnt_50, fph_50, vmax = eval_validation_fph(model, val_neg_2d, threshold=0.50)
-    fp_cnt_38, fph_38, _ = eval_validation_fph(model, val_neg_2d, threshold=0.38)
+    fp_cnt_50, fph_50, vmax = eval_validation_fph(model, val_blocks, threshold=0.50, hours_override=val_hours)
+    fp_cnt_38, fph_38, _ = eval_validation_fph(model, val_blocks, threshold=0.38, hours_override=val_hours)
     print(
         f"\nFINAL AVERAGED MODEL: unseen_recall@0.50={rec_50*100:.1f}% (@0.38={rec_38*100:.1f}%) | "
         f"10.7h_val_FP@0.50={fp_cnt_50} ({fph_50:.2f}/hr) | @0.38={fp_cnt_38} ({fph_38:.2f}/hr, max={vmax:.3f})"
@@ -989,6 +1108,7 @@ def train_and_export(phrase: str, work_dir: Path, out_onnx: Path, *, steps: int 
         "val10hFphAt050": round(fph_50, 3),
         "val10hFpAt038": fp_cnt_38,
         "val10hFphAt038": round(fph_38, 3),
+        "userFilesCount": int(user_files_count),
         "userClipsUsed": int(len(user_pos)),
         "trainedAt": datetime.now().isoformat(timespec="seconds"),
     }
@@ -1066,25 +1186,55 @@ def blind_gym_stress_test(phrase: str, onnx_path: Path) -> None:
                 best = s
         return best
 
+    low_p = phrase.strip().lower()
+    if "atlas" in low_p:
+        adv_tests = (
+            ("ADV: Hey At Last", "Hey At Last", False),
+            ("ADV: Hey Alice", "Hey Alice", False),
+            ("ADV: Hey Alex", "Hey Alex", False),
+            ("ADV: Hey Axis", "Hey Axis", False),
+            ("ADV: Hey Practice", "Hey Practice", False),
+            ("ADV: Hey Status", "Hey Status", False),
+            ("ADV: Bare Atlas", "Atlas", False),
+        )
+    elif "jarvis" in low_p:
+        adv_tests = (
+            ("ADV: Hey Harvest", "Hey Harvest", False),
+            ("ADV: Hey Service", "Hey Service", False),
+            ("ADV: Hey Travis", "Hey Travis", False),
+            ("ADV: Hey Davis", "Hey Davis", False),
+            ("ADV: Hey Nervous", "Hey Nervous", False),
+            ("ADV: Bare Jarvis", "Jarvis", False),
+        )
+    else:
+        adv_tests = (
+            ("ADV: Hey Army", "Hey Army", False),
+            ("ADV: Hey Harmony", "Hey Harmony", False),
+            ("ADV: Hey Memory", "Hey Memory", False),
+            ("ADV: Hey Buddy", "Hey Buddy", False),
+            ("ADV: I'm already done", "I'm already done", False),
+            ("ADV: Primary, record", "Primary, record this", False),
+            ("ADV: Bare Armory", "Armory", False),
+        )
+
     unseen_vs = ("am_onyx", "am_echo", "bm_george", "af_bella")
     for label, txt, mix in (
         ("Unseen clean wake", f"{phrase}", False),
         ("Unseen clean + cmd", f"{phrase}, 225 for 8", False),
         ("Unseen 0dB rock wake", f"{phrase}", True),
         ("Unseen 0dB rock + cmd", f"{phrase}, record this", True),
-        ("ADV: Hey Army", "Hey Army", False),
-        ("ADV: Hey Harmony", "Hey Harmony", False),
-        ("ADV: Hey Memory", "Hey Memory", False),
-        ("ADV: Hey Buddy", "Hey Buddy", False),
-        ("ADV: I'm already done", "I'm already done", False),
-        ("ADV: Primary, record", "Primary, record this", False),
-        ("ADV: Bare Armory", "Armory", False),
+        *adv_tests,
     ):
         scs = [score_phrase(txt, v, mix_0db=mix) for v in unseen_vs]
         print(f"  {label:24s}: " + ", ".join(f"{v}={s:.3f}" for v, s in zip(unseen_vs, scs)))
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+    _configure_low_impact_cpu()
     ap = argparse.ArgumentParser(description="Train custom openWakeWord ONNX wake word for The Armory")
     ap.add_argument("--phrase", default="hey armory", help="Wake phrase (default: 'hey armory')")
     ap.add_argument("--retrain-only", action="store_true", help="Reuse cached synthetic features + add user_positives/")

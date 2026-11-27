@@ -1,6 +1,6 @@
 import {
-  PHASE1_PLAN, dayOfWeek, extraKey, parseYmd, shiftYmd, slotKey,
-  type ExtraWorkout, type PlanSlot, type ProjectedStep, type SlotState,
+  PHASE1_PLAN, dayOfWeek, extraKey, modalityOf, parseYmd, shiftYmd, slotKey,
+  type ExtraWorkout, type PlanSlot, type ProjectedStep, type SlotState, type StripModality,
 } from '../domain/plan';
 import { sessionStats, type ExOf, type PRHit } from '../lifts/calc';
 import { labels } from '../lifts/logic';
@@ -12,8 +12,10 @@ import type { ExRow, ExerciseRx, LiftSession, Routine, SessionEx } from '../lift
 import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../types';
 import { ICON, esc, hms } from './dom';
 
+const modalityLabel = (mod: StripModality): string => (mod === 'ruck' ? 'Ruck' : EQUIPMENT_LABEL[mod]);
+
 export interface TodayCompletedItem {
-  equipment: Equipment;
+  equipment: StripModality;
   name: string;
   sub: string;
 }
@@ -53,13 +55,13 @@ export function localYmdFromMs(ms: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/** Groups finished lift sessions and saved cardio sessions by local YYYY-MM-DD date. */
+/** Groups finished lift sessions and saved cardio/ruck sessions by local YYYY-MM-DD date. */
 export function groupDayLogs(
   liftSessions: LiftSession[],
   metas: WorkoutMeta[],
-): { byDate: Map<string, DayLogs>; summaryByDate: Map<string, { equipment: Equipment; name: string }[]> } {
+): { byDate: Map<string, DayLogs>; summaryByDate: Map<string, { equipment: StripModality; name: string }[]> } {
   const byDate = new Map<string, DayLogs>();
-  const summaryByDate = new Map<string, { equipment: Equipment; name: string }[]>();
+  const summaryByDate = new Map<string, { equipment: StripModality; name: string }[]>();
 
   const ensure = (ymd: string): DayLogs => {
     let entry = byDate.get(ymd);
@@ -69,7 +71,7 @@ export function groupDayLogs(
     }
     return entry;
   };
-  const pushSum = (ymd: string, equipment: Equipment, name: string): void => {
+  const pushSum = (ymd: string, equipment: StripModality, name: string): void => {
     const arr = summaryByDate.get(ymd) ?? [];
     arr.push({ equipment, name });
     summaryByDate.set(ymd, arr);
@@ -80,10 +82,10 @@ export function groupDayLogs(
     ensure(ymd).lifts.push(s);
     pushSum(ymd, 'strength', s.name);
   }
-  for (const m of [...metas].filter((x) => x.status === 'saved' && x.equipment !== 'strength').sort((a, b) => a.startEpochMs - b.startEpochMs)) {
+  for (const m of [...metas].filter((x) => x.status === 'saved' && (x.equipment !== 'strength' || x.programId === 'ruck')).sort((a, b) => a.startEpochMs - b.startEpochMs)) {
     const ymd = localYmdFromMs(m.startEpochMs);
     ensure(ymd).cardio.push(m);
-    pushSum(ymd, m.equipment, m.name);
+    pushSum(ymd, modalityOf(m), m.name);
   }
   return { byDate, summaryByDate };
 }
@@ -112,14 +114,15 @@ export function todayCompletedItems(
     out.push({ equipment: 'strength', name: s.name, sub });
   }
   for (const m of cardioDone) {
-    doneEqs.add(m.equipment);
+    const mod = modalityOf(m);
+    if (mod !== 'ruck') doneEqs.add(m.equipment);
     const sub = [
-      EQUIPMENT_LABEL[m.equipment],
+      modalityLabel(mod),
       `${Math.max(1, Math.round(m.seconds / 60))} min`,
       m.avgW > 0 ? `${m.avgW} W` : '',
       m.avgHr > 0 ? `${m.avgHr} bpm` : '',
     ].filter(Boolean).join(' · ');
-    out.push({ equipment: m.equipment, name: m.name, sub });
+    out.push({ equipment: mod, name: m.name, sub });
   }
   if (opts?.today) {
     for (const p of opts.proj ?? []) {
@@ -189,8 +192,9 @@ export function renderCompletedLiftSlot(
   </div>`;
 }
 
-/** Rich completed cardio slot showing duration, average/max power, HR, energy and RPE. */
+/** Rich completed cardio/ruck slot showing duration, average/max power, HR, energy and RPE. */
 export function renderCompletedCardioSlot(m: WorkoutMeta): string {
+  const mod = modalityOf(m);
   const mins = Math.max(1, Math.round(m.seconds / 60));
   const avgW = Math.round(m.avgW);
   const maxW = Math.round(m.maxW);
@@ -206,8 +210,8 @@ export function renderCompletedCardioSlot(m: WorkoutMeta): string {
   ].filter(Boolean);
   return `<div class="sh-slot done">
     <div class="sh-slot-h">
-      <span class="cal-ico ${m.equipment}">${ICON[m.equipment]}</span>
-      <span><b>${esc(m.name)}</b><small>${EQUIPMENT_LABEL[m.equipment]} · ${mins} min</small></span>
+      <span class="cal-ico ${mod}">${ICON[mod]}</span>
+      <span><b>${esc(m.name)}</b><small>${modalityLabel(mod)} · ${mins} min</small></span>
       <span class="p-badge ok">✓ Done</span>
     </div>
     ${pills.length ? `<div class="dz-stats">${pills.map((x) => `<i>${esc(x)}</i>`).join('')}</div>` : ''}
@@ -311,7 +315,9 @@ export function resolveDayZoom(args: {
   const cardioDone = dayLog?.cardio ?? [];
   const doneEqs = new Set<Equipment>();
   if (liftsDone.length) doneEqs.add('strength');
-  for (const m of cardioDone) doneEqs.add(m.equipment);
+  for (const m of cardioDone) {
+    if (m.programId !== 'ruck') doneEqs.add(m.equipment);
+  }
 
   const externalDoneSlots: ResolvedDayZoom['externalDoneSlots'] = [];
   const skippedSlots: ResolvedDayZoom['skippedSlots'] = [];
@@ -462,6 +468,19 @@ export function renderDayZoomCard(args: {
   }
   const actsHtml = `${topRowActs.length ? `<div class="dz-row">${topRowActs.join('')}</div>` : ''}<a class="btn dz-btn dz-full" href="#/program?w=${res.week}">View Full Program</a>`;
 
+  const overloadBar = pendingList.length >= 3
+    ? (() => {
+        const totMin = pendingList.reduce((acc, item) => {
+          const sec = item.kind === 'extra' ? item.x.seconds : item.slot.seconds;
+          return acc + (sec > 0 ? Math.max(1, Math.round(sec / 60)) : 30);
+        }, 0);
+        const h = Math.floor(totMin / 60);
+        const mRem = totMin % 60;
+        const est = h > 0 ? (mRem > 0 ? `${h}h ${mRem}m` : `${h}h`) : `${mRem}m`;
+        return `<div class="dz-overload">⚡ ${pendingList.length} sessions scheduled · ~${est} total</div>`;
+      })()
+    : '';
+
   return `<section class="card day-zoom${anim ? ` ${anim}` : ''}" id="dayZoom" data-zoom-ymd="${ymd}">
     <div class="dz-top">
       <div class="dz-top-l">
@@ -478,6 +497,7 @@ export function renderDayZoomCard(args: {
       <h3 class="sh-title">${esc(fullDate)}</h3>
       ${res.associatedStep ? `<small class="dz-sub">${esc(res.associatedStep.step.title)}</small>` : ''}
     </div>
+    ${overloadBar}
     ${body}
     <div class="dz-acts">${actsHtml}</div>
   </section>`;

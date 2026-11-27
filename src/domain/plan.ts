@@ -1,6 +1,12 @@
 import type { Equipment } from '../types';
 import type { ExerciseRx } from '../lifts/types';
 
+export type StripModality = Equipment | 'ruck';
+
+export function modalityOf(item: { equipment: Equipment; programId?: string | null }): StripModality {
+  return item.programId === 'ruck' ? 'ruck' : item.equipment;
+}
+
 export interface PlanSlot {
   equipment: Equipment;
   /** Optional AirBike program id when applicable. */
@@ -777,7 +783,7 @@ export interface WeekDayCell {
   isToday: boolean;
   isPast: boolean;
   kind: 'done' | 'today' | 'upcoming' | 'rest';
-  equipments: Equipment[];
+  equipments: StripModality[];
   stepIndices: number[];
 }
 
@@ -786,9 +792,9 @@ export function buildWeekGlimpse(args: {
   today: string;
   anchorYmd?: string;
   proj: ProjectedStep[];
-  todayEquipment?: Equipment[];
+  todayEquipment?: StripModality[];
   extras?: ExtraWorkout[];
-  loggedByDate: Map<string, { equipment: Equipment; name: string }[]>;
+  loggedByDate: Map<string, { equipment: StripModality; name: string }[]>;
 }): WeekDayCell[] {
   const { today, anchorYmd = today, proj, todayEquipment = [], extras = [], loggedByDate } = args;
   const sun = shiftYmd(anchorYmd, -dayOfWeek(anchorYmd));
@@ -798,7 +804,7 @@ export function buildWeekGlimpse(args: {
     const ymd = shiftYmd(sun, d);
     const logged = loggedByDate.get(ymd) ?? [];
     const stepSet = new Set<number>();
-    const eqSet = new Set<Equipment>();
+    const eqSet = new Set<StripModality>();
 
     let doneCount = logged.length;
     if (ymd <= today) {
@@ -807,7 +813,7 @@ export function buildWeekGlimpse(args: {
         p.step.slots.forEach((sl, si) => {
           const onYmd = p.slotDates[si] === ymd || (p.slotDates[si] == null && p.date === ymd);
           if (p.slotStates[si] === 'done' && onYmd) {
-            eqSet.add(sl.equipment);
+            eqSet.add(modalityOf(sl));
             stepSet.add(p.step.index);
             doneCount++;
           }
@@ -815,7 +821,7 @@ export function buildWeekGlimpse(args: {
       }
       for (const x of extras) {
         if (x.doneDate === ymd) {
-          eqSet.add(x.equipment);
+          eqSet.add(modalityOf(x));
           doneCount++;
         }
       }
@@ -839,7 +845,7 @@ export function buildWeekGlimpse(args: {
       for (const p of proj) {
         p.step.slots.forEach((sl, si) => {
           if (p.slotStates[si] === 'pending' && p.slotDates[si] === today) {
-            eqSet.add(sl.equipment);
+            eqSet.add(modalityOf(sl));
             stepSet.add(p.step.index);
             remaining++;
           }
@@ -847,7 +853,7 @@ export function buildWeekGlimpse(args: {
       }
       for (const x of extras) {
         if (!x.doneDate && !x.skippedDate && x.date <= today) {
-          eqSet.add(x.equipment);
+          eqSet.add(modalityOf(x));
           remaining++;
         }
       }
@@ -863,13 +869,13 @@ export function buildWeekGlimpse(args: {
     for (const p of proj) {
       p.step.slots.forEach((sl, si) => {
         if (p.slotStates[si] === 'pending' && p.slotDates[si] === ymd) {
-          eqSet.add(sl.equipment);
+          eqSet.add(modalityOf(sl));
           stepSet.add(p.step.index);
         }
       });
     }
     for (const x of extras) {
-      if (!x.doneDate && !x.skippedDate && x.date === ymd) eqSet.add(x.equipment);
+      if (!x.doneDate && !x.skippedDate && x.date === ymd) eqSet.add(modalityOf(x));
     }
     cells.push({
       ymd,

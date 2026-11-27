@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   PHASE1_PLAN, UPPER1_FINISH_ITEMS, buildWeekGlimpse, defaultQueueState, fmtWeekSpan,
-  projectPlan, reconcileQueue, slotKey, todayItemsFromQueue,
+  modalityOf, projectPlan, reconcileQueue, slotKey, todayItemsFromQueue,
+  type ExtraWorkout, type StripModality, type WeekDayCell,
 } from '../src/domain/plan';
-import type { Equipment } from '../src/types';
+import { EQUIPMENT_LABEL, type Equipment, type WorkoutMeta } from '../src/types';
+import { groupDayLogs, renderCompletedCardioSlot, renderDayZoomCard, resolveDayZoom } from '../src/ui/dayZoom';
+import { weekStripCard } from '../src/ui/chrome';
 
 describe('local rolling schedule & queue reconciliation', () => {
   it('returns today items synchronously for Step 2 (index 1: Upper 1 + Z5 #1) without Intervals events', () => {
@@ -368,5 +371,108 @@ describe('local rolling schedule & queue reconciliation', () => {
     expect(overnight.nextState.stepIndex).toBe(3);
     expect(overnight.nextState.stepDates?.[2]).toBe('2026-11-17');
     expect(overnight.nextState.stagedDate).toBe('2026-11-18');
+  });
+
+  it('renders 3-4+ unique modalities in the week strip grid, surfaces Ruck as its own modality without checking off Strength, and shows Day Zoom overload warning for 3+ pending sessions', () => {
+    const day3: WeekDayCell = {
+      ymd: '2026-11-19',
+      dow: 4,
+      isToday: true,
+      isPast: false,
+      kind: 'today',
+      equipments: ['strength', 'airbike', 'spin'],
+      stepIndices: [1, 2],
+    };
+    const day4: WeekDayCell = {
+      ymd: '2026-11-20',
+      dow: 5,
+      isToday: false,
+      isPast: false,
+      kind: 'upcoming',
+      equipments: ['strength', 'airbike', 'spin', 'ruck'],
+      stepIndices: [3],
+    };
+    const day5: WeekDayCell = {
+      ymd: '2026-11-21',
+      dow: 6,
+      isToday: false,
+      isPast: false,
+      kind: 'upcoming',
+      equipments: ['strength', 'airbike', 'spin', 'treadmill', 'ruck'],
+      stepIndices: [4],
+    };
+    const stripHtml = weekStripCard([day3, day4, day5], '2026-11-19', '2026-11-19');
+    expect(stripHtml).toContain('class="wk-icos grid"');
+    expect(stripHtml).toContain('wk-ico ruck');
+    expect(stripHtml).toContain('>+2</i>');
+
+    // Deduplication in buildWeekGlimpse: 2 strength + airbike + spin = 3 unique icons
+    const today = '2026-11-19';
+    const proj = projectPlan(PHASE1_PLAN, { ...defaultQueueState(), stepIndex: 1, stagedDate: today }, today, 0);
+    const cells = buildWeekGlimpse({
+      today,
+      proj,
+      todayEquipment: ['strength', 'strength', 'airbike', 'spin'],
+      loggedByDate: new Map<string, { equipment: StripModality; name: string }[]>([
+        ['2026-11-18', [{ equipment: 'ruck', name: 'Weighted Ruck' }]],
+      ]),
+    });
+    const wedCell = cells.find((c) => c.ymd === '2026-11-18')!;
+    expect(wedCell.kind).toBe('done');
+    expect(wedCell.equipments).toEqual(['ruck']);
+    const thuCell = cells.find((c) => c.ymd === '2026-11-19')!;
+    expect(thuCell.equipments).toEqual(['strength', 'airbike', 'spin']);
+
+    // Saved Ruck meta (stored under equipment='strength', programId='ruck') appears in groupDayLogs & card,
+    // AND does NOT falsely mark planned Strength as completed in resolveDayZoom.
+    const ruckMeta: WorkoutMeta = {
+      id: 'ruck-1',
+      equipment: 'strength',
+      programId: 'ruck',
+      name: 'Morning Ruck',
+      startEpochMs: new Date(2026, 10, 19, 8, 0, 0).getTime(),
+      status: 'saved',
+      seconds: 2400,
+      kj: 0,
+      avgW: 0,
+      maxW: 0,
+      avgHr: 128,
+      maxHr: 142,
+      rpe: 6,
+      eventId: null,
+      upload: 'done',
+      patched: true,
+      activityId: 'act-r1',
+      lastError: null,
+    };
+    expect(modalityOf(ruckMeta)).toBe('ruck');
+    const grouped = groupDayLogs([], [ruckMeta]);
+    expect(grouped.byDate.get('2026-11-19')?.cardio).toHaveLength(1);
+    expect(grouped.summaryByDate.get('2026-11-19')).toEqual([{ equipment: 'ruck', name: 'Morning Ruck' }]);
+    const cardHtml = renderCompletedCardioSlot(ruckMeta);
+    expect(cardHtml).toContain('cal-ico ruck');
+    expect(cardHtml).toContain('Ruck · 40 min');
+
+    const res = resolveDayZoom({
+      ymd: today,
+      today,
+      proj,
+      dayLog: grouped.byDate.get(today),
+      extras: [],
+      restDay: 0,
+    });
+    expect(res.pendingSlots.some((x) => x.slot.equipment === 'strength')).toBe(true);
+
+    // Day Zoom overload banner for 3+ pending sessions, hidden for <3
+    const extras: ExtraWorkout[] = [
+      { id: 'ex-1', name: 'Extra Bike', date: today, equipment: 'spin', seconds: 1500, description: 'Z2' },
+    ];
+    const lookup = { exOf: () => undefined, rowOf: () => undefined, prevOf: () => null, routines: [], prs: new Map(), unit: 'lb' as const };
+    const zoom3 = renderDayZoomCard({ ymd: today, today, proj, extras, restDay: 0, lookup });
+    expect(zoom3).toContain('dz-overload');
+    expect(zoom3).toContain('3 sessions scheduled');
+    const zoom2 = renderDayZoomCard({ ymd: today, today, proj, extras: [], restDay: 0, lookup });
+    expect(zoom2).not.toContain('dz-overload');
+    expect(EQUIPMENT_LABEL.strength).toBe('Strength');
   });
 });

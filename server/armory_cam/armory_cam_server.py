@@ -49,9 +49,14 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
 try:
-    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word, wake_phrase_slug
+    from .room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, format_wake_display, strip_wake_word, wake_phrase_slug
 except ImportError:
-    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, strip_wake_word, wake_phrase_slug
+    from room_voice import ATLAS_VOICE_CATALOG, RoomVoiceConfig, RoomVoiceService, format_wake_display, strip_wake_word, wake_phrase_slug
+
+try:
+    from .bt_button import BtButtonConfig, BtButtonListener
+except ImportError:
+    from bt_button import BtButtonConfig, BtButtonListener
 
 try:
     from .room_audio import RoomAudioRecorder
@@ -3083,10 +3088,11 @@ _WAKE_CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\.wav$", re.IG
 class WakeWordTrainerManager:
     """Manages Dave's personal S330 wake-word recordings and custom openWakeWord ONNX training."""
 
-    def __init__(self, root_dir: Path) -> None:
+    def __init__(self, root_dir: Path, busy_check_fn: Callable[[], bool] | None = None) -> None:
         self.root = Path(root_dir)
         self.models_dir = self.root / "models" / "openwakeword"
         self.train_root = self.root / "oww_training"
+        self._busy_check_fn = busy_check_fn
         self.lock = threading.Lock()
         self._running = False
         self._phrase = ""
@@ -3245,6 +3251,12 @@ class WakeWordTrainerManager:
         entry = self.resolve_entry(phrase_or_slug)
         if entry is None:
             return False, "Unsupported wake word"
+        if callable(self._busy_check_fn):
+            try:
+                if self._busy_check_fn():
+                    return False, "Finish active workout/recording before training ONNX"
+            except Exception:
+                pass
         if voice_svc is not None:
             voice_svc.stop_wake_enrollment()
         phrase = entry["phrase"]
@@ -3299,6 +3311,9 @@ class WakeWordTrainerManager:
         rc = 1
         err_msg: str | None = None
         try:
+            popen_kwargs: dict[str, Any] = {}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -3307,6 +3322,7 @@ class WakeWordTrainerManager:
                 encoding="utf-8",
                 errors="replace",
                 env=env,
+                **popen_kwargs,
             )
             assert proc.stdout is not None
             for raw_line in proc.stdout:
@@ -3455,7 +3471,16 @@ class ArmoryCamService:
             wake_duck_callbacks=self.house_audio.wake_duck_callbacks(),
             show_active_fn=self.shows.is_active,
         )
-        self.wake_trainer = WakeWordTrainerManager(self.root)
+        self.wake_trainer = WakeWordTrainerManager(
+            self.root,
+            busy_check_fn=lambda: bool(self.recording or self.wallboard.workout_active),
+        )
+        self.bt_button_cfg = BtButtonConfig()
+        self.bt_button = BtButtonListener(
+            config=self.bt_button_cfg,
+            on_action=self.execute_bt_button_action,
+            allow_hardware=self._voice_autostart,
+        )
         self.pre_roll_sec = DEFAULT_PRE_ROLL_SEC
         if drive_backup_dir is not None:
             self.drive_backup_dir = str(drive_backup_dir).strip()
@@ -3659,6 +3684,7 @@ class ArmoryCamService:
             self.wallboard_cfg = WallboardConfig()
             self.voice_cfg = RoomVoiceConfig()
             self.voice.update_config(self.voice_cfg.to_dict())
+            self.bt_button_cfg = self.bt_button.update_config(BtButtonConfig().to_dict())
             self.house_audio_cfg = self.house_audio.update_config({})
             self.displays_cfg = self.displays.update_config({})
             self.save_config()
@@ -3679,6 +3705,8 @@ class ArmoryCamService:
             self.wallboard_cfg = WallboardConfig.from_dict(raw.get("wallboard"))
             self.voice_cfg = RoomVoiceConfig.from_dict(raw.get("voice"))
             self.voice.update_config(self.voice_cfg.to_dict())
+            bt_raw = raw.get("btButton") if isinstance(raw.get("btButton"), dict) else {}
+            self.bt_button_cfg = self.bt_button.update_config(bt_raw)
             ha_raw = raw.get("houseAudio") if isinstance(raw.get("houseAudio"), dict) else {}
             self.house_audio_cfg = self.house_audio.update_config(ha_raw)
             disp_raw = raw.get("displays") if isinstance(raw.get("displays"), dict) else {}
@@ -3702,6 +3730,7 @@ class ArmoryCamService:
             "cameras": [c.to_dict() for c in self.cameras],
             "wallboard": self.wallboard_cfg.to_dict(),
             "voice": self.voice_cfg.to_dict(),
+            "btButton": self.bt_button_cfg.to_dict(),
             "houseAudio": self.house_audio_cfg.to_dict(),
             "displays": self.displays_cfg.to_dict(),
         }
@@ -3905,6 +3934,8 @@ class ArmoryCamService:
                 self.wallboard_cfg = WallboardConfig.from_dict(merged)
             if isinstance(raw.get("voice"), dict):
                 self.voice_cfg = self.voice.update_config(raw["voice"])
+            if isinstance(raw.get("btButton"), dict):
+                self.bt_button_cfg = self.bt_button.update_config(raw["btButton"])
             if isinstance(raw.get("houseAudio"), dict):
                 self.house_audio_cfg = self.house_audio.update_config(raw["houseAudio"])
             if isinstance(raw.get("displays"), dict):
@@ -4001,6 +4032,7 @@ class ArmoryCamService:
             self.room_audio.start()
             if self._voice_autostart:
                 self.voice.start()
+                self.bt_button.start()
                 denon_t = threading.Thread(
                     target=self._denon_ip_control_watch_loop,
                     name="denon-ip-control-watch",
@@ -4067,6 +4099,7 @@ class ArmoryCamService:
         self.log.info("Shutting down ArmoryCamService background workers...")
         self._stop_event.set()
         self.shows.stop_active_show()
+        self.bt_button.stop()
         self.voice.stop()
         self.room_audio.stop()
         self.live_hub.stop_all()
@@ -8532,6 +8565,7 @@ class ArmoryCamService:
             "cameras": cams,
             "wallboard": wb_status,
             "voice": self.voice.status_dict(),
+            "btButton": self.bt_button.status_dict(),
             "houseAudio": self.house_audio.status_dict(live_probe=False),
             "displays": self.displays.status_dict(live_probe=False),
             "shows": self.shows.status_dict(),
@@ -8577,6 +8611,28 @@ class ArmoryCamService:
             cur = self.server_armed_clip
             self.server_armed_clip = None
             return dict(cur) if isinstance(cur, dict) else None
+
+    def _schedule_armed_clip_fallback(
+        self,
+        *,
+        armed_at_ms: int,
+        camera: str | None = None,
+        delay_sec: float = 4.0,
+    ) -> None:
+        """If phone misses 'done', auto-cut the armed clip on OptiPlex so footage is never lost."""
+        def _fallback() -> None:
+            if self._stop_event.is_set():
+                return
+            cur = self.active_server_armed_clip()
+            if not cur or int(cur.get("armedAtMs") or 0) != int(armed_at_ms):
+                return
+            clips = self.cut_server_armed_or_recent_clip(mode="armed", camera=camera)
+            if clips and self.voice.cfg.speaker_readback:
+                self.voice.speak_confirmation("Clip saved")
+
+        t = threading.Timer(max(0.5, float(delay_sec)), _fallback)
+        t.daemon = True
+        t.start()
 
     def active_server_armed_clip(self, max_age_ms: int = 300_000) -> dict[str, Any] | None:
         now_ms = int(time.time() * 1000)
@@ -8737,35 +8793,49 @@ class ArmoryCamService:
             if act == "arm":
                 is_guest = bool(cam_cmd.get("guest"))
                 armed_info = self.arm_server_clip(camera=cam, guest=is_guest)
+                speech = (
+                    f"Guest recording {short_cam}".strip()
+                    if is_guest
+                    else (f"Recording {short_cam}" if short_cam else "Recording")
+                )
+                return {
+                    "handled": True,
+                    "alsoEmitSse": True,
+                    "alwaysReadback": True,
+                    "ok": True,
+                    "target": "camera",
+                    "action": "arm",
+                    "speech": speech,
+                    "ackText": f"🎥 {speech}…",
+                    "armedClip": armed_info,
+                }
+            if act in ("stop", "clip_last"):
+                clips = self.cut_server_armed_or_recent_clip(
+                    mode="clip_last" if act == "clip_last" else "armed",
+                    camera=cam,
+                )
+                ok = bool(clips)
+                speech = "Clip saved" if ok else "Could not save clip"
+                return {
+                    "handled": True,
+                    "alsoEmitSse": True,
+                    "alwaysReadback": True,
+                    "ok": ok,
+                    "target": "camera",
+                    "action": act,
+                    "speech": speech,
+                    "ackText": "✓ Clip saved on OptiPlex" if ok else "✗ No matching video segments",
+                    "clips": clips,
+                }
+            armed_cur = self.active_server_armed_clip()
+            if act == "commit_done" and armed_cur is not None:
                 if not phone_session_live:
-                    speech = (
-                        f"Guest recording {short_cam}".strip()
-                        if is_guest
-                        else (f"Recording {short_cam}" if short_cam else "Recording")
-                    )
-                    return {
-                        "handled": True,
-                        "ok": True,
-                        "target": "camera",
-                        "action": "arm",
-                        "speech": speech,
-                        "ackText": f"🎥 {speech}…",
-                        "armedClip": armed_info,
-                    }
-                # Active phone workout session connected: let SSE deliver to session.ts while keeping server_armed_clip latched
-                return None
-            if act in ("stop", "clip_last") or (
-                act == "commit_done" and self.active_server_armed_clip() is not None
-            ):
-                if not phone_session_live:
-                    clips = self.cut_server_armed_or_recent_clip(
-                        mode="clip_last" if act == "clip_last" else "armed",
-                        camera=cam,
-                    )
+                    clips = self.cut_server_armed_or_recent_clip(mode="armed", camera=cam)
                     ok = bool(clips)
                     speech = "Clip saved" if ok else "Could not save clip"
                     return {
                         "handled": True,
+                        "alwaysReadback": True,
                         "ok": ok,
                         "target": "camera",
                         "action": act,
@@ -8773,7 +8843,31 @@ class ArmoryCamService:
                         "ackText": "✓ Clip saved on OptiPlex" if ok else "✗ No matching video segments",
                         "clips": clips,
                     }
+                self._schedule_armed_clip_fallback(
+                    armed_at_ms=int(armed_cur.get("armedAtMs") or 0),
+                    camera=cam,
+                    delay_sec=4.0,
+                )
         return None
+
+    def execute_bt_button_action(self, action: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute a PICO V0.1 Bluetooth chest-strap button action directly on OptiPlex."""
+        clean = str(action or "").strip().lower()
+        wake_disp = format_wake_display(str(self.voice.cfg.wake_word or "hey armory"))
+        if clean == "voice":
+            return self.voice.trigger_manual_wake(source="bt_button")
+        if clean == "check":
+            entry = self.voice._emit_transcript(f"{wake_disp}, done", latency_ms=0, from_oww=True)
+            return {"ok": True, "action": "check", "entry": entry}
+        if clean == "record":
+            armed = self.active_server_armed_clip()
+            phrase = f"{wake_disp}, stop recording" if armed is not None else f"{wake_disp}, record this"
+            entry = self.voice._emit_transcript(phrase, latency_ms=0, from_oww=True)
+            return {"ok": True, "action": "record", "wasArmed": armed is not None, "entry": entry}
+        if clean == "undo":
+            entry = self.voice._emit_transcript(f"{wake_disp}, undo", latency_ms=0, from_oww=True)
+            return {"ok": True, "action": "undo", "entry": entry}
+        return {"ok": False, "error": f"Unknown button action: {action}"}
 
     def play_house_audio_test(self, params: dict[str, Any]) -> dict[str, Any]:
         """Execute an explicit House Audio / Mode Test Bench cue with direct S330 fallback support."""
@@ -9133,6 +9227,7 @@ DASHBOARD_HTML = """<!doctype html>
   .ws-clips{max-height:200px;overflow-y:auto;border:1px solid var(--line);border-radius:9px;background:#0b1017;margin-top:8px}
   .ws-clip-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;border-top:1px solid rgba(255,255,255,.05);font-size:12px}
   .ws-clip-row:first-child{border-top:0}
+  .spec-canvas{width:100%;height:78px;display:block;border-radius:9px;background:#070b11;border:1px solid #1e2c3d;margin:6px 0 8px}
   @media (max-width:640px){
     .realign-modal{padding:8px;gap:8px;justify-content:flex-start}
     .ra-top{gap:6px}
@@ -10191,7 +10286,7 @@ DASHBOARD_HTML = """<!doctype html>
             <span id="vxBadge" class="pill">CHECKING</span>
           </h2>
           <div id="vxMsg" style="color:var(--mut);font-size:12px;margin-bottom:8px">WASAPI Shared Mode opens automatically only during active Strength workouts so Windows Voice Typing (<code>Win + H</code>) works anytime.</div>
-          <div class="mbar-wrap" style="margin-bottom:8px"><div id="vxMeter" class="mbar-fill"></div></div>
+          <canvas id="vxSpecCanvas" class="spec-canvas"></canvas>
           <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
             <div>
               <label>Room Mic Relay</label>
@@ -10288,12 +10383,142 @@ DASHBOARD_HTML = """<!doctype html>
           </details>
         </div>
 
+        <div class="card" id="btButtonCard">
+          <h2>
+            <span>Bluetooth Chest-Strap Button (PICO V0.1 · Vol+ / Vol−)</span>
+            <span id="btBtnBadge" class="pill">CHECKING</span>
+          </h2>
+          <div style="color:var(--mut);font-size:12px;margin-bottom:8px">Captures Raw BLE HID reports &amp; Windows media events globally on OptiPlex (swallowing Windows volume changes) so Check / Record / Instant Voice work reliably with 0.0/hr false triggers.</div>
+          <div class="row">
+            <div>
+              <label>Button Layout</label>
+              <select id="btBtnMode">
+                <option value="one_button">One-Button (Either Button Does Same — Foolproof Under Shirt)</option>
+                <option value="two_button">Two-Button (Vol+ Top / Vol− Bottom Independent)</option>
+              </select>
+            </div>
+            <div>
+              <label>Hold / Double-Tap Timing (ms)</label>
+              <div style="display:flex;gap:8px">
+                <input id="btBtnHoldMs" type="number" min="200" max="1500" step="25" value="450" title="Hold threshold (ms)">
+                <input id="btBtnDblMs" type="number" min="180" max="700" step="20" value="380" title="Double-tap window (ms)">
+              </div>
+            </div>
+          </div>
+          <div id="btOneBtnRow" class="row" style="margin-top:8px">
+            <div>
+              <label>Single Click</label>
+              <select id="btSingleAct">
+                <option value="check">Check / Done (stops rec)</option>
+                <option value="record">Start / Stop Recording</option>
+                <option value="voice">Instant Voice Duck</option>
+                <option value="undo">Undo Last Set</option>
+                <option value="none">Disabled</option>
+              </select>
+            </div>
+            <div>
+              <label>Double Click</label>
+              <select id="btDoubleAct">
+                <option value="check">Check / Done (stops rec)</option>
+                <option value="record">Start / Stop Recording</option>
+                <option value="voice">Instant Voice Duck</option>
+                <option value="undo">Undo Last Set</option>
+                <option value="none">Disabled (0ms single click)</option>
+              </select>
+            </div>
+            <div>
+              <label>Long Press (Hold)</label>
+              <select id="btLongAct">
+                <option value="check">Check / Done (stops rec)</option>
+                <option value="record">Start / Stop Recording</option>
+                <option value="voice">Instant Voice Duck</option>
+                <option value="undo">Undo Last Set</option>
+                <option value="none">Disabled</option>
+              </select>
+            </div>
+          </div>
+          <div id="btTwoBtnRow" hidden style="margin-top:8px">
+            <div class="row">
+              <div>
+                <label>Vol+ Single Click</label>
+                <select id="btUpSingle">
+                  <option value="check">Check / Done (stops rec)</option>
+                  <option value="record">Start / Stop Recording</option>
+                  <option value="voice">Instant Voice Duck</option>
+                  <option value="undo">Undo Last Set</option>
+                  <option value="none">Disabled</option>
+                </select>
+              </div>
+              <div>
+                <label>Vol+ Double Click</label>
+                <select id="btUpDouble">
+                  <option value="none">Disabled (0ms single click)</option>
+                  <option value="check">Check / Done (stops rec)</option>
+                  <option value="record">Start / Stop Recording</option>
+                  <option value="voice">Instant Voice Duck</option>
+                  <option value="undo">Undo Last Set</option>
+                </select>
+              </div>
+              <div>
+                <label>Long Press Either</label>
+                <select id="btTwoLong">
+                  <option value="voice">Instant Voice Duck</option>
+                  <option value="record">Start / Stop Recording</option>
+                  <option value="check">Check / Done (stops rec)</option>
+                  <option value="undo">Undo Last Set</option>
+                  <option value="none">Disabled</option>
+                </select>
+              </div>
+            </div>
+            <div class="row" style="margin-top:8px">
+              <div>
+                <label>Vol− Single Click</label>
+                <select id="btDnSingle">
+                  <option value="record">Start / Stop Recording</option>
+                  <option value="check">Check / Done (stops rec)</option>
+                  <option value="voice">Instant Voice Duck</option>
+                  <option value="undo">Undo Last Set</option>
+                  <option value="none">Disabled</option>
+                </select>
+              </div>
+              <div>
+                <label>Vol− Double Click</label>
+                <select id="btDnDouble">
+                  <option value="none">Disabled (0ms single click)</option>
+                  <option value="check">Check / Done (stops rec)</option>
+                  <option value="record">Start / Stop Recording</option>
+                  <option value="voice">Instant Voice Duck</option>
+                  <option value="undo">Undo Last Set</option>
+                </select>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-top:8px;font-size:12px">
+            <label style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+              <input id="btBtnEnabled" type="checkbox" checked style="width:auto"> Enabled
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer">
+              <input id="btBtnSwallow" type="checkbox" checked style="width:auto"> Swallow Windows Vol+ / Vol−
+            </label>
+            <label style="display:inline-flex;align-items:center;gap:6px;margin:0;cursor:pointer" title="Optional GATT read ping while awake (coin-cell firmware may still auto-sleep on hardware timer)">
+              <input id="btBtnKeepalive" type="checkbox" style="width:auto"> Gentle BLE Keepalive Ping
+            </label>
+          </div>
+          <div id="btBtnInfo" style="margin-top:8px;font-size:12px;color:var(--mut)">Waiting for hook status…</div>
+          <div class="ctrl-row" style="margin-top:8px">
+            <button class="btn ok sm" id="btBtnSaveBtn" type="button">Save Button</button>
+            <button class="btn sec sm" id="btBtnTestCheck" type="button">Test Check</button>
+            <button class="btn sec sm" id="btBtnTestRec" type="button">Test Record/Stop</button>
+            <button class="btn sec sm" id="btBtnTestVoice" type="button">Test Voice Duck</button>
+          </div>
+        </div>
+
         <div class="card" id="wakeStudioCard">
           <h2>
             <span>Custom Wake Word Studio (S330 Voice Enrollment &amp; ONNX Trainer)</span>
             <span id="wsStatusPill" class="pill">READY</span>
           </h2>
-          <div style="color:var(--mut);font-size:12px;margin-bottom:10px">Record ~20 natural reps of your voice through the PowerConf S330 across gym positions, then train &amp; hot-deploy your personalized ONNX wake model in ~45s.</div>
+          <div style="color:var(--mut);font-size:12px;margin-bottom:10px">Record ~20 natural reps of your voice through the PowerConf S330 across gym positions, then train &amp; hot-deploy your personalized ONNX wake model (~10 min CPU retrain).</div>
           <div id="wsWordPills" class="ws-pills"></div>
           <div id="wsWordMeta" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--mut);padding:8px 10px;background:#0e151f;border:1px solid var(--line);border-radius:9px">
             <span id="wsMetricsTxt">Loading wake model telemetry…</span>
@@ -10308,7 +10533,7 @@ DASHBOARD_HTML = """<!doctype html>
               <span id="wsRepCounter" class="pill">0 / 20 reps</span>
             </div>
             <div id="wsPromptCue" style="font-size:13px;color:#e2e8f0;margin-top:4px">Pick a wake word above and click Start Guided Capture.</div>
-            <div class="mbar-wrap" style="margin:8px 0 4px"><div id="wsMeter" class="mbar-fill"></div></div>
+            <canvas id="wsSpecCanvas" class="spec-canvas"></canvas>
             <div id="wsLastEvent" style="font-size:11.5px;color:var(--mut)">Say only the wake phrase after each chime — training mixes in gym rock &amp; command tails automatically.</div>
           </div>
           <div class="ctrl-row" style="margin-top:8px">
@@ -11467,6 +11692,7 @@ function openMaskModal(idx, opts = {}) {
   $('maskModal').hidden = false;
   document.body.style.overflow = 'hidden';
   syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
   updateModalMediaSrc();
   fitInitialModalView();
   drawAllCanvases();
@@ -11501,6 +11727,7 @@ function closeMaskModal() {
   const img = $('mmStream');
   if (img) img.removeAttribute('src');
   syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
   syncCropOverlay(mmState.camIdx);
 }
 
@@ -12058,6 +12285,7 @@ function renderCameras() {
     $(`en-${idx}`).onchange = () => markDirty();
   });
   syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
   drawAllCanvases();
 }
 
@@ -12309,6 +12537,7 @@ async function saveConfig(triggerBtn = null) {
     cfg.bumpAlertNtfy = body.bumpAlertNtfy;
     cfg.motionRecord247 = body.motionRecord247;
     syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
     markDirty(false);
     pollStatus();
     if (triggerBtn) {
@@ -12572,6 +12801,9 @@ async function pollStatus() {
     }
     if (st.voice) {
       syncVoiceUI(st.voice);
+    }
+    if (st.btButton) {
+      syncBtButtonUI(st.btButton);
     }
     if (st.houseAudio) {
       syncHouseAudioUI(st.houseAudio);
@@ -13311,6 +13543,7 @@ function openRealignModal(camSlugOrName) {
   if ($('raCropsBtn')) $('raCropsBtn').classList.toggle('on', raState.showCrops);
   if ($('raChimeBtn')) $('raChimeBtn').classList.toggle('on', raState.chimeOn);
   syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
   renderRealignCrops();
   refreshRealignOverlay(true);
   syncRealignBlink();
@@ -13332,6 +13565,7 @@ function closeRealignModal() {
     try { window.history.replaceState(null, '', '#cameras'); } catch {}
   }
   syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
 }
 
 function wireRealignModal() {
@@ -13521,6 +13755,8 @@ async function init() {
   pollLoop(pollClips, 8000, () => activePage === 'overview' || activePage === 'footage');
   document.addEventListener('visibilitychange', () => {
     syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
+    if (typeof syncMeterStream === 'function') syncMeterStream();
     if (!document.hidden) {
       pollStatus();
       if (raState.open) pollRealignLive();
@@ -13606,6 +13842,188 @@ $('vxAbResetBtn').onclick = async () => {
   $('vxOut').textContent = 'Cleared passive workout A/B trials';
   await pollVoiceAb();
 };
+
+const meterState = {
+  es: null,
+  raf: 0,
+  target: new Float32Array(24),
+  bars: new Float32Array(24),
+  peaks: new Float32Array(24),
+  peakHold: new Float32Array(24),
+  db: -72.0,
+  pk: -72.0,
+  vad: 0.0,
+  ws: 0.0,
+  aec: false,
+  erle: 0.0,
+  listening: false,
+  enrolling: false,
+  lastRxMs: 0,
+};
+
+function _drawSpecCanvas(canvas) {
+  if (!canvas || !canvas.isConnected) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 40 || rect.height < 24) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const wPx = Math.round(rect.width * dpr);
+  const hPx = Math.round(rect.height * dpr);
+  if (canvas.width !== wPx || canvas.height !== hPx) {
+    canvas.width = wPx;
+    canvas.height = hPx;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.save();
+  ctx.scale(dpr, dpr);
+  const W = rect.width;
+  const H = rect.height;
+
+  ctx.fillStyle = '#070b11';
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle horizontal dB grid lines
+  ctx.strokeStyle = 'rgba(148,163,184,0.09)';
+  ctx.lineWidth = 1;
+  [24, 42, 60].forEach(y => {
+    if (y < H - 4) {
+      ctx.beginPath();
+      ctx.moveTo(0, y + 0.5);
+      ctx.lineTo(W, y + 0.5);
+      ctx.stroke();
+    }
+  });
+
+  // Top HUD row
+  const live = meterState.listening && (Date.now() - meterState.lastRxMs < 1500);
+  const speechHot = meterState.vad >= 0.38;
+  ctx.font = '700 10.5px ui-monospace, Consolas, monospace';
+  ctx.textBaseline = 'middle';
+
+  // Status dot + label
+  ctx.fillStyle = !live ? '#64748b' : (meterState.enrolling ? '#4ade80' : '#38bdf8');
+  ctx.beginPath();
+  ctx.arc(10, 11, 3.2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = !live ? '#64748b' : '#cbd5e1';
+  ctx.fillText(!live ? 'STANDBY' : (meterState.enrolling ? 'REC 30Hz' : 'LIVE 30Hz'), 18, 11.5);
+
+  // dBFS readout
+  ctx.fillStyle = meterState.pk > -3 ? '#f87171' : (speechHot ? '#86efac' : '#94a3b8');
+  const dbTxt = `${meterState.db > -71.5 ? meterState.db.toFixed(1) : '-∞'} dBFS`;
+  ctx.fillText(dbTxt, 92, 11.5);
+
+  // SPEECH / VAD badge
+  if (speechHot) {
+    ctx.fillStyle = 'rgba(34,197,94,0.22)';
+    ctx.fillRect(162, 4, 54, 15);
+    ctx.fillStyle = '#4ade80';
+    ctx.fillText('SPEECH', 169, 11.5);
+  } else {
+    ctx.fillStyle = '#475569';
+    ctx.fillText(`VAD ${meterState.vad.toFixed(2)}`, 162, 11.5);
+  }
+
+  // AEC ERLE badge
+  if (meterState.aec) {
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillText(`AEC -${meterState.erle.toFixed(1)}dB`, 224, 11.5);
+  }
+
+  // Right-aligned live Wake Score bar + value
+  const wakeW = Math.min(92, Math.max(52, W * 0.14));
+  const wakeX = W - wakeW - 56;
+  ctx.fillStyle = '#64748b';
+  ctx.fillText(`WAKE ${meterState.ws.toFixed(2)}`, wakeX - 66, 11.5);
+  ctx.fillStyle = '#0f172a';
+  ctx.fillRect(wakeX, 7, wakeW, 8);
+  const thrX = wakeX + wakeW * 0.38;
+  ctx.fillStyle = meterState.ws >= 0.38 ? '#4ade80' : '#38bdf8';
+  ctx.fillRect(wakeX, 7, wakeW * clamp(meterState.ws, 0, 1), 8);
+  ctx.fillStyle = 'rgba(248,250,252,0.55)';
+  ctx.fillRect(thrX, 5, 1.5, 12);
+
+  // 24-band FFT spectrum bars
+  const padX = 8;
+  const topY = 22;
+  const botY = H - 5;
+  const plotH = Math.max(12, botY - topY);
+  const n = 24;
+  const slotW = (W - padX * 2) / n;
+  const barW = Math.max(3, slotW - 3);
+  const grad = ctx.createLinearGradient(0, botY, 0, topY);
+  grad.addColorStop(0.0, speechHot ? '#22c55e' : '#0ea5e9');
+  grad.addColorStop(0.6, speechHot ? '#4ade80' : '#38bdf8');
+  grad.addColorStop(0.85, '#f59e0b');
+  grad.addColorStop(1.0, '#ef4444');
+
+  for (let i = 0; i < n; i++) {
+    const x = padX + i * slotW + 1.5;
+    const v = clamp(meterState.bars[i] / 100.0, 0, 1);
+    const bh = Math.max(2, v * plotH);
+    ctx.fillStyle = live ? grad : 'rgba(100,116,139,0.35)';
+    ctx.fillRect(x, botY - bh, barW, bh);
+
+    // Floating peak cap
+    const pv = clamp(meterState.peaks[i] / 100.0, 0, 1);
+    if (pv > 0.03 && live) {
+      const py = botY - pv * plotH;
+      ctx.fillStyle = pv > 0.85 ? '#fca5a5' : '#e2e8f0';
+      ctx.fillRect(x, Math.max(topY, py - 1.5), barW, 2);
+    }
+  }
+  ctx.restore();
+}
+
+function _meterTick() {
+  if (!meterState.es) { meterState.raf = 0; return; }
+  const stale = !meterState.listening || (Date.now() - meterState.lastRxMs > 750);
+  for (let i = 0; i < 24; i++) {
+    const tgt = stale ? 0 : meterState.target[i];
+    const cur = meterState.bars[i];
+    meterState.bars[i] = tgt > cur ? cur + (tgt - cur) * 0.58 : cur + (tgt - cur) * 0.16;
+    if (meterState.bars[i] >= meterState.peaks[i]) {
+      meterState.peaks[i] = meterState.bars[i];
+      meterState.peakHold[i] = 14;
+    } else if (meterState.peakHold[i] > 0) {
+      meterState.peakHold[i] -= 1;
+    } else {
+      meterState.peaks[i] = Math.max(0, meterState.peaks[i] - 0.9);
+    }
+  }
+  _drawSpecCanvas($('vxSpecCanvas'));
+  _drawSpecCanvas($('wsSpecCanvas'));
+  meterState.raf = requestAnimationFrame(_meterTick);
+}
+
+function syncMeterStream() {
+  const want = activePage === 'audio' && !document.hidden;
+  if (want && !meterState.es) {
+    const es = new EventSource('/api/voice/meter/stream');
+    es.onmessage = (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        meterState.lastRxMs = Date.now();
+        meterState.db = Number(d.db ?? -72);
+        meterState.pk = Number(d.pk ?? -72);
+        meterState.vad = Number(d.vad ?? 0);
+        meterState.ws = Number(d.ws ?? 0);
+        meterState.aec = !!d.aec;
+        meterState.erle = Number(d.erle ?? 0);
+        meterState.listening = !!d.listening;
+        meterState.enrolling = !!d.enrolling;
+        const arr = Array.isArray(d.b) ? d.b : [];
+        for (let i = 0; i < 24; i++) meterState.target[i] = Number(arr[i] || 0);
+      } catch {}
+    };
+    meterState.es = es;
+    if (!meterState.raf) meterState.raf = requestAnimationFrame(_meterTick);
+  } else if (!want && meterState.es) {
+    try { meterState.es.close(); } catch {}
+    meterState.es = null;
+    if (meterState.raf) { cancelAnimationFrame(meterState.raf); meterState.raf = 0; }
+  }
+}
 
 const wsState = { data: null, selectedPhrase: 'hey atlas', timer: null };
 
@@ -13711,7 +14129,7 @@ function renderWakeStudio(st) {
   const trainBtn = $('wsTrainBtn');
   if (trainBtn && word) {
     trainBtn.disabled = !!trn.running;
-    trainBtn.textContent = trn.running ? `Training (${Number(trn.progressPct || 0)}%)…` : (word.synthCached ? '⚡ Train & Deploy (~45s)' : '⚡ Full Synth & Train (~3m)');
+    trainBtn.textContent = trn.running ? `Training (${Number(trn.progressPct || 0)}%)…` : (word.synthCached ? '⚡ Train & Deploy (~10 min)' : '⚡ Full Synth & Train (~15 min)');
   }
   if ($('wsDelLastBtn')) $('wsDelLastBtn').disabled = !word || !word.clips || !word.clips.length || !!trn.running;
   if ($('wsClearBtn')) $('wsClearBtn').disabled = !word || !word.clips || !word.clips.length || !!trn.running;
@@ -13828,6 +14246,99 @@ if ($('wsRestoreStockBtn')) {
   };
 }
 $('haSaveBtn').onclick = () => saveHouseAudioConfig($('haSaveBtn'));
+
+function _toggleBtLayoutRows() {
+  const mode = ($('btBtnMode') && $('btBtnMode').value) || 'one_button';
+  if ($('btOneBtnRow')) $('btOneBtnRow').hidden = (mode !== 'one_button');
+  if ($('btTwoBtnRow')) $('btTwoBtnRow').hidden = (mode !== 'two_button');
+}
+if ($('btBtnMode')) $('btBtnMode').onchange = _toggleBtLayoutRows;
+
+function syncBtButtonUI(bt) {
+  if (!bt) return;
+  const badge = $('btBtnBadge');
+  if (badge) {
+    if (!bt.enabled) { badge.textContent = 'OFF'; badge.className = 'pill'; }
+    else if (bt.hookActive || bt.rawInputActive) { badge.textContent = bt.rawInputActive ? 'RAW HID + HOOK' : 'HOOK ACTIVE'; badge.className = 'pill ok'; }
+    else { badge.textContent = bt.hookError ? 'HOOK ERR' : 'STANDBY'; badge.className = 'pill live'; }
+  }
+  const setSel = (id, val) => {
+    const el = $(id);
+    if (el && document.activeElement !== el && val != null) el.value = String(val);
+  };
+  setSel('btBtnMode', bt.mode || 'one_button');
+  setSel('btBtnHoldMs', bt.holdMs);
+  setSel('btBtnDblMs', bt.doubleTapMs);
+  setSel('btSingleAct', bt.singleAction);
+  setSel('btDoubleAct', bt.doubleAction);
+  setSel('btLongAct', bt.longAction);
+  setSel('btUpSingle', bt.volUpSingle);
+  setSel('btUpDouble', bt.volUpDouble);
+  setSel('btDnSingle', bt.volDownSingle);
+  setSel('btDnDouble', bt.volDownDouble);
+  setSel('btTwoLong', bt.twoLongAction);
+  if ($('btBtnEnabled')) $('btBtnEnabled').checked = bt.enabled !== false;
+  if ($('btBtnSwallow')) $('btBtnSwallow').checked = bt.swallowVolumeKeys !== false;
+  if ($('btBtnKeepalive')) $('btBtnKeepalive').checked = !!bt.bleKeepalive;
+  _toggleBtLayoutRows();
+  const info = $('btBtnInfo');
+  if (info) {
+    const ev = bt.lastEvent;
+    const evTxt = ev
+      ? `Last: <b>${escHtml(ev.action)}</b> (${escHtml(ev.key)} ${escHtml(ev.gesture)}${ev.heldMs ? ` ${ev.heldMs}ms` : ''}${bt.lastSource ? ` · ${escHtml(bt.lastSource)}` : ''})`
+      : 'No button presses recorded yet this session';
+    const rawTxt = bt.rawInputActive ? 'Raw HID: ON' : `Raw HID: ${escHtml(bt.rawInputError || 'OFF')}`;
+    const kaTxt = bt.bleKeepalive ? ` · BLE KA: ${escHtml(bt.bleKeepaliveStatus || 'idle')}` : '';
+    const errTxt = bt.hookError ? ` · <span style="color:var(--amber)">${escHtml(bt.hookError)}</span>` : '';
+    info.innerHTML = `Presses: <b>${Number(bt.pressCount || 0)}</b> · ${rawTxt} · ${evTxt}${kaTxt}${errTxt}`;
+  }
+}
+
+async function pollBtButtonStatus() {
+  try {
+    const r = await fetch('/api/bt-button/status', { cache: 'no-store' }).then(x => x.json());
+    syncBtButtonUI(r);
+  } catch {}
+}
+
+if ($('btBtnSaveBtn')) {
+  $('btBtnSaveBtn').onclick = async () => {
+    const val = (id, def) => ($(id) ? $(id).value : def);
+    const body = {
+      enabled: $('btBtnEnabled') ? $('btBtnEnabled').checked : true,
+      swallowVolumeKeys: $('btBtnSwallow') ? $('btBtnSwallow').checked : true,
+      bleKeepalive: $('btBtnKeepalive') ? $('btBtnKeepalive').checked : false,
+      mode: val('btBtnMode', 'one_button'),
+      singleAction: val('btSingleAct', 'check'),
+      doubleAction: val('btDoubleAct', 'record'),
+      longAction: val('btLongAct', 'voice'),
+      volUpSingle: val('btUpSingle', 'check'),
+      volUpDouble: val('btUpDouble', 'none'),
+      volDownSingle: val('btDnSingle', 'record'),
+      volDownDouble: val('btDnDouble', 'none'),
+      twoLongAction: val('btTwoLong', 'voice'),
+      holdMs: Number(val('btBtnHoldMs', '450')) || 450,
+      doubleTapMs: Number(val('btBtnDblMs', '380')) || 380,
+    };
+    const r = await fetch('/api/bt-button/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+    if (r && r.btButton) syncBtButtonUI(r.btButton);
+    if (r && r.ok) setBtnFeedback($('btBtnSaveBtn'), 'saved', '✓ Saved!', 1800);
+  };
+}
+[
+  ['btBtnTestCheck', 'check'],
+  ['btBtnTestRec', 'record'],
+  ['btBtnTestVoice', 'voice'],
+].forEach(([id, act]) => {
+  const b = $(id);
+  if (b) {
+    b.onclick = async () => {
+      const r = await fetch('/api/bt-button/trigger', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ action: act }) }).then(x => x.json());
+      if (r && r.btButton) syncBtButtonUI(r.btButton);
+      showToast(`BT Test -> ${act}`, r && r.ok ? 'ok' : 'err');
+    };
+  }
+});
 
 function _applyDuckPreset(stage, key) {
   const preset = stage === 'listen' ? HA_LISTEN_PRESETS[key] : HA_OUT_PRESETS[key];
@@ -15513,6 +16024,7 @@ function navigatePage(pageId, pushHash = true) {
     try { window.history.replaceState(null, '', '#' + next); } catch { window.location.hash = next; }
   }
   syncRawFeeds();
+  if (typeof syncMeterStream === 'function') syncMeterStream();
   if (next === 'cameras') {
     requestAnimationFrame(() => {
       drawAllCanvases();
@@ -15526,6 +16038,7 @@ function navigatePage(pageId, pushHash = true) {
     pollClips();
   } else if (next === 'audio') {
     pollVoiceStatus();
+    pollBtButtonStatus();
     pollAudioStatus();
     pollVoiceAb();
     pollWakeStudio();
@@ -17969,6 +18482,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 "cameras": cams,
                 "wallboard": service.wallboard_cfg.to_dict(),
                 "voice": service.voice_cfg.to_dict(),
+                "btButton": service.bt_button_cfg.to_dict(),
                 "houseAudio": service.house_audio_cfg.to_dict(),
                 "displays": service.displays_cfg.to_dict(),
                 "disk": service.disk_stats(),
@@ -18179,6 +18693,31 @@ def create_app(service: ArmoryCamService) -> Flask:
         res = service.adb.connect_and_probe(cfg)
         return jsonify(res)
 
+    @app.get("/api/bt-button/status")
+    def api_bt_button_status() -> Response:
+        resp = jsonify(service.bt_button.status_dict())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.post("/api/bt-button/config")
+    def api_bt_button_config() -> Response:
+        body = request.get_json(silent=True) or {}
+        with service.lock:
+            service.bt_button_cfg = service.bt_button.update_config(body)
+            service.save_config()
+            st = service.bt_button.status_dict()
+        return jsonify({"ok": True, "config": service.bt_button_cfg.to_dict(), "btButton": st})
+
+    @app.post("/api/bt-button/trigger")
+    def api_bt_button_trigger() -> Response:
+        body = request.get_json(silent=True) or {}
+        act = str(body.get("action") or "").strip().lower()
+        try:
+            res = service.bt_button.simulate_action(act)
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        return jsonify({**res, "btButton": service.bt_button.status_dict()})
+
     @app.get("/api/voice/status")
     def api_voice_status() -> Response:
         resp = jsonify(service.voice.status_dict(include_devices=True))
@@ -18193,6 +18732,13 @@ def create_app(service: ArmoryCamService) -> Flask:
         after_raw = request.args.get("afterId")
         after_id = int(after_raw) if after_raw and after_raw.isdigit() else None
         resp = Response(service.voice.subscribe_sse(after_id=after_id), mimetype="text/event-stream")
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return resp
+
+    @app.get("/api/voice/meter/stream")
+    def api_voice_meter_stream() -> Response:
+        resp = Response(service.voice.subscribe_meter_sse(), mimetype="text/event-stream")
         resp.headers["Cache-Control"] = "no-cache"
         resp.headers["X-Accel-Buffering"] = "no"
         return resp
@@ -18309,7 +18855,7 @@ def create_app(service: ArmoryCamService) -> Flask:
         force_full = bool(body.get("forceFull", False))
         ok, msg = service.wake_trainer.start_training(phrase, force_full=force_full, voice_svc=service.voice)
         if not ok:
-            code = 409 if "Already training" in msg else 400
+            code = 409 if ("Already training" in msg or "active workout" in msg.lower()) else 400
             return jsonify({"ok": False, "error": msg, "studio": service.wake_trainer.studio_state(service.voice)}), code
         return jsonify({"ok": True, "message": msg, "studio": service.wake_trainer.studio_state(service.voice)}), 202
 
@@ -19315,6 +19861,7 @@ def create_app(service: ArmoryCamService) -> Flask:
                 cams_list = [s_cam]
         include_audio = bool(body.get("includeAudio", False))
         src = str(body.get("source") or "all")
+        service.clear_server_armed_clip()
         clips = service.cut_clips_multi(
             session_id=sid,
             ex_name=ex_name,

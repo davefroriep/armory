@@ -6,7 +6,8 @@ import { liftSettings } from '../../lifts/settings';
 import { lifts } from '../../lifts/store';
 import { fmtDuration, fmtVolume, sessionPRs } from '../../lifts/summary';
 import type { LiftSession } from '../../lifts/types';
-import { esc } from '../dom';
+import type { WorkoutMeta } from '../../types';
+import { ICON, esc, hms } from '../dom';
 import { openSheet, toast } from './kit';
 
 export const stat = (label: string, value: string): string => `<div><small>${label}</small><b>${value}</b></div>`;
@@ -23,6 +24,21 @@ export function sessionRow(s: LiftSession): string {
     <span class="hmain"><b>${esc(s.name)}${pr ? ` <em class="prpill">★ ${pr}</em>` : ''}</b>
       <small>${esc(names.slice(0, 3).join(' · '))}${names.length > 3 ? ` · +${names.length - 3}` : ''}</small>
       <small class="hstats">${fmtDuration(st.durationSec)} · ${st.sets} sets · ${fmtVolume(st.volumeKg, unit)}</small></span>
+    <span class="chev">›</span></a>`;
+}
+
+/** Compact history row for a saved Ruck session. */
+export function ruckRow(m: WorkoutMeta): string {
+  const d = new Date(m.startEpochMs);
+  const details = [
+    hms(m.seconds),
+    m.avgHr > 0 ? `${Math.round(m.avgHr)} bpm` : '',
+    m.notes ? m.notes : '',
+  ].filter(Boolean).join(' · ');
+  return `<a class="hrow" href="#/airbike/w/${m.id}">
+    <span class="cal-ico sm ruck">${ICON.ruck}</span>
+    <span class="hmain"><b>${esc(m.name)} <em class="prpill" style="background:rgba(245,158,11,.16);color:#fbbf24">Ruck</em></b>
+      <small>${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}${details ? ` · ${esc(details)}` : ''}</small></span>
     <span class="chev">›</span></a>`;
 }
 

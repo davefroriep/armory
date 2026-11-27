@@ -356,8 +356,13 @@ a.metro { text-decoration: none; }
 .wk-icos { flex: 1; width: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; margin-top: 1px; }
 .wk-ico { width: min(82%, 30px); aspect-ratio: 1; height: auto; color: var(--blue); display: grid; place-items: center; }
 .wk-icos.two .wk-ico { width: min(74%, 23px); }
+.wk-icos.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); place-items: center; align-content: center; gap: 2px; padding: 0 3px; }
+.wk-icos.grid .wk-ico { width: 100%; max-width: 17px; }
+.wk-ico.wk-more { font-style: normal; font-size: .58rem; font-weight: 900; color: var(--mut); }
 .wk-ico svg { width: 100%; height: 100%; display: block; }
+.wk-ico.ruck { color: var(--amber); }
 .wk-d.done .wk-ico { color: var(--green); }
+.cal-ico.ruck { color: var(--amber); background: rgba(245, 158, 11, .14); }
 .wk-chk { position: absolute; top: 5px; right: 4px; font-style: normal; font-size: .62rem; font-weight: 900; color: var(--green); line-height: 1; margin: 0; }
 
 .home-scroll { flex: 1 1 0%; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior-y: contain; -webkit-overflow-scrolling: touch; padding: 8px 14px 14px; gap: 10px; }
@@ -408,6 +413,7 @@ a.metro { text-decoration: none; }
 .dz-head { display: flex; flex-direction: column; gap: 2px; }
 .dz-head .sh-title { font-size: 1.04rem; font-weight: 800; }
 .dz-sub { color: var(--mut); font-size: .78rem; }
+.dz-overload { font-size: .74rem; font-weight: 800; color: #fbbf24; background: rgba(245, 158, 11, .12); border: 1px solid rgba(245, 158, 11, .35); border-radius: 9px; padding: 5px 9px; }
 .dz-stats { display: flex; flex-wrap: wrap; gap: 6px; }
 .dz-stats i { font-style: normal; font-size: .74rem; font-weight: 700; color: #e2e8f0; background: rgba(255, 255, 255, .06); padding: 4px 9px; border-radius: 999px; font-variant-numeric: tabular-nums; }
 .dz-acts { display: flex; flex-direction: column; gap: 7px; padding-top: 2px; }

@@ -2201,6 +2201,9 @@ def looks_like_workout_app_command(text: str, wake_word: str = "hey armory") -> 
     tail = strip_wake_word(text, wake_word).strip().lower()
     if not tail:
         return False
+    # Video/buddy commands containing "close" or "guest" still belong to the workout app
+    if re.search(r"\b(?:close\s+video|guest\s+(?:record|recording|rack|smith))\b", tail):
+        return True
     # Never alert "App not connected" on room/gym open/close/stop/chatter commands
     if re.search(r"\b(?:open|close|shut\s*down|power\s*(?:on|off|down)|guests?|welcome|lights?)\b", tail):
         return False
@@ -2211,8 +2214,10 @@ def looks_like_workout_app_command(text: str, wake_word: str = "hey armory") -> 
     return bool(
         re.search(
             r"\b(?:check|done|log|logged|set|reps?|weight|pounds?|lbs?|rpe|skip|rest|next|previous|back|"
-            r"record|recording|clip|replay|slow|workout|exercise|warmup|warm\s*up|working\s*set|drop\s*set|amrap|"
-            r"timer|pause\s+workout|resume\s+workout|finish|undo|delete\s+(?:last|set))\b",
+            r"add\s+(?:set|\d+|thirty|30)|delete(?:\s+(?:last|set|empty))?|start\s+hold|hold|bodyweight|"
+            r"camera|rack|smith|record|recording|clip|replay|play\s+set|slow|switch\s+(?:views?|cameras?)|"
+            r"buddy(?:\s+mode)?|solo(?:\s+mode)?|workout|exercise|warmup|warm\s*up|working\s*set|drop\s*set|"
+            r"amrap|timer|pause(?:\s+workout)?|resume(?:\s+workout)?|finish(?:\s+workout)?|undo)\b",
             tail,
         )
     )
@@ -2295,6 +2300,7 @@ class RoomVoiceService:
         self._wake_duck_held = False
         self._release_wake_duck_on_play_done = False
         self._wake_duck_release_timer: threading.Timer | None = None
+        self._didnt_catch_streak: int = 0
 
         self._stream: sd.InputStream | None = None
         self._aec_stream: sd.InputStream | None = None
@@ -2371,6 +2377,32 @@ class RoomVoiceService:
             max_utterance_sec=2.6,
             rms_gate=0.0025,
         )
+
+        self._meter_lock = threading.Lock()
+        self._meter_cond = threading.Condition(self._meter_lock)
+        self._meter_clients: int = 0
+        self._meter_seq: int = 0
+        self._meter_last_push_mono: float = 0.0
+        self._meter_hann = np.hanning(VAD_FRAME_SAMPLES).astype(np.float32)
+        edges_hz = np.geomspace(60.0, 7800.0, 25)
+        bin_hz = SAMPLE_RATE_16K / float(VAD_FRAME_SAMPLES)
+        self._meter_band_slices: list[tuple[int, int]] = []
+        for i in range(24):
+            b0 = min(256, max(1, int(round(edges_hz[i] / bin_hz))))
+            b1 = min(257, max(b0 + 1, int(round(edges_hz[i + 1] / bin_hz))))
+            self._meter_band_slices.append((b0, b1))
+        self._meter_snap: dict[str, Any] = {
+            "db": -72.0,
+            "pk": -72.0,
+            "rms": 0.0,
+            "vad": 0.0,
+            "ws": 0.0,
+            "aec": False,
+            "erle": 0.0,
+            "listening": False,
+            "enrolling": False,
+            "b": [0] * 24,
+        }
 
         self.seq = 0
         self.event_seq = int(time.time() * 1000)
@@ -2798,6 +2830,61 @@ class RoomVoiceService:
             self._bump_status_locked()
             return self.status_dict()
 
+    def trigger_manual_wake(self, *, source: str = "bt_button", arm_window_ms: int = 7_500) -> dict[str, Any]:
+        """Arm the S330 mic & duck Denon immediately on hardware trigger (zero wake word required)."""
+        now_ms = int(time.time() * 1000)
+        win_ms = max(3_000, int(arm_window_ms))
+        with self.lock:
+            self._rescue_active = False
+            self._rescue_chunks.clear()
+            self._rescue_post_samples = 0
+            self._didnt_catch_streak = 0
+            self._mute_until_mono = 0.0
+            self._detector.reset()
+            self._aec_vad_detector.reset()
+            self.armed_until_ms = now_ms + win_ms
+            self._oww_awaiting_cmd = True
+            if self._started:
+                self._ensure_model_loading_locked()
+            self._bump_status_locked()
+            armed_until = self.armed_until_ms
+            if self.sse_clients > 0:
+                wake = self._effective_wake_word_locked()
+                client_wake = (self._client_wake_word or wake).strip().lower() or wake
+                arm_text = format_wake_display(client_wake)
+                self.event_seq += 1
+                self._events.append({
+                    "type": "transcript",
+                    "id": self.event_seq,
+                    "tsMs": now_ms,
+                    "transcript": arm_text,
+                    "candidates": [arm_text],
+                    "wakeWord": client_wake,
+                })
+                self.seq += 1
+                self._cond.notify_all()
+
+        ducked = False
+        begin_fn = self._wake_duck_cbs.get("begin")
+        if callable(begin_fn):
+            try:
+                res = begin_fn()
+                if isinstance(res, dict):
+                    ducked = bool(res.get("ducked"))
+            except Exception as exc:
+                self.log.debug("Manual wake duck begin error: %s", exc)
+        with self.lock:
+            if ducked:
+                self._wake_duck_held = True
+                self._release_wake_duck_on_play_done = False
+            self._bump_status_locked()
+        self.play_ready_chime()
+        self._log_voice_event(
+            "manual_wake",
+            {"source": str(source or "bt_button"), "armWindowMs": win_ms, "ducked": bool(ducked)},
+        )
+        return {"ok": True, "armedUntilMs": armed_until, "ducked": bool(ducked), "source": source}
+
     @staticmethod
     def _enroll_prompt_for_rep(rep_idx: int, phrase: str) -> str:
         disp = format_wake_display(phrase)
@@ -2963,6 +3050,89 @@ class RoomVoiceService:
                 self._ensure_model_loading_locked()
             self._bump_status_locked()
             return self.status_dict()
+
+    def _update_meter_from_frame(
+        self,
+        pcm16: np.ndarray,
+        *,
+        vad_val: float = 0.0,
+        aec_active: bool = False,
+        now_mono: float | None = None,
+    ) -> None:
+        if self._meter_clients <= 0 or pcm16.size == 0:
+            return
+        t = time.monotonic() if now_mono is None else float(now_mono)
+        if (t - self._meter_last_push_mono) < 0.030:
+            return
+        arr = np.asarray(pcm16, dtype=np.float32).reshape(-1)
+        rms = float(np.sqrt(np.mean(arr * arr)))
+        peak = float(np.max(np.abs(arr)))
+        db = round(max(-72.0, 20.0 * math.log10(max(rms, 1e-6))), 1)
+        pk = round(max(-72.0, 20.0 * math.log10(max(peak, 1e-6))), 1)
+        if arr.size >= VAD_FRAME_SAMPLES:
+            win = arr[-VAD_FRAME_SAMPLES:] * self._meter_hann
+        else:
+            padded = np.zeros(VAD_FRAME_SAMPLES, dtype=np.float32)
+            padded[-arr.size :] = arr
+            win = padded * self._meter_hann
+        mag = np.abs(np.fft.rfft(win)) / 256.0
+        bands: list[int] = []
+        for b0, b1 in self._meter_band_slices:
+            seg = mag[b0:b1]
+            b_rms = float(np.sqrt(np.mean(seg * seg))) if seg.size else 0.0
+            b_db = 20.0 * math.log10(max(b_rms, 1e-6))
+            bands.append(int(max(0, min(100, round(((b_db + 72.0) / 60.0) * 100.0)))))
+        erle = float(getattr(self._aec, "last_erle_db", 0.0) or 0.0) if aec_active else 0.0
+        snap = {
+            "db": db,
+            "pk": pk,
+            "rms": round(rms, 5),
+            "vad": round(float(vad_val), 3),
+            "ws": round(float(getattr(self._oww_spotter, "latest_score", 0.0) or 0.0), 3),
+            "aec": bool(aec_active),
+            "erle": round(erle, 1),
+            "listening": bool(self.listening),
+            "enrolling": bool(self._enroll_active),
+            "b": bands,
+        }
+        with self._meter_lock:
+            self._meter_last_push_mono = t
+            self._meter_snap = snap
+            self._meter_seq += 1
+            self._meter_cond.notify_all()
+
+    def subscribe_meter_sse(self):
+        """Stream ~30 Hz 24-band FFT spectrum + dBFS VU snapshots for the Console live analyzer."""
+        with self._meter_lock:
+            self._meter_clients += 1
+            last_seq = -1
+        try:
+            while not self._stop_event.is_set():
+                with self._meter_lock:
+                    if self._meter_seq == last_seq:
+                        self._meter_cond.wait(timeout=0.25)
+                    if self._stop_event.is_set():
+                        break
+                    if self._meter_seq != last_seq:
+                        last_seq = self._meter_seq
+                        payload = dict(self._meter_snap)
+                    else:
+                        payload = {
+                            "db": -72.0,
+                            "pk": -72.0,
+                            "rms": 0.0,
+                            "vad": 0.0,
+                            "ws": 0.0,
+                            "aec": False,
+                            "erle": 0.0,
+                            "listening": bool(self.listening),
+                            "enrolling": bool(self._enroll_active),
+                            "b": [0] * 24,
+                        }
+                yield f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8")
+        finally:
+            with self._meter_lock:
+                self._meter_clients = max(0, self._meter_clients - 1)
 
     def _bump_status_locked(self) -> None:
         self.seq += 1
@@ -3195,9 +3365,12 @@ class RoomVoiceService:
         if isinstance(local_res, dict) and local_res.get("handled"):
             speech_txt = str(local_res.get("speech") or "").strip()
             ack_txt = str(local_res.get("ackText") or speech_txt or "Done").strip()
+            also_sse = bool(local_res.get("alsoEmitSse"))
+            always_rb = bool(local_res.get("alwaysReadback"))
             with self.lock:
                 self.armed_until_ms = 0
                 self._oww_awaiting_cmd = False
+                self._didnt_catch_streak = 0
                 self.event_seq += 1
                 ev_id = self.event_seq
                 entry = {
@@ -3211,7 +3384,23 @@ class RoomVoiceService:
                     "ackText": ack_txt,
                 }
                 self.recent_transcripts.appendleft(entry)
-                do_readback = bool(self.cfg.speaker_readback and self.context_readback and self.cfg.room_command_readback)
+                if also_sse:
+                    evt = {
+                        "type": "transcript",
+                        "id": ev_id,
+                        "tsMs": now_ms,
+                        "transcript": sse_clean,
+                        "candidates": [sse_clean],
+                        "wakeWord": sse_wake,
+                    }
+                    self._events.append(evt)
+                    self.seq += 1
+                    self._cond.notify_all()
+                do_readback = bool(
+                    self.cfg.speaker_readback
+                    and self.context_readback
+                    and (always_rb or self.cfg.room_command_readback)
+                )
             if do_readback and speech_txt:
                 with self.lock:
                     if self._wake_duck_held:
@@ -3236,6 +3425,31 @@ class RoomVoiceService:
             return entry
 
         with self.lock:
+            is_app_cmd = looks_like_workout_app_command(display_clean, wake)
+            if from_rescue and not is_app_cmd:
+                self._log_voice_event(
+                    "utterance",
+                    {
+                        "tier": "tier2_rescue",
+                        "emitted": False,
+                        "rescueDropped": True,
+                        "reason": "non_command",
+                        "transcript": display_clean,
+                        "latencyMs": int(latency_ms),
+                        "rescueScore": round(float(rescue_score), 3),
+                    },
+                )
+                return {
+                    "id": 0,
+                    "tsMs": now_ms,
+                    "transcript": display_clean,
+                    "wakeMatched": False,
+                    "emitted": False,
+                    "rescueDropped": True,
+                    "latencyMs": int(latency_ms),
+                    "ackText": "",
+                }
+
             if emitted and not from_oww:
                 if has_wake and not has_command_tail(clean, wake):
                     self.armed_until_ms = now_ms + ARM_WINDOW_MS
@@ -3276,7 +3490,6 @@ class RoomVoiceService:
                 do_alert = False
 
         if emitted:
-            is_app_cmd = looks_like_workout_app_command(display_clean, wake)
             if sse_count > 0:
                 if not ctx_active and do_alert and is_app_cmd:
                     alert_txt = "Can't find session"
@@ -3340,11 +3553,35 @@ class RoomVoiceService:
         set_commit_mode: str | None = None,
     ) -> dict[str, Any]:
         now_ms = int(time.time() * 1000)
+        clean_speech = str(speech or "").strip()
+        is_warn_miss = (
+            str(kind or "").strip().lower() == "warn"
+            and (
+                "didn't catch" in clean_speech.lower()
+                or "didn't catch" in str(text or "").lower()
+                or "didn’t catch" in str(text or "").lower()
+            )
+        )
+        keep_ducked_for_retry = False
+        need_begin_duck = False
         with self.lock:
-            if armed is True:
-                self.armed_until_ms = now_ms + ARM_WINDOW_MS
-            elif armed is False:
-                self.armed_until_ms = 0
+            if is_warn_miss and self._didnt_catch_streak < 2:
+                self._didnt_catch_streak += 1
+                keep_ducked_for_retry = True
+                self.armed_until_ms = max(self.armed_until_ms, now_ms + 9_000)
+                self._oww_awaiting_cmd = True
+                self._release_wake_duck_on_play_done = False
+                need_begin_duck = not self._wake_duck_held
+                self._detector.reset()
+                self._aec_vad_detector.reset()
+                self._bump_status_locked()
+            else:
+                if not is_warn_miss:
+                    self._didnt_catch_streak = 0
+                if armed is True:
+                    self.armed_until_ms = max(self.armed_until_ms, now_ms + ARM_WINDOW_MS)
+                elif armed is False:
+                    self.armed_until_ms = 0
             if text and self.recent_transcripts:
                 for item in self.recent_transcripts:
                     if item.get("emitted") and not item.get("ackText"):
@@ -3354,9 +3591,25 @@ class RoomVoiceService:
             override_mode = str(set_commit_mode or "").strip().lower()
             commit_mode = override_mode if override_mode in ("chime", "voice") else self.cfg.set_commit_mode
 
+        if keep_ducked_for_retry:
+            self._cancel_wake_duck_release_timer()
+            if need_begin_duck:
+                begin_fn = self._wake_duck_cbs.get("begin")
+                if callable(begin_fn):
+                    try:
+                        res = begin_fn()
+                        if isinstance(res, dict) and res.get("ducked"):
+                            with self.lock:
+                                self._wake_duck_held = True
+                                self._release_wake_duck_on_play_done = False
+                                self._bump_status_locked()
+                    except Exception as exc:
+                        self.log.debug("Retry wake duck begin error: %s", exc)
+            else:
+                self._extend_wake_duck(10.0)
+
         spoke = False
         chime_played = False
-        clean_speech = str(speech or "").strip()
         will_play = False
         if do_readback:
             if is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
@@ -3366,9 +3619,11 @@ class RoomVoiceService:
         if will_play:
             self._cancel_wake_duck_release_timer()
             with self.lock:
-                if self._wake_duck_held:
+                if keep_ducked_for_retry:
+                    self._release_wake_duck_on_play_done = False
+                elif self._wake_duck_held:
                     self._release_wake_duck_on_play_done = True
-            self._extend_wake_duck(6.0)
+            self._extend_wake_duck(10.0 if keep_ducked_for_retry else 6.0)
 
         if do_readback:
             if is_set_commit_ack(text=text or "", kind=kind, speech=clean_speech):
@@ -3382,11 +3637,12 @@ class RoomVoiceService:
             elif armed is True and not (self._using_oww_spotter() and self._wake_duck_held):
                 self.play_ready_chime()
 
-        if not spoke and armed is not True:
-            self._release_wake_duck_async()
-        elif spoke and not self._started:
-            # Synchronous playback already completed when worker thread isn't running
-            self._release_wake_duck_sync()
+        if not keep_ducked_for_retry:
+            if not spoke and armed is not True:
+                self._release_wake_duck_async()
+            elif spoke and not self._started:
+                # Synchronous playback already completed when worker thread isn't running
+                self._release_wake_duck_sync()
         self._log_voice_event(
             "ack",
             {
@@ -3396,9 +3652,10 @@ class RoomVoiceService:
                 "speech": clean_speech,
                 "spoke": bool(spoke),
                 "chime": bool(chime_played),
+                "keptDuckForRetry": bool(keep_ducked_for_retry),
             },
         )
-        return {"ok": True, "spoke": spoke, "chime": bool(chime_played)}
+        return {"ok": True, "spoke": spoke, "chime": bool(chime_played), "keptDuckForRetry": bool(keep_ducked_for_retry)}
 
     def subscribe_sse(self, after_id: int | None = None, max_replay_age_ms: int = 12_000):
         """Generator yielding SSE `data:` frames (`status` + `transcript`) and keepalive pings.
@@ -3736,7 +3993,7 @@ class RoomVoiceService:
         now_mono = time.monotonic()
         norm = clean.lower()
         with self.lock:
-            if norm == self._last_spoken_text and (now_mono - self._last_spoken_mono) < 3.0:
+            if norm == self._last_spoken_text and (now_mono - self._last_spoken_mono) < 4.5:
                 return True
             self._last_spoken_text = norm
             self._last_spoken_mono = now_mono
@@ -3794,7 +4051,40 @@ class RoomVoiceService:
         else:
             lin_16k, vad_clean_16k, aec_active = pcm16, pcm16, False
         vad_in = np.clip(vad_clean_16k * 3.0, -0.98, 0.98).astype(np.float32) if aec_active else None
+        cur_mono = time.monotonic() if now_mono is None else float(now_mono)
+        cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
 
+        try:
+            self._ingest_pcm16_inner(
+                lin_16k,
+                vad_in=vad_in,
+                aec_active=aec_active,
+                muted=muted,
+                now_ms=cur_ms,
+                cur_mono=cur_mono,
+            )
+        finally:
+            eff_vad = (
+                float(self._enroll_detector.latest_vad)
+                if self._enroll_active
+                else (
+                    float(self._aec_vad_detector.latest_vad)
+                    if self._using_oww_spotter() and not (cur_ms < self.armed_until_ms)
+                    else float(self._detector.latest_vad)
+                )
+            )
+            self._update_meter_from_frame(lin_16k, vad_val=eff_vad, aec_active=aec_active, now_mono=cur_mono)
+
+    def _ingest_pcm16_inner(
+        self,
+        lin_16k: np.ndarray,
+        *,
+        vad_in: np.ndarray | None,
+        aec_active: bool,
+        muted: bool,
+        now_ms: int | None,
+        cur_mono: float,
+    ) -> None:
         if self._enroll_active:
             self._detector.latest_rms = float(np.sqrt(np.mean(lin_16k * lin_16k)))
             utterances = self._enroll_detector.push_samples(lin_16k, muted=muted, vad_samples_16k=vad_in)
@@ -3823,7 +4113,6 @@ class RoomVoiceService:
 
         self._detector.latest_rms = float(np.sqrt(np.mean(lin_16k * lin_16k)))
         cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
-        cur_mono = time.monotonic() if now_mono is None else float(now_mono)
 
         if cur_ms < self.armed_until_ms:
             if muted:
@@ -3847,6 +4136,7 @@ class RoomVoiceService:
             self._rescue_chunks.clear()
             self._rescue_post_samples = 0
             self._aec_vad_detector.reset()
+            self._didnt_catch_streak = 0
             self._mute_until_mono = 0.0
             self.armed_until_ms = cur_ms + ARM_WINDOW_MS
             self._oww_awaiting_cmd = True
@@ -3866,21 +4156,31 @@ class RoomVoiceService:
             threading.Thread(target=self._on_oww_wake_detected, args=(score,), name="armory-oww-wake", daemon=True).start()
             return
 
-        # Zero-Miss AEC-VAD Safety Net: while Line-In AEC is actively cancelling loud Denon music,
-        # run Silero VAD on the -15 dB RES-suppressed stream and silently verify any speech burst
-        # via GPU Whisper on the pristine linear-PBFDAF audio (zero false ducks, 100% Vol 69 landing).
-        if aec_active:
-            self._rescue_active = False
-            self._rescue_chunks.clear()
-            self._rescue_post_samples = 0
-            if muted:
-                self._aec_vad_detector.push_samples(lin_16k, muted=True)
-            else:
-                for utt in self._aec_vad_detector.push_samples(lin_16k, muted=False, vad_samples_16k=vad_in):
-                    self._enqueue_utterance((utt, False, True, 0.99))
+        # Zero-Miss Silero-VAD Safety Net (active BOTH during Line-In AEC AND in quiet rooms when AEC is idle):
+        # Run Silero VAD on RES-cleaned audio (when AEC is active) or raw 16 kHz mic audio (quiet room)
+        # and silently verify any speech burst via GPU Whisper (zero false Denon ducks, catches OWW misses on try #1).
+        if muted:
+            self._aec_vad_detector.push_samples(lin_16k, muted=True)
+            vad_utts: list[np.ndarray] = []
+        else:
+            vad_utts = self._aec_vad_detector.push_samples(
+                lin_16k,
+                muted=False,
+                vad_samples_16k=(vad_in if aec_active else None),
+            )
+            vad_score = 0.99 if aec_active else 0.98
+            for utt in vad_utts:
+                self._rescue_active = False
+                self._rescue_chunks.clear()
+                self._rescue_post_samples = 0
+                self._enqueue_utterance((utt, False, True, vad_score))
+
+        if aec_active or vad_utts or self._aec_vad_detector._in_speech:
+            if aec_active or vad_utts:
+                self._rescue_active = False
+                self._rescue_chunks.clear()
+                self._rescue_post_samples = 0
             return
-        elif self._aec_vad_detector._in_speech or self._aec_vad_detector._collected:
-            self._aec_vad_detector.reset()
 
         # Two-Tier Silent Rescue Gate (when Line-In AEC is idle/bypassed): grey-zone hits
         # (rescueThreshold <= score < wakeThreshold) capture quietly and verify via GPU Whisper.
@@ -4133,6 +4433,7 @@ class RoomVoiceService:
                 and not self._detector.is_user_speaking()
             ):
                 self._oww_awaiting_cmd = False
+                self._didnt_catch_streak = 0
                 self._detector.reset()
                 if self._oww_spotter is not None:
                     self._oww_spotter.reset()
@@ -4194,15 +4495,16 @@ class RoomVoiceService:
 
         self._close_stream()
 
-    def _transcribe_utterance(self, audio16: np.ndarray) -> str:
+    def _transcribe_utterance(self, audio16: np.ndarray, *, from_rescue: bool = False) -> str:
         with self.lock:
             wake = self._effective_wake_word_locked()
             phrases = list(self.bias_phrases)
             fn = self._asr_transcribe_fn
             model = self._model
         prompt, hotwords = build_whisper_prompt(wake, phrases)
+        eff_prompt = None if from_rescue else prompt
         if fn is not None:
-            raw = str(fn(audio16, prompt, hotwords) or "").strip()
+            raw = str(fn(audio16, eff_prompt or "", hotwords) or "").strip()
         elif model is None:
             return ""
         else:
@@ -4216,15 +4518,25 @@ class RoomVoiceService:
                 temperature=0.0,
                 condition_on_previous_text=False,
                 vad_filter=False,
-                no_speech_threshold=0.72,
-                log_prob_threshold=-1.2,
+                no_speech_threshold=(0.55 if from_rescue else 0.72),
+                log_prob_threshold=(-0.85 if from_rescue else -1.2),
                 repetition_penalty=1.15,
                 no_repeat_ngram_size=3,
                 max_new_tokens=36,
-                initial_prompt=prompt,
+                initial_prompt=eff_prompt,
                 hotwords=hotwords,
             )
-            raw = " ".join(s.text.strip() for s in segs).strip()
+            kept: list[str] = []
+            for s in list(segs):
+                if from_rescue:
+                    ns_prob = float(getattr(s, "no_speech_prob", 0.0) or 0.0)
+                    avg_lp = float(getattr(s, "avg_logprob", 0.0) or 0.0)
+                    if ns_prob > 0.55 or avg_lp < -0.85:
+                        continue
+                st = str(getattr(s, "text", "") or "").strip()
+                if st:
+                    kept.append(st)
+            raw = " ".join(kept).strip()
         if raw and is_prompt_echo(raw, prompt):
             self.log.debug("Dropped Whisper prompt-echo hallucination: %s", raw)
             return ""
@@ -4248,7 +4560,7 @@ class RoomVoiceService:
                 audio16, from_oww = raw_item, False
             t0 = time.perf_counter()
             try:
-                text = self._transcribe_utterance(audio16)
+                text = self._transcribe_utterance(audio16, from_rescue=from_rescue)
             except Exception as exc:
                 self.log.warning("ASR transcription error: %s", exc)
                 continue

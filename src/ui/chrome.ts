@@ -193,11 +193,18 @@ export function weekStripCard(cells: WeekDayCell[], selectedYmd?: string | null,
   const cols = cells.map((c) => {
     const dayNum = Number(c.ymd.slice(8));
     const sel = selectedYmd === c.ymd;
-    const icos = c.equipments.slice(0, 2);
+    const icos = c.equipments;
     const chk = c.kind === 'done' ? '<em class="wk-chk" aria-hidden="true">✓</em>' : '';
-    const mid = c.kind === 'rest'
-      ? '<span class="wk-rest">REST</span>'
-      : `<span class="wk-icos${icos.length > 1 ? ' two' : ''}">${icos.map((eq) => `<i class="wk-ico ${eq}">${ICON[eq]}</i>`).join('')}</span>`;
+    let mid = '';
+    if (c.kind === 'rest') {
+      mid = '<span class="wk-rest">REST</span>';
+    } else if (icos.length >= 3) {
+      const shown = icos.length <= 4 ? icos : icos.slice(0, 3);
+      const more = icos.length > 4 ? `<i class="wk-ico wk-more">+${icos.length - 3}</i>` : '';
+      mid = `<span class="wk-icos grid">${shown.map((eq) => `<i class="wk-ico ${eq}">${ICON[eq]}</i>`).join('')}${more}</span>`;
+    } else {
+      mid = `<span class="wk-icos${icos.length > 1 ? ' two' : ''}">${icos.map((eq) => `<i class="wk-ico ${eq}">${ICON[eq]}</i>`).join('')}</span>`;
+    }
     return `<button class="wk-d ${c.kind}${c.isToday ? ' today' : ''}${sel ? ' sel' : ''}" type="button" data-wk-ymd="${c.ymd}" aria-pressed="${sel}" aria-label="${DOW[c.dow]} ${dayNum}">
       ${chk}
       <span class="wk-dow">${DOW[c.dow]}</span>
@@ -322,6 +329,17 @@ export async function openCalendarItemMenu(planSlot: string): Promise<void> {
   const cardioProg = (it.equipment === 'airbike' || it.equipment === 'spin') && it.programId
     ? programById(it.programId)
     : undefined;
+  const s = getSettings();
+  const today = localDate();
+  const tomorrow = addDays(today, 1);
+  const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
+  const tomorrowPlanCount = proj.reduce(
+    (n, p) => n + p.step.slots.filter((_, si) => p.slotStates[si] === 'pending' && p.slotDates[si] === tomorrow).length,
+    0,
+  );
+  const tomorrowExtraCount = (s.queue.extras ?? []).filter((x) => !x.doneDate && !x.skippedDate && x.date === tomorrow).length;
+  const tomorrowCount = tomorrowPlanCount + tomorrowExtraCount;
+  const overloadHint = tomorrowCount >= 2 ? ` — heads up: tomorrow already has ${tomorrowCount} sessions` : '';
   const targetOpt: { key: string; label: string; sub?: string; danger?: boolean }[] = cardioProg
     ? [{ key: 'targets', label: 'Targets & setpoints', sub: 'View workout blocks or adjust today’s target' }]
     : [];
@@ -330,21 +348,27 @@ export async function openCalendarItemMenu(planSlot: string): Promise<void> {
     ...(isExtra
       ? [
           { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
-          { key: 'move', label: 'Move to tomorrow', sub: 'Moves this carry-over workout to tomorrow' },
+          { key: 'move', label: 'Move to tomorrow', sub: `Moves this carry-over workout to tomorrow${overloadHint}` },
           { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
         ]
       : it.carried
         ? [
             { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
             { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
-            { key: 'move', label: 'Move to tomorrow', sub: 'Moves this carried-over workout to tomorrow' },
+            { key: 'move', label: 'Move to tomorrow', sub: `Moves this carried-over workout to tomorrow${overloadHint}` },
             { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
           ]
         : [
             { key: 'done', label: 'Mark done', sub: 'Did it outside Armory — saves locally & logs to Intervals.icu' },
             { key: 'skip', label: 'Skip', sub: 'Marks (skipped) & removes from today' },
-            { key: 'push', label: 'Push to tomorrow', sub: 'Moves to tomorrow and holds schedule back' },
-            { key: 'add', label: 'Add to tomorrow', sub: 'Carries to tomorrow and keeps tomorrow’s schedule' },
+            { key: 'push', label: 'Push to tomorrow (delays next day)', sub: 'Moves to tomorrow and holds schedule back 1 day' },
+            {
+              key: 'add',
+              label: 'Stack onto tomorrow (adds to next day)',
+              sub: tomorrowCount >= 2
+                ? `Heads up: tomorrow already has ${tomorrowCount} sessions (becomes ${tomorrowCount + 1})`
+                : 'Carries to tomorrow and keeps tomorrow’s schedule',
+            },
             { key: 'remove', label: 'Remove workout', sub: 'Drops from schedule — not logged or marked skipped', danger: true },
           ]),
   ];

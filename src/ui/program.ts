@@ -1,6 +1,6 @@
 import {
-  WEEK_THEMES, extraKey, parseExtraKey, parseSlotKey, parseYmd, projectPlan, slotKey,
-  type ProjectedStep,
+  WEEK_THEMES, extraKey, modalityOf, parseExtraKey, parseSlotKey, parseYmd, projectPlan, slotKey,
+  type ProjectedStep, type StripModality,
 } from '../domain/plan';
 import { addDays, calendar, localDate } from '../intervals/calendar';
 import { matchRoutineByTitle } from '../lifts/seed';
@@ -8,7 +8,7 @@ import { liftSettings } from '../lifts/settings';
 import { lifts } from '../lifts/store';
 import { allMeta } from '../store/db';
 import { activePlan, getSettings, settingsChanged, updateSettings } from '../store/settings';
-import { EQUIPMENT_LABEL, type Equipment } from '../types';
+import { EQUIPMENT_LABEL } from '../types';
 import { revFooter, topbar, wireChips } from './chrome';
 import {
   localYmdFromMs, renderCompletedCardioSlot, renderCompletedLiftSlot,
@@ -31,11 +31,11 @@ export function fmtShortDate(ymd: string, today = localDate()): string {
   return new Date(y, m - 1, d).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
-/** Merges finished lifts and saved cardio workouts by local YYYY-MM-DD date. */
-export async function collectLoggedByDate(): Promise<Map<string, { equipment: Equipment; name: string }[]>> {
+/** Merges finished lifts and saved cardio/ruck workouts by local YYYY-MM-DD date. */
+export async function collectLoggedByDate(): Promise<Map<string, { equipment: StripModality; name: string }[]>> {
   await lifts.ready;
-  const map = new Map<string, { equipment: Equipment; name: string }[]>();
-  const add = (ymd: string, equipment: Equipment, name: string): void => {
+  const map = new Map<string, { equipment: StripModality; name: string }[]>();
+  const add = (ymd: string, equipment: StripModality, name: string): void => {
     const arr = map.get(ymd) ?? [];
     arr.push({ equipment, name });
     map.set(ymd, arr);
@@ -45,8 +45,8 @@ export async function collectLoggedByDate(): Promise<Map<string, { equipment: Eq
   }
   const metas = await allMeta();
   for (const m of metas) {
-    if (m.status === 'saved' && m.equipment !== 'strength') {
-      add(localDate(new Date(m.startEpochMs)), m.equipment, m.name);
+    if (m.status === 'saved' && (m.equipment !== 'strength' || m.programId === 'ruck')) {
+      add(localDate(new Date(m.startEpochMs)), modalityOf(m), m.name);
     }
   }
   return map;
@@ -100,7 +100,7 @@ export async function openStepSheet(stepIndex: number): Promise<void> {
   const lookup = currentZoomLookup();
   const routines = lookup.routines;
   const finishedLifts = lifts.finished();
-  const savedCardio = metas.filter((m) => m.status === 'saved' && m.equipment !== 'strength');
+  const savedCardio = metas.filter((m) => m.status === 'saved' && (m.equipment !== 'strength' || m.programId === 'ruck'));
 
   const slotsHtml = p.step.slots.map((slot, si) => {
     const state = p.slotStates[si];
@@ -332,7 +332,7 @@ export function programScreen(root: HTMLElement, _args: string[], query: URLSear
 
   return mount(() => {
     let dead = false;
-    let loggedByDate = new Map<string, { equipment: Equipment; name: string }[]>();
+    let loggedByDate = new Map<string, { equipment: StripModality; name: string }[]>();
 
     const paint = (): void => {
       if (dead) return;

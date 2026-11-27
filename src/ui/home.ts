@@ -1,5 +1,5 @@
 import { ensureSensors } from '../ble/sources';
-import { buildWeekGlimpse, dayOfWeek, projectPlan, shiftYmd } from '../domain/plan';
+import { buildWeekGlimpse, dayOfWeek, modalityOf, projectPlan, shiftYmd, type StripModality } from '../domain/plan';
 import { calendar, localDate } from '../intervals/calendar';
 import { pendingCount, retryPending, syncWorkout, discard } from '../workout/sync';
 import { allMeta, getSamples, putMeta } from '../store/db';
@@ -27,7 +27,7 @@ export function homeScreen(root: HTMLElement): () => void {
   let zoomAnim: '' | 'from-right' | 'from-left' | 'fade-in' = '';
   let weekAnim: '' | 'from-right' | 'from-left' = '';
   let dayLogsByDate = new Map<string, DayLogs>();
-  let loggedByDate = new Map<string, { equipment: Equipment; name: string }[]>();
+  let loggedByDate = new Map<string, { equipment: StripModality; name: string }[]>();
   let lastSwipeAt = 0;
 
   const paint = () => {
@@ -40,9 +40,10 @@ export function homeScreen(root: HTMLElement): () => void {
     }
     const proj = projectPlan(activePlan(), s.queue, today, s.restDay);
     const todayEquipment = calendar.items.map((i) => i.equipment);
+    const todayModalities = calendar.items.map((i) => modalityOf(i));
     const lookup = currentZoomLookup();
     const completedToday = todayCompletedItems(dayLogsByDate.get(today), lookup, { today, proj, extras: s.queue.extras });
-    const weekCells = buildWeekGlimpse({ today, anchorYmd: selectedYmd, proj, todayEquipment, extras: s.queue.extras, loggedByDate });
+    const weekCells = buildWeekGlimpse({ today, anchorYmd: selectedYmd, proj, todayEquipment: todayModalities, extras: s.queue.extras, loggedByDate });
     const zoomHtml = renderDayZoomCard({
       ymd: selectedYmd,
       today,

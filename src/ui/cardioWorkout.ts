@@ -54,7 +54,8 @@ export function cardioWorkoutScreen(root: HTMLElement, args: string[]): () => vo
         : `<div class="status warn">Saved on this phone.${m.lastError ? ` ${esc(m.lastError)}` : ''} <button class="btn sm" data-act="retry">Retry upload</button></div>`;
 
       const backTo = m.equipment === 'strength' ? '#/strength/history' : (m.equipment === 'airbike' || m.equipment === 'spin') ? `#/${m.equipment}` : '#/';
-      root.innerHTML = `${topbar({ back: backTo, title: EQUIPMENT_LABEL[m.equipment] })}
+      const titleLbl = m.programId === 'ruck' ? 'Ruck' : EQUIPMENT_LABEL[m.equipment];
+      root.innerHTML = `${topbar({ back: backTo, title: titleLbl })}
         <main class="page summary">
           <h1 class="sum-title">${esc(m.name)}</h1>
           <div class="sum-sub">${new Date(m.startEpochMs).toLocaleString([], { weekday: 'long', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</div>

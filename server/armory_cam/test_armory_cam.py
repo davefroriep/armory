@@ -6805,13 +6805,35 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(m_cut.call_count, 1)
             self.assertIsNone(svc.active_server_armed_clip())
 
-            # When an active phone workout session is live on SSE, OptiPlex still latches server_armed_clip
-            # and lets the event forward to the phone app without stealing it
+            # When an active phone workout session is live on SSE, OptiPlex STILL executes camera recording & stop
+            # immediately (zero wait on the Pixel), pushes fire-and-forget SSE, and dedups phone echo acks!
+            spoken_live: list[str] = []
+            svc.voice._speak_fn = lambda txt: (spoken_live.append(txt), True)[1]
             svc.voice.sse_clients = 1
             svc.voice.context_active = True
-            r_live = svc._handle_local_voice_command("Hey Armory, record this")
-            self.assertIsNone(r_live)
+            svc.voice.cfg.speaker_readback = True
+            r_live = svc.voice._emit_transcript("Hey Armory, record this", latency_ms=110, from_oww=True)
+            self.assertTrue(r_live.get("localHandled"))
+            self.assertEqual(r_live["ackText"], "🎥 Recording…")
             self.assertIsNotNone(svc.active_server_armed_clip())
+            self.assertEqual(svc.voice._events[-1]["transcript"], "Armory, record this")
+            self.assertEqual(spoken_live, ["Recording"])
+
+            # Phone later acks "Recording" within 4.5s -> suppressed so OptiPlex never double-speaks
+            svc.voice.handle_ack(armed=False, kind="info", text="🎥 Recording", speech="Recording")
+            self.assertEqual(spoken_live, ["Recording"])
+
+            # "stop recording" cuts immediately on OptiPlex even while phone workout is active
+            with mock.patch.object(
+                svc,
+                "cut_clips_multi",
+                return_value=[{"ok": True, "fileName": "Gym_Clip_2.mp4", "lanUrl": "/clips/2026-11-26/Gym_Clip_2.mp4"}],
+            ) as m_cut_stop:
+                r_stop = svc.voice._emit_transcript("Hey Armory, stop recording", latency_ms=105, from_oww=True)
+            self.assertTrue(r_stop.get("localHandled"))
+            self.assertEqual(m_cut_stop.call_count, 1)
+            self.assertIsNone(svc.active_server_armed_clip())
+            self.assertEqual(spoken_live, ["Recording", "Clip saved"])
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -7266,6 +7288,408 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(r_act["config"]["wakeWord"], "hey atlas")
             self.assertEqual(svc.voice.cfg.wake_word, "hey atlas")
             self.assertEqual(svc.voice._oww_spotter.model_name, "hey_atlas_v0.1")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+    def test_meter_sse_fft_spectrum_and_stream_endpoint(self) -> None:
+        import numpy as np
+        import room_voice as rv
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_meter_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            svc.voice.listening = True
+            gen = svc.voice.subscribe_meter_sse()
+            _ = next(gen)  # Advance generator to register _meter_clients == 1
+            self.assertEqual(svc.voice._meter_clients, 1)
+            # Push a 1 kHz sine frame after client subscribes
+            t = np.arange(512, dtype=np.float32) / 16_000.0
+            tone = np.sin(2.0 * np.pi * 1000.0 * t).astype(np.float32) * 0.25
+            with mock.patch.object(svc.voice._oww_spotter, "push_samples", return_value=(False, 0.0)):
+                svc.voice._ingest_pcm16_frame(tone, now_ms=10_000, now_mono=100.0)
+            frame = next(gen).decode("utf-8")
+            gen.close()
+            self.assertEqual(svc.voice._meter_clients, 0)
+            payload = json.loads(frame.split("data: ", 1)[1])
+            self.assertEqual(len(payload["b"]), 24)
+            self.assertGreater(max(payload["b"]), 40)
+            self.assertGreater(payload["db"], -25.0)
+            self.assertTrue(payload["listening"])
+
+            # Flask SSE route streams valid text/event-stream frame
+            app = ac.create_app(svc)
+            client = app.test_client()
+            resp = client.get("/api/voice/meter/stream", buffered=False)
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("text/event-stream", resp.mimetype)
+            chunk = next(resp.response).decode("utf-8")
+            resp.close()
+            d_http = json.loads(chunk.split("data: ", 1)[1])
+            self.assertEqual(len(d_http["b"]), 24)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_keep_ducked_retry_rescue_command_gate_quiet_vad_and_train_lock(self) -> None:
+        import numpy as np
+        import room_voice as rv
+
+        # 1. "Didn't catch that" keeps Denon ducked & server armed for bare retry (capped at 2 retries)
+        duck_ops: list[str] = []
+        spoken: list[str] = []
+        svc_v = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(
+                wake_word="hey atlas",
+                wake_engine="openwakeword",
+                speaker_readback=True,
+            ),
+            speak_fn=lambda txt: (spoken.append(txt), True)[1],
+            allow_hardware_audio=False,
+            wake_duck_callbacks={
+                "begin": lambda: (duck_ops.append("begin"), {"ducked": True})[1],
+                "end": lambda: (duck_ops.append("end"), {"restored": True})[1],
+                "extend": lambda sec=6.0: duck_ops.append(f"extend:{int(round(float(sec)))}"),
+            },
+        )
+        svc_v.set_context(active=True, wake_word="armory", readback=True)
+        svc_v.sse_clients = 1
+        svc_v._wake_duck_held = True
+        svc_v._release_wake_duck_on_play_done = True
+
+        # Retry #1: stays ducked, armed, awaiting cmd, zero "end" call
+        ack1 = svc_v.handle_ack(armed=False, kind="warn", text='Didn’t catch "come on"', speech="Didn't catch that")
+        self.assertTrue(ack1["keptDuckForRetry"])
+        self.assertTrue(svc_v._wake_duck_held)
+        self.assertFalse(svc_v._release_wake_duck_on_play_done)
+        self.assertTrue(svc_v._oww_awaiting_cmd)
+        self.assertGreater(svc_v.armed_until_ms, int(time.time() * 1000) + 5000)
+        self.assertNotIn("end", duck_ops)
+        self.assertIn("extend:10", duck_ops)
+
+        # Bare follow-up "done" while armed translates to SSE "Armory, done"
+        retry_em = svc_v._emit_transcript("done", latency_ms=140, from_oww=True)
+        self.assertTrue(retry_em["emitted"])
+        self.assertEqual(retry_em["transcript"], "Hey Atlas, done")
+        self.assertEqual(svc_v._events[-1]["transcript"], "Armory, done")
+
+        # Subsequent non-warn ack releases duck cleanly and resets streak
+        svc_v.handle_ack(armed=False, kind="ok", text="✓ 50 lb × 8", speech="50 for 8, check")
+        self.assertFalse(svc_v._wake_duck_held)
+        self.assertIn("end", duck_ops)
+        self.assertEqual(svc_v._didnt_catch_streak, 0)
+
+        # Capped at 2 consecutive retries so a stuck miss cannot hold Denon ducked indefinitely
+        svc_v._wake_duck_held = True
+        duck_ops.clear()
+        self.assertTrue(svc_v.handle_ack(armed=False, kind="warn", speech="Didn't catch that")["keptDuckForRetry"])
+        self.assertTrue(svc_v.handle_ack(armed=False, kind="warn", speech="Didn't catch that")["keptDuckForRetry"])
+        ack3 = svc_v.handle_ack(armed=False, kind="warn", speech="Didn't catch that")
+        self.assertFalse(ack3["keptDuckForRetry"])
+        self.assertEqual(svc_v.armed_until_ms, 0)
+        self.assertIn("end", duck_ops)
+
+        # 2. tier2_rescue drops song-lyric hallucinations silently while passing real & local commands
+        local_calls: list[str] = []
+        svc_v._local_command_handler = lambda txt: (
+            (local_calls.append(txt), {"handled": True, "action": "run", "ackText": "✓ Gym opened"})[1]
+            if "open the gym" in txt.lower()
+            else None
+        )
+        ev_cnt_before = len(svc_v._events)
+        recent_before = len(svc_v.recent_transcripts)
+        spoken.clear()
+
+        drop_switch = svc_v._emit_transcript("Hey Atlas, every switch.", latency_ms=855, from_rescue=True, rescue_score=0.99)
+        self.assertFalse(drop_switch["emitted"])
+        self.assertTrue(drop_switch.get("rescueDropped"))
+
+        drop_comeon = svc_v._emit_transcript("Hey Atlas, come on.", latency_ms=610, from_rescue=True, rescue_score=0.98)
+        self.assertFalse(drop_comeon["emitted"])
+        self.assertTrue(drop_comeon.get("rescueDropped"))
+
+        self.assertEqual(len(svc_v._events), ev_cnt_before)
+        self.assertEqual(len(svc_v.recent_transcripts), recent_before)
+        self.assertEqual(spoken, [])
+
+        ok_rec = svc_v._emit_transcript("Hey Atlas, record this", latency_ms=420, from_rescue=True, rescue_score=0.98)
+        ok_wt = svc_v._emit_transcript("Hey Atlas, 50 for 8", latency_ms=410, from_rescue=True, rescue_score=0.98)
+        ok_loc = svc_v._emit_transcript("Hey Atlas, open the gym", latency_ms=390, from_rescue=True, rescue_score=0.98)
+        self.assertTrue(ok_rec["emitted"])
+        self.assertTrue(ok_wt["emitted"])
+        self.assertTrue(ok_loc["emitted"])
+        self.assertTrue(ok_loc.get("localHandled"))
+        self.assertEqual(local_calls, ["Hey Atlas, open the gym"])
+        self.assertTrue(rv.looks_like_workout_app_command("Hey Atlas, close video", "hey atlas"))
+        self.assertTrue(rv.looks_like_workout_app_command("Hey Atlas, guest rack", "hey atlas"))
+
+        # 3. Quiet-Room Silero-VAD Safety Net runs when aec_active=False and captures OWW=0.000 misses
+        class _ZeroOww:
+            ready = True
+            threshold = 0.38
+            latest_score = 0.0
+            def push_samples(self, _pcm, now_mono=0.0):
+                return False, 0.0
+            def reset(self):
+                pass
+
+        svc_q = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(wake_word="hey atlas", wake_engine="openwakeword"),
+            allow_hardware_audio=False,
+            wake_spotter=_ZeroOww(),
+        )
+        speech_burst = np.ones(1600, dtype=np.float32) * 0.2
+        with mock.patch.object(svc_q._aec_vad_detector, "push_samples", return_value=[speech_burst]) as m_vad:
+            svc_q._ingest_pcm16_frame(np.ones(512, dtype=np.float32) * 0.05, now_ms=90_000, now_mono=90.0)
+        m_vad.assert_called_once()
+        self.assertEqual(m_vad.call_args.kwargs.get("vad_samples_16k"), None)
+        self.assertEqual(svc_q._utt_queue.qsize(), 1)
+        q_item = svc_q._utt_queue.get_nowait()
+        self.assertFalse(q_item[1])  # from_oww=False
+        self.assertTrue(q_item[2])   # from_rescue=True (zero Denon duck)
+        self.assertAlmostEqual(q_item[3], 0.98, places=2)
+
+        # 4. WakeWordTrainerManager refuses ONNX training with HTTP 409 during active recording/workout
+        tmp = Path(tempfile.mkdtemp(prefix="armory_train_lock_"))
+        try:
+            svc_busy = ac.ArmoryCamService(root_dir=tmp)
+            app = ac.create_app(svc_busy)
+            client = app.test_client()
+            svc_busy.recording = True
+            resp_rec = client.post("/api/voice/wake-studio/train", json={"phrase": "hey atlas"})
+            self.assertEqual(resp_rec.status_code, 409)
+            self.assertIn("active workout", resp_rec.get_json()["error"].lower())
+
+            svc_busy.recording = False
+            svc_busy.wallboard.workout_active = True
+            resp_wb = client.post("/api/voice/wake-studio/train", json={"phrase": "hey atlas"})
+            self.assertEqual(resp_wb.status_code, 409)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_rescue_whisper_omits_prompt_echo_and_drops_low_confidence_segments(self) -> None:
+        import types
+        import numpy as np
+        import room_voice as rv
+
+        seen_calls: list[dict[str, object]] = []
+
+        class _FakeWhisperModel:
+            def __init__(self, segs):
+                self._segs = segs
+
+            def transcribe(self, _audio, **kwargs):
+                seen_calls.append(kwargs)
+                return list(self._segs), types.SimpleNamespace(language="en")
+
+        svc = rv.RoomVoiceService(
+            config=rv.RoomVoiceConfig(wake_word="hey atlas", wake_engine="openwakeword"),
+            allow_hardware_audio=False,
+        )
+        sample = np.ones(8000, dtype=np.float32) * 0.25
+
+        # 1. from_rescue=True must omit initial_prompt and drop high-no_speech / low-logprob segments
+        svc._model = _FakeWhisperModel([
+            types.SimpleNamespace(text="Hey Atlas, check.", no_speech_prob=0.62, avg_logprob=-0.40),
+            types.SimpleNamespace(text="Hey Atlas, done.", no_speech_prob=0.10, avg_logprob=-1.10),
+        ])
+        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=True), "")
+        self.assertIsNone(seen_calls[-1]["initial_prompt"])
+        self.assertAlmostEqual(float(seen_calls[-1]["no_speech_threshold"]), 0.55)
+        self.assertAlmostEqual(float(seen_calls[-1]["log_prob_threshold"]), -0.85)
+
+        # 2. Confident rescue segment passes cleanly with hotwords preserved
+        svc._model = _FakeWhisperModel([
+            types.SimpleNamespace(text="Hey Atlas, record this.", no_speech_prob=0.05, avg_logprob=-0.32),
+        ])
+        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=True), "Hey Atlas, record this.")
+        self.assertIn("Hey Atlas", str(seen_calls[-1]["hotwords"]))
+
+        # 3. Normal Tier-1 OWW path keeps initial_prompt & standard thresholds
+        svc._model = _FakeWhisperModel([
+            types.SimpleNamespace(text="Hey Atlas, done.", no_speech_prob=0.15, avg_logprob=-0.95),
+        ])
+        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=False), "Hey Atlas, done.")
+        self.assertIn("Hey Atlas, check.", str(seen_calls[-1]["initial_prompt"]))
+        self.assertAlmostEqual(float(seen_calls[-1]["no_speech_threshold"]), 0.72)
+
+    def test_bt_button_modes_long_press_double_tap_and_optiplex_actions(self) -> None:
+        from server.armory_cam import bt_button as bt
+        import numpy as np
+
+        # Virtual clock + scheduler for instant deterministic testing of hold & double-tap timing
+        sched_tasks: list[dict[str, object]] = []
+
+        def fake_schedule(delay_sec: float, fn):
+            task = {"delay": delay_sec, "fn": fn, "canceled": False}
+            sched_tasks.append(task)
+            return lambda: task.__setitem__("canceled", True)
+
+        def flush_timers(max_delay: float | None = None) -> None:
+            for t in list(sched_tasks):
+                if not t["canceled"] and (max_delay is None or float(t["delay"]) <= max_delay):
+                    t["canceled"] = True
+                    t["fn"]()  # type: ignore[operator]
+
+        events: list[tuple[str, dict[str, object]]] = []
+        # 1. Legacy "split" migrates cleanly to two_button (Vol+ tap -> check, Vol- tap -> record, Hold -> voice)
+        sm = bt.BtButtonStateMachine(
+            bt.BtButtonConfig.from_dict({"mode": "split", "holdMs": 450, "doubleTapMs": 380}),
+            on_action=lambda act, meta: events.append((act, meta)),
+            schedule_fn=fake_schedule,
+        )
+        self.assertEqual(sm.cfg.mode, "two_button")
+        # Zero-delay single tap when double is "none": no timer needed!
+        sm.on_key_down("vol_up", 1.00)
+        sm.on_key_up("vol_up", 1.12)
+        sm.on_key_down("vol_down", 2.00)
+        sm.on_key_up("vol_down", 2.15)
+        self.assertEqual([e[0] for e in events], ["check", "record"])
+
+        events.clear()
+        sched_tasks.clear()
+        sm.on_key_down("vol_down", 3.00)
+        sm.on_key_down("vol_down", 3.20)  # Windows auto-repeat while held -> ignored
+        sm.on_key_down("vol_down", 3.35)
+        self.assertEqual(len(sched_tasks), 1)
+        flush_timers()  # 450ms elapsed while held -> fires voice IMMEDIATELY before key_up!
+        self.assertEqual([e[0] for e in events], ["voice"])
+        self.assertEqual(events[0][1]["gesture"], "hold")
+        sm.on_key_up("vol_down", 3.70)  # Release after hold must NOT also fire short tap
+        self.assertEqual(len(events), 1)
+
+        # 2. Configurable "one_button" mode: custom single=check, double=record, long=voice
+        events.clear()
+        sched_tasks.clear()
+        sm.update_config(
+            bt.BtButtonConfig(
+                mode="one_button",
+                single_action="check",
+                double_action="record",
+                long_action="voice",
+                hold_ms=450,
+                double_tap_ms=380,
+            )
+        )
+        sm.on_key_down("vol_up", 4.00)
+        sm.on_key_up("vol_up", 4.08)
+        flush_timers()
+        self.assertEqual([e[0] for e in events], ["check"])
+
+        events.clear()
+        sched_tasks.clear()
+        sm.on_key_down("vol_down", 5.00)
+        sm.on_key_up("vol_down", 5.07)
+        sm.on_key_down("vol_down", 5.20)
+        sm.on_key_up("vol_down", 5.28)
+        self.assertEqual([e[0] for e in events], ["record"])
+        self.assertEqual(events[0][1]["gesture"], "double_tap")
+
+        events.clear()
+        sched_tasks.clear()
+        sm.on_key_down("vol_up", 6.00)
+        flush_timers()
+        sm.on_key_up("vol_up", 6.60)
+        self.assertEqual([e[0] for e in events], ["voice"])
+
+        # 2b. Single action "none" never emits on single tap; PICO HID matcher detects hardware string
+        events.clear()
+        sched_tasks.clear()
+        sm.update_config(bt.BtButtonConfig(mode="one_button", single_action="none", double_action="record", long_action="none"))
+        sm.on_key_down("vol_up", 6.80)
+        sm.on_key_up("vol_up", 6.88)
+        flush_timers()
+        self.assertEqual(events, [])
+        self.assertTrue(bt.is_pico_hid_device_name(r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_DEV_VID&020504_PID&0000_REV&0110_FFFF114F976F"))
+        self.assertFalse(bt.is_pico_hid_device_name(r"\\?\HID#VID_046D&PID_C548"))
+
+        # 3. Legacy "split_voice" migrates to two_button: Vol+ -> check, Vol- -> voice, Hold -> record
+        events.clear()
+        sched_tasks.clear()
+        sm.update_config(bt.BtButtonConfig.from_dict({"mode": "split_voice", "holdMs": 450}))
+        self.assertEqual(sm.cfg.mode, "two_button")
+        sm.on_key_down("vol_up", 7.00)
+        sm.on_key_up("vol_up", 7.10)
+        sm.on_key_down("vol_down", 8.00)
+        sm.on_key_up("vol_down", 8.10)
+        self.assertEqual([e[0] for e in events], ["check", "voice"])
+
+        # 4. ArmoryCamService integration & Flask REST endpoints
+        tmp = Path(tempfile.mkdtemp(prefix="armory_bt_btn_"))
+        try:
+            svc = ac.ArmoryCamService(root_dir=tmp)
+            spoken: list[str] = []
+            ducks: list[str] = []
+            chimes = [0]
+            svc.voice._speak_fn = lambda txt: (spoken.append(txt), True)[1]
+            svc.voice._chime_fn = lambda _k: (chimes.__setitem__(0, chimes[0] + 1), True)[1]
+            svc.voice._wake_duck_cbs = {
+                "begin": lambda: (ducks.append("begin"), {"ducked": True})[1],
+                "end": lambda: (ducks.append("end"), {"restored": True})[1],
+            }
+            svc.voice.sse_clients = 1
+            svc.voice.context_active = True
+
+            app = ac.create_app(svc)
+            client = app.test_client()
+            self.assertIn("btButtonCard", client.get("/").get_data(as_text=True))
+
+            c_res = client.post(
+                "/api/bt-button/config",
+                json={
+                    "mode": "one_button",
+                    "singleAction": "record",
+                    "doubleAction": "check",
+                    "longAction": "voice",
+                    "holdMs": 500,
+                    "doubleTapMs": 320,
+                    "swallowVolumeKeys": True,
+                },
+            )
+            self.assertEqual(c_res.status_code, 200)
+            self.assertEqual(c_res.get_json()["config"]["mode"], "one_button")
+            self.assertEqual(c_res.get_json()["config"]["singleAction"], "record")
+            self.assertEqual(c_res.get_json()["config"]["holdMs"], 500)
+
+            # Tap "record" -> arms clip & speaks Recording; tap "record" again (or "check") -> cuts & speaks Clip saved
+            r1 = client.post("/api/bt-button/trigger", json={"action": "record"}).get_json()
+            self.assertTrue(r1["ok"])
+            self.assertIsNotNone(svc.active_server_armed_clip())
+            self.assertEqual(spoken[-1], "Recording")
+
+            with mock.patch.object(
+                svc,
+                "cut_clips_multi",
+                return_value=[{"ok": True, "fileName": "Clip_BT_1.mp4", "lanUrl": "/clips/2026-11-26/Clip_BT_1.mp4"}],
+            ) as m_cut:
+                r2 = client.post("/api/bt-button/trigger", json={"action": "record"}).get_json()
+                self.assertTrue(r2["ok"])
+                self.assertEqual(m_cut.call_count, 1)
+                self.assertIsNone(svc.active_server_armed_clip())
+                self.assertEqual(spoken[-1], "Clip saved")
+
+                # Check action ALSO emits "Armory, done" for phone set check AND stops armed recording!
+                client.post("/api/bt-button/trigger", json={"action": "record"})
+                self.assertIsNotNone(svc.active_server_armed_clip())
+                r_chk = client.post("/api/bt-button/trigger", json={"action": "check"}).get_json()
+                self.assertTrue(r_chk["ok"])
+                self.assertIn("done", svc.voice._events[-1]["transcript"].lower())
+                # Mark claimed via /api/clip clears armed clip without double-cut
+                svc.clear_server_armed_clip()
+
+            # Voice action triggers manual wake -> Denon duck + ready chime + accepts bare "50 for 8"
+            with mock.patch.object(svc.voice, "play_ready_chime", side_effect=lambda: (chimes.__setitem__(0, chimes[0] + 1), True)[1]):
+                r_vx = client.post("/api/bt-button/trigger", json={"action": "voice"}).get_json()
+            self.assertTrue(r_vx["ok"])
+            self.assertIn("begin", ducks)
+            self.assertGreaterEqual(chimes[0], 1)
+            self.assertGreater(svc.voice.armed_until_ms, int(time.time() * 1000) + 4000)
+
+            # Status + config persistence across reload
+            self.assertEqual(client.get("/api/bt-button/status").get_json()["mode"], "one_button")
+            svc_reload = ac.ArmoryCamService(root_dir=tmp)
+            self.assertEqual(svc_reload.bt_button_cfg.mode, "one_button")
+            self.assertEqual(svc_reload.bt_button_cfg.single_action, "record")
+            self.assertEqual(svc_reload.bt_button_cfg.hold_ms, 500)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
