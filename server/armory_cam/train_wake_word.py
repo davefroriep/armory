@@ -1,4 +1,4 @@
-"""Custom openWakeWord ONNX trainer for The Armory (e.g. `hey_armory.onnx`, `hey_atlas.onnx`).
+"""Custom openWakeWord ONNX trainer for The Armory (`hey_armory.onnx`).
 
 Uses openWakeWord's exact frozen feature extractor (`melspectrogram.onnx` + `embedding_model.onnx`)
 so training features have 100% parity with live inference in `room_voice.py`.
@@ -191,47 +191,10 @@ def adversarial_phrases_for(phrase: str) -> list[str]:
             "hey maury",
             "hey aubrey",
             "hey audrey",
-            "hey atlas",
         ]
-        if clean != "armory":
-            # Only treat bare "armory" / "the armory" / "amory" as negatives when training multi-word "hey armory"
-            armory_adv.extend(["hey amory", "amory", "armory", "the armory"])
-        else:
-            # Extra 3-syllable confusables for bare "armory" (never include "the armory" or "hey armory" as negatives!)
-            armory_adv.extend([
-                "arming", "armies", "armed", "armor plate", "barbell", "arnold", "armani",
-                "artillery", "archery", "bakery", "brewery", "calvary", "cavalry", "chancery",
-                "creamery", "drapery", "finery", "forgery", "grocery", "imagery", "jewelry",
-                "lottery", "machinery", "memory card", "nursery", "pottery", "robbery",
-                "scenery", "slavery", "surgery", "winery", "i'm ready", "are we", "all righty",
-                "harming", "alarming", "charming", "farming", "warming", "swarmy",
-            ])
+        # Treat bare "armory" / "the armory" / "amory" as negatives when training multi-word "hey armory"
+        armory_adv.extend(["hey amory", "amory", "armory", "the armory"])
         base.extend(armory_adv)
-    elif "atlas" in clean:
-        base.extend([
-            "hey at last",
-            "at last",
-            "hey alice",
-            "alice",
-            "hey alex",
-            "alex",
-            "hey axis",
-            "axis",
-            "hey mantis",
-            "hey cactus",
-            "hey practice",
-            "practice",
-            "hey status",
-            "status",
-            "hey mattress",
-            "hey palace",
-            "hey dallas",
-            "hey hatless",
-            "hey headless",
-            "hey careless",
-            "hey armory",
-            "atlas",
-        ])
     elif "jarvis" in clean:
         base.extend([
             "hey harvest",
@@ -250,7 +213,6 @@ def adversarial_phrases_for(phrase: str) -> list[str]:
             "hey office",
             "hey target",
             "hey armory",
-            "hey atlas",
             "jarvis",
         ])
     # Deduplicate while preserving order
@@ -1187,17 +1149,7 @@ def blind_gym_stress_test(phrase: str, onnx_path: Path) -> None:
         return best
 
     low_p = phrase.strip().lower()
-    if "atlas" in low_p:
-        adv_tests = (
-            ("ADV: Hey At Last", "Hey At Last", False),
-            ("ADV: Hey Alice", "Hey Alice", False),
-            ("ADV: Hey Alex", "Hey Alex", False),
-            ("ADV: Hey Axis", "Hey Axis", False),
-            ("ADV: Hey Practice", "Hey Practice", False),
-            ("ADV: Hey Status", "Hey Status", False),
-            ("ADV: Bare Atlas", "Atlas", False),
-        )
-    elif "jarvis" in low_p:
+    if "jarvis" in low_p:
         adv_tests = (
             ("ADV: Hey Harvest", "Hey Harvest", False),
             ("ADV: Hey Service", "Hey Service", False),

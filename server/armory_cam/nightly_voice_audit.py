@@ -1049,8 +1049,8 @@ def run_streaming_sweep(
     # Record per-command peak OWW score on baseline model for diagnostic tables
     oww_curves: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     wake_models_to_test: list[tuple[str, str]] = [("hey armory", "hey_armory_v0.1")]
-    if (models_dir / "openwakeword" / "armory_v0.1.onnx").is_file() or (models_dir / "armory_v0.1.onnx").is_file():
-        wake_models_to_test.append(("armory", "armory_v0.1"))
+    if (models_dir / "openwakeword" / "hey_jarvis_v0.1.onnx").is_file() or (models_dir / "hey_jarvis_v0.1.onnx").is_file():
+        wake_models_to_test.append(("hey jarvis", "hey_jarvis_v0.1"))
     if base_wake_model not in [m for _w, m in wake_models_to_test]:
         wake_models_to_test.insert(0, (base_wake_word, base_wake_model))
 

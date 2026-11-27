@@ -333,7 +333,7 @@ def normalize_wake_text(text: str) -> str:
 
 
 def wake_phrase_slug(phrase: str) -> str:
-    """Normalize a wake phrase (e.g. 'hey atlas') into its file/folder slug ('hey_atlas')."""
+    """Normalize a wake phrase (e.g. 'hey armory') into its file/folder slug ('hey_armory')."""
     return re.sub(r"[^a-z0-9]+", "_", str(phrase or "").strip().lower()).strip("_") or "hey_armory"
 
 
@@ -351,18 +351,11 @@ def encode_pcm16_wav_bytes(pcm: np.ndarray, sr: int = SAMPLE_RATE_16K) -> bytes:
 
 
 def resolve_oww_model_name(wake_word: str) -> str:
-    """Map configured wake phrase (e.g. 'armory', 'hey armory', 'hey jarvis', 'hey atlas') to its ONNX model stem."""
+    """Map configured wake phrase ('hey armory' or 'hey jarvis') to its ONNX model stem."""
     w = re.sub(r"\s+", " ", (wake_word or "hey jarvis").strip().lower())
-    if w in ("armory", "armoury"):
-        return "armory_v0.1"
     if "armory" in w or "armoury" in w:
         return "hey_armory_v0.1"
-    if "jarvis" in w:
-        return "hey_jarvis_v0.1"
-    if "atlas" in w:
-        return "hey_atlas_v0.1"
-    slug = re.sub(r"[^a-z0-9]+", "_", w).strip("_") or "hey_jarvis"
-    return f"{slug}_v0.1"
+    return "hey_jarvis_v0.1"
 
 
 def _wake_regex(wake_word: str) -> re.Pattern[str]:
@@ -405,8 +398,6 @@ def _wake_regex(wake_word: str) -> re.Pattern[str]:
             "jarves",
             "jarvish",
         ]
-    elif "atlas" in wake_raw:
-        alts = ["hey atlas", "ok atlas", "okay atlas", "atlas"]
     else:
         alts = [wake_raw]
     joined = "|".join(re.escape(a) for a in alts)

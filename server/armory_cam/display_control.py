@@ -514,8 +514,6 @@ def _strip_wake_prefix(text: str, wake_word: str = "armory") -> str:
             "jarves",
             "jarvish",
         ]
-    elif "atlas" in wake_raw:
-        alts = ["hey atlas", "ok atlas", "okay atlas", "atlas"]
     else:
         alts = [wake_raw]
     pat = r"^(?:(?:hey|ok|okay)\s+)?(?:" + "|".join(re.escape(a) for a in alts) + r")(?:\s+|$)"

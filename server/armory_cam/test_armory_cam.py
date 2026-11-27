@@ -6280,10 +6280,11 @@ class ShowDirectorTests(unittest.TestCase):
         cfg_blend = rv.RoomVoiceConfig.from_dict({"ttsVoice": "kokoro:onyx_fenrir_epic"})
         self.assertEqual(cfg_blend.tts_voice, "kokoro:onyx_fenrir_epic")
 
-        # 5. Multi-wake-word ONNX resolution & hey armory regex/hot-swap
+        # 5. Multi-wake-word ONNX resolution & hey armory regex/hot-swap (Atlas & 1-word Armory retired)
         self.assertEqual(rv.resolve_oww_model_name("hey armory"), "hey_armory_v0.1")
+        self.assertEqual(rv.resolve_oww_model_name("armory"), "hey_armory_v0.1")
         self.assertEqual(rv.resolve_oww_model_name("hey jarvis"), "hey_jarvis_v0.1")
-        self.assertEqual(rv.resolve_oww_model_name("hey atlas"), "hey_atlas_v0.1")
+        self.assertEqual(rv.resolve_oww_model_name("hey atlas"), "hey_jarvis_v0.1")
         self.assertEqual(rv.strip_wake_word("Hey Armory, 225 for 8", "hey armory"), "225 for 8")
         self.assertEqual(rv.strip_wake_word("Hey Armoury, record this.", "hey armory"), "record this.")
         self.assertTrue(rv.matches_wake_word("Hey Armory, done", "hey armory"))
@@ -6303,7 +6304,11 @@ class ShowDirectorTests(unittest.TestCase):
 
             dash_html = client.get("/").get_data(as_text=True)
             self.assertIn("vxWakeWord", dash_html)
-            self.assertIn("hey armory", dash_html)
+            wake_sel = dash_html.split('<select id="vxWakeWord">', 1)[1].split("</select>", 1)[0]
+            self.assertIn('value="hey armory"', wake_sel)
+            self.assertIn('value="hey jarvis"', wake_sel)
+            self.assertNotIn('value="hey atlas"', wake_sel)
+            self.assertNotIn('value="armory"', wake_sel)
 
             page = client.get("/voice-auditions")
             self.assertEqual(page.status_code, 200)
@@ -7204,7 +7209,7 @@ class ShowDirectorTests(unittest.TestCase):
             vcfg = rv.RoomVoiceConfig(
                 enabled=True,
                 listen_mode="workout",
-                wake_word="hey atlas",
+                wake_word="hey armory",
                 wake_engine="openwakeword",
                 speaker_readback=False,
             )
@@ -7215,9 +7220,9 @@ class ShowDirectorTests(unittest.TestCase):
                 wake_spotter=spy,
             )
             self.assertFalse(svc.should_capture_now())
-            st0 = svc.start_wake_enrollment("hey atlas", target_reps=2)
+            st0 = svc.start_wake_enrollment("hey armory", target_reps=2)
             self.assertTrue(st0["active"])
-            self.assertEqual(st0["slug"], "hey_atlas")
+            self.assertEqual(st0["slug"], "hey_armory")
             self.assertTrue(svc.should_capture_now())
 
             # During enrollment, OWW spotter is bypassed and never receives frames
@@ -7245,12 +7250,12 @@ class ShowDirectorTests(unittest.TestCase):
             st2 = svc.wake_enrollment_status()
             self.assertEqual(st2["sessionCaptured"], 2)
             self.assertFalse(st2["active"])
-            wavs = list((tmp / "oww_training" / "hey_atlas" / "user_positives").glob("*.wav"))
+            wavs = list((tmp / "oww_training" / "hey_armory" / "user_positives").glob("*.wav"))
             self.assertEqual(len(wavs), 2)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_wake_studio_rest_endpoints_and_atlas_activation(self) -> None:
+    def test_wake_studio_rest_endpoints_and_activation(self) -> None:
         import numpy as np
         import room_voice as rv
 
@@ -7258,8 +7263,8 @@ class ShowDirectorTests(unittest.TestCase):
         try:
             oww_dir = tmp / "models" / "openwakeword"
             oww_dir.mkdir(parents=True, exist_ok=True)
-            (oww_dir / "hey_atlas_v0.1.onnx").write_bytes(b"fake-onnx")
-            udir = tmp / "oww_training" / "hey_atlas" / "user_positives"
+            (oww_dir / "hey_armory_v0.1.onnx").write_bytes(b"fake-onnx")
+            udir = tmp / "oww_training" / "hey_armory" / "user_positives"
             udir.mkdir(parents=True, exist_ok=True)
             clip_wav = rv.encode_pcm16_wav_bytes(np.ones(8000, dtype=np.float32) * 0.2, 16000)
             (udir / "dave_01.wav").write_bytes(clip_wav)
@@ -7269,35 +7274,40 @@ class ShowDirectorTests(unittest.TestCase):
             client = app.test_client()
 
             html = client.get("/").get_data(as_text=True)
-            self.assertIn('value="hey atlas"', html)
+            wake_sel = html.split('<select id="vxWakeWord">', 1)[1].split("</select>", 1)[0]
+            self.assertIn('value="hey armory"', wake_sel)
+            self.assertIn('value="hey jarvis"', wake_sel)
+            self.assertNotIn('value="hey atlas"', wake_sel)
+            self.assertNotIn('value="armory"', wake_sel)
             self.assertIn("wakeStudioCard", html)
 
             r0 = client.get("/api/voice/wake-studio").get_json()
             self.assertTrue(r0["ok"])
-            atlas = next(w for w in r0["words"] if w["slug"] == "hey_atlas")
-            self.assertTrue(atlas["modelExists"])
-            self.assertEqual(atlas["clipCount"], 1)
+            self.assertEqual([w["slug"] for w in r0["words"]], ["hey_jarvis", "hey_armory"])
+            ha = next(w for w in r0["words"] if w["slug"] == "hey_armory")
+            self.assertTrue(ha["modelExists"])
+            self.assertEqual(ha["clipCount"], 1)
 
-            r_enr = client.post("/api/voice/wake-studio/enroll", json={"action": "start", "phrase": "hey atlas", "targetReps": 20}).get_json()
+            r_enr = client.post("/api/voice/wake-studio/enroll", json={"action": "start", "phrase": "hey armory", "targetReps": 20}).get_json()
             self.assertTrue(r_enr["enrollment"]["active"])
             r_stop = client.post("/api/voice/wake-studio/enroll", json={"action": "stop"}).get_json()
             self.assertFalse(r_stop["enrollment"]["active"])
 
-            r_wav = client.get("/api/voice/wake-studio/clip/hey_atlas/dave_01.wav")
+            r_wav = client.get("/api/voice/wake-studio/clip/hey_armory/dave_01.wav")
             self.assertEqual(r_wav.status_code, 200)
             self.assertEqual(r_wav.mimetype, "audio/wav")
 
-            self.assertEqual(client.get("/api/voice/wake-studio/clip/hey_atlas/..%5Cconfig.json").status_code, 404)
+            self.assertEqual(client.get("/api/voice/wake-studio/clip/hey_armory/..%5Cconfig.json").status_code, 404)
 
-            r_del = client.delete("/api/voice/wake-studio/clip/hey_atlas/dave_01.wav").get_json()
+            r_del = client.delete("/api/voice/wake-studio/clip/hey_armory/dave_01.wav").get_json()
             self.assertTrue(r_del["ok"])
-            self.assertEqual(next(w for w in r_del["studio"]["words"] if w["slug"] == "hey_atlas")["clipCount"], 0)
+            self.assertEqual(next(w for w in r_del["studio"]["words"] if w["slug"] == "hey_armory")["clipCount"], 0)
 
-            r_act = client.post("/api/voice/wake-studio/activate", json={"phrase": "hey atlas"}).get_json()
+            r_act = client.post("/api/voice/wake-studio/activate", json={"phrase": "hey armory"}).get_json()
             self.assertTrue(r_act["ok"])
-            self.assertEqual(r_act["config"]["wakeWord"], "hey atlas")
-            self.assertEqual(svc.voice.cfg.wake_word, "hey atlas")
-            self.assertEqual(svc.voice._oww_spotter.model_name, "hey_atlas_v0.1")
+            self.assertEqual(r_act["config"]["wakeWord"], "hey armory")
+            self.assertEqual(svc.voice.cfg.wake_word, "hey armory")
+            self.assertEqual(svc.voice._oww_spotter.model_name, "hey_armory_v0.1")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
@@ -7349,7 +7359,7 @@ class ShowDirectorTests(unittest.TestCase):
         spoken: list[str] = []
         svc_v = rv.RoomVoiceService(
             config=rv.RoomVoiceConfig(
-                wake_word="hey atlas",
+                wake_word="hey jarvis",
                 wake_engine="openwakeword",
                 speaker_readback=True,
             ),
@@ -7379,7 +7389,7 @@ class ShowDirectorTests(unittest.TestCase):
         # Bare follow-up "done" while armed translates to SSE "Armory, done"
         retry_em = svc_v._emit_transcript("done", latency_ms=140, from_oww=True)
         self.assertTrue(retry_em["emitted"])
-        self.assertEqual(retry_em["transcript"], "Hey Atlas, done")
+        self.assertEqual(retry_em["transcript"], "Hey Jarvis, done")
         self.assertEqual(svc_v._events[-1]["transcript"], "Armory, done")
 
         # Subsequent non-warn ack releases duck cleanly and resets streak
@@ -7399,6 +7409,7 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertIn("end", duck_ops)
 
         # 2. tier2_rescue drops song-lyric hallucinations silently while passing real & local commands
+        svc_v.update_config({"wakeWord": "hey armory"})
         local_calls: list[str] = []
         svc_v._local_command_handler = lambda txt: (
             (local_calls.append(txt), {"handled": True, "action": "run", "ackText": "✓ Gym opened"})[1]
@@ -7409,11 +7420,11 @@ class ShowDirectorTests(unittest.TestCase):
         recent_before = len(svc_v.recent_transcripts)
         spoken.clear()
 
-        drop_switch = svc_v._emit_transcript("Hey Atlas, every switch.", latency_ms=855, from_rescue=True, rescue_score=0.99)
+        drop_switch = svc_v._emit_transcript("Hey Armory, every switch.", latency_ms=855, from_rescue=True, rescue_score=0.99)
         self.assertFalse(drop_switch["emitted"])
         self.assertTrue(drop_switch.get("rescueDropped"))
 
-        drop_comeon = svc_v._emit_transcript("Hey Atlas, come on.", latency_ms=610, from_rescue=True, rescue_score=0.98)
+        drop_comeon = svc_v._emit_transcript("Hey Armory, come on.", latency_ms=610, from_rescue=True, rescue_score=0.98)
         self.assertFalse(drop_comeon["emitted"])
         self.assertTrue(drop_comeon.get("rescueDropped"))
 
@@ -7421,16 +7432,16 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertEqual(len(svc_v.recent_transcripts), recent_before)
         self.assertEqual(spoken, [])
 
-        ok_rec = svc_v._emit_transcript("Hey Atlas, record this", latency_ms=420, from_rescue=True, rescue_score=0.98)
-        ok_wt = svc_v._emit_transcript("Hey Atlas, 50 for 8", latency_ms=410, from_rescue=True, rescue_score=0.98)
-        ok_loc = svc_v._emit_transcript("Hey Atlas, open the gym", latency_ms=390, from_rescue=True, rescue_score=0.98)
+        ok_rec = svc_v._emit_transcript("Hey Armory, record this", latency_ms=420, from_rescue=True, rescue_score=0.98)
+        ok_wt = svc_v._emit_transcript("Hey Armory, 50 for 8", latency_ms=410, from_rescue=True, rescue_score=0.98)
+        ok_loc = svc_v._emit_transcript("Hey Armory, open the gym", latency_ms=390, from_rescue=True, rescue_score=0.98)
         self.assertTrue(ok_rec["emitted"])
         self.assertTrue(ok_wt["emitted"])
         self.assertTrue(ok_loc["emitted"])
         self.assertTrue(ok_loc.get("localHandled"))
-        self.assertEqual(local_calls, ["Hey Atlas, open the gym"])
-        self.assertTrue(rv.looks_like_workout_app_command("Hey Atlas, close video", "hey atlas"))
-        self.assertTrue(rv.looks_like_workout_app_command("Hey Atlas, guest rack", "hey atlas"))
+        self.assertEqual(local_calls, ["Hey Armory, open the gym"])
+        self.assertTrue(rv.looks_like_workout_app_command("Hey Armory, close video", "hey armory"))
+        self.assertTrue(rv.looks_like_workout_app_command("Hey Armory, guest rack", "hey armory"))
 
         # 3. Quiet-Room Silero-VAD Safety Net runs when aec_active=False and captures OWW=0.000 misses
         class _ZeroOww:
@@ -7443,7 +7454,7 @@ class ShowDirectorTests(unittest.TestCase):
                 pass
 
         svc_q = rv.RoomVoiceService(
-            config=rv.RoomVoiceConfig(wake_word="hey atlas", wake_engine="openwakeword"),
+            config=rv.RoomVoiceConfig(wake_word="hey armory", wake_engine="openwakeword"),
             allow_hardware_audio=False,
             wake_spotter=_ZeroOww(),
         )
@@ -7465,13 +7476,13 @@ class ShowDirectorTests(unittest.TestCase):
             app = ac.create_app(svc_busy)
             client = app.test_client()
             svc_busy.recording = True
-            resp_rec = client.post("/api/voice/wake-studio/train", json={"phrase": "hey atlas"})
+            resp_rec = client.post("/api/voice/wake-studio/train", json={"phrase": "hey armory"})
             self.assertEqual(resp_rec.status_code, 409)
             self.assertIn("active workout", resp_rec.get_json()["error"].lower())
 
             svc_busy.recording = False
             svc_busy.wallboard.workout_active = True
-            resp_wb = client.post("/api/voice/wake-studio/train", json={"phrase": "hey atlas"})
+            resp_wb = client.post("/api/voice/wake-studio/train", json={"phrase": "hey armory"})
             self.assertEqual(resp_wb.status_code, 409)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -7492,15 +7503,15 @@ class ShowDirectorTests(unittest.TestCase):
                 return list(self._segs), types.SimpleNamespace(language="en")
 
         svc = rv.RoomVoiceService(
-            config=rv.RoomVoiceConfig(wake_word="hey atlas", wake_engine="openwakeword"),
+            config=rv.RoomVoiceConfig(wake_word="hey armory", wake_engine="openwakeword"),
             allow_hardware_audio=False,
         )
         sample = np.ones(8000, dtype=np.float32) * 0.25
 
         # 1. from_rescue=True must omit initial_prompt and drop high-no_speech / low-logprob segments
         svc._model = _FakeWhisperModel([
-            types.SimpleNamespace(text="Hey Atlas, check.", no_speech_prob=0.62, avg_logprob=-0.40),
-            types.SimpleNamespace(text="Hey Atlas, done.", no_speech_prob=0.10, avg_logprob=-1.10),
+            types.SimpleNamespace(text="Hey Armory, check.", no_speech_prob=0.62, avg_logprob=-0.40),
+            types.SimpleNamespace(text="Hey Armory, done.", no_speech_prob=0.10, avg_logprob=-1.10),
         ])
         self.assertEqual(svc._transcribe_utterance(sample, from_rescue=True), "")
         self.assertIsNone(seen_calls[-1]["initial_prompt"])
@@ -7509,17 +7520,17 @@ class ShowDirectorTests(unittest.TestCase):
 
         # 2. Confident rescue segment passes cleanly with hotwords preserved
         svc._model = _FakeWhisperModel([
-            types.SimpleNamespace(text="Hey Atlas, record this.", no_speech_prob=0.05, avg_logprob=-0.32),
+            types.SimpleNamespace(text="Hey Armory, record this.", no_speech_prob=0.05, avg_logprob=-0.32),
         ])
-        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=True), "Hey Atlas, record this.")
-        self.assertIn("Hey Atlas", str(seen_calls[-1]["hotwords"]))
+        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=True), "Hey Armory, record this.")
+        self.assertIn("Hey Armory", str(seen_calls[-1]["hotwords"]))
 
         # 3. Normal Tier-1 OWW path keeps initial_prompt & standard thresholds
         svc._model = _FakeWhisperModel([
-            types.SimpleNamespace(text="Hey Atlas, done.", no_speech_prob=0.15, avg_logprob=-0.95),
+            types.SimpleNamespace(text="Hey Armory, done.", no_speech_prob=0.15, avg_logprob=-0.95),
         ])
-        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=False), "Hey Atlas, done.")
-        self.assertIn("Hey Atlas, check.", str(seen_calls[-1]["initial_prompt"]))
+        self.assertEqual(svc._transcribe_utterance(sample, from_rescue=False), "Hey Armory, done.")
+        self.assertIn("Hey Armory, check.", str(seen_calls[-1]["initial_prompt"]))
         self.assertAlmostEqual(float(seen_calls[-1]["no_speech_threshold"]), 0.72)
 
     def test_bt_button_modes_long_press_double_tap_and_optiplex_actions(self) -> None:

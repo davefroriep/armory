@@ -3084,10 +3084,8 @@ class WallboardRelay:
 
 
 WAKE_STUDIO_CATALOG: tuple[dict[str, str], ...] = (
-    {"phrase": "hey atlas", "slug": "hey_atlas", "label": "Hey Atlas", "kind": "custom"},
-    {"phrase": "hey armory", "slug": "hey_armory", "label": "Hey Armory", "kind": "custom"},
-    {"phrase": "armory", "slug": "armory", "label": "Armory (Bare)", "kind": "custom"},
     {"phrase": "hey jarvis", "slug": "hey_jarvis", "label": "Hey Jarvis", "kind": "stock"},
+    {"phrase": "hey armory", "slug": "hey_armory", "label": "Hey Armory", "kind": "custom"},
 )
 _WAKE_CLIP_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\.wav$", re.IGNORECASE)
 
@@ -10344,9 +10342,7 @@ DASHBOARD_HTML = """<!doctype html>
               <label>Wake Word (Streaming ONNX)</label>
               <select id="vxWakeWord">
                 <option value="hey jarvis">Hey Jarvis (Built-in ONNX)</option>
-                <option value="hey atlas">Hey Atlas (Custom ONNX)</option>
                 <option value="hey armory">Hey Armory (Custom ONNX)</option>
-                <option value="armory">Armory (Custom Bare ONNX)</option>
               </select>
             </div>
             <div>
@@ -14047,7 +14043,7 @@ function syncMeterStream() {
   }
 }
 
-const wsState = { data: null, selectedPhrase: 'hey atlas', timer: null };
+const wsState = { data: null, selectedPhrase: 'hey armory', timer: null };
 
 function _wsSelectedWord() {
   const words = (wsState.data && Array.isArray(wsState.data.words)) ? wsState.data.words : [];
@@ -14066,7 +14062,7 @@ function renderWakeStudio(st) {
   const enr = st.enrollment || {};
   const trn = st.training || {};
   if (enr.active && enr.phrase) wsState.selectedPhrase = enr.phrase;
-  else if (!st.words.some(w => w.phrase === wsState.selectedPhrase)) wsState.selectedPhrase = st.activePhrase || 'hey atlas';
+  else if (!st.words.some(w => w.phrase === wsState.selectedPhrase)) wsState.selectedPhrase = st.activePhrase || 'hey armory';
   const word = _wsSelectedWord();
 
   const pillsEl = $('wsWordPills');
@@ -14131,7 +14127,7 @@ function renderWakeStudio(st) {
   if ($('wsPromptCue')) {
     $('wsPromptCue').textContent = enr.active
       ? (enr.prompt || 'Speak clearly toward PowerConf S330…')
-      : `Click Start Guided Capture, then say "${word ? word.label : 'Hey Atlas'}" 20 times at your natural gym pace (chime between reps).`;
+      : `Click Start Guided Capture, then say "${word ? word.label : 'Hey Armory'}" 20 times at your natural gym pace (chime between reps).`;
   }
   if ($('wsLastEvent')) {
     $('wsLastEvent').textContent = enr.lastEvent || 'Say only the wake phrase after each chime — training mixes in gym rock & command tails automatically.';
