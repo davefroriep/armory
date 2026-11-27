@@ -1,8 +1,8 @@
-# Armory Chest Strap Wi-Fi Button Pod — Master Engineering Spec (`Rev v2.1`)
+# Armory Chest Strap Wi-Fi Button Pod — Master Engineering Spec (`Rev v2.2`)
 
 ## Executive Summary
 
-The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.1` — Version C Eased-Wing Single-Button)** keeps the ultra-compact `47.00 × 37.60 × 10.50 mm` main pod housing a **`502030` 250 mAh 3.7 V LiPo pouch**, floated **Seeed Studio XIAO ESP32-C6**, and single `6×6×4.3 mm` tactile switch (`SW1` above the XIAO), while replacing the separate backplate clip with **monolithic eased-transition strap wings** (`62.20 mm` overall wing-to-wing — still shorter than Polar H10's `65.0 mm`). Removing the inner wing stub opens a wide **`4.80 mm` slot** flush against **`1.80 × 2.00 mm` underside Base ramps** (`6.60 mm` effective lead-in), letting the 30 mm Polar band flow smoothly beneath the base at a shallow angle, while the low **`2.60 × 2.80 mm` outer slotted C-bars** feature `0.90 mm` top bevels and centered `2.60 -> 4.20 mm` slip-in slits that clear both Polar plastic end clips effortlessly.
+The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.2` — Version C Eased-Wing Single-Button)** keeps the ultra-compact `47.00 × 37.60 × 10.50 mm` main pod housing a **`502030` 250 mAh 3.7 V LiPo pouch**, floated **Seeed Studio XIAO ESP32-C6**, and single `6×6×4.3 mm` tactile switch (`SW1` above the XIAO) alongside **monolithic eased-transition strap wings** (`62.20 mm` overall wing-to-wing). `Rev v2.2` upgrades the `SW1` cradle with solid top/bottom bars + `3.00 mm` left/right center locking bars (clearing all 4 corner switch legs cleanly) and shortens the Lid plunger stalk by `0.50 mm` (`Z = 6.15 mm`) so the paddle rests flat with zero pre-load.
 
 ---
 
@@ -18,10 +18,11 @@ The **Armory Chest Strap Wi-Fi Button Pod (`Rev v2.1` — Version C Eased-Wing S
   - `Z = 0.00..1.20 mm` (`1.20 mm`): 100% solid continuous PETG bottom floor (`Method 2`), `0.80 mm × 45°` anti-elephant-foot outer chamfer (`DRC 29`)
   - `Z = 1.20..4.50 mm` (`3.30 mm`): Floated XIAO ESP32-C6 corner support piers (`component_lib` bare-PCB zones only; open airgap beneath `ANT1` & header pins per `DRC 24/37`)
   - `Z = 1.20..4.80 mm` (`3.60 mm`): True `SlotOverall(10.00, 3.60)` stadium USB-C port flush in `-Y` wall (`WALL_USB = 1.60 mm`, flat butt seam per `DRC 14`)
-  - `Z = 1.20..5.50 mm`: Single `6×6×4.3 mm` tactile switch (`SW1`) seated at `(34.31, +10.50)` in a snug `6.70 × 6.70 mm` retention cradle above the XIAO
+  - `Z = 1.20..5.50 mm`: Single `6×6×4.3 mm` tactile switch (`SW1`) seated at `(34.31, +10.50)` in a `6.70 × 6.70 mm` cradle (solid top/bottom bars + `3.00 mm` `-X/+X` center bars clearing all 4 switch legs cleanly)
   - `Z = 5.60 mm`: Base/Lid parting plane (`0.80 mm` solid bridge above USB-C stadium -> clean un-notched Lid skirt)
   - `Z = 5.60..8.80 mm` (`3.20 mm`): Stepped `1.45 mm` shoulder tongue on `-X/+X/+Y` with **2× `10 mm` slotted cantilever snap tabs** (`0.55 mm` barb, `0.10 mm` radial gap = **`0.45 mm` net interference**, `1.15 mm` solid Lid retaining lip per `DRC 10/30`)
-  - `Z = 8.95..10.50 mm` (`1.55 mm`): Solid Lid roof (`ARMORY v2.1` `0.35 mm` deboss leaves `1.20 mm` solid backing per `DRC 8`)
+  - `Z = 6.15..8.95 mm`: Shortened `-0.50 mm` Lid plunger stalk above `SW1` (flush resting paddle, zero pre-load)
+  - `Z = 8.95..10.50 mm` (`1.55 mm`): Solid Lid roof (`ARMORY v2.2` `0.35 mm` deboss leaves `1.20 mm` solid backing per `DRC 8`)
   - `Z = 10.50..12.10 mm` (`1.60 mm`): Optional removable/CA-bond Anti-Mash Barbell Guard Bezel (`4× Ø1.40 mm` alignment pins mate into `0.35 mm` blind Lid dimples)
 
 ---

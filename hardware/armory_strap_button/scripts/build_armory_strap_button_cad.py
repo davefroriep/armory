@@ -217,9 +217,9 @@ def build_base_lid_and_bezel():
     # 2. Hollow interior cavity above 1.20 mm solid continuous floor (Z = FLOOR_T..LID_CEIL_Z)
     hull = hull - PosBox(CAV_X0, CAV_X1, CAV_Y0, CAV_Y1, FLOOR_T, LID_CEIL_Z)
 
-    # 3. Deboss ARMORY / v2.1 on flat lower roof (Y < +2) -> 1.20 mm solid backing
+    # 3. Deboss ARMORY / v2.2 on flat lower roof (Y < +2) -> 1.20 mm solid backing
     t_brand = Text("ARMORY", font_size=5.8, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
-    t_rev = Text("v2.1", font_size=4.8, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
+    t_rev = Text("v2.2", font_size=4.8, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
     deb1 = extrude(Plane.XY.offset(H_TOTAL - 0.35) * t_brand, amount=0.55).translate((23.5, -5.2, 0.0))
     deb2 = extrude(Plane.XY.offset(H_TOTAL - 0.35) * t_rev, amount=0.55).translate((23.5, -12.6, 0.0))
 
@@ -357,16 +357,25 @@ def build_base_lid_and_bezel():
     usb_cut = extrude(usb_sk, amount=WALL_USB + 2.40).translate((usb_x, CAV_Y0 + 0.80, FLOOR_T + 1.80))
     base = base - usb_cut
 
-    # 10. Single 6x6x4.3 mm Tactile Switch Cradle (SW1) centered at (34.31, +10.50) above XIAO
-    cradle_w = SW_BODY_W + 2.0 * SW_CRADLE_CLR
+    # 10. Single 6x6x4.3 mm Tactile Switch Cradle (SW1) at (34.31, +10.50):
+    #     Solid +Y (top) & -Y (bottom) bars + 3.00 mm centered -X (left) & +X (right) bars
+    #     so all 4 corner switch legs (Y = SW_CY +/- 2.25 mm) sit in 100% open air!
+    cradle_w = SW_BODY_W + 2.0 * SW_CRADLE_CLR  # 6.70 mm square pocket (half_c = 3.35)
     half_c = 0.5 * cradle_w
     rib_t = 0.80
-    outer_c = PosBox(SW_CX - half_c - rib_t, SW_CX + half_c + rib_t, SW_CY - half_c - rib_t, SW_CY + half_c + rib_t, FLOOR_T - 0.10, FLOOR_T + 2.50)
-    inner_c = PosBox(SW_CX - half_c, SW_CX + half_c, SW_CY - half_c, SW_CY + half_c, FLOOR_T + 0.01, FLOOR_T + 3.00)
-    lead_clear = PosBox(SW_CX - half_c - rib_t - 0.30, SW_CX + half_c + rib_t + 0.30, SW_CY - 1.60, SW_CY + 1.60, FLOOR_T + 0.01, FLOOR_T + 3.00)
-    base = base + (outer_c - inner_c - lead_clear)
+    bar_h = 2.50
+    top_bar = PosBox(SW_CX - half_c, SW_CX + half_c, SW_CY + half_c, SW_CY + half_c + rib_t, FLOOR_T - 0.10, FLOOR_T + bar_h)
+    bot_bar = PosBox(SW_CX - half_c, SW_CX + half_c, SW_CY - half_c - rib_t, SW_CY - half_c, FLOOR_T - 0.10, FLOOR_T + bar_h)
+    left_ctr = PosBox(SW_CX - half_c - rib_t, SW_CX - half_c, SW_CY - 1.50, SW_CY + 1.50, FLOOR_T - 0.10, FLOOR_T + bar_h)
+    right_ctr = PosBox(SW_CX + half_c, SW_CX + half_c + rib_t, SW_CY - 1.50, SW_CY + 1.50, FLOOR_T - 0.10, FLOOR_T + bar_h)
+    base = base + top_bar + bot_bar + left_ctr + right_ctr
+    assert base.is_inside((SW_CX - half_c - 0.40, SW_CY, FLOOR_T + 1.20)), "SW1 -X 3mm center bar missing!"
+    assert base.is_inside((SW_CX + half_c + 0.40, SW_CY, FLOOR_T + 1.20)), "SW1 +X 3mm center bar missing!"
+    for lx_s in (-1.0, 1.0):
+        for ly_s in (-1.0, 1.0):
+            assert not base.is_inside((SW_CX + lx_s * (half_c + 0.40), SW_CY + ly_s * 2.25, FLOOR_T + 1.20)), "SW1 corner leg zone must be open!"
 
-    # 11. Single Wide PETG Cantilever Flex-Paddle in Lid + Plunger Boss over SW1
+    # 11. Single Wide PETG Cantilever Flex-Paddle in Lid + Shortened Plunger Stalk (Z=6.15mm -> 0.65mm rest gap)
     u_top = PosBox(HINGE_X0, PADDLE_X1 + SLOT_GAP, PADDLE_Y1, PADDLE_Y1 + SLOT_GAP, LID_CEIL_Z - 0.2, H_TOTAL + 0.3)
     u_bot = PosBox(HINGE_X0, PADDLE_X1 + SLOT_GAP, PADDLE_Y0 - SLOT_GAP, PADDLE_Y0, LID_CEIL_Z - 0.2, H_TOTAL + 0.3)
     u_tip = PosBox(PADDLE_X1, PADDLE_X1 + SLOT_GAP, PADDLE_Y0 - SLOT_GAP, PADDLE_Y1 + SLOT_GAP, LID_CEIL_Z - 0.2, H_TOTAL + 0.3)
@@ -374,8 +383,9 @@ def build_base_lid_and_bezel():
     dimple = Cone(0.50, 2.15, 0.85, align=(Align.CENTER, Align.CENTER, Align.MIN)).translate((SW_CX, SW_CY, H_TOTAL - 0.83))
     lid_mated = lid_mated - u_top - u_bot - u_tip - hinge_relief - dimple
 
-    plunger_h = LID_CEIL_Z - 5.65
-    boss = Cylinder(radius=2.10, height=plunger_h + 0.20, align=(Align.CENTER, Align.CENTER, Align.MIN)).translate((SW_CX, SW_CY, 5.65))
+    plunger_bot_z = 6.15  # 0.50 mm shorter than 5.65 -> rests flat without pre-pressing switch stem!
+    plunger_h = LID_CEIL_Z - plunger_bot_z
+    boss = Cylinder(radius=2.10, height=plunger_h + 0.20, align=(Align.CENTER, Align.CENTER, Align.MIN)).translate((SW_CX, SW_CY, plunger_bot_z))
     lid_mated = lid_mated + boss
     lid_print = lid_mated.rotate(Axis.Y, 180.0).translate((ENC_L, 0.0, H_TOTAL))
 
@@ -416,12 +426,12 @@ def _wire_routes_3d():
         {
             "net": "BTN1_D1",
             "color": "#2563eb",
-            "points": [[p_d1[0], p_d1[1], z_wire], [29.8, SW_CY, z_wire], [SW_CX - 3.4, SW_CY, 3.00]],
+            "points": [[p_d1[0], p_d1[1], z_wire], [29.8, 8.25, z_wire], [SW_CX - 3.6, 8.25, 2.50]],
         },
         {
             "net": "GND_SW",
             "color": "#475569",
-            "points": [[p_gnd[0], p_gnd[1], z_wire], [38.8, SW_CY, z_wire], [SW_CX + 3.4, SW_CY, 3.00]],
+            "points": [[p_gnd[0], p_gnd[1], z_wire], [38.8, 8.25, z_wire], [SW_CX + 3.6, 8.25, 2.50]],
         },
     ]
 
@@ -441,8 +451,8 @@ def _write_spec_json(path, snaps_spec, xiao_spec):
         {"name": "SW1", "x": round(SW_CX, 3),               "y": round(SW_CY, 3),               "net": "BTN1_D1"},
     ]
     spec = {
-        "project": "Armory Chest Strap Wi-Fi Button Pod v2.1 (Version C — Monolithic Eased Wings)",
-        "title": "Armory Strap Button v2.1 (62.2 x 37.6 x 10.5 mm) — BRep Internals",
+        "project": "Armory Chest Strap Wi-Fi Button Pod v2.2 (Version C — Monolithic Eased Wings)",
+        "title": "Armory Strap Button v2.2 (62.2 x 37.6 x 10.5 mm) — BRep Internals",
         "architecture": "method2",
         "uses_wire_combs": False,
         "has_usb_port": True,
