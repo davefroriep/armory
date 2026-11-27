@@ -1,22 +1,20 @@
 """
 build_armory_strap_button_cad.py
-Master Parametric CAD Generator for Armory Chest Strap Wi-Fi Button Pod (Rev v2.0 — Version C Single-Button).
+Master Parametric CAD Generator for Armory Chest Strap Wi-Fi Button Pod (Rev v2.1 — Version C Eased Wings).
 
-Architecture (Compact Side-by-Side 502030 250mAh + Single Button + Zero-Electrode-Contact Strap Clip):
-  - Compact enclosure without side wings: 47.00 mm (L) x 37.60 mm (W) x 10.50 mm (H)
-    (-24.6 mm shorter than v1.1; -18.0 mm shorter than Polar H10!).
-  - Method 2 100% solid 1.20 mm bottom floor (Z=0..1.20) + 2 compact internal bays:
-      1. Bay 1 (-X): 502030 (250 mAh) LiPo pouch + PCM cavity (20.60 x 32.60 mm) behind 1.20 mm armor wall
-      2. Bay 2 (+X): Lower Zone = Floated Seeed XIAO ESP32-C6 (belly-down, 3.30 mm piers, rotation=-90 -> USB-C on -Y)
-                     Upper Zone = Single 6x6x4.3 mm tactile switch (SW1) centered at (34.31, +10.50)
-  - Separate 1-Piece Zero-Electrode-Contact Strap Clip (armory_strap_button_strap_clip.step):
-      * 1.15 mm top & bottom slide-in pockets + 2.00 mm inward-trapping wings grip ONLY outer strap edges
-      * Leaves entire center 26.80 mm Polar electrode strip 100% open & flat
+Architecture (Monolithic Compact Side-by-Side 502030 250mAh + Single Button + Eased Strap Wings):
+  - Compact main enclosure: 47.00 mm (L) x 37.60 mm (W) x 10.50 mm (H)
+  - Overall with monolithic zero-stub flush strap wings: 62.20 mm (L) x 37.60 mm (W)
+    (still shorter than Polar H10's 65.00 mm!):
+      * Zero inner stub (4.80 mm wide open slot starts flush against Base X=0 / X=47 outer walls)
+      * Eased 1.80 x 2.00 mm underside Base ramps across the 31.20 mm strap window (Y in [-15.60, +15.60])
+        so the Polar band flows smoothly under the floor at a shallow wave instead of a sharp 90-deg bend
+      * Low 2.60 mm x 2.80 mm outer slotted C-bars with 0.90 mm top-edge bevels (strap glides smoothly OVER bars)
+        + centered 2.60 -> 4.20 mm flared slip-in slits (clears Polar plastic end clips cleanly)
   - Exported Z=0 Support-Free Component STEPs in models/:
-      1. armory_strap_button_base.step
-      2. armory_strap_button_lid.step         (Single wide PETG flex-paddle, ARMORY v2.0)
-      3. armory_strap_button_bezel.step       (Optional 1.60 mm anti-mash barbell guard frame)
-      4. armory_strap_button_strap_clip.step  (Vertically printed C-rail strap clip)
+      1. armory_strap_button_base.step   (Monolithic Base + eased strap wings)
+      2. armory_strap_button_lid.step    (Single wide PETG flex-paddle, ARMORY v2.1)
+      3. armory_strap_button_bezel.step  (Optional 1.60 mm anti-mash barbell guard)
 """
 
 import json
@@ -68,8 +66,8 @@ Y_MIN = -0.5 * ENC_W          # -18.80 mm
 Y_MAX = +0.5 * ENC_W          # +18.80 mm
 CORNER_R = 3.00
 
-WALL_X_L = 3.40               # Left snap wall (>= 1.25 mm backing behind groove)
-WALL_X_R = 3.58               # Right snap wall (>= 1.45 mm backing behind groove)
+WALL_X_L = 3.40               # Left snap wall (leaves >= 1.60 mm solid wall behind 1.80 mm base ramp)
+WALL_X_R = 3.58               # Right snap wall
 WALL_POS_Y = 3.40             # Top registration tongue wall
 WALL_USB = 1.60               # Flush XIAO USB-C wall on -Y (DRC 14)
 
@@ -80,7 +78,7 @@ CAV_Y1 = Y_MAX - WALL_POS_Y   # +15.40 mm (32.60 mm height for 30 mm 502030 LiPo
 
 # Bottom-Up Z-Stackup (DRC 13)
 FLOOR_T = 1.20                # Solid Method 2 continuous floor (Z = 0.00..1.20)
-H_BASE = 5.60                 # Split line (leaves 0.80 mm bridge above Z=1.20..4.80 USB stadium!)
+H_BASE = 5.60                 # Split line (leaves 0.80 mm bridge above Z=1.20..4.80 USB stadium)
 TONGUE_H = 3.20               # DRC 30: tall structural shoulder tongue (Z = 5.60..8.80)
 TONGUE_T = 1.45               # DRC 30: >= 1.40 mm tongue wall
 RADIAL_CLR = 0.10             # Tight radial slip fit
@@ -88,6 +86,19 @@ BARB_PROUD = 0.55             # DRC 10: 0.45 mm net snap interference
 LID_CEIL_Z = H_BASE + TONGUE_H + 0.15   # 8.95 mm interior Lid ceiling
 ROOF_T = 1.55                 # Leaves 1.20 mm solid backing behind 0.35 mm deboss (DRC 8)
 H_TOTAL = LID_CEIL_Z + ROOF_T # 10.50 mm total pod thickness
+
+# Monolithic Eased-Transition Flat Wings (Z = 0.00..2.60 mm, Zero Inner Stub)
+WING_EXT = 7.60               # Wing overhang past Base ends -> 62.20 mm overall wing-to-wing!
+WING_H = 2.60                 # Low-profile 2.60 mm outer C-bar height
+WING_OUTER_BAR = 2.80         # 2.80 x 2.60 mm slotted C-bar cross-section
+SLOT_W_X = WING_EXT - WING_OUTER_BAR  # 4.80 mm wide open slot (starts flush at X=0 / X=47!)
+SLOT_LEN_Y = 31.20            # Y in [-15.60, +15.60] (fits 30 mm Polar band + 3.20 mm bridge arms)
+BASE_RAMP_DX = 1.80           # Eased Base underside bevel X width (6.60 mm effective lead-in!)
+BASE_RAMP_DZ = 2.00           # Eased Base underside bevel Z rise (n.Z = -0.669 > -0.75 -> 0 overhangs)
+BAR_TOP_BEVEL = 0.90          # Top inner & outer 45-deg bevels on each C-bar so strap flows smoothly OVER
+SLIT_THROAT_HALF_Y = 1.30     # 2.60 mm neck throat
+SLIT_OUTER_HALF_Y = 2.10      # 4.20 mm flared entry mouth
+SLIT_INNER_HALF_Y = 1.70      # 3.40 mm soft inner flare
 
 # Bay 1 (-X): 502030 (250 mAh) LiPo Pouch
 DIV1_X0, DIV1_X1 = 24.00, 25.20  # 1.20 mm internal armor divider
@@ -107,26 +118,16 @@ XIAO_POCK_Y1 = XIAO_BY1 + XIAO_CLR               # +4.195 mm
 
 # Upper Bay 2: Single 6x6x4.3 mm Switch (SW1) centered directly above XIAO
 SW_CX = XIAO_CX               # 34.31 mm
-SW_CY = +10.50                # 3.52 mm clean gap above XIAO +Y edge
+SW_CY = +10.50
 SW_BODY_W = 6.00
-SW_CRADLE_CLR = 0.35          # 6.35 x 6.35 mm snug cradle
-SW_PLUNGER_Z = FLOOR_T + 4.30 # 5.50 mm stem tip
+SW_CRADLE_CLR = 0.35
 
 # Single Flex-Paddle & Anti-Mash Bezel Constants
-HINGE_X0 = 22.00              # Left hinge root cleanly over divider zone
-PADDLE_X1 = 41.50             # Paddle tip X (+7.2 mm past SW_CX)
+HINGE_X0 = 22.00
+PADDLE_X1 = 41.50
 PADDLE_Y0, PADDLE_Y1 = +5.50, +14.50
 SLOT_GAP = 0.90
-BEZEL_H = 1.60                # Optional raised barbell guard
-
-# Zero-Electrode-Contact Top/Bottom Strap Clip (C-rail backplate)
-CLIP_X0, CLIP_X1 = 2.50, 44.50       # 42.00 mm wide spine along strap
-CLIP_OUTER_W = 36.80                 # Y in [-18.40, +18.40] (slight 0.40 mm setback from pod edge)
-CLIP_SPINE_T = 0.80                  # Glue plate Z in [-0.80, 0.00]
-CLIP_POCKET_H = 1.15                 # ~1 mm pocket height (Z in [-1.95, -0.80])
-CLIP_SIDE_WALL = 3.00                # Y outer pocket wall -> clear Y slot = 30.80 mm (30 mm Polar band)
-CLIP_WING_LEN = 2.00                 # 2.00 mm inward-pointing strap edge trapping wings
-CLIP_WING_T = 1.20                   # Z in [-3.15, -1.95]
+BEZEL_H = 1.60
 
 
 def PosBox(x0, x1, y0, y1, z0, z1):
@@ -141,19 +142,16 @@ def _rounded_rect_prism(x0, x1, y0, y1, z0, z1, r):
 
 
 def _build_snap_tongue_with_custom_barb(tongue_solid, lid_clr_solid):
-    """
-    DRC 10 & DRC 30: Build 2 opposed 10 mm slotted cantilever snap tabs on -X and +X walls
-    with >= 1.15 mm solid Lid retaining lip below the barb groove and 0.45 mm net interference.
-    """
-    z_ctr = H_BASE + 2.05     # 7.65 mm -> bottom of 45-deg ramp at 6.85 -> groove bottom 6.75 -> 1.15 mm Lid lip
+    """DRC 10 & DRC 30: 2 opposed 10 mm slotted cantilever snap tabs on -X and +X walls."""
+    z_ctr = H_BASE + 2.05
     crest_h = 0.50
-    z_c0 = z_ctr - 0.5 * crest_h   # 7.40 mm
-    z_c1 = z_ctr + 0.5 * crest_h   # 7.90 mm
-    z_bot_ramp = z_c0 - BARB_PROUD # 6.85 mm
-    z_top_ramp = min(H_BASE + TONGUE_H - 0.05, z_c1 + 1.30 * BARB_PROUD)  # 8.615 mm
+    z_c0 = z_ctr - 0.5 * crest_h
+    z_c1 = z_ctr + 0.5 * crest_h
+    z_bot_ramp = z_c0 - BARB_PROUD
+    z_top_ramp = min(H_BASE + TONGUE_H - 0.05, z_c1 + 1.30 * BARB_PROUD)
     slot_w = 0.80
     tab_len = 10.00
-    slot_z0 = H_BASE + 0.35        # 5.95 mm (safely outside H_BASE +/- 0.30 split band)
+    slot_z0 = H_BASE + 0.35
     slot_z1 = H_BASE + TONGUE_H + 0.50
     groove_rad = BARB_PROUD + 0.08
     groove_z_pad = 0.10
@@ -209,7 +207,7 @@ def _build_snap_tongue_with_custom_barb(tongue_solid, lid_clr_solid):
 
 
 def build_base_lid_and_bezel():
-    """Construct compact 47 x 37.6 x 10.5 mm Base, Single-Button Lid, and Anti-Mash Bezel."""
+    """Construct compact 47 x 37.6 x 10.5 mm Base w/ Monolithic Eased Strap Wings, Single-Button Lid & Bezel."""
     # 1. Monolithic outer hull (0..H_TOTAL) + 0.80 mm DRC 29 anti-elephant-foot chamfers
     hull = _rounded_rect_prism(0.0, ENC_L, Y_MIN, Y_MAX, 0.0, H_TOTAL, CORNER_R)
     bot_edges = [e for e in hull.edges() if abs(e.bounding_box().min.Z) < 0.05 and abs(e.bounding_box().max.Z) < 0.05]
@@ -219,9 +217,9 @@ def build_base_lid_and_bezel():
     # 2. Hollow interior cavity above 1.20 mm solid continuous floor (Z = FLOOR_T..LID_CEIL_Z)
     hull = hull - PosBox(CAV_X0, CAV_X1, CAV_Y0, CAV_Y1, FLOOR_T, LID_CEIL_Z)
 
-    # 3. Deboss ARMORY / v2.0 on flat lower roof (Y < +2, X in [3.5, 43.5]) -> 1.20 mm solid backing
+    # 3. Deboss ARMORY / v2.1 on flat lower roof (Y < +2) -> 1.20 mm solid backing
     t_brand = Text("ARMORY", font_size=5.8, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
-    t_rev = Text("v2.0", font_size=4.8, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
+    t_rev = Text("v2.1", font_size=4.8, font_style=FontStyle.BOLD, align=(Align.CENTER, Align.CENTER))
     deb1 = extrude(Plane.XY.offset(H_TOTAL - 0.35) * t_brand, amount=0.55).translate((23.5, -5.2, 0.0))
     deb2 = extrude(Plane.XY.offset(H_TOTAL - 0.35) * t_rev, amount=0.55).translate((23.5, -12.6, 0.0))
 
@@ -262,13 +260,82 @@ def build_base_lid_and_bezel():
     base = base_raw + tongue
     lid_mated = lid_raw - clr_outer
 
-    # 6. Bay 1 & Bay 2 Internal Partition (Z=5.15 clear of 5.60 split band)
+    # 6. Monolithic Zero-Stub Eased-Transition Flat Wings (4.80 mm wide gap + 2.60 mm beveled C-bars + 1.80x2.00 Base ramps)
+    left_wing = _rounded_rect_prism(-WING_EXT, 1.40, Y_MIN, Y_MAX, 0.0, WING_H, 2.40)
+    right_wing = _rounded_rect_prism(ENC_L - 1.40, ENC_L + WING_EXT, Y_MIN, Y_MAX, 0.0, WING_H, 2.40)
+    for wg in (left_wing, right_wing):
+        wg_bot = [e for e in wg.edges() if abs(e.bounding_box().min.Z) < 0.05 and abs(e.bounding_box().max.Z) < 0.05]
+        base = base + chamfer(wg_bot, length=0.60)
+
+    # Cut wide 4.80 mm zero-stub slots flush against Base outer walls (X = -4.80..0.00 and 47.00..51.80)
+    left_bar_x1 = -SLOT_W_X                # -4.80 mm
+    right_bar_x0 = ENC_L + SLOT_W_X       # +51.80 mm
+    for sx0, sx1 in ((left_bar_x1, 0.0), (ENC_L, right_bar_x0)):
+        slot_cut = _rounded_rect_prism(sx0, sx1, -0.5 * SLOT_LEN_Y, 0.5 * SLOT_LEN_Y, -0.50, WING_H + 0.50, 0.60)
+        base = base - slot_cut
+
+    # Cut eased 1.80 x 2.00 mm Base underside ramps across the 31.20 mm strap span (zero sharp 90-deg corner!)
+    ramp_l_pts = [(-0.20, -0.20), (BASE_RAMP_DX, -0.20), (-0.20, BASE_RAMP_DZ)]
+    ramp_r_pts = [(ENC_L + 0.20, -0.20), (ENC_L + 0.20, BASE_RAMP_DZ), (ENC_L - BASE_RAMP_DX, -0.20)]
+    for rp in (ramp_l_pts, ramp_r_pts):
+        ramp_cut = extrude(
+            make_face(Plane.XZ.offset(-0.5 * SLOT_LEN_Y) * Polyline(*rp, close=True)),
+            amount=SLOT_LEN_Y,
+            dir=(0, -1, 0),
+        )
+        base = base - ramp_cut
+
+    # Bevel top inner & outer edges (0.90 x 0.90 mm) of both 2.60 mm outer C-bars so strap glides smoothly OVER
+    for bar_x0, bar_x1 in ((-WING_EXT, left_bar_x1), (right_bar_x0, ENC_L + WING_EXT)):
+        b_in = [(bar_x1 + 0.20, WING_H + 0.20), (bar_x1 - BAR_TOP_BEVEL, WING_H + 0.20), (bar_x1 + 0.20, WING_H - BAR_TOP_BEVEL)]
+        b_out = [(bar_x0 - 0.20, WING_H + 0.20), (bar_x0 - 0.20, WING_H - BAR_TOP_BEVEL), (bar_x0 + BAR_TOP_BEVEL, WING_H + 0.20)]
+        for bp in (b_in, b_out):
+            bev_cut = extrude(
+                make_face(Plane.XZ.offset(-0.5 * SLOT_LEN_Y) * Polyline(*bp, close=True)),
+                amount=SLOT_LEN_Y,
+                dir=(0, -1, 0),
+            )
+            base = base - bev_cut
+
+    # Centered double-flared hourglass slip-in slits through BOTH outer bars (CCW + dir=(0,0,1))
+    l_pts = [
+        (-WING_EXT - 0.40, -SLIT_OUTER_HALF_Y),
+        (-WING_EXT + 0.70, -SLIT_OUTER_HALF_Y),
+        (-WING_EXT + 1.50, -SLIT_THROAT_HALF_Y),
+        (left_bar_x1 - 0.40, -SLIT_THROAT_HALF_Y),
+        (left_bar_x1 + 0.30, -SLIT_INNER_HALF_Y),
+        (left_bar_x1 + 0.30, +SLIT_INNER_HALF_Y),
+        (left_bar_x1 - 0.40, +SLIT_THROAT_HALF_Y),
+        (-WING_EXT + 1.50, +SLIT_THROAT_HALF_Y),
+        (-WING_EXT + 0.70, +SLIT_OUTER_HALF_Y),
+        (-WING_EXT - 0.40, +SLIT_OUTER_HALF_Y),
+    ]
+    x_out_r = ENC_L + WING_EXT
+    r_pts = [
+        (x_out_r + 0.40, -SLIT_OUTER_HALF_Y),
+        (x_out_r - 0.70, -SLIT_OUTER_HALF_Y),
+        (x_out_r - 1.50, -SLIT_THROAT_HALF_Y),
+        (right_bar_x0 + 0.40, -SLIT_THROAT_HALF_Y),
+        (right_bar_x0 - 0.30, -SLIT_INNER_HALF_Y),
+        (right_bar_x0 - 0.30, +SLIT_INNER_HALF_Y),
+        (right_bar_x0 + 0.40, +SLIT_THROAT_HALF_Y),
+        (x_out_r - 1.50, +SLIT_THROAT_HALF_Y),
+        (x_out_r - 0.70, +SLIT_OUTER_HALF_Y),
+        (x_out_r + 0.40, +SLIT_OUTER_HALF_Y),
+    ]
+    for s_pts in (l_pts, list(reversed(r_pts))):
+        slit_cut = extrude(Plane.XY.offset(-0.50) * Polygon(*s_pts, align=None), amount=WING_H + 1.00, dir=(0, 0, 1))
+        base = base - slit_cut
+    assert not base.is_inside((-WING_EXT + 1.40, 0.0, 1.30)), "Left (-X) wing slip-in slit must be open air!"
+    assert not base.is_inside((ENC_L + WING_EXT - 1.40, 0.0, 1.30)), "Right (+X) wing slip-in slit must be open air!"
+
+    # 7. Bay 1 & Bay 2 Internal Partition (Z=5.15 clear of 5.60 split band)
     div_top_z = 5.15
     div1 = PosBox(DIV1_X0, DIV1_X1, CAV_Y0 - 0.1, CAV_Y1 + 0.1, FLOOR_T - 0.10, div_top_z)
     div1 = div1 - PosBox(DIV1_X0 - 0.2, DIV1_X1 + 0.2, +7.50, +13.00, 3.30, div_top_z + 0.5)
     base = base + div1
 
-    # 7. Floated XIAO ESP32-C6 Pocket + Exact Piers + Anti-Pushout Backstops (DRC 24 & DRC 37)
+    # 8. Floated XIAO ESP32-C6 Pocket + Exact Piers + Anti-Pushout Backstops (DRC 24 & DRC 37)
     xiao_wall_top_z = 6.50
     xiao_pocket, _, xiao_spec = pcb_helpers.build_floated_module_pocket(
         XIAO_PLACED,
@@ -281,17 +348,16 @@ def build_base_lid_and_bezel():
     clip_box = PosBox(DIV1_X0, CAV_X1, CAV_Y0 + 0.02, XIAO_POCK_Y1 + 1.20, FLOOR_T - 0.2, xiao_wall_top_z + 0.2)
     base = base + xiao_pocket.intersect(clip_box)
 
-    # Anti-pushout corner backstops behind +Y XIAO edge (middle ANT1 stays 100% open RF air!)
     for bx_post0, bx_post1 in ((XIAO_BX0, XIAO_BX0 + 2.20), (XIAO_BX1 - 2.20, XIAO_BX1)):
         base = base + PosBox(bx_post0, bx_post1, XIAO_POCK_Y1, XIAO_POCK_Y1 + 1.20, FLOOR_T - 0.1, 6.50)
 
-    # 8. Cut True Stadium USB-C Port flush through -Y wall (Z = 1.20..4.80 mm)
+    # 9. Cut True Stadium USB-C Port flush through -Y wall (Z = 1.20..4.80 mm)
     usb_x = XIAO_PLACED["usb_xy"][0]
     usb_sk = Plane.XZ * SlotOverall(10.00, 3.60)
     usb_cut = extrude(usb_sk, amount=WALL_USB + 2.40).translate((usb_x, CAV_Y0 + 0.80, FLOOR_T + 1.80))
     base = base - usb_cut
 
-    # 9. Single 6x6x4.3 mm Tactile Switch Cradle (SW1) centered at (34.31, +10.50) above XIAO
+    # 10. Single 6x6x4.3 mm Tactile Switch Cradle (SW1) centered at (34.31, +10.50) above XIAO
     cradle_w = SW_BODY_W + 2.0 * SW_CRADLE_CLR
     half_c = 0.5 * cradle_w
     rib_t = 0.80
@@ -300,7 +366,7 @@ def build_base_lid_and_bezel():
     lead_clear = PosBox(SW_CX - half_c - rib_t - 0.30, SW_CX + half_c + rib_t + 0.30, SW_CY - 1.60, SW_CY + 1.60, FLOOR_T + 0.01, FLOOR_T + 3.00)
     base = base + (outer_c - inner_c - lead_clear)
 
-    # 10. Single Wide PETG Cantilever Flex-Paddle in Lid + Plunger Boss over SW1
+    # 11. Single Wide PETG Cantilever Flex-Paddle in Lid + Plunger Boss over SW1
     u_top = PosBox(HINGE_X0, PADDLE_X1 + SLOT_GAP, PADDLE_Y1, PADDLE_Y1 + SLOT_GAP, LID_CEIL_Z - 0.2, H_TOTAL + 0.3)
     u_bot = PosBox(HINGE_X0, PADDLE_X1 + SLOT_GAP, PADDLE_Y0 - SLOT_GAP, PADDLE_Y0, LID_CEIL_Z - 0.2, H_TOTAL + 0.3)
     u_tip = PosBox(PADDLE_X1, PADDLE_X1 + SLOT_GAP, PADDLE_Y0 - SLOT_GAP, PADDLE_Y1 + SLOT_GAP, LID_CEIL_Z - 0.2, H_TOTAL + 0.3)
@@ -308,12 +374,12 @@ def build_base_lid_and_bezel():
     dimple = Cone(0.50, 2.15, 0.85, align=(Align.CENTER, Align.CENTER, Align.MIN)).translate((SW_CX, SW_CY, H_TOTAL - 0.83))
     lid_mated = lid_mated - u_top - u_bot - u_tip - hinge_relief - dimple
 
-    plunger_h = LID_CEIL_Z - 5.65  # 3.30 mm boss -> 0.15 mm pre-travel above switch tip Z=5.50
+    plunger_h = LID_CEIL_Z - 5.65
     boss = Cylinder(radius=2.10, height=plunger_h + 0.20, align=(Align.CENTER, Align.CENTER, Align.MIN)).translate((SW_CX, SW_CY, 5.65))
     lid_mated = lid_mated + boss
     lid_print = lid_mated.rotate(Axis.Y, 180.0).translate((ENC_L, 0.0, H_TOTAL))
 
-    # 11. Optional Anti-Mash Barbell Guard Bezel (prints top-down at Z=0 -> zero overhangs!)
+    # 12. Optional Anti-Mash Barbell Guard Bezel (prints top-down at Z=0 -> zero overhangs)
     frame = _rounded_rect_prism(bx0_b, bx1_b, by0_b, by1_b, H_TOTAL, H_TOTAL + BEZEL_H, 2.00)
     b_top_e = [e for e in frame.edges() if abs(e.bounding_box().min.Z - (H_TOTAL + BEZEL_H)) < 0.05 and abs(e.bounding_box().max.Z - (H_TOTAL + BEZEL_H)) < 0.05]
     frame = chamfer(b_top_e, length=0.50)
@@ -328,55 +394,10 @@ def build_base_lid_and_bezel():
     return base, lid_mated, lid_print, bezel_mated, bezel_print, snaps_spec, xiao_spec
 
 
-def build_strap_clip():
-    """
-    Build 1-Piece Zero-Electrode-Contact Top/Bottom Polar Strap Clip:
-      - 1.15 mm (~1 mm) top & bottom slide-in pockets + 2.00 mm inward trapping wings
-      - Leaves center 26.80 mm (Y in [-13.40, +13.40]) 100% OPEN so PETG never bends/pinches electrodes!
-      - Printed standing upright on its -X face (Z_print = 0..42.00 mm): ZERO overhangs, continuous
-        unbroken perimeter loops wrapping around both 2 mm trapping wings!
-    """
-    half_w = 0.5 * CLIP_OUTER_W    # 18.40 mm
-    y_slot = half_w - CLIP_SIDE_WALL  # 15.40 mm -> 30.80 mm strap pocket
-    y_wing = y_slot - CLIP_WING_LEN   # 13.40 mm -> 26.80 mm open electrode gap!
-    z0 = 0.0
-    z1 = -CLIP_SPINE_T                # -0.80
-    z2 = z1 - CLIP_POCKET_H           # -1.95 (1.15 mm strap edge pocket!)
-    z3 = z2 - CLIP_WING_T             # -3.15 (1.20 mm wing thickness)
-
-    # C-rail cross-section in (Y, Z_mated) extruded cleanly from X = CLIP_X0..CLIP_X1
-    yz_pts = [
-        (-half_w, z0),
-        (+half_w, z0),
-        (+half_w, z3 + 0.35),
-        (+half_w - 0.35, z3),
-        (+y_wing + 0.35, z3),
-        (+y_wing, z3 + 0.35),
-        (+y_wing, z2 + 0.35),
-        (+y_wing + 0.35, z2),
-        (+y_slot, z2),
-        (+y_slot, z1),
-        (-y_slot, z1),
-        (-y_slot, z2),
-        (-y_wing - 0.35, z2),
-        (-y_wing, z2 + 0.35),
-        (-y_wing, z3 + 0.35),
-        (-y_wing - 0.35, z3),
-        (-half_w + 0.35, z3),
-        (-half_w, z3 + 0.35),
-    ]
-    sk_face = make_face(Plane.YZ * Polyline(*yz_pts, close=True))
-    clip_mated = extrude(sk_face, amount=CLIP_X1 - CLIP_X0, dir=(1, 0, 0)).translate((CLIP_X0, 0.0, 0.0))
-
-    # Rotate onto -X end at Z_print = 0 for 100% support-free vertical layer loops!
-    clip_print = clip_mated.rotate(Axis.Y, -90.0).translate((0.0, 0.0, -CLIP_X0))
-    return clip_mated, clip_print
-
-
 def _wire_routes_3d():
     """Exact 4-wire 30 AWG silicone routes (zero plastic collision per Check 8d)."""
-    z_pcb_top = FLOOR_T + float(C6["pier_height_mm"]) + float(C6["thickness"])  # 6.10 mm
-    z_wire = z_pcb_top + 0.80  # 6.90 mm
+    z_pcb_top = FLOOR_T + float(C6["pier_height_mm"]) + float(C6["thickness"])
+    z_wire = z_pcb_top + 0.80
     p_d1 = XIAO_PLACED["pins"]["D1"]
     p_gnd = XIAO_PLACED["pins"]["GND"]
     p_bat_pos = [XIAO_CX - 3.5, XIAO_CY + 3.0]
@@ -420,15 +441,16 @@ def _write_spec_json(path, snaps_spec, xiao_spec):
         {"name": "SW1", "x": round(SW_CX, 3),               "y": round(SW_CY, 3),               "net": "BTN1_D1"},
     ]
     spec = {
-        "project": "Armory Chest Strap Wi-Fi Button Pod v2.0 (Version C — Single Button)",
-        "title": "Armory Strap Button v2.0 (47.0 x 37.6 x 10.5 mm) — BRep Internals",
+        "project": "Armory Chest Strap Wi-Fi Button Pod v2.1 (Version C — Monolithic Eased Wings)",
+        "title": "Armory Strap Button v2.1 (62.2 x 37.6 x 10.5 mm) — BRep Internals",
         "architecture": "method2",
         "uses_wire_combs": False,
         "has_usb_port": True,
         "has_electronics": True,
         "has_z0_deboss": False,
+        "well_floor_z": FLOOR_T,
         "mated_lid_translate_z": H_TOTAL,
-        "pier_slice_z": 2.40,
+        "pier_slice_z": 2.20,
         "comb_slice_z": 4.90,
         "longitudinal_slice_x": round(SW_CX, 2),
         "transverse_slice_y": 0.0,
@@ -456,7 +478,6 @@ def _write_spec_json(path, snaps_spec, xiao_spec):
 def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
     base, lid_mated, lid_print, bezel_mated, bezel_print, snaps_spec, xiao_spec = build_base_lid_and_bezel()
-    clip_mated, clip_print = build_strap_clip()
 
     z0_edges = [e for e in base.edges() if abs(e.bounding_box().min.Z) < 0.08 and abs(e.bounding_box().max.Z) < 0.08]
     print(f"Base Z=0 edges count = {len(z0_edges)}")
@@ -464,7 +485,6 @@ def main():
     for lbl, a, b in [
         ("Base vs Lid", base, lid_mated),
         ("Lid vs Bezel", lid_mated, bezel_mated),
-        ("Base vs Strap Clip", base, clip_mated),
     ]:
         inter = a.intersect(b)
         vol = sum(s.volume for s in inter.solids()) if inter and hasattr(inter, "solids") and len(inter.solids()) > 0 else 0.0
@@ -474,17 +494,15 @@ def main():
     p_base = os.path.join(MODELS_DIR, "armory_strap_button_base.step")
     p_lid = os.path.join(MODELS_DIR, "armory_strap_button_lid.step")
     p_bezel = os.path.join(MODELS_DIR, "armory_strap_button_bezel.step")
-    p_clip = os.path.join(MODELS_DIR, "armory_strap_button_strap_clip.step")
 
     export_step(base, p_base)
     export_step(lid_print, p_lid)
     export_step(bezel_print, p_bezel)
-    export_step(clip_print, p_clip)
 
     _write_spec_json(SPEC_JSON, snaps_spec, dict(xiao_spec))
 
-    print("Exported 4 Z=0 support-free v2.0 STEP files to models/:")
-    for p in (p_base, p_lid, p_bezel, p_clip):
+    print("Exported 3 Z=0 support-free v2.1 STEP files to models/:")
+    for p in (p_base, p_lid, p_bezel):
         print(f"  - {os.path.basename(p)} ({os.path.getsize(p):,} bytes)")
     print(f"XIAO placed bbox={XIAO_PLACED['bbox']} usb_xy={XIAO_PLACED['usb_xy']} SW1=({SW_CX}, {SW_CY})")
 
