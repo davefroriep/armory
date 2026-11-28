@@ -32,6 +32,13 @@
           "uri": "https://drive.google.com/file/d/1E5HUTLSdAGbp0x8FYARdwi2nS861-ZzZ/view"
         }
       ]
+    },
+    {
+      "id": "2026-11-27-hrmax-186-v1",
+      "label": "Updated HRmax to 186 bpm (96% ceiling now 179 bpm)",
+      "settings": {
+        "hrMax": 186
+      }
     }
   ]
 }
