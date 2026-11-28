@@ -2865,8 +2865,252 @@ class ArmoryCamTests(unittest.TestCase):
             multi_res = client.post("/api/displays/action", json={"targets": ["tv", "wallboard"], "action": "on"})
             self.assertEqual(multi_res.status_code, 200)
             self.assertTrue(multi_res.get_json()["ok"])
+
+            # Verify dpIdleMin field + /api/displays/config idleSleepSec roundtrip
+            self.assertIn("dpIdleMin", dash)
+            self.assertIn("dpIdleStatus", dash)
+            idle_cfg = client.post("/api/displays/config", json={"idleSleepSec": 1800}).get_json()
+            self.assertEqual(idle_cfg["config"]["idleSleepSec"], 1800)
+            idle_off = client.post("/api/displays/config", json={"idleSleepSec": 0}).get_json()
+            self.assertEqual(idle_off["config"]["idleSleepSec"], 0)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_display_idle_autosleep_main_tv_and_smartspin(self) -> None:
+        # 1. Config defaults, clamping, and zero-disable
+        self.assertEqual(dc.GymDisplaysConfig().idle_sleep_sec, 3600)
+        self.assertEqual(dc.GymDisplaysConfig.from_dict({"idleSleepSec": 0}).idle_sleep_sec, 0)
+        self.assertEqual(dc.GymDisplaysConfig.from_dict({"idleSleepSec": 120}).idle_sleep_sec, 300)
+        self.assertEqual(dc.GymDisplaysConfig.from_dict({"idleSleepSec": 99999}).idle_sleep_sec, 28800)
+        self.assertEqual(dc.GymDisplaysConfig.from_dict({"idleSleepSec": None}).idle_sleep_sec, 3600)
+
+        # 2. Pure parsers: Roku media-player + ADB activity dump (distinguishes historical audio logs & paused state=2)
+        self.assertEqual(dc.parse_roku_media_player('<player state="play"><plugin id="12"/></player>'), {"ok": True, "state": "play"})
+        self.assertEqual(dc.parse_roku_media_player('<player state="pause" />'), {"ok": True, "state": "pause"})
+        self.assertEqual(dc.parse_roku_media_player('<player state="none" />'), {"ok": True, "state": "none"})
+
+        hist_audio_dump = "\n".join([
+            "---PWR---",
+            "  mWakefulness=Awake",
+            "  mLastUserActivityTime=52965703 (3700000 ms ago)",
+            "Display Power: state=ON",
+            "---TVIN---",
+            "  inputId: com.mediatek.tis/.HdmiInputService/HW2",
+            "  com.mediatek.tis/.HdmiInputService/HW2",
+            "  com.mediatek.tis/.HdmiInputService/HW3",
+            "---ACT---",
+            "  mResumedActivity: ActivityRecord{85bbbec u0 com.amazon.tv.inputpreference.service/.PassthroughPlayerActivity}",
+            "---MS---",
+            "  package=com.amazon.firetv.youtube",
+            "  active=true",
+            "  state=PlaybackState {state=2, position=100}",
+            "---AUD---",
+            "  AudioPlaybackConfiguration piid:15 state:idle",
+            "11-27 10:45:41:227 player piid:3111 state:started",
+        ])
+        parsed_idle = dc.parse_adb_activity_dump(hist_audio_dump)
+        self.assertTrue(parsed_idle["awake"])
+        self.assertAlmostEqual(parsed_idle["user_idle_sec"], 3700.0, places=1)
+        self.assertEqual(parsed_idle["active_input"], "com.mediatek.tis/.HdmiInputService/HW2")
+        self.assertTrue(parsed_idle["passthrough_active"])
+        self.assertFalse(parsed_idle["playing"])
+
+        live_audio_dump = hist_audio_dump.replace(
+            "AudioPlaybackConfiguration piid:15 state:idle",
+            "AudioPlaybackConfiguration piid:15 state:started",
+        )
+        self.assertTrue(dc.parse_adb_activity_dump(live_audio_dump)["playing"])
+
+        live_ms_dump = hist_audio_dump.replace("state=2", "state=3")
+        self.assertTrue(dc.parse_adb_activity_dump(live_ms_dump)["playing"])
+
+        # 3. End-to-end state machine across HDMI 1 (PC), HDMI 2 (Denon/Cube), and SmartSpin (Roku)
+        sim: dict[str, Any] = {
+            "primary_awake": True,
+            "primary_user_idle_ms": 4_000_000,
+            "primary_input": "com.mediatek.tis/.HdmiInputService/HW2",  # HDMI 1 (OptiPlex)
+            "primary_passthrough": True,
+            "primary_playing": False,
+            "pc_idle_sec": 300.0,
+            "cube_awake": True,
+            "cube_user_idle_ms": 4_000_000,
+            "cube_playing": False,
+            "denon_power": "OFF",
+            "spin_power": "PowerOn",
+            "spin_app_id": "tvinput.hdmi1",
+            "spin_app_type": "tvin",
+            "spin_player": "none",
+        }
+        adb_cmds: list[list[str]] = []
+        roku_posts: list[str] = []
+        denon_cmds: list[str] = []
+
+        def fake_runner(cmd: list[str], _timeout: float) -> tuple[int, str, str]:
+            adb_cmds.append(cmd)
+            if "devices" in cmd:
+                return 0, "List of devices attached\n192.168.1.230:5555\tdevice\n192.168.1.151:5555\tdevice\n", ""
+            ser = cmd[2] if len(cmd) > 3 and cmd[1] == "-s" else ""
+            shell_str = cmd[-1] if cmd else ""
+            if "---PWR---" in shell_str:
+                if "192.168.1.230" in ser:
+                    wake = "Awake" if sim["primary_awake"] else "Asleep"
+                    disp = "ON" if sim["primary_awake"] else "OFF"
+                    act = "PassthroughPlayerActivity" if sim["primary_passthrough"] else "HomeActivity"
+                    ms = "  active=true\n  state=PlaybackState {state=3}" if sim["primary_playing"] else "  active=false"
+                    out = "\n".join([
+                        "---PWR---",
+                        f"  mWakefulness={wake}",
+                        f"  mLastUserActivityTime=100 ({sim['primary_user_idle_ms']} ms ago)",
+                        f"Display Power: state={disp}",
+                        "---TVIN---",
+                        f"  inputId: {sim['primary_input']}",
+                        "  com.mediatek.tis/.HdmiInputService/HW2",
+                        "  com.mediatek.tis/.HdmiInputService/HW3",
+                        "---ACT---",
+                        f"  mResumedActivity: {act}",
+                        "---MS---",
+                        ms,
+                        "---AUD---",
+                        "  AudioPlaybackConfiguration piid:15 state:idle",
+                    ])
+                    return 0, out, ""
+                if "192.168.1.151" in ser:
+                    wake = "Awake" if sim["cube_awake"] else "Asleep"
+                    disp = "ON" if sim["cube_awake"] else "OFF"
+                    ms = "  active=true\n  state=PlaybackState {state=3}" if sim["cube_playing"] else "  active=true\n  state=PlaybackState {state=2}"
+                    out = "\n".join([
+                        "---PWR---",
+                        f"  mWakefulness={wake}",
+                        f"  mLastUserActivityTime=200 ({sim['cube_user_idle_ms']} ms ago)",
+                        f"Display Power: state={disp}",
+                        "---MS---",
+                        ms,
+                        "---AUD---",
+                        "  AudioPlaybackConfiguration piid:15 state:idle",
+                    ])
+                    return 0, out, ""
+            if "KEYCODE_SLEEP" in shell_str or (len(cmd) >= 3 and cmd[-3:] == ["input", "keyevent", "223"]):
+                if "192.168.1.230" in ser:
+                    sim["primary_awake"] = False
+            return 0, "connected", ""
+
+        def fake_get(url: str, _to: float) -> tuple[int, bytes]:
+            if "formMainZone_MainZoneXml.xml" in url:
+                return 200, f"<item><Power><value>{sim['denon_power']}</value></Power></item>".encode("ascii")
+            if "formiPhoneAppDirect.xml?" in url:
+                denon_cmds.append(url.split("?", 1)[1])
+                return 200, b""
+            if "192.168.1.220:8060/query/device-info" in url:
+                return 200, f"<device-info><power-mode>{sim['spin_power']}</power-mode></device-info>".encode("ascii")
+            if "192.168.1.220:8060/query/active-app" in url:
+                return 200, f'<active-app><app id="{sim["spin_app_id"]}" type="{sim["spin_app_type"]}">App</app></active-app>'.encode("ascii")
+            if "192.168.1.220:8060/query/media-player" in url:
+                return 200, f'<player state="{sim["spin_player"]}" />'.encode("ascii")
+            return 404, b""
+
+        def fake_post(url: str, _body: bytes, _hdrs: dict[str, str] | None, _to: float) -> tuple[int, bytes]:
+            roku_posts.append(url)
+            if url.endswith("/keypress/PowerOff"):
+                sim["spin_power"] = "Ready"
+            return 200, b""
+
+        fake_adb = ac.FireTvAdbController(adb_bin="adb", runner=fake_runner, settle_sec=0.0)
+        ha_cfg = ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15")
+        denon_cli = ha.DenonAvrClient(lambda: ha_cfg, http_get=fake_get, sleep_fn=lambda _s: None)
+        ctrl = dc.GymDisplayController(
+            config=dc.GymDisplaysConfig(
+                primary=dc.PrimaryDisplayConfig(host="192.168.1.230", mac="bc:09:b9:e7:35:26"),
+                spin=dc.SpinDisplayConfig(host="192.168.1.220", auto_denon_dual=True),
+                idle_sleep_sec=3600,
+            ),
+            adb_controller=fake_adb,
+            denon_client=denon_cli,
+            http_get=fake_get,
+            http_post=fake_post,
+            sleep_fn=lambda _s: None,
+            allow_network=False,
+            pc_idle_fn=lambda: sim["pc_idle_sec"],
+        )
+
+        t0 = 1_000_000_000
+        # 3a. Main TV on HDMI 1 (OptiPlex) stays awake while PC is active (<3600s); SmartSpin starts idle countdown
+        r1 = ctrl.check_idle_sleep(now_ms=t0)
+        self.assertEqual(r1["slept"], [])
+        self.assertEqual(r1["primary"]["state"], "active")
+        self.assertEqual(r1["primary"]["reason"], "pc_input")
+        self.assertEqual(r1["spin"]["state"], "idle")
+        # Verify ADB disconnected cleanly after probing Hisense
+        self.assertIn(["adb", "disconnect", "192.168.1.230:5555"], adb_cmds)
+
+        # 3b. Once PC is idle >= 3600s too (2 polls -> hw_confirmed_idle), Main TV sleeps with NO_DEEP_SLEEP_SHELL + KEYCODE_SLEEP + disconnect
+        sim["pc_idle_sec"] = 3650.0
+        adb_cmds.clear()
+        r2 = ctrl.check_idle_sleep(now_ms=t0 + 60_000)
+        self.assertEqual(r2["slept"], [])
+        self.assertEqual(r2["primary"]["state"], "idle")
+        r3 = ctrl.check_idle_sleep(now_ms=t0 + 120_000)
+        self.assertEqual(r3["slept"], ["tv"])
+        self.assertFalse(sim["primary_awake"])
+        flat_adb = [" ".join(c) for c in adb_cmds]
+        self.assertTrue(any("sleep_timeout 0" in s for s in flat_adb))
+        self.assertTrue(any("223" in s for s in flat_adb))
+        self.assertIn(["adb", "disconnect", "192.168.1.230:5555"], adb_cmds)
+
+        # 3c. SmartSpin Roku app/state change resets idle timer; after 60m continuous idle with Denon OFF, sleeps with sync_denon=False
+        sim["spin_app_id"] = "12"
+        sim["spin_app_type"] = "appl"
+        sim["spin_player"] = "play"
+        r4 = ctrl.check_idle_sleep(now_ms=t0 + 180_000)
+        self.assertEqual(r4["spin"]["state"], "active")
+        self.assertEqual(r4["spin"]["reason"], "roku_media")
+
+        sim["spin_player"] = "pause"
+        r5 = ctrl.check_idle_sleep(now_ms=t0 + 240_000)
+        self.assertEqual(r5["spin"]["state"], "idle")
+        r6 = ctrl.check_idle_sleep(now_ms=t0 + 240_000 + 3_599_000)
+        self.assertEqual(r6["slept"], [])
+        denon_cmds.clear()
+        roku_posts.clear()
+        r7 = ctrl.check_idle_sleep(now_ms=t0 + 240_000 + 3_600_000)
+        self.assertEqual(r7["slept"], ["spin"])
+        self.assertIn("http://192.168.1.220:8060/keypress/PowerOff", roku_posts)
+        self.assertNotIn("VSMONI1", denon_cmds)
+
+        # 3d. Main TV on HDMI 2 (Denon/Cube) stays awake while Cube is playing, sleeps when Cube paused & Denon OFF; SmartSpin syncs Denon when Denon ON
+        sim["primary_awake"] = True
+        sim["primary_input"] = "com.mediatek.tis/.HdmiInputService/HW3"  # HDMI 2 (Denon)
+        sim["denon_power"] = "ON"
+        sim["cube_playing"] = True
+        sim["spin_power"] = "PowerOn"
+        sim["spin_app_id"] = "tvinput.hdmi1"
+        sim["spin_app_type"] = "tvin"
+        sim["spin_player"] = "none"
+        t1 = t0 + 10_000_000
+        r8 = ctrl.check_idle_sleep(now_ms=t1)
+        self.assertEqual(r8["primary"]["reason"], "cube_media")
+        self.assertEqual(r8["spin"]["reason"], "cube_media")
+
+        # workout_active=True protects both TVs even if Cube pauses
+        sim["cube_playing"] = False
+        r9 = ctrl.check_idle_sleep(now_ms=t1 + 60_000, workout_active=True)
+        self.assertEqual(r9["primary"]["reason"], "workout_active")
+        self.assertEqual(r9["spin"]["reason"], "workout_active")
+
+        # Cube paused + Denon still ON -> both enter idle; SmartSpin sleeps after 60m AND flips Denon back to Monitor 1
+        r10 = ctrl.check_idle_sleep(now_ms=t1 + 120_000)
+        self.assertEqual(r10["primary"]["state"], "idle")
+        self.assertEqual(r10["spin"]["state"], "idle")
+        denon_cmds.clear()
+        r11 = ctrl.check_idle_sleep(now_ms=t1 + 120_000 + 3_600_000)
+        self.assertEqual(set(r11["slept"]), {"tv", "spin"})
+        self.assertIn("VSMONI1", denon_cmds)
+
+        # 3e. idleSleepSec=0 disables auto-sleep completely
+        ctrl.update_config({"idleSleepSec": 0})
+        r_dis = ctrl.check_idle_sleep(now_ms=t1 + 20_000_000)
+        self.assertFalse(r_dis["enabled"])
+        self.assertEqual(r_dis["slept"], [])
+        self.assertFalse(ctrl.status_dict()["idleSleep"]["enabled"])
 
     def test_denon_ip_control_auto_provisioner_and_safety_guards(self) -> None:
         ha_cfg = ha.HouseAudioConfig(denon_enabled=True, denon_host="192.168.1.15")
@@ -7749,7 +7993,7 @@ class ShowDirectorTests(unittest.TestCase):
         sm.on_key_up("vol_down", 3.70)  # Release after hold must NOT also fire short tap
         self.assertEqual(len(events), 1)
 
-        # 2. Configurable "one_button" mode: custom single=check, double=record, long=voice
+        # 2. Configurable "one_button" mode: 1x=check, 2x=record, 3x=undo (default), hold=voice
         events.clear()
         sched_tasks.clear()
         sm.update_config(
@@ -7757,6 +8001,7 @@ class ShowDirectorTests(unittest.TestCase):
                 mode="one_button",
                 single_action="check",
                 double_action="record",
+                triple_action="undo",
                 long_action="voice",
                 hold_ms=450,
                 double_tap_ms=380,
@@ -7773,8 +8018,22 @@ class ShowDirectorTests(unittest.TestCase):
         sm.on_key_up("vol_down", 5.07)
         sm.on_key_down("vol_down", 5.20)
         sm.on_key_up("vol_down", 5.28)
+        self.assertEqual(events, [])  # Waits for potential 3rd tap before emitting double_tap
+        flush_timers()
         self.assertEqual([e[0] for e in events], ["record"])
         self.assertEqual(events[0][1]["gesture"], "double_tap")
+
+        # Triple tap emits "undo" IMMEDIATELY on 3rd key-up with zero timer delay!
+        events.clear()
+        sched_tasks.clear()
+        sm.on_key_down("vol_down", 5.50)
+        sm.on_key_up("vol_down", 5.55)
+        sm.on_key_down("vol_down", 5.65)
+        sm.on_key_up("vol_down", 5.70)
+        sm.on_key_down("vol_down", 5.80)
+        sm.on_key_up("vol_down", 5.85)
+        self.assertEqual([e[0] for e in events], ["undo"])
+        self.assertEqual(events[0][1]["gesture"], "triple_tap")
 
         events.clear()
         sched_tasks.clear()
@@ -7786,11 +8045,16 @@ class ShowDirectorTests(unittest.TestCase):
         # 2b. Single action "none" never emits on single tap; PICO HID matcher detects hardware string
         events.clear()
         sched_tasks.clear()
-        sm.update_config(bt.BtButtonConfig(mode="one_button", single_action="none", double_action="record", long_action="none"))
+        sm.update_config(bt.BtButtonConfig(mode="one_button", single_action="none", double_action="record", triple_action="none", long_action="none"))
         sm.on_key_down("vol_up", 6.80)
         sm.on_key_up("vol_up", 6.88)
         flush_timers()
         self.assertEqual(events, [])
+        sm.on_key_down("vol_up", 6.86)
+        sm.on_key_up("vol_up", 6.89)
+        sm.on_key_down("vol_up", 6.91)
+        sm.on_key_up("vol_up", 6.94)
+        self.assertEqual([e[0] for e in events], ["record"])
         self.assertTrue(bt.is_pico_hid_device_name(r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}_DEV_VID&020504_PID&0000_REV&0110_FFFF114F976F"))
         self.assertFalse(bt.is_pico_hid_device_name(r"\\?\HID#VID_046D&PID_C548"))
 
@@ -7831,6 +8095,7 @@ class ShowDirectorTests(unittest.TestCase):
                     "mode": "one_button",
                     "singleAction": "record",
                     "doubleAction": "check",
+                    "tripleAction": "undo",
                     "longAction": "voice",
                     "holdMs": 500,
                     "doubleTapMs": 320,
@@ -7840,6 +8105,7 @@ class ShowDirectorTests(unittest.TestCase):
             self.assertEqual(c_res.status_code, 200)
             self.assertEqual(c_res.get_json()["config"]["mode"], "one_button")
             self.assertEqual(c_res.get_json()["config"]["singleAction"], "record")
+            self.assertEqual(c_res.get_json()["config"]["tripleAction"], "undo")
             self.assertEqual(c_res.get_json()["config"]["holdMs"], 500)
 
             # Tap "record" -> arms clip & speaks Recording; tap "record" again (or "check") -> cuts & speaks Clip saved
@@ -7867,6 +8133,11 @@ class ShowDirectorTests(unittest.TestCase):
                 self.assertIn("done", svc.voice._events[-1]["transcript"].lower())
                 # Mark claimed via /api/clip clears armed clip without double-cut
                 svc.clear_server_armed_clip()
+
+            # Triple-tap "undo" action emits non-destructive "uncheck" so single-click re-commits without losing weight/reps!
+            r_un = client.post("/api/bt-button/trigger", json={"action": "undo"}).get_json()
+            self.assertTrue(r_un["ok"])
+            self.assertIn("uncheck", svc.voice._events[-1]["transcript"].lower())
 
             # Voice action triggers manual wake -> Denon duck + ready chime + accepts bare "50 for 8"
             with mock.patch.object(svc.voice, "play_ready_chime", side_effect=lambda: (chimes.__setitem__(0, chimes[0] + 1), True)[1]):
@@ -8062,6 +8333,145 @@ class ShowDirectorTests(unittest.TestCase):
         self.assertGreaterEqual(blks_sq[0]["startSec"], 4.0)
         self.assertLessEqual(blks_sq[0]["startSec"], 7.5)
         self.assertLessEqual(blks_sq[0]["endSec"], 21.5)
+
+    def test_bar_tracker_25fps_bounds_negative_control_and_marker(self) -> None:
+        import math
+        from server.armory_cam import bar_tracker as bt
+
+        tmp = Path(tempfile.mkdtemp(prefix="armory_bar_tracker_"))
+        try:
+            ff = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+
+            def _write_mp4_frames(out_path: Path, frames_bgr: list[np.ndarray], fps: float = 25.0) -> None:
+                h, w = frames_bgr[0].shape[:2]
+                raw_bytes = b"".join(fr.tobytes() for fr in frames_bgr)
+                subprocess.run(
+                    [
+                        ff, "-y", "-hide_banner", "-loglevel", "error",
+                        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.2f}", "-i", "-",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", str(out_path),
+                    ],
+                    input=raw_bytes,
+                    check=True,
+                )
+
+            w, h, fps = 320, 240, 25.0
+
+            # 1. Bare-steel textured plate moving 5 full vertical cycles from 8.0s..22.0s inside rack_barbell ROI
+            frames_bar: list[np.ndarray] = []
+            y_base = 100
+            for fi in range(int(30.0 * fps)):
+                t = fi / fps
+                fr = np.full((h, w, 3), 28, dtype=np.uint8)
+                cv2.line(fr, (20, 30), (20, 220), (85, 85, 85), 2)
+                if 8.0 <= t <= 22.0:
+                    ph = 0.5 - 0.5 * math.cos(2.0 * math.pi * (t - 8.0) / 2.8)
+                    cy = int(round(y_base + 78.0 * ph))
+                else:
+                    cy = y_base
+                cv2.rectangle(fr, (24, cy - 22), (76, cy + 22), (175, 175, 175), -1)
+                cv2.line(fr, (26, cy), (74, cy), (55, 55, 55), 3)
+                cv2.circle(fr, (50, cy), 8, (230, 230, 230), -1)
+                frames_bar.append(fr)
+
+            p_bar = tmp / "bar.mp4"
+            _write_mp4_frames(p_bar, frames_bar, fps=fps)
+            res_bar = bt.detect_bar_lift_bounds(p_bar, station="rack_barbell", pre_pad_sec=0.25, post_pad_sec=0.25)
+            self.assertIsNotNone(res_bar)
+            self.assertFalse(res_bar["markerUsed"])
+            self.assertGreaterEqual(res_bar["repCount"], 4.0)
+            self.assertAlmostEqual(res_bar["firstMoveSec"], 8.0, delta=0.25)
+            self.assertAlmostEqual(res_bar["lastMoveSec"], 22.0, delta=0.25)
+            self.assertAlmostEqual(res_bar["startSec"], 7.75, delta=0.25)
+            self.assertAlmostEqual(res_bar["endSec"], 22.25, delta=0.25)
+
+            # 2. Negative control: single plate-loading bump inside ROI -> must return None
+            frames_neg: list[np.ndarray] = []
+            for fi in range(int(16.0 * fps)):
+                t = fi / fps
+                fr = np.full((h, w, 3), 28, dtype=np.uint8)
+                dx = int(round(28.0 * math.sin(math.pi * (t - 6.0) / 1.4))) if 6.0 <= t <= 7.4 else 0
+                cv2.rectangle(fr, (32 + dx, 110), (72 + dx, 150), (175, 175, 175), -1)
+                frames_neg.append(fr)
+            p_neg = tmp / "neg_plate.mp4"
+            _write_mp4_frames(p_neg, frames_neg, fps=fps)
+            self.assertIsNone(bt.detect_bar_lift_bounds(p_neg, station="rack_barbell"))
+
+            # 3. High-contrast neon magenta sleeve marker auto-lock -> markerUsed=True & +/- 0.20s precision
+            frames_mk: list[np.ndarray] = []
+            for fi in range(int(26.0 * fps)):
+                t = fi / fps
+                fr = np.full((h, w, 3), 30, dtype=np.uint8)
+                if 6.0 <= t <= 18.0:
+                    ph = 0.5 - 0.5 * math.cos(2.0 * math.pi * (t - 6.0) / 2.4)
+                    cy = int(round(90.0 + 70.0 * ph))
+                else:
+                    cy = 90
+                cv2.circle(fr, (52, cy), 12, (210, 40, 235), -1)
+                frames_mk.append(fr)
+            p_mk = tmp / "marker.mp4"
+            _write_mp4_frames(p_mk, frames_mk, fps=fps)
+            res_mk = bt.detect_bar_lift_bounds(p_mk, station="rack_barbell", pre_pad_sec=0.25, post_pad_sec=0.25)
+            self.assertIsNotNone(res_mk)
+            self.assertTrue(res_mk["markerUsed"])
+            self.assertGreaterEqual(res_mk["repCount"], 4.0)
+            self.assertAlmostEqual(res_mk["firstMoveSec"], 6.0, delta=0.20)
+            self.assertAlmostEqual(res_mk["lastMoveSec"], 18.0, delta=0.20)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_bar_tracker_multi_set_extraction_ignores_clutter(self) -> None:
+        import math
+        from server.armory_cam import bar_tracker as bt
+
+        tmp = Path(tempfile.mkdtemp(prefix="bar_trk_l2_"))
+        try:
+            ff = ac.resolve_tool_bin("ffmpeg", "ARMORY_CAM_FFMPEG")
+            fps = 25.0
+            w, h = 320, 240
+            dur_s = 36.0
+            frames: list[np.ndarray] = []
+            # Set 1: 4.0..12.0s (4 reps @ 2s/rep); Clutter bump at 16.0..17.6s; Set 2: 22.0..30.0s (4 reps)
+            for fi in range(int(dur_s * fps)):
+                t = fi / fps
+                fr = np.full((h, w, 3), 28, dtype=np.uint8)
+                cv2.line(fr, (20, 30), (20, 220), (85, 85, 85), 2)
+                if 4.0 <= t <= 12.0:
+                    ph = 0.5 - 0.5 * math.cos(2.0 * math.pi * (t - 4.0) / 2.0)
+                    cy = int(round(75.0 + 70.0 * ph))
+                elif 22.0 <= t <= 30.0:
+                    ph = 0.5 - 0.5 * math.cos(2.0 * math.pi * (t - 22.0) / 2.0)
+                    cy = int(round(75.0 + 70.0 * ph))
+                elif 16.0 <= t <= 17.6:
+                    ph = 0.5 - 0.5 * math.cos(2.0 * math.pi * (t - 16.0) / 1.6)
+                    cy = int(round(75.0 + 60.0 * ph))
+                else:
+                    cy = 75
+                cv2.rectangle(fr, (24, cy - 22), (76, cy + 22), (175, 175, 175), -1)
+                cv2.line(fr, (26, cy), (74, cy), (55, 55, 55), 3)
+                cv2.circle(fr, (50, cy), 8, (230, 230, 230), -1)
+                frames.append(fr)
+
+            p_multi = tmp / "multi_2sets.mp4"
+            raw_bytes = b"".join(fr.tobytes() for fr in frames)
+            subprocess.run(
+                [
+                    ff, "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps:.2f}", "-i", "-",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "16", "-pix_fmt", "yuv420p", str(p_multi),
+                ],
+                input=raw_bytes,
+                check=True,
+            )
+            res = bt.detect_bar_lifts_multi(p_multi, station="rack_barbell", pre_pad_sec=0.25, post_pad_sec=0.25)
+            lifts = res["lifts"]
+            self.assertEqual(len(lifts), 2)
+            self.assertAlmostEqual(lifts[0]["firstMoveSec"], 4.0, delta=0.35)
+            self.assertAlmostEqual(lifts[0]["lastMoveSec"], 12.0, delta=0.35)
+            self.assertAlmostEqual(lifts[1]["firstMoveSec"], 22.0, delta=0.35)
+            self.assertAlmostEqual(lifts[1]["lastMoveSec"], 30.0, delta=0.35)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_ble_manual_wake_preserves_denon_duck_and_silent_cancel_disarms(self) -> None:
         from unittest import mock

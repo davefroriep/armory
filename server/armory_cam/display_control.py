@@ -11,6 +11,7 @@ Controls:
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 from dataclasses import dataclass, field
 import html as html_lib
 import json
@@ -18,6 +19,7 @@ from pathlib import Path
 import re
 import shlex
 import socket
+import sys
 import threading
 import time
 from typing import Any, Callable, Sequence
@@ -32,6 +34,7 @@ DEFAULT_HDMI_OPTIPLEX_INPUT = "KEYCODE_TV_INPUT_HDMI_1"
 DEFAULT_HDMI_DENON_INPUT = "KEYCODE_TV_INPUT_HDMI_2"
 DEFAULT_CUBE_HOST = "192.168.1.151"
 DEFAULT_OPEN_GYM_MUSIC_QUERY = "workout music mix"
+DEFAULT_DISPLAY_IDLE_SLEEP_SEC = 3600
 
 
 @dataclass
@@ -127,6 +130,7 @@ class GymDisplaysConfig:
     open_gym_play_music: bool = True
     open_gym_music_url: str = ""
     open_gym_music_query: str = DEFAULT_OPEN_GYM_MUSIC_QUERY
+    idle_sleep_sec: int = DEFAULT_DISPLAY_IDLE_SLEEP_SEC
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -137,6 +141,7 @@ class GymDisplaysConfig:
             "openGymPlayMusic": bool(self.open_gym_play_music),
             "openGymMusicUrl": self.open_gym_music_url,
             "openGymMusicQuery": self.open_gym_music_query,
+            "idleSleepSec": int(self.idle_sleep_sec),
         }
 
     @classmethod
@@ -147,6 +152,15 @@ class GymDisplaysConfig:
             cube_adb_port = max(1, min(65535, int(raw.get("cubeAdbPort", 5555))))
         except (TypeError, ValueError):
             cube_adb_port = 5555
+        raw_idle = raw.get("idleSleepSec", DEFAULT_DISPLAY_IDLE_SLEEP_SEC)
+        if raw_idle is None or raw_idle == "":
+            idle_sleep_sec = DEFAULT_DISPLAY_IDLE_SLEEP_SEC
+        else:
+            try:
+                idle_val = int(raw_idle)
+                idle_sleep_sec = 0 if idle_val <= 0 else max(300, min(28800, idle_val))
+            except (TypeError, ValueError):
+                idle_sleep_sec = DEFAULT_DISPLAY_IDLE_SLEEP_SEC
         query_raw = raw.get("openGymMusicQuery", DEFAULT_OPEN_GYM_MUSIC_QUERY)
         query_clean = str(DEFAULT_OPEN_GYM_MUSIC_QUERY if query_raw is None else query_raw).strip()
         return cls(
@@ -157,6 +171,7 @@ class GymDisplaysConfig:
             open_gym_play_music=bool(raw.get("openGymPlayMusic", True)),
             open_gym_music_url=str(raw.get("openGymMusicUrl", "") or "").strip(),
             open_gym_music_query=query_clean or DEFAULT_OPEN_GYM_MUSIC_QUERY,
+            idle_sleep_sec=idle_sleep_sec,
         )
 
 
@@ -476,6 +491,118 @@ def parse_roku_active_app(xml_text: str) -> dict[str, Any]:
     }
 
 
+def parse_roku_media_player(xml_text: str) -> dict[str, Any]:
+    """Parse Roku ECP `/query/media-player` XML into structured playback state."""
+    text = (xml_text or "").strip()
+    if not text:
+        return {"ok": False, "error": "Empty Roku media-player XML"}
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        return {"ok": False, "error": f"Roku XML parse error: {exc}"}
+    state = str(root.attrib.get("state") or "").strip().lower()
+    return {"ok": True, "state": state}
+
+
+def _split_adb_sections(raw: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    cur_key = ""
+    buf: list[str] = []
+    for line in (raw or "").splitlines():
+        m = re.match(r"^---(PWR|TVIN|ACT|MS|AUD)---\s*$", line.strip())
+        if m:
+            if cur_key:
+                sections[cur_key] = "\n".join(buf)
+            cur_key = m.group(1)
+            buf = []
+        elif cur_key:
+            buf.append(line)
+    if cur_key:
+        sections[cur_key] = "\n".join(buf)
+    return sections
+
+
+def parse_adb_activity_dump(raw: str) -> dict[str, Any]:
+    """Parse combined `dumpsys power/tv_input/activity/media_session/audio` output."""
+    sec = _split_adb_sections(raw)
+    pwr = sec.get("PWR", raw or "")
+    tvin = sec.get("TVIN", "")
+    act = sec.get("ACT", "")
+    ms = sec.get("MS", "")
+    aud = sec.get("AUD", "")
+
+    wake_m = re.search(r"mWakefulness=(\w+)", pwr)
+    disp_m = re.search(r"Display Power:\s*state=(\w+)", pwr)
+    wakefulness = wake_m.group(1) if wake_m else ""
+    display_power = disp_m.group(1) if disp_m else ""
+    awake = (wakefulness == "Awake") and (display_power == "ON")
+
+    idle_m = re.search(r"mLastUserActivityTime=[^\n]*?\((\d+)\s*ms ago\)", pwr)
+    user_idle_sec = (int(idle_m.group(1)) / 1000.0) if idle_m else None
+
+    active_m = re.search(r"^\s*inputId:\s*(\S+)", tvin, re.M)
+    active_input = active_m.group(1) if active_m else ""
+
+    def _hw_num(item: str) -> int:
+        m_hw = re.search(r"(\d+)$", item)
+        return int(m_hw.group(1)) if m_hw else 0
+
+    hdmi_inputs = sorted(
+        set(re.findall(r"com\.mediatek\.tis/\.HdmiInputService/HW\d+", tvin)),
+        key=_hw_num,
+    )
+    passthrough_active = "PassthroughPlayerActivity" in act
+
+    playing = False
+    in_active_session = False
+    for line in ms.splitlines():
+        if re.search(r"\bactive=true\b", line):
+            in_active_session = True
+            continue
+        if re.search(r"\b(?:active=|package=)", line):
+            in_active_session = False
+            continue
+        if in_active_session and re.search(r"PlaybackState\s*\{[^}]*\bstate=(?:3|6)\b", line):
+            playing = True
+            break
+
+    if not playing:
+        for line in aud.splitlines():
+            if "AudioPlaybackConfiguration" in line and "state:started" in line:
+                playing = True
+                break
+
+    return {
+        "awake": awake,
+        "wakefulness": wakefulness,
+        "display_power": display_power,
+        "user_idle_sec": user_idle_sec,
+        "active_input": active_input,
+        "hdmi_inputs": hdmi_inputs,
+        "passthrough_active": passthrough_active,
+        "playing": playing,
+    }
+
+
+def get_windows_idle_sec() -> float | None:
+    """Return seconds since last Windows keyboard/mouse input via Win32 GetLastInputInfo."""
+    if sys.platform != "win32":
+        return None
+    try:
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        lii = _LASTINPUTINFO()
+        lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+            return None
+        tick = ctypes.windll.kernel32.GetTickCount()
+        idle_ms = (tick - lii.dwTime) & 0xFFFFFFFF
+        return max(0.0, idle_ms / 1000.0)
+    except Exception:
+        return None
+
+
 def _strip_wake_prefix(text: str, wake_word: str = "armory") -> str:
     s = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
     s = re.sub(r"\s+", " ", s).strip()
@@ -719,6 +846,7 @@ class GymDisplayController:
         sleep_fn: Callable[[float], None] | None = None,
         allow_network: bool = True,
         state_dir: Path | None = None,
+        pc_idle_fn: Callable[[], float | None] | None = None,
     ) -> None:
         self._lock = threading.RLock()
         self.cfg = config or GymDisplaysConfig()
@@ -731,9 +859,20 @@ class GymDisplayController:
         self._http_post = http_post
         self._sleep = sleep_fn or time.sleep
         self._allow_network = bool(allow_network)
+        self._pc_idle_fn = pc_idle_fn or get_windows_idle_sec
         self.last_primary_probe: dict[str, Any] = {}
         self.last_cube_probe: dict[str, Any] = {}
         self.last_spin_info: dict[str, Any] = {}
+        self._primary_last_cmd_ms: int = 0
+        self._primary_idle_since_ms: int | None = None
+        self._primary_idle_polls: int = 0
+        self._primary_last_autosleep_ms: int = 0
+        self._primary_idle_state: dict[str, Any] = {}
+        self._spin_last_cmd_ms: int = 0
+        self._spin_idle_since_ms: int | None = None
+        self._spin_last_sig: tuple[str, str] | None = None
+        self._spin_last_autosleep_ms: int = 0
+        self._spin_idle_state: dict[str, Any] = {}
         self._state_dir = Path(state_dir) if state_dir is not None else None
         self._ip_ctrl_state_path = (self._state_dir / "denon_ip_control_state.json") if self._state_dir else None
         self._ip_ctrl_dump_path = (self._state_dir / "denon_network_dump.json") if self._state_dir else None
@@ -1059,7 +1198,14 @@ class GymDisplayController:
                     cur["primary"] = {**cur["primary"], **raw["primary"]}
                 if isinstance(raw.get("spin"), dict):
                     cur["spin"] = {**cur["spin"], **raw["spin"]}
-                for k in ("cubeHost", "cubeAdbPort", "openGymPlayMusic", "openGymMusicUrl", "openGymMusicQuery"):
+                for k in (
+                    "cubeHost",
+                    "cubeAdbPort",
+                    "openGymPlayMusic",
+                    "openGymMusicUrl",
+                    "openGymMusicQuery",
+                    "idleSleepSec",
+                ):
                     if k in raw:
                         cur[k] = raw[k]
             self.cfg = GymDisplaysConfig.from_dict(cur)
@@ -1290,6 +1436,11 @@ class GymDisplayController:
                 return {"ok": False, "target": "tv", "action": action, "state": st, "error": f"ADB {st}: {detail}"}
             self._ensure_no_deep_sleep(ser)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "224"], timeout=4.0)
+            if rc == 0:
+                with self._lock:
+                    self._primary_last_cmd_ms = int(time.time() * 1000)
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
             return {
                 "ok": rc == 0,
                 "target": "tv",
@@ -1305,6 +1456,9 @@ class GymDisplayController:
             self._ensure_no_deep_sleep(ser)
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", "223"], timeout=4.0)
             if rc == 0:
+                with self._lock:
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
                 self._sleep(0.25)
                 if hasattr(self.adb, "disconnect_serial"):
                     self.adb.disconnect_serial(ser)
@@ -1336,6 +1490,11 @@ class GymDisplayController:
                 ["-s", ser, "shell", "input", "keyevent", keycode],
                 timeout=4.0,
             )
+            if rc == 0:
+                with self._lock:
+                    self._primary_last_cmd_ms = int(time.time() * 1000)
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
             denon_res = self.sync_denon_monitor_for_spin() if (rc == 0 and not is_hdmi1) else None
             return {
                 "ok": rc == 0,
@@ -1419,6 +1578,11 @@ class GymDisplayController:
             rc, out, err = self.adb._run(["-s", ser, "shell", "input", "keyevent", keycode], timeout=4.0)
             if rc == 0 and (not target_hw or active_input != target_hw):
                 switched = True
+            if rc == 0 and switched:
+                with self._lock:
+                    self._primary_last_cmd_ms = int(time.time() * 1000)
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
             return {
                 "ok": rc == 0,
                 "target": "tv",
@@ -1567,6 +1731,14 @@ class GymDisplayController:
                 self.denon.send_command("MSMCH STEREO")
                 self.sync_denon_monitor_for_spin()
             res = self._launch_cube_youtube_music(query_override=q_over or None)
+            if res.get("ok"):
+                now_ms = int(time.time() * 1000)
+                with self._lock:
+                    self._primary_last_cmd_ms = now_ms
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
+                    self._spin_last_cmd_ms = now_ms
+                    self._spin_idle_since_ms = None
             return {**res, "target": "music", "action": raw_act}
         key_map = {
             "pause": ("127", "Music paused"),
@@ -1577,6 +1749,14 @@ class GymDisplayController:
         if low in key_map:
             kc, msg = key_map[low]
             res = self._cube_media_keyevent(kc, msg)
+            if res.get("ok") and low in ("resume", "next", "prev"):
+                now_ms = int(time.time() * 1000)
+                with self._lock:
+                    self._primary_last_cmd_ms = now_ms
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
+                    self._spin_last_cmd_ms = now_ms
+                    self._spin_idle_since_ms = None
             return {**res, "target": "music", "action": low}
         return {"ok": False, "target": "music", "action": raw_act, "error": f"Unsupported music action: {raw_act}"}
 
@@ -1605,6 +1785,19 @@ class GymDisplayController:
             if code >= 400:
                 return {"ok": False, "host": clean, "error": f"HTTP {code}"}
             return {**parse_roku_active_app(raw.decode("utf-8", errors="ignore")), "host": clean, "port": int(port)}
+        except Exception as exc:
+            return {"ok": False, "host": clean, "error": str(exc)}
+
+    def get_roku_media_player(self, host: str, port: int = 8060) -> dict[str, Any]:
+        """Query Roku ECP `/query/media-player` to check active playback state."""
+        clean = str(host or "").strip()
+        if not clean:
+            return {"ok": False, "unconfigured": True, "error": "SmartSpin TV IP not set"}
+        try:
+            code, raw = self._do_get(f"http://{clean}:{int(port)}/query/media-player", 1.2)
+            if code >= 400:
+                return {"ok": False, "host": clean, "error": f"HTTP {code}"}
+            return {**parse_roku_media_player(raw.decode("utf-8", errors="ignore")), "host": clean, "port": int(port)}
         except Exception as exc:
             return {"ok": False, "host": clean, "error": str(exc)}
 
@@ -1657,6 +1850,10 @@ class GymDisplayController:
                 if cfg.hdmi_input:
                     self._sleep(0.5)
                     self._do_post(f"{base}/keypress/{urllib.parse.quote(cfg.hdmi_input, safe='')}", b"", {}, 2.0)
+                with self._lock:
+                    self._spin_last_cmd_ms = int(time.time() * 1000)
+                    self._spin_idle_since_ms = None
+                    self._spin_last_sig = None
                 denon_res = (
                     self.sync_denon_monitor_for_spin(spin_expected_on=True)
                     if sync_denon
@@ -1677,6 +1874,9 @@ class GymDisplayController:
                 code, _ = self._do_post(f"{base}/keypress/PowerOff", b"", {}, 2.0)
                 if code >= 400:
                     return {"ok": False, "target": "spin", "action": "off", "error": f"HTTP {code}"}
+                with self._lock:
+                    self._spin_idle_since_ms = None
+                    self._spin_last_sig = None
                 denon_res = (
                     self.sync_denon_monitor_for_spin(spin_expected_on=False)
                     if sync_denon
@@ -1736,6 +1936,11 @@ class GymDisplayController:
                 self._sleep(0.5 if switched else 0.1)
                 self._do_post(f"{base}/keypress/{urllib.parse.quote(cfg.hdmi_input, safe='')}", b"", {}, 2.0)
                 switched = True
+            if switched:
+                with self._lock:
+                    self._spin_last_cmd_ms = int(time.time() * 1000)
+                    self._spin_idle_since_ms = None
+                    self._spin_last_sig = None
             return {
                 "ok": True,
                 "target": "spin",
@@ -1951,11 +2156,375 @@ class GymDisplayController:
 
         return {"ok": False, "target": tgt, "action": act, "error": f"Unknown target: {tgt}"}
 
+    def _probe_denon_power(self) -> bool | None:
+        if self.denon is None:
+            return None
+        dcfg = self.denon._get_cfg()
+        base = self.denon._base_url(dcfg)
+        if not getattr(dcfg, "denon_enabled", False) or not base:
+            return False
+        try:
+            code, raw = self._do_get(f"{base}/goform/formMainZone_MainZoneXml.xml", 1.5)
+            if code >= 400:
+                return False
+            root = ET.fromstring(raw.decode("utf-8", errors="ignore"))
+            for tag in ("Power", "ZonePower"):
+                el = root.find(f".//{tag}/value")
+                if el is not None and (el.text or "").strip():
+                    val = (el.text or "").strip().upper()
+                    return val == "ON"
+            return False
+        except Exception:
+            return False
+
+    def _probe_primary_activity(self) -> dict[str, Any]:
+        cfg = self.get_config().primary
+        if not cfg.enabled or not cfg.host or self.adb is None:
+            return {"ok": False, "state": "unconfigured"}
+        ser = self._adb_serial(cfg.host, cfg.adb_port)
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            return {"ok": False, "state": st, "detail": detail}
+        try:
+            cmd = (
+                "echo '---PWR---'; dumpsys power; "
+                "echo '---TVIN---'; dumpsys tv_input; "
+                "echo '---ACT---'; dumpsys activity activities | grep -E 'mResumedActivity|topResumedActivity|PassthroughPlayerActivity'; "
+                "echo '---MS---'; dumpsys media_session; "
+                "echo '---AUD---'; dumpsys audio"
+            )
+            rc, out, err = self.adb._run(["-s", ser, "shell", cmd], timeout=6.0)
+            if rc != 0:
+                return {"ok": False, "state": "error", "detail": (err or out).strip()}
+            parsed = parse_adb_activity_dump(out)
+            return {"ok": True, "serial": ser, **parsed}
+        finally:
+            if hasattr(self.adb, "disconnect_serial"):
+                try:
+                    self.adb.disconnect_serial(ser)
+                except Exception:
+                    pass
+
+    def _probe_cube_activity(self) -> dict[str, Any]:
+        cfg = self.get_config()
+        if not cfg.cube_host or self.adb is None:
+            return {"ok": False, "state": "unconfigured"}
+        ser = self._adb_serial(cfg.cube_host, cfg.cube_adb_port)
+        st, detail = self.adb._connect_and_status(ser)
+        if st != "device":
+            return {"ok": False, "state": st, "detail": detail}
+        cmd = (
+            "echo '---PWR---'; dumpsys power; "
+            "echo '---MS---'; dumpsys media_session; "
+            "echo '---AUD---'; dumpsys audio"
+        )
+        rc, out, err = self.adb._run(["-s", ser, "shell", cmd], timeout=6.0)
+        if rc != 0:
+            return {"ok": False, "state": "error", "detail": (err or out).strip()}
+        parsed = parse_adb_activity_dump(out)
+        return {"ok": True, "serial": ser, **parsed}
+
+    def check_idle_sleep(
+        self,
+        *,
+        now_ms: int | None = None,
+        workout_active: bool = False,
+        show_active: bool = False,
+        pc_idle_sec: float | None = None,
+    ) -> dict[str, Any]:
+        """Auto-sleep Main TV (Hisense) and SmartSpin TV (Roku) after configurable inactivity."""
+        cur_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        cfg = self.get_config()
+        idle_sec = int(cfg.idle_sleep_sec)
+        if idle_sec <= 0:
+            with self._lock:
+                self._primary_idle_since_ms = None
+                self._primary_idle_polls = 0
+                self._spin_idle_since_ms = None
+                self._spin_last_sig = None
+                self._primary_idle_state = {"state": "disabled"}
+                self._spin_idle_state = {"state": "disabled"}
+            return {"ok": True, "enabled": False, "idleSleepSec": 0, "slept": []}
+
+        if workout_active or show_active:
+            busy_reason = "workout_active" if workout_active else "show_active"
+            with self._lock:
+                self._primary_idle_since_ms = None
+                self._primary_idle_polls = 0
+                self._spin_idle_since_ms = None
+                self._primary_idle_state = {"state": "active", "reason": busy_reason, "checkedAtMs": cur_ms}
+                self._spin_idle_state = {"state": "active", "reason": busy_reason, "checkedAtMs": cur_ms}
+            return {
+                "ok": True,
+                "enabled": True,
+                "idleSleepSec": idle_sec,
+                "slept": [],
+                "primary": dict(self._primary_idle_state),
+                "spin": dict(self._spin_idle_state),
+            }
+
+        idle_ms = idle_sec * 1000
+        slept: list[str] = []
+        denon_cache: dict[str, Any] = {}
+        cube_cache: dict[str, Any] = {}
+
+        def _get_denon_on() -> bool:
+            if "on" not in denon_cache:
+                denon_cache["on"] = bool(self._probe_denon_power())
+            return bool(denon_cache["on"])
+
+        def _get_cube_active() -> tuple[bool, dict[str, Any]]:
+            if "act" not in cube_cache:
+                cube_cache["act"] = self._probe_cube_activity()
+            c_act = cube_cache["act"]
+            c_active = bool(
+                c_act.get("ok")
+                and c_act.get("awake")
+                and (
+                    c_act.get("playing")
+                    or (c_act.get("user_idle_sec") is not None and float(c_act["user_idle_sec"]) < idle_sec)
+                )
+            )
+            return c_active, c_act
+
+        # 1. Main TV (Hisense)
+        prim_state: dict[str, Any]
+        if not cfg.primary.enabled or not cfg.primary.host:
+            prim_state = {"state": "unconfigured", "checkedAtMs": cur_ms}
+        else:
+            p_act = self._probe_primary_activity()
+            if not p_act.get("ok"):
+                with self._lock:
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
+                prim_state = {"state": str(p_act.get("state") or "offline"), "checkedAtMs": cur_ms}
+            elif not p_act.get("awake"):
+                with self._lock:
+                    self._primary_idle_since_ms = None
+                    self._primary_idle_polls = 0
+                prim_state = {
+                    "state": "asleep",
+                    "wakefulness": p_act.get("wakefulness", ""),
+                    "displayPower": p_act.get("display_power", ""),
+                    "checkedAtMs": cur_ms,
+                }
+            else:
+                user_idle = p_act.get("user_idle_sec")
+                active_input = str(p_act.get("active_input") or "")
+                hdmi_inputs = list(p_act.get("hdmi_inputs") or [])
+                passthrough_active = bool(p_act.get("passthrough_active"))
+
+                opti_kc = resolve_hdmi_keyevent(cfg.primary.hdmi_optiplex_input, "243")
+                denon_kc = resolve_hdmi_keyevent(cfg.primary.hdmi_denon_input, "244")
+                port_idx_map = {"243": 0, "244": 1, "245": 2, "246": 3}
+                opti_idx = port_idx_map.get(opti_kc, 0)
+                denon_idx = port_idx_map.get(denon_kc, 1)
+                opti_hw = hdmi_inputs[opti_idx] if opti_idx < len(hdmi_inputs) else ""
+                denon_hw = hdmi_inputs[denon_idx] if denon_idx < len(hdmi_inputs) else ""
+
+                active_reason = ""
+                pc_idle_val: float | None = None
+                denon_on_val: bool | None = None
+                cube_active_val: bool | None = None
+
+                with self._lock:
+                    last_cmd_ms = self._primary_last_cmd_ms
+
+                if last_cmd_ms > 0 and (cur_ms - last_cmd_ms) < idle_ms:
+                    active_reason = "recent_cmd"
+                elif user_idle is not None and float(user_idle) < idle_sec:
+                    active_reason = "tv_remote"
+                elif p_act.get("playing"):
+                    active_reason = "tv_media"
+                elif passthrough_active:
+                    if opti_hw and active_input == opti_hw:
+                        pc_idle_val = pc_idle_sec if pc_idle_sec is not None else self._pc_idle_fn()
+                        if pc_idle_val is not None and float(pc_idle_val) < idle_sec:
+                            active_reason = "pc_input"
+                    elif denon_hw and active_input == denon_hw:
+                        denon_on_val = _get_denon_on()
+                        if denon_on_val:
+                            cube_active_val, c_act = _get_cube_active()
+                            if cube_active_val:
+                                active_reason = "cube_media" if c_act.get("playing") else "cube_remote"
+
+                if active_reason:
+                    with self._lock:
+                        self._primary_idle_since_ms = None
+                        self._primary_idle_polls = 0
+                    prim_state = {
+                        "state": "active",
+                        "reason": active_reason,
+                        "activeInput": active_input,
+                        "userIdleSec": user_idle,
+                        **({"pcIdleSec": round(float(pc_idle_val), 1)} if pc_idle_val is not None else {}),
+                        "checkedAtMs": cur_ms,
+                    }
+                else:
+                    with self._lock:
+                        self._primary_idle_polls += 1
+                        polls = self._primary_idle_polls
+                        if self._primary_idle_since_ms is None:
+                            self._primary_idle_since_ms = cur_ms
+                        idle_since = self._primary_idle_since_ms
+                    elapsed_ms = max(0, cur_ms - idle_since)
+                    hw_confirmed_idle = False
+                    if polls >= 2 and user_idle is not None and float(user_idle) >= idle_sec:
+                        if passthrough_active and opti_hw and active_input == opti_hw:
+                            hw_confirmed_idle = pc_idle_val is not None and float(pc_idle_val) >= idle_sec
+                        elif passthrough_active and denon_hw and active_input == denon_hw:
+                            hw_confirmed_idle = (not denon_on_val) or (not cube_active_val)
+                        else:
+                            hw_confirmed_idle = True
+                    if elapsed_ms >= idle_ms or hw_confirmed_idle:
+                        sleep_res = self._control_primary("off")
+                        if sleep_res.get("ok"):
+                            with self._lock:
+                                self._primary_last_autosleep_ms = cur_ms
+                                self._primary_idle_since_ms = None
+                                self._primary_idle_polls = 0
+                            slept.append("tv")
+                            prim_state = {
+                                "state": "slept",
+                                "reason": "hw_idle" if hw_confirmed_idle and elapsed_ms < idle_ms else "idle_timeout",
+                                "activeInput": active_input,
+                                "checkedAtMs": cur_ms,
+                            }
+                        else:
+                            prim_state = {
+                                "state": "idle_sleep_failed",
+                                "error": sleep_res.get("error", ""),
+                                "idleForSec": round(elapsed_ms / 1000.0, 1),
+                                "checkedAtMs": cur_ms,
+                            }
+                    else:
+                        prim_state = {
+                            "state": "idle",
+                            "activeInput": active_input,
+                            "idleForSec": round(elapsed_ms / 1000.0, 1),
+                            "remainingSec": round(max(0, idle_ms - elapsed_ms) / 1000.0, 1),
+                            "polls": polls,
+                            "checkedAtMs": cur_ms,
+                        }
+
+        # 2. SmartSpin TV (TCL Roku)
+        spin_state: dict[str, Any]
+        if not cfg.spin.enabled or not cfg.spin.host:
+            spin_state = {"state": "unconfigured", "checkedAtMs": cur_ms}
+        else:
+            r_info = self.get_roku_info(cfg.spin.host, cfg.spin.ecp_port)
+            if not r_info.get("ok"):
+                with self._lock:
+                    self._spin_idle_since_ms = None
+                    self._spin_last_sig = None
+                spin_state = {"state": "offline", "error": r_info.get("error", ""), "checkedAtMs": cur_ms}
+            elif r_info.get("powerMode") != "PowerOn":
+                with self._lock:
+                    self._spin_idle_since_ms = None
+                    self._spin_last_sig = None
+                spin_state = {"state": "asleep", "powerMode": r_info.get("powerMode", ""), "checkedAtMs": cur_ms}
+            else:
+                r_app = self.get_roku_active_app(cfg.spin.host, cfg.spin.ecp_port)
+                r_mp = self.get_roku_media_player(cfg.spin.host, cfg.spin.ecp_port)
+                app_id = str(r_app.get("appId") or "")
+                app_type = str(r_app.get("appType") or "")
+                player_state = str(r_mp.get("state") or "")
+                sig = (app_id, player_state)
+
+                with self._lock:
+                    prev_sig = self._spin_last_sig
+                    if prev_sig is not None and sig != prev_sig:
+                        self._spin_idle_since_ms = cur_ms
+                    self._spin_last_sig = sig
+                    last_spin_cmd_ms = self._spin_last_cmd_ms
+
+                m_hdmi = re.search(r"hdmi\s*([1-4])", cfg.spin.hdmi_input or "", re.I)
+                expected_hdmi_id = f"tvinput.hdmi{m_hdmi.group(1)}" if m_hdmi else "tvinput.hdmi1"
+
+                spin_active_reason = ""
+                if last_spin_cmd_ms > 0 and (cur_ms - last_spin_cmd_ms) < idle_ms:
+                    spin_active_reason = "recent_cmd"
+                elif app_type != "tvin" and player_state in ("play", "buffer"):
+                    spin_active_reason = "roku_media"
+                elif app_id == expected_hdmi_id:
+                    if _get_denon_on():
+                        c_active, c_act = _get_cube_active()
+                        if c_active:
+                            spin_active_reason = "cube_media" if c_act.get("playing") else "cube_remote"
+
+                if spin_active_reason:
+                    with self._lock:
+                        self._spin_idle_since_ms = None
+                    spin_state = {
+                        "state": "active",
+                        "reason": spin_active_reason,
+                        "appId": app_id,
+                        "playerState": player_state,
+                        "checkedAtMs": cur_ms,
+                    }
+                else:
+                    with self._lock:
+                        if self._spin_idle_since_ms is None:
+                            self._spin_idle_since_ms = cur_ms
+                        s_idle_since = self._spin_idle_since_ms
+                    s_elapsed_ms = max(0, cur_ms - s_idle_since)
+                    if s_elapsed_ms >= idle_ms:
+                        sync_denon = _get_denon_on()
+                        sleep_res = self._control_spin("off", sync_denon=sync_denon)
+                        if sleep_res.get("ok"):
+                            with self._lock:
+                                self._spin_last_autosleep_ms = cur_ms
+                                self._spin_idle_since_ms = None
+                                self._spin_last_sig = None
+                            slept.append("spin")
+                            spin_state = {
+                                "state": "slept",
+                                "reason": "idle_timeout",
+                                "appId": app_id,
+                                "checkedAtMs": cur_ms,
+                            }
+                        else:
+                            spin_state = {
+                                "state": "idle_sleep_failed",
+                                "error": sleep_res.get("error", ""),
+                                "idleForSec": round(s_elapsed_ms / 1000.0, 1),
+                                "checkedAtMs": cur_ms,
+                            }
+                    else:
+                        spin_state = {
+                            "state": "idle",
+                            "appId": app_id,
+                            "playerState": player_state,
+                            "idleForSec": round(s_elapsed_ms / 1000.0, 1),
+                            "remainingSec": round(max(0, idle_ms - s_elapsed_ms) / 1000.0, 1),
+                            "checkedAtMs": cur_ms,
+                        }
+
+        with self._lock:
+            self._primary_idle_state = prim_state
+            self._spin_idle_state = spin_state
+
+        return {
+            "ok": True,
+            "enabled": True,
+            "idleSleepSec": idle_sec,
+            "slept": slept,
+            "primary": prim_state,
+            "spin": spin_state,
+        }
+
     def status_dict(self, *, live_probe: bool = False) -> dict[str, Any]:
         cfg = self.get_config()
         spin_info = self.get_roku_info(cfg.spin.host, cfg.spin.ecp_port) if (live_probe and cfg.spin.host) else (
             {"ok": False, "unconfigured": True, "error": "SmartSpin TV IP not set"} if not cfg.spin.host else self.last_spin_info
         )
+        with self._lock:
+            idle_snap = {
+                "enabled": int(cfg.idle_sleep_sec) > 0,
+                "idleSleepSec": int(cfg.idle_sleep_sec),
+                "primary": dict(self._primary_idle_state),
+                "spin": dict(self._spin_idle_state),
+            }
         return {
             "config": cfg.to_dict(),
             "primary": {
@@ -1970,4 +2539,5 @@ class GymDisplayController:
             },
             "spin": spin_info,
             "denonIpControl": self.get_denon_ip_control_state(),
+            "idleSleep": idle_snap,
         }

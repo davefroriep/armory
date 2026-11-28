@@ -4062,6 +4062,13 @@ class ArmoryCamService:
                 )
                 no_sleep_t.start()
                 self._worker_threads.append(no_sleep_t)
+                idle_t = threading.Thread(
+                    target=self._display_idle_watch_loop,
+                    name="display-idle-watch",
+                    daemon=True,
+                )
+                idle_t.start()
+                self._worker_threads.append(idle_t)
         self.trigger_optiplex_config_backup_async()
 
     def _startup_enforce_no_deep_sleep(self) -> None:
@@ -4071,6 +4078,29 @@ class ArmoryCamService:
             self.displays.enforce_no_deep_sleep_all(self.wallboard_cfg)
         except Exception as exc:
             self.log.debug("Startup no-deep-sleep enforcement error: %s", exc)
+
+    def _display_idle_watch_loop(self) -> None:
+        """Auto-sleep Main TV & SmartSpin TV after configured inactivity without enabling Fire OS deep sleep."""
+        if self._stop_event.wait(15.0):
+            return
+        while not self._stop_event.is_set():
+            try:
+                workout_active = bool(self.wallboard.workout_active or self.recording)
+                show_active = bool(self.shows.is_active())
+                res = self.displays.check_idle_sleep(
+                    workout_active=workout_active,
+                    show_active=show_active,
+                )
+                if res.get("slept"):
+                    self.log.info(
+                        "Display idle auto-sleep put %s to sleep: %s",
+                        ", ".join(str(x) for x in res["slept"]),
+                        res,
+                    )
+            except Exception as exc:
+                self.log.debug("Display idle watch error: %s", exc)
+            if self._stop_event.wait(60.0):
+                return
 
     def _denon_ip_control_watch_loop(self) -> None:
         """Self-healing watcher: verify & enforce Denon IP Control = Always On periodically."""
@@ -8995,8 +9025,8 @@ class ArmoryCamService:
             entry = self.voice._emit_transcript(phrase, latency_ms=0, from_oww=True)
             return {"ok": True, "action": "record", "wasArmed": armed is not None, "entry": entry}
         if clean == "undo":
-            entry = self.voice._emit_transcript(f"{wake_disp}, undo", latency_ms=0, from_oww=True)
-            return {"ok": True, "action": "undo", "entry": entry}
+            entry = self.voice._emit_transcript(f"{wake_disp}, uncheck", latency_ms=0, from_oww=True)
+            return {"ok": True, "action": "undo", "voiceIntent": "uncheck", "entry": entry}
         return {"ok": False, "error": f"Unknown button action: {action}"}
 
     def play_house_audio_test(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -10132,6 +10162,7 @@ DASHBOARD_HTML = """<!doctype html>
             <div><label>Fire TV Cube IP</label><input id="dpCubeHost" type="text" value="192.168.1.151"></div>
             <div><label>YouTube Music Playlist/Mix URL</label><input id="dpMusicUrl" type="text" placeholder="https://music.youtube.com/playlist?list=..."></div>
             <div><label>YouTube Music Search Fallback</label><input id="dpMusicQuery" type="text" value="workout music mix"></div>
+            <div><label>Idle Auto-Sleep (minutes, 0=off)</label><input id="dpIdleMin" type="number" min="0" max="480" value="60"></div>
           </div>
           <div class="ctrl-row" style="margin-top:10px">
             <button class="btn" id="dpSaveBtn" type="button">Save Displays</button>
@@ -10140,6 +10171,7 @@ DASHBOARD_HTML = """<!doctype html>
             <button class="btn sec" id="dpFindRokuBtn" type="button">Find Roku TVs</button>
             <span id="dpOut" style="color:var(--mut);font-size:12px"></span>
           </div>
+          <div id="dpIdleStatus" style="margin-top:6px;color:var(--mut);font-size:12px"></div>
           <div id="dpRokuList" style="margin-top:8px;color:var(--mut);font-size:12px" hidden></div>
         </div>
 
@@ -10540,7 +10572,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <option value="check">Check / Done (stops rec)</option>
                 <option value="record">Start / Stop Recording</option>
                 <option value="voice">Instant Voice Duck</option>
-                <option value="undo">Undo Last Set</option>
+                <option value="undo">Uncheck Last Set (keeps w/r)</option>
                 <option value="none">Disabled</option>
               </select>
             </div>
@@ -10550,8 +10582,18 @@ DASHBOARD_HTML = """<!doctype html>
                 <option value="check">Check / Done (stops rec)</option>
                 <option value="record">Start / Stop Recording</option>
                 <option value="voice">Instant Voice Duck</option>
-                <option value="undo">Undo Last Set</option>
+                <option value="undo">Uncheck Last Set (keeps w/r)</option>
                 <option value="none">Disabled (0ms single click)</option>
+              </select>
+            </div>
+            <div>
+              <label>Triple Click</label>
+              <select id="btTripleAct">
+                <option value="undo">Uncheck Last Set (keeps w/r)</option>
+                <option value="none">Disabled (0ms double click)</option>
+                <option value="check">Check / Done (stops rec)</option>
+                <option value="record">Start / Stop Recording</option>
+                <option value="voice">Instant Voice Duck</option>
               </select>
             </div>
             <div>
@@ -10560,7 +10602,7 @@ DASHBOARD_HTML = """<!doctype html>
                 <option value="check">Check / Done (stops rec)</option>
                 <option value="record">Start / Stop Recording</option>
                 <option value="voice">Instant Voice Duck</option>
-                <option value="undo">Undo Last Set</option>
+                <option value="undo">Uncheck Last Set (keeps w/r)</option>
                 <option value="none">Disabled</option>
               </select>
             </div>
@@ -10573,7 +10615,7 @@ DASHBOARD_HTML = """<!doctype html>
                   <option value="check">Check / Done (stops rec)</option>
                   <option value="record">Start / Stop Recording</option>
                   <option value="voice">Instant Voice Duck</option>
-                  <option value="undo">Undo Last Set</option>
+                  <option value="undo">Uncheck Last Set (keeps w/r)</option>
                   <option value="none">Disabled</option>
                 </select>
               </div>
@@ -10584,7 +10626,7 @@ DASHBOARD_HTML = """<!doctype html>
                   <option value="check">Check / Done (stops rec)</option>
                   <option value="record">Start / Stop Recording</option>
                   <option value="voice">Instant Voice Duck</option>
-                  <option value="undo">Undo Last Set</option>
+                  <option value="undo">Uncheck Last Set (keeps w/r)</option>
                 </select>
               </div>
               <div>
@@ -10593,7 +10635,7 @@ DASHBOARD_HTML = """<!doctype html>
                   <option value="voice">Instant Voice Duck</option>
                   <option value="record">Start / Stop Recording</option>
                   <option value="check">Check / Done (stops rec)</option>
-                  <option value="undo">Undo Last Set</option>
+                  <option value="undo">Uncheck Last Set (keeps w/r)</option>
                   <option value="none">Disabled</option>
                 </select>
               </div>
@@ -10605,7 +10647,7 @@ DASHBOARD_HTML = """<!doctype html>
                   <option value="record">Start / Stop Recording</option>
                   <option value="check">Check / Done (stops rec)</option>
                   <option value="voice">Instant Voice Duck</option>
-                  <option value="undo">Undo Last Set</option>
+                  <option value="undo">Uncheck Last Set (keeps w/r)</option>
                   <option value="none">Disabled</option>
                 </select>
               </div>
@@ -10616,7 +10658,7 @@ DASHBOARD_HTML = """<!doctype html>
                   <option value="check">Check / Done (stops rec)</option>
                   <option value="record">Start / Stop Recording</option>
                   <option value="voice">Instant Voice Duck</option>
-                  <option value="undo">Undo Last Set</option>
+                  <option value="undo">Uncheck Last Set (keeps w/r)</option>
                 </select>
               </div>
             </div>
@@ -10637,6 +10679,7 @@ DASHBOARD_HTML = """<!doctype html>
             <button class="btn ok sm" id="btBtnSaveBtn" type="button">Save Button</button>
             <button class="btn sec sm" id="btBtnTestCheck" type="button">Test Check</button>
             <button class="btn sec sm" id="btBtnTestRec" type="button">Test Record/Stop</button>
+            <button class="btn sec sm" id="btBtnTestUndo" type="button">Test Uncheck</button>
             <button class="btn sec sm" id="btBtnTestVoice" type="button">Test Voice Duck</button>
           </div>
         </div>
@@ -13288,6 +13331,19 @@ function populateDisplaysInputs(dc) {
   if ($('dpCubeHost')) $('dpCubeHost').value = dc.cubeHost || '192.168.1.151';
   if ($('dpMusicUrl')) $('dpMusicUrl').value = dc.openGymMusicUrl || '';
   if ($('dpMusicQuery')) $('dpMusicQuery').value = dc.openGymMusicQuery || 'workout music mix';
+  if ($('dpIdleMin')) $('dpIdleMin').value = dc.idleSleepSec === 0 ? 0 : Math.round(Number(dc.idleSleepSec || 3600) / 60);
+}
+
+function formatDisplayIdleSummary(label, st) {
+  if (!st || !st.state) return `${label}: pending`;
+  if (st.state === 'idle' && st.remainingSec != null) {
+    const mins = Math.max(1, Math.ceil(Number(st.remainingSec) / 60));
+    return `${label}: idle (~${mins}m left)`;
+  }
+  if (st.state === 'active' && st.reason) {
+    return `${label}: active (${st.reason.replace(/_/g, ' ')})`;
+  }
+  return `${label}: ${st.state.replace(/_/g, ' ')}`;
 }
 
 function syncDisplaysUI(ds) {
@@ -13314,9 +13370,20 @@ function syncDisplaysUI(ds) {
       badge.textContent += ` · CUBE ${cube.displayPower || cube.wakefulness || 'OK'}`;
     }
   }
+  const idleEl = $('dpIdleStatus');
+  if (idleEl && ds.idleSleep) {
+    if (!ds.idleSleep.enabled) {
+      idleEl.textContent = 'Auto-sleep: Off';
+    } else {
+      const mins = Math.round(Number(ds.idleSleep.idleSleepSec || 3600) / 60);
+      idleEl.textContent = `Auto-sleep (${mins}m): ${formatDisplayIdleSummary('Main TV', ds.idleSleep.primary)} · ${formatDisplayIdleSummary('SmartSpin', ds.idleSleep.spin)}`;
+    }
+  }
 }
 
 async function saveDisplaysConfig(triggerBtn) {
+  const rawIdleMin = $('dpIdleMin') ? $('dpIdleMin').value.trim() : '60';
+  const idleSec = rawIdleMin === '0' ? 0 : Math.max(0, Math.round((Number(rawIdleMin) || 60) * 60));
   const body = {
     primary: {
       host: $('dpPrimHost').value.trim(),
@@ -13335,6 +13402,7 @@ async function saveDisplaysConfig(triggerBtn) {
     openGymPlayMusic: $('dpOpenMusic') ? ($('dpOpenMusic').value !== '0') : true,
     openGymMusicUrl: $('dpMusicUrl') ? $('dpMusicUrl').value.trim() : '',
     openGymMusicQuery: ($('dpMusicQuery') ? $('dpMusicQuery').value.trim() : '') || 'workout music mix',
+    idleSleepSec: idleSec,
   };
   try {
     const r = await fetch('/api/displays/config', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
@@ -14399,6 +14467,7 @@ function syncBtButtonUI(bt) {
   setSel('btBtnDblMs', bt.doubleTapMs);
   setSel('btSingleAct', bt.singleAction);
   setSel('btDoubleAct', bt.doubleAction);
+  setSel('btTripleAct', bt.tripleAction || 'undo');
   setSel('btLongAct', bt.longAction);
   setSel('btUpSingle', bt.volUpSingle);
   setSel('btUpDouble', bt.volUpDouble);
@@ -14439,6 +14508,7 @@ if ($('btBtnSaveBtn')) {
       mode: val('btBtnMode', 'one_button'),
       singleAction: val('btSingleAct', 'check'),
       doubleAction: val('btDoubleAct', 'record'),
+      tripleAction: val('btTripleAct', 'undo'),
       longAction: val('btLongAct', 'voice'),
       volUpSingle: val('btUpSingle', 'check'),
       volUpDouble: val('btUpDouble', 'none'),
@@ -14456,6 +14526,7 @@ if ($('btBtnSaveBtn')) {
 [
   ['btBtnTestCheck', 'check'],
   ['btBtnTestRec', 'record'],
+  ['btBtnTestUndo', 'undo'],
   ['btBtnTestVoice', 'voice'],
 ].forEach(([id, act]) => {
   const b = $(id);
