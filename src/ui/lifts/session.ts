@@ -1217,7 +1217,7 @@ function build(root: HTMLElement, id?: string): () => void {
         const guestList = guestVids.length
           ? `<div class="fl">GUEST CLIPS (THIS SESSION)</div>
              <div style="display:flex;flex-direction:column;gap:6px;margin:6px 0 10px">
-               ${guestVids.map((v) => `<button class="aitem" type="button" data-gplay="${esc(v.id)}"><b>Guest Clip · ${esc(v.camera || 'Gym Cam')}</b><small>${new Date(v.ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}${v.durationSec ? ` · ${v.durationSec}s` : ''} · Tap to watch &amp; share</small></button>`).join('')}
+               ${guestVids.map((v) => `<button class="aitem" type="button" data-gplay="${esc(v.id)}"><b>Guest Clip · ${esc(v.camera || 'Gym Cam')}</b><small>${new Date(v.ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true })}${v.durationSec ? ` · ${v.durationSec}s` : ''} · Tap to watch &amp; share</small></button>`).join('')}
              </div>`
           : '';
         sh.body.querySelector('#camStatusBody')!.innerHTML = `

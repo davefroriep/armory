@@ -196,7 +196,7 @@ export function settingsScreen(root: HTMLElement): () => void {
     const coachEl = root.querySelector<HTMLElement>('#coachSyncInfo');
     if (coachEl) {
       const cnt = cur.appliedCoachPatches?.length ?? 0;
-      const last = cur.coachSyncLastMs ? new Date(cur.coachSyncLastMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : 'never';
+      const last = cur.coachSyncLastMs ? new Date(cur.coachSyncLastMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }) : 'never';
       coachEl.textContent = `Coach sync (zero-APK): ${cnt} patch${cnt === 1 ? '' : 'es'} applied · Last checked ${last}`;
     }
 

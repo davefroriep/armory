@@ -100,7 +100,7 @@ export function homeScreen(root: HTMLElement): () => void {
         : canRuckResume
           ? `#/strength/hr?resume=${esc(m.id)}`
           : '';
-      const whenTxt = new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      const whenTxt = new Date(m.startEpochMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
       const msgTxt = m.status === 'finished'
         ? `${esc(m.name)} — finished at ${whenTxt} before saving.`
         : `${esc(m.name)} — started ${whenTxt}. The app closed before you finished.`;

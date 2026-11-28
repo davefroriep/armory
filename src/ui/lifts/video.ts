@@ -58,7 +58,7 @@ const isMobileWeb = (): boolean => !isNative() && /Android|iPhone|iPad|iPod/i.te
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
 const fmtEpochClock = (ms: number): string =>
-  new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
 
 const blobToBase64 = (blob: Blob): Promise<string> =>
   new Promise((resolve, reject) => {
@@ -195,7 +195,7 @@ const fmtVideoTimestamp = (ms: number): string => {
   const now = new Date();
   const ymd = (x: Date) => `${x.getFullYear()}-${x.getMonth()}-${x.getDate()}`;
   const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
-  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
   if (ymd(d) === ymd(now)) return `Today · ${time}`;
   if (ymd(d) === ymd(yest)) return `Yesterday · ${time}`;
   const date = d.toLocaleDateString([], {

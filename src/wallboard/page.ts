@@ -411,7 +411,7 @@ function render(st) {
   lastState = st;
   markFresh();
   const app = document.getElementById('app');
-  const nowStr = new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+  const nowStr = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
   const modePill = st.mode === 'lift'
     ? '<span class="pill live">' + (st.lift.paused ? 'PAUSED' : 'LIVE · LIFT') + ' · ' + mmss(st.lift.elapsedSec) + '</span>'
     : st.mode === 'cardio'
@@ -659,13 +659,13 @@ document.addEventListener('click', keepAwake);
 
 setInterval(() => {
   const nowD = new Date();
-  const t = nowD.toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+  const t = nowD.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
   document.querySelectorAll('.clk, .standby-big').forEach((el) => { el.textContent = t; });
   const stale = !!(lastState && lastState.mode !== 'standby' && Date.now() - lastRxMs > 12000);
   document.body.classList.toggle('stale', stale);
   if (stale) {
     const sbEl = document.getElementById('staleBanner');
-    const agoT = new Date(lastRxMs).toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+    const agoT = new Date(lastRxMs).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
     if (sbEl) sbEl.textContent = 'PHONE PAUSED · last update ' + agoT;
   }
   if (lastState && lastState.mode === 'standby' && lastState.standby && lastState.standby.ymd) {

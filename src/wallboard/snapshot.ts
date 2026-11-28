@@ -888,7 +888,7 @@ export function buildWallboardSnapshot(inp: WallboardBuildInput): WallboardState
     standby: {
       ymd: todayYmd,
       dateLabel: d.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' }),
-      timeLabel: d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }),
+      timeLabel: d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true }),
       weekLabel,
       todayItems,
       completedItems,
